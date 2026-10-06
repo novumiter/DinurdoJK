@@ -838,7 +838,7 @@ impl App {
             self.hitch.connection_key = Some(connection_key);
             self.hitch.recording_connection = Some(serde_json::json!({
                 "kind": "solo", "map": server.map_name(), "server_id": 0,
-                "physics_msec_at_start": self.video.physics_msec,
+                "command_rate_at_start": self.network.command_rate,
             }));
         }
         let committed = crate::net::prediction_state_debug(&latest.player_state);

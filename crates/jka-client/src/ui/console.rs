@@ -236,21 +236,20 @@ pub(in crate::ui) fn console_keycaps(
     }
 }
 
-/// Tone for the gutter marker of echoed input (amber) and error lines (magenta).
-pub(in crate::ui) fn console_line_tone(line: &str) -> Option<[f32; 4]> {
-    let mut rest = line;
-    // Optional `^8[hh:mm:ss]^7 ` timestamp prefix from `con_timestamps`.
-    if let Some(after) = rest.strip_prefix("^8[") {
-        if let Some(index) = after.find("]^7 ") {
-            rest = &after[index + 4..];
-        }
-    }
-    if rest.starts_with("^7] ") || rest.starts_with("] ") {
-        Some(CON_AMBER)
-    } else if rest.starts_with("^1") {
-        Some(CON_MAGENTA)
-    } else {
-        None
+/// Tone for the gutter marker/highlight. Semantic classification arrives with
+/// the log record; JKA `^N` colours are presentation only and never imply an
+/// error or notification.
+pub(in crate::ui) fn console_line_tone(
+    kind: crate::logging::ConsoleLineKind,
+) -> Option<[f32; 4]> {
+    use crate::logging::ConsoleLineKind;
+    match kind {
+        ConsoleLineKind::Normal => None,
+        ConsoleLineKind::CommandEcho => Some(CON_AMBER),
+        ConsoleLineKind::Error => Some(CON_MAGENTA),
+        ConsoleLineKind::NotifyMention => Some(CON_CYAN),
+        ConsoleLineKind::NotifyConnect => Some([0.96, 0.84, 0.30, 1.0]),
+        ConsoleLineKind::NotifyVote => Some([1.0, 0.56, 0.20, 1.0]),
     }
 }
 
@@ -593,7 +592,12 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         .enumerate()
     {
         let absolute_line = history_start + line_index;
-        if let Some(tone) = console_line_tone(line) {
+        let kind = ui
+            .console_line_kinds
+            .get(absolute_line)
+            .copied()
+            .unwrap_or_default();
+        if let Some(tone) = console_line_tone(kind) {
             rect(
                 out,
                 0.0,

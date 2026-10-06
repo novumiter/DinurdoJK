@@ -7,7 +7,7 @@ use crate::renderer::{
     PipelineKey, Vec3, WorldShaderVariantKey, BLOB_MARK_PROJECTION, BLOB_MARK_SURFACE_LIFT,
     DEPTH_FORMAT, DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
     FX_GPU_SPRITE_INSTANCE_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
-    LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES, VERTEX_ATTRIBUTES,
+    LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES, RT_RECEIVER_RAW_COLOR_ATTRIBUTES, VERTEX_ATTRIBUTES,
 };
 
 impl DynamicModelRenderer {
@@ -25,6 +25,7 @@ impl DynamicModelRenderer {
         // MD3 / Ghoul2 alpha-mode pipelines are lazy: recompiled by
         // ensure_model_pipelines for only the modes that have draws.
         self.model_pipelines = Default::default();
+        self.model_glow_pipelines = Default::default();
         self.model_alpha_mask = 0;
         self.fx_sprite_opaque_pipeline = None;
         self.fx_sprite_mask_pipeline = None;
@@ -37,7 +38,9 @@ impl DynamicModelRenderer {
         self.fx_sprite_dst_color_add_pipeline = None;
         self.fx_sprite_modulate2x_pipeline = None;
         self.fx_sprite_darken_pipeline = None;
+        self.fx_sprite_glow_pipelines = Default::default();
         self.skin_pipelines = Default::default();
+        self.skin_glow_pipelines = Default::default();
         self.skin_alpha_mask = 0;
     }
 
@@ -67,6 +70,7 @@ impl DynamicModelRenderer {
                     samples,
                     alpha_mode,
                     legacy_fog,
+                    false,
                 )
             });
         } else {
@@ -77,6 +81,55 @@ impl DynamicModelRenderer {
             let legacy_fog = self.legacy_fog_compiled;
             jobs.request(key, "dynamic model alpha variant", move || {
                 create_dynamic_model_pipeline(
+                    &device,
+                    &layout,
+                    &shader,
+                    surface_format,
+                    samples,
+                    alpha_mode,
+                    legacy_fog,
+                )
+            });
+        }
+    }
+
+    pub(in crate::renderer) fn request_model_glow_pipeline_variant(
+        &self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+        alpha_mode: DynamicModelAlphaMode,
+        skin: bool,
+    ) {
+        let surface_format = self.fx_sprite_surface_format;
+        let samples = self.fx_sprite_samples;
+        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled));
+        let index = alpha_mode.index();
+        if skin {
+            let key = PipelineJobKey::new("ghoul2-model-glow", index as u32, config);
+            let device = device.clone();
+            let layout = self.skin_pipeline_layout.clone();
+            let shader = self.skin_shader.clone();
+            let legacy_fog = self.legacy_fog_compiled;
+            jobs.request(key, "Ghoul2 authored glow alpha variant", move || {
+                create_ghoul2_skin_pipeline(
+                    &device,
+                    &layout,
+                    &shader,
+                    surface_format,
+                    samples,
+                    alpha_mode,
+                    legacy_fog,
+                    true,
+                )
+            });
+        } else {
+            let key = PipelineJobKey::new("dynamic-model-glow", index as u32, config);
+            let device = device.clone();
+            let layout = self.pipeline_layout.clone();
+            let shader = self.shader.clone();
+            let legacy_fog = self.legacy_fog_compiled;
+            jobs.request(key, "dynamic model authored glow alpha variant", move || {
+                create_dynamic_model_glow_pipeline(
                     &device,
                     &layout,
                     &shader,
@@ -111,6 +164,7 @@ impl DynamicModelRenderer {
         &mut self,
         jobs: &mut PipelineJobManager,
         device: &wgpu::Device,
+        prepare_authored_glow: bool,
     ) {
         let mut model_mask = 0u16;
         for draw in &self.draws {
@@ -119,6 +173,16 @@ impl DynamicModelRenderer {
         let mut skin_mask = 0u16;
         for draw in &self.skin_draws {
             skin_mask |= 1 << draw.alpha_mode.index();
+        }
+        let mut model_glow_mask = 0u16;
+        let mut skin_glow_mask = 0u16;
+        if prepare_authored_glow {
+            for draw in self.draws.iter().filter(|draw| draw.authored_glow) {
+                model_glow_mask |= 1 << draw.alpha_mode.index();
+            }
+            for draw in self.skin_draws.iter().filter(|draw| draw.authored_glow) {
+                skin_glow_mask |= 1 << draw.alpha_mode.index();
+            }
         }
         self.model_alpha_mask = model_mask;
         self.skin_alpha_mask = skin_mask;
@@ -144,6 +208,26 @@ impl DynamicModelRenderer {
                     self.skin_pipelines[index] = Some(pipeline);
                 } else {
                     self.request_model_pipeline_variant(jobs, device, alpha_mode, true);
+                }
+            }
+            if model_glow_mask & (1 << index) != 0
+                && self.model_glow_pipelines[index].is_none()
+            {
+                let key = PipelineJobKey::new("dynamic-model-glow", index as u32, config);
+                if let Some(pipeline) = jobs.take_ready(key) {
+                    self.model_glow_pipelines[index] = Some(pipeline);
+                } else {
+                    self.request_model_glow_pipeline_variant(jobs, device, alpha_mode, false);
+                }
+            }
+            if skin_glow_mask & (1 << index) != 0
+                && self.skin_glow_pipelines[index].is_none()
+            {
+                let key = PipelineJobKey::new("ghoul2-model-glow", index as u32, config);
+                if let Some(pipeline) = jobs.take_ready(key) {
+                    self.skin_glow_pipelines[index] = Some(pipeline);
+                } else {
+                    self.request_model_glow_pipeline_variant(jobs, device, alpha_mode, true);
                 }
             }
         }
@@ -278,6 +362,55 @@ impl DynamicModelRenderer {
                 alpha_mode,
                 legacy_fog,
                 zero_alpha_discard,
+                false,
+            )
+        });
+    }
+
+    pub(in crate::renderer) fn ensure_fx_sprite_glow_pipeline(
+        &mut self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+        alpha_mode: DynamicModelAlphaMode,
+    ) {
+        let index = alpha_mode.index();
+        if self.fx_sprite_glow_pipelines[index].is_some() {
+            return;
+        }
+        // The ordinary lazy path owns shader-module creation. If it is not
+        // ready yet, the authored replay simply waits for that worker result.
+        let Some(shader) = self.fx_sprite_shader.as_ref() else {
+            return;
+        };
+        let config = pipeline_hash(&(
+            self.fx_sprite_surface_format,
+            self.fx_sprite_samples,
+            self.legacy_fog_compiled,
+            self.fx_zero_alpha_discard,
+        ));
+        let key = PipelineJobKey::new("fx-sprite-glow", index as u32, config);
+        if let Some(pipeline) = jobs.take_ready(key) {
+            self.fx_sprite_glow_pipelines[index] = Some(pipeline);
+            return;
+        }
+        let device = device.clone();
+        let layout = self.pipeline_layout.clone();
+        let shader = shader.clone();
+        let surface_format = self.fx_sprite_surface_format;
+        let samples = self.fx_sprite_samples;
+        let legacy_fog = self.legacy_fog_compiled;
+        let zero_alpha_discard = self.fx_zero_alpha_discard;
+        jobs.request(key, "FX sprite authored glow alpha variant", move || {
+            create_fx_sprite_pipeline(
+                &device,
+                &layout,
+                &shader,
+                surface_format,
+                samples,
+                alpha_mode,
+                legacy_fog,
+                zero_alpha_discard,
+                true,
             )
         });
     }
@@ -709,6 +842,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
     zero_alpha_discard: bool,
+    force_fog_black: bool,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(match alpha_mode {
@@ -779,7 +913,10 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
                 _ => "fs_main",
             }),
             compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                constants: &[
+                    ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
+                    ("FORCE_FOG_BLACK", f64::from(u8::from(force_fog_black))),
+                ],
                 ..Default::default()
             },
             targets: &[Some(wgpu::ColorTargetState {
@@ -866,6 +1003,29 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline(
         alpha_mode,
         legacy_fog,
         false,
+        false,
+    )
+}
+
+pub(in crate::renderer) fn create_dynamic_model_glow_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    alpha_mode: DynamicModelAlphaMode,
+    legacy_fog: bool,
+) -> wgpu::RenderPipeline {
+    create_dynamic_model_pipeline_inner(
+        device,
+        layout,
+        shader,
+        surface_format,
+        samples,
+        alpha_mode,
+        legacy_fog,
+        false,
+        true,
     )
 }
 
@@ -878,6 +1038,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
     rt_receiver: bool,
+    force_fog_black: bool,
 ) -> wgpu::RenderPipeline {
     let vertex_layouts = [
         wgpu::VertexBufferLayout {
@@ -888,7 +1049,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
         wgpu::VertexBufferLayout {
             array_stride: 16,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![4 => Float32x4],
+            attributes: &RT_RECEIVER_RAW_COLOR_ATTRIBUTES,
         },
     ];
     let blend = match alpha_mode {
@@ -1031,7 +1192,10 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
                 _ => "fs_main",
             }),
             compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                constants: &[
+                    ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
+                    ("FORCE_FOG_BLACK", f64::from(u8::from(force_fog_black))),
+                ],
                 ..Default::default()
             },
             targets: &[Some(wgpu::ColorTargetState {
@@ -1053,6 +1217,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
     samples: u32,
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
+    force_fog_black: bool,
 ) -> wgpu::RenderPipeline {
     let blend = match alpha_mode {
         DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
@@ -1200,7 +1365,10 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
                 _ => "fs_main",
             }),
             compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
+                constants: &[
+                    ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
+                    ("FORCE_FOG_BLACK", f64::from(u8::from(force_fog_black))),
+                ],
                 ..Default::default()
             },
             targets: &[Some(wgpu::ColorTargetState {

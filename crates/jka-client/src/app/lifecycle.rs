@@ -227,7 +227,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 for command in std::mem::take(&mut self.startup_commands) {
                     println!("STARTUP COMMAND: {command}");
-                    self.push_console_line(format!("^7] {command}"));
+                    self.push_console_command_echo(format!("^7] {command}"));
                     self.append_console_commands(split_console_script(&command));
                 }
             }
@@ -552,10 +552,55 @@ impl ApplicationHandler<UserEvent> for App {
                         );
                     }
                 }
+                // Baselines include globally sent misc_bsp holders even before
+                // the first active snapshot. Reserve their shared-handle copies
+                // during the normal upload, avoiding a second upload on join.
+                if !frontend_background {
+                    let decoder = self
+                        .net
+                        .as_ref()
+                        .map(|net| net.session().decoder())
+                        .or_else(|| self.game_session.as_ref().map(|session| &session.decoder));
+                    if let Some(decoder) = decoder {
+                        let mut counts = std::collections::BTreeMap::new();
+                        for entity in decoder.baselines.values() {
+                            if entity.field_i32("eType") == Some(crate::cgame::ET_MOVER)
+                                && entity.field_i32("solid") == Some(0x00ff_ffff)
+                            {
+                                if let Some(model) = entity
+                                    .field_i32("modelindex")
+                                    .and_then(|index| u32::try_from(index).ok())
+                                {
+                                    *counts.entry(model).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                        map.reserve_inline_instances(&counts);
+                    }
+                }
+                // CG_Init applies CS_SHADERSTATE before the first rendered frame.
+                // Consume those actions only when this worker result belongs to
+                // the cgame that owns them. A speculative live-map prefetch can
+                // finish while the previous cgame is still alive; its remap
+                // state must never be baked into the prefetched/new world.
+                let shader_remap_map_matches_session = !frontend_background
+                    && self.game_session.as_ref().is_some_and(|session| {
+                        session.map_name.as_deref().is_some_and(|map_name| {
+                            Self::normalized_bsp_name(map_name)
+                                == Self::normalized_bsp_name(&name)
+                        })
+                    });
+                if shader_remap_map_matches_session {
+                    self.consume_server_shader_remaps();
+                }
+
                 let cache_started = Instant::now();
                 self.prepared_map_cache = Some(PreparedMapCache {
                     label: name.clone(),
                     prepare_options: self.latest_prepare_options,
+                    // Keep the authored/unremapped world as the restart source.
+                    // Runtime R_RemapShader changes are presentation state, not
+                    // a destructive rewrite of this cache.
                     map: Arc::new(map.as_ref().clone()),
                 });
                 rverbose!(
@@ -563,6 +608,24 @@ impl ApplicationHandler<UserEvent> for App {
                     "Map restart cache: retained prepared CPU map in {:.1} ms",
                     cache_started.elapsed().as_secs_f64() * 1000.0
                 );
+
+                if shader_remap_map_matches_session && !self.shader_remaps.is_empty() {
+                    if let Err(error) = scene::apply_shader_remaps_in_place(
+                        map.as_mut(),
+                        &self.base,
+                        self.game.as_deref(),
+                        self.latest_prepare_options,
+                        &self.shader_remaps,
+                    ) {
+                        self.push_console_line(format!("^1shader remap: {error}"));
+                    }
+                }
+                if shader_remap_map_matches_session {
+                    // This upload now represents the complete remap/reset state
+                    // observed at MapPrepared. Later server commands can set the
+                    // bit again while this upload is in flight.
+                    self.shader_remap_dirty = false;
+                }
                 // What is resident is what this map was prepared with, whichever
                 // renderer instance loaded it. Enabling grass/ocean beyond that
                 // needs the map prepared again.
@@ -676,6 +739,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.live_without_world = false;
                 self.demo_without_world = false;
+                if self.map_name != name {
+                    self.promoted_oceans.clear();
+                    self.promoted_ocean_overrides.clear();
+                    self.ocean_settings_target = -1;
+                }
                 self.map_name = name.clone();
                 self.triangles = map.triangles;
                 self.map_distance_cull = map
@@ -752,6 +820,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.keys.clear();
                     self.movement_keys.clear();
                     self.live_buttons.clear();
+                    self.live_button_sources.clear();
                     self.japro_zoom_transition_at = None;
                     self.japro_flipkick_frames = 0;
                     self.japro_flipkick_jumps = 0;
@@ -816,9 +885,9 @@ impl ApplicationHandler<UserEvent> for App {
                                 server.set_char_color(self.network.char_color);
                                 server.set_mouse_input_settings(self.mouse_input);
                                 if let Err(error) =
-                                    server.set_physics_tick_msec(self.video.physics_msec)
+                                    server.set_command_rate(self.network.command_rate)
                                 {
-                                    self.console_status = format!("PHYSICS FPS ERROR: {error}");
+                                    self.console_status = format!("COMMAND RATE ERROR: {error}");
                                 }
                                 server.camera(&mut self.camera);
                                 match self.build_local_game_session(&server) {
@@ -852,6 +921,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.keys.clear();
                         self.movement_keys.clear();
                         self.live_buttons.clear();
+                        self.live_button_sources.clear();
                         self.japro_zoom_transition_at = None;
                         self.japro_flipkick_frames = 0;
                         self.japro_flipkick_jumps = 0;
@@ -979,6 +1049,21 @@ impl ApplicationHandler<UserEvent> for App {
                 self.game_session = None;
                 self.console_status = format!("MAP LOAD FAILED: {error}");
                 self.push_console_line(format!("^1{}", self.console_status));
+                if self.shader_remap_upload {
+                    // Runtime R_RemapShader rebuilds are presentation-only
+                    // world swaps. Do not replay real map-load lifecycle work
+                    // (demo clocks, join timing, video confirmation, physics,
+                    // or map-loaded console noise) after their first frame.
+                    self.loading = None;
+                    self.shader_remap_upload = false;
+                    self.publish_ui();
+                    if self.shader_remap_dirty {
+                        if let Err(error) = self.rebuild_shader_remapped_world() {
+                            self.push_console_line(format!("^1shader remap: {error}"));
+                        }
+                    }
+                    return;
+                }
                 if self.video_confirmation.is_some() || self.pending_video_confirmation.is_some() {
                     self.revert_video_settings("FAILED");
                     return;
@@ -999,6 +1084,21 @@ impl ApplicationHandler<UserEvent> for App {
                 if request_id != self.latest_request_id {
                     return;
                 }
+                if self.promoted_oceans != upload_timings.promoted_oceans {
+                    self.promoted_oceans = upload_timings.promoted_oceans.clone();
+                    self.promoted_ocean_overrides.clear();
+                    let eye = self.camera.position.to_array();
+                    self.ocean_settings_target = self.promoted_oceans.iter().min_by(|a,b| {
+                        let distance = |p: &crate::ocean::appearance::PromotedOcean| {
+                            let s = p.surface;
+                            (eye[0]-eye[0].clamp(s.minimum[0],s.maximum[0])).powi(2)
+                                +(eye[2]-eye[2].clamp(s.minimum[1],s.maximum[1])).powi(2)
+                                +(eye[1]-s.plane_height).powi(2)
+                        };
+                        distance(a).total_cmp(&distance(b))
+                    }).map_or(-1, |p| p.index as i32);
+                }
+                self.render_command(RenderCommand::SetPromotedOceanSettings(self.promoted_ocean_overrides.clone()));
                 if self.map_edit_preview_request_id == Some(request_id) {
                     if let Some(collision) = self.map_edit_preview_pending_collision.take() {
                         self.map_collision = Some(collision.clone());
@@ -1276,6 +1376,9 @@ impl ApplicationHandler<UserEvent> for App {
                     format!("LOADED {name}: {:.3} seconds", first_frame_ms / 1000.0);
                 self.push_console_line(format!("^2{}", self.console_status));
                 self.loading = None;
+                // Runtime shader-remap uploads go straight to the render thread
+                // and therefore finish here (there is no MapPrepared event).
+                self.shader_remap_upload = false;
                 // Physics may have been enabled while this map was loading.
                 self.ensure_map_physics_mesh();
 
@@ -1305,6 +1408,16 @@ impl ApplicationHandler<UserEvent> for App {
                 // creation and map upload.
                 self.begin_pending_video_confirmation();
                 self.publish_ui();
+
+                // A shader remap can arrive before the pristine world exists or
+                // while a prior remap upload is in flight. Collapse all such
+                // changes into one fresh cold-path rebuild now that the renderer
+                // has completed the current upload.
+                if self.shader_remap_dirty {
+                    if let Err(error) = self.rebuild_shader_remapped_world() {
+                        self.push_console_line(format!("^1shader remap: {error}"));
+                    }
+                }
             }
         }
     }
@@ -1377,9 +1490,10 @@ impl ApplicationHandler<UserEvent> for App {
                     } else {
                         self.mouse_buttons_down.remove(&button_number);
                     }
-                    self.refresh_bound_state();
                     if down {
                         self.execute_binding_press(BindKey::Mouse(button_number));
+                    } else {
+                        self.execute_binding_release(BindKey::Mouse(button_number));
                     }
                 }
             }
@@ -1477,7 +1591,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // orbit zoom.
                 if let Some(key) = key {
                     if self.bindings.get_spectator(key).is_some() {
-                        self.execute_binding_press(key);
+                        self.execute_binding_tap(key);
                         return;
                     }
                 }
@@ -1500,7 +1614,7 @@ impl ApplicationHandler<UserEvent> for App {
                     _ => None,
                 };
                 if let Some(key) = key {
-                    self.execute_binding_press(key);
+                    self.execute_binding_tap(key);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if self.overlay == OverlayMode::Console => {
@@ -1517,6 +1631,22 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_audio_mix();
 
                 if focused {
+                    if let Some(window) = self.window.as_ref() {
+                        // Cancel any outstanding taskbar/dock attention request
+                        // as soon as the user returns to the game.
+                        window.request_user_attention(None);
+                    }
+                    // Focus has already been granted by the OS at this point. Restore
+                    // the same gameplay mouse/raw-input capture that a left click used
+                    // to re-enable after Alt+Tab, without stealing focus while another
+                    // application is active. Menus/console intentionally keep the cursor.
+                    if self.overlay == OverlayMode::None {
+                        if self.demo_playback_active() {
+                            self.sync_demo_camera_capture();
+                        } else {
+                            self.set_capture(true);
+                        }
+                    }
                     return;
                 }
 
@@ -1534,6 +1664,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
 
+                self.release_all_pressed_bindings();
                 self.keys.clear();
                 self.movement_keys.clear();
                 self.mouse_buttons_down.clear();
@@ -1948,7 +2079,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.keys.remove(&code);
                     }
                 }
-                self.refresh_bound_state();
+                let bind_key = keybinds::bind_key_for_code(code);
                 if event.state == ElementState::Pressed && !event.repeat {
                     if code == KeyCode::Escape {
                         let overlay = self.remembered_in_game_menu_overlay();
@@ -1959,38 +2090,11 @@ impl ApplicationHandler<UserEvent> for App {
                         self.cycle_spawn();
                         return;
                     }
-                    if let Some(binding) = self
-                        .bindings
-                        .get_resolved(
-                            keybinds::bind_key_for_code(code),
-                            self.spectator_binding_context(),
-                        )
-                        .map(str::to_owned)
-                    {
-                        if let Some(player) = &mut self.local_server {
-                            for command in keybinds::split_binding_commands(&binding) {
-                                let canonical = match command
-                                    .split_whitespace()
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_ascii_lowercase()
-                                    .as_str()
-                                {
-                                    "+forward" => Some(KeyCode::KeyW),
-                                    "+back" => Some(KeyCode::KeyS),
-                                    "+moveright" => Some(KeyCode::KeyD),
-                                    "+moveleft" => Some(KeyCode::KeyA),
-                                    "+moveup" => Some(KeyCode::Space),
-                                    "+movedown" => Some(KeyCode::ControlLeft),
-                                    _ => None,
-                                };
-                                if let Some(canonical) = canonical {
-                                    player.note_movement_key_press(canonical);
-                                }
-                            }
-                        }
-                    }
-                    self.execute_binding_press(keybinds::bind_key_for_code(code));
+                    self.execute_binding_press_from(bind_key, BindKey::Keyboard(code));
+                } else if event.state == ElementState::Released {
+                    // TaystJK CL_KeyUpEvent always emits the `-` half of every
+                    // +command in the bind, so held actions cannot stick.
+                    self.execute_binding_release_from(bind_key, BindKey::Keyboard(code));
                 }
             }
             _ => {}

@@ -74,7 +74,6 @@ pub(in crate::app) enum DemoConsoleFilter {
     All,
     Print,
     Chat,
-    CenterPrint,
     Event,
 }
 
@@ -85,7 +84,6 @@ impl DemoConsoleFilter {
                 (self, *kind),
                 (Self::Print, DemoConsoleKind::Print)
                     | (Self::Chat, DemoConsoleKind::Chat)
-                    | (Self::CenterPrint, DemoConsoleKind::CenterPrint)
                     | (Self::Event, DemoConsoleKind::Event)
             )
     }

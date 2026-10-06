@@ -40,7 +40,8 @@ use std::{
 const MAX_QUEUED_JOBS: usize = 256;
 const MAX_ASSET_WORKERS: usize = 2;
 
-static ASYNC_ENABLED: AtomicBool = AtomicBool::new(true);
+pub(crate) const DEFAULT_ASYNC_ENABLED: bool = true;
+static ASYNC_ENABLED: AtomicBool = AtomicBool::new(DEFAULT_ASYNC_ENABLED);
 
 /// Developer A/B switch (`cg_asyncAssets`). When off, consumers keep the
 /// original synchronous registration path.

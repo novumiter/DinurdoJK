@@ -10,9 +10,10 @@ impl PlayerPresenter {
     pub(in crate::cgame::player_presenter) fn custom_shader_material(
         &mut self,
         shader_name: &str,
-    ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
-        let key = shader_name.replace('\\', "/").to_ascii_lowercase();
-        let stage = jka_assets::shader::find_shader(&self.shaders, shader_name)
+    ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode, bool) {
+        let effective = self.shader_remaps.effective_name(shader_name);
+        let key = effective.replace('\\', "/").to_ascii_lowercase();
+        let stage = jka_assets::shader::find_shader(&self.shaders, effective.as_ref())
             .and_then(Shader::primary)
             .cloned();
         let (image, clamp, blend) = match &stage {
@@ -35,6 +36,7 @@ impl PlayerPresenter {
         (
             texture,
             crate::fx::draw::FxBlend::from_blend_func(&blend).custom_shader_alpha_mode(),
+            stage.is_some_and(|stage| stage.glow),
         )
     }
 
@@ -46,10 +48,12 @@ impl PlayerPresenter {
         shader_name: &str,
         seconds: f32,
     ) -> [f32; 4] {
-        let tc_mods = jka_assets::shader::find_shader(&self.shaders, shader_name)
+        let effective = self.shader_remaps.effective_name(shader_name);
+        let tc_mods = jka_assets::shader::find_shader(&self.shaders, effective.as_ref())
             .and_then(Shader::primary)
             .map(|stage| stage.tc_mods.clone())
             .unwrap_or_default();
+        let seconds = seconds - self.shader_remaps.time_offset_for(effective.as_ref());
         stage_uv_xform(&tc_mods, seconds)
     }
 
@@ -68,9 +72,11 @@ impl PlayerPresenter {
         shader_name: &str,
         seconds: f32,
     ) -> f32 {
-        let Some(shader) = jka_assets::shader::find_shader(&self.shaders, shader_name) else {
+        let effective = self.shader_remaps.effective_name(shader_name);
+        let Some(shader) = jka_assets::shader::find_shader(&self.shaders, effective.as_ref()) else {
             return 0.0;
         };
+        let seconds = seconds - self.shader_remaps.time_offset_for(effective.as_ref());
         if let Some(bulge) = shader.bulge.filter(Bulge::is_static) {
             return bulge.height;
         }
@@ -86,7 +92,8 @@ impl PlayerPresenter {
         &self,
         shader_name: &str,
     ) -> bool {
-        jka_assets::shader::find_shader(&self.shaders, shader_name)
+        let effective = self.shader_remaps.effective_name(shader_name);
+        jka_assets::shader::find_shader(&self.shaders, effective.as_ref())
             .and_then(Shader::primary)
             .is_some_and(|stage| stage.tc_gen == TcGen::Environment)
     }
@@ -106,11 +113,13 @@ impl PlayerPresenter {
         shader_name: &str,
         seconds: f32,
         force_alpha_blend: bool,
-    ) -> Vec<(Option<Arc<TextureData>>, DynamicModelAlphaMode, [f32; 4])> {
+    ) -> Vec<(Option<Arc<TextureData>>, DynamicModelAlphaMode, [f32; 4], bool)> {
         use crate::fx::draw::FxBlend;
-        let Some(shader) = jka_assets::shader::find_shader(&self.shaders, shader_name) else {
+        let effective = self.shader_remaps.effective_name(shader_name);
+        let Some(shader) = jka_assets::shader::find_shader(&self.shaders, effective.as_ref()) else {
             return Vec::new();
         };
+        let seconds = seconds - self.shader_remaps.time_offset_for(effective.as_ref());
         let Some(primary) = shader.primary() else {
             return Vec::new();
         };
@@ -153,7 +162,7 @@ impl PlayerPresenter {
                     FxBlend::from_blend_func(&stage.blend).custom_shader_alpha_mode()
                 };
                 let uv_xform = stage_uv_xform(&stage.tc_mods, seconds);
-                (texture, alpha_mode, uv_xform)
+                (texture, alpha_mode, uv_xform, stage.glow)
             })
             .collect()
     }

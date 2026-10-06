@@ -657,6 +657,9 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
 
     let mark_surfaces = mark_surfaces_from_batches(&vertices, &batches);
     Ok(PreparedMap {
+        shader_library: Arc::new(library),
+        shader_origins: Arc::new(library_debug.origins.clone()),
+        sub_bsp_names: Vec::new(),
         authored_oceans: Vec::new(),
         vertices,
         legacy_dlight_triangle_surfaces: Vec::new(),

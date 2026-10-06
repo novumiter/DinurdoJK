@@ -9,11 +9,11 @@
 
 struct WeatherSurfaceSettings {
     amount_distance: vec4<f32>, // wetness, grass fade start, grass fade end, rain-intensity response
-    puddle: vec4<f32>,          // accumulation, time seconds, ripple strength, debug view
+    puddle: vec4<f32>,          // accumulation, time seconds, ripple strength, debug view mode
     occlusion_uv: vec4<f32>,    // min X/Z, inverse map width/depth
     occlusion_size: vec4<u32>,  // field width, height, active, reserved
     look: vec4<f32>,            // scattered puddle amount, reflection streak strength, high-quality water, film gloss
-    film_fade: vec4<f32>,       // wet-film fade start, fade end (world units), reserved
+    film_fade: vec4<f32>,       // wet-film fade start, fade end (world units), coat skybox handover window, skybox share ceiling
     sun_direction: vec4<f32>,   // xyz light travel direction (render space), w relative intensity (250 = 1)
     sun_radiance: vec4<f32>,    // rgb linear sun colour, w: the map has a real skybox
     wind: vec4<f32>,            // render-space wind X/Z units per second, reserved
@@ -207,10 +207,21 @@ fn weather_puddle_shape(
     }
 
     let submerged = level - weather_relief(world_xz);
-    // A wide, soft shoreline: the water thins out over a metre or so, wetness
-    // creeping out beyond it, rather than ending on a line.
-    puddle.coverage = smoothstep(0.0, 0.22, submerged);
-    puddle.depth = clamp(submerged / 0.35, 0.0, 1.0);
+    // The shoreline and depth windows have to fit inside the submergence a level
+    // can actually produce. On open flat ground `level` peaks near 0.42 while the
+    // relief averages 0.5 with a deviation of 0.15, so a wet pixel there is only
+    // 0.05..0.15 submerged: windows of 0.22 and 0.35 put the whole puddle inside
+    // its own shoreline ramp. Coverage never passed about 0.5, which in turn left
+    // the reflection normal a third of the way to the water, the roughness near
+    // 0.09 instead of 0.012 and the ripples at half strength - every scattered
+    // puddle a strong wet patch rather than water. Sized to the range that exists
+    // these are still soft in world terms (the relief moves about 0.003 per unit,
+    // so 0.055 spans roughly 19 units) while the interior now commits. Basins,
+    // whose level reaches 1.74, are unaffected: they already saturated.
+    puddle.coverage = smoothstep(0.0, 0.055, submerged);
+    puddle.depth = clamp(submerged / 0.10, 0.0, 1.0);
+    // The damp margin keeps its full reach. That wide soft wet ring outside the
+    // water, not a wide shoreline, is what stops a puddle ending on a visible line.
     puddle.damp = smoothstep(-0.18, 0.0, submerged);
     return puddle;
 }
@@ -236,7 +247,10 @@ fn weather_ripple_ring(
     let centre = vec2<f32>(0.30) + random * 0.40;
     let delta = local - centre;
     let dist = max(length(delta), 0.001);
-    let age = fract(time_seconds * 0.52 + phase_offset
+    // A ring always expands by the same fraction of its own cell, so a smaller
+    // cell has to cycle faster to keep one world-space expansion speed (~12 units
+    // a second, which is what the 96 unit layers in weather_water_gradient run at).
+    let age = fract(time_seconds * (0.52 * 96.0 / cell_size) + phase_offset
         + weather_hash12(cell + uv_offset * 31.0));
     let radius = mix(0.03, 0.27, age);
     let behind = radius - dist;
@@ -278,12 +292,22 @@ fn weather_capillary_gradient(
 
 // Height gradient of the water surface. Rain intensity progressively enables one
 // to four offset ring layers so heavy rain has a persistent overlapping field
-// rather than one lonely disappearing ring.
+// rather than one lonely disappearing ring. `detail` is 0..1 fine-ripple authority
+// (high quality, faded out with camera distance by the caller) and adds two finer,
+// faster layers on top for the close-range patter.
+//
+// Every cell size here is chosen from the ring it produces, because a ring grows to
+// 0.27 of its cell: at 40 units to the metre these layers make rings 30-45 cm
+// across and the fine pair 18-22 cm, which is the size a raindrop actually makes.
+// They used to sit at 91-105 units, which is a 1.3 m ring - a rock dropped in a
+// pond, not rain - and being both the largest and the strongest layers they were
+// what the eye read, as slow swirls on the water rather than patter.
 fn weather_water_gradient(
     world_xz: vec2<f32>,
     time_seconds: f32,
     rain_strength: f32,
     wind: vec2<f32>,
+    detail: f32,
 ) -> vec2<f32> {
     let weights = clamp(
         (vec4<f32>(rain_strength) - vec4<f32>(0.0, 0.25, 0.50, 0.75)) * 4.0,
@@ -292,16 +316,23 @@ fn weather_water_gradient(
     );
     var rings = vec2<f32>(0.0);
     if (weights.x > 0.0) {
-        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>( 0.25,  0.00), 0.00,  96.0) * weights.x;
+        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>( 0.25,  0.00), 0.00, 30.0) * weights.x;
     }
     if (weights.y > 0.0) {
-        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>(-0.55,  0.30), 0.31, 101.0) * weights.y;
+        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>(-0.55,  0.30), 0.31, 26.0) * weights.y;
     }
     if (weights.z > 0.0) {
-        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>( 0.60,  0.85), 0.57,  91.0) * weights.z;
+        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>( 0.60,  0.85), 0.57, 34.0) * weights.z;
     }
     if (weights.w > 0.0) {
-        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>( 0.50, -0.75), 0.79, 105.0) * weights.w;
+        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>( 0.50, -0.75), 0.79, 22.0) * weights.w;
+    }
+    // High quality adds a finer pair on top, small enough to read as the spatter
+    // between the main impacts. Standard quality pays nothing for them.
+    let fine = clamp((rain_strength - 0.06) * 2.4, 0.0, 1.0) * clamp(detail, 0.0, 1.0);
+    if (fine > 0.001) {
+        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>( 0.13,  0.41), 0.17, 16.0) * (fine * 0.55);
+        rings += weather_ripple_ring(world_xz, time_seconds, vec2<f32>(-0.37, -0.22), 0.63, 13.0) * (fine * 0.45);
     }
     return rings + weather_capillary_gradient(world_xz, time_seconds, wind, rain_strength);
 }

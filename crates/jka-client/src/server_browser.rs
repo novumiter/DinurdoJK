@@ -15,7 +15,7 @@ use std::{
     path::Path,
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use jka_protocol::{parse_info_response, PROTOCOL_VERSION};
@@ -132,6 +132,7 @@ pub enum BrowserSort {
     Name,
     Map,
     Gametype,
+    LastVisited,
 }
 
 impl BrowserSort {
@@ -142,6 +143,7 @@ impl BrowserSort {
             Self::Name => "NAME",
             Self::Map => "MAP",
             Self::Gametype => "MODE",
+            Self::LastVisited => "LAST VISITED",
         }
     }
 }
@@ -155,6 +157,10 @@ pub struct BrowserUiState {
     pub hide_empty: bool,
     pub hide_full: bool,
     pub hide_bots: bool,
+    /// Hide getstatus player rows that report the classic 999 "connecting" ping.
+    /// When enabled, cached status data is also used to make the displayed player
+    /// counts reflect those hidden rows.
+    pub hide_connecting: bool,
     pub mod_filter: String,
     pub max_ping: u32,
     pub sort: BrowserSort,
@@ -168,9 +174,9 @@ pub struct BrowserUiState {
     pub status_text: String,
     pub source_status: HashMap<ServerSource, String>,
     pub details: Option<ServerStatus>,
-    /// Cached getstatus replies used by both the details pane and player-name
-    /// filtering. Entries are refreshed opportunistically while a player
-    /// search is active.
+    /// Cached getstatus replies used by the details pane and player-row filters.
+    /// Entries are refreshed opportunistically while player-name search or the
+    /// HIDE CONNECTING filter needs per-player status data.
     pub status_cache: HashMap<SocketAddr, ServerStatus>,
     pub status_pending: HashSet<SocketAddr>,
     pub player_search: String,
@@ -178,6 +184,9 @@ pub struct BrowserUiState {
     pub player_search_last_query: Option<Instant>,
     pub favorites: Vec<SocketAddr>,
     pub history: Vec<SocketAddr>,
+    /// Last successful visit time for history entries, in Unix milliseconds.
+    /// Legacy plain-address history rows simply have no timestamp here.
+    pub history_last_visited: HashMap<SocketAddr, u64>,
     pub direct_connect: String,
     pub internet_requested_once: bool,
     /// `(source, address)` for a full server that should be polled until a
@@ -202,12 +211,18 @@ impl BrowserUiState {
         let history_path = settings_dir.join("server-history.txt");
         let mut favorites = load_address_list(&favorites_path);
         favorites.sort_unstable();
-        let mut history = load_address_list(&history_path);
-        // Keep the most recent history entries bounded.  The file is intentionally
-        // human-editable and stores plain host:port lines.
-        if history.len() > 64 {
-            history = history.split_off(history.len() - 64);
+        let mut history_rows = load_history_list(&history_path);
+        // Keep the most recent history entries bounded. Legacy files containing
+        // only plain host:port rows remain valid; newly written rows append a
+        // Unix-millisecond last-visited timestamp.
+        if history_rows.len() > 64 {
+            history_rows = history_rows.split_off(history_rows.len() - 64);
         }
+        let history: Vec<_> = history_rows.iter().map(|(address, _)| *address).collect();
+        let history_last_visited = history_rows
+            .into_iter()
+            .filter_map(|(address, visited)| visited.map(|visited| (address, visited)))
+            .collect();
         let mut master_drafts = master_servers.clone();
         for (slot, default) in DEFAULT_MASTER_CVARS.iter().enumerate() {
             if master_drafts[slot].trim().is_empty() && !default.is_empty() {
@@ -223,6 +238,7 @@ impl BrowserUiState {
             hide_empty: false,
             hide_full: false,
             hide_bots: false,
+            hide_connecting: false,
             mod_filter: String::new(),
             max_ping: 0,
             sort: BrowserSort::Ping,
@@ -239,6 +255,7 @@ impl BrowserUiState {
             player_search_last_query: None,
             favorites,
             history,
+            history_last_visited,
             direct_connect: String::new(),
             internet_requested_once: false,
             autojoin: None,
@@ -302,7 +319,7 @@ impl BrowserUiState {
                 self.source_status.insert(source, text.clone());
                 self.status_text = text;
             }
-            BrowserEvent::Status(status) => {
+            BrowserEvent::Status(status) | BrowserEvent::ServerInfo(status) => {
                 self.status_pending.remove(&status.address);
                 if self.selected == Some(status.address) {
                     self.details = Some(status.clone());
@@ -377,13 +394,50 @@ impl BrowserUiState {
     }
 
     pub fn remember_history(&mut self, address: SocketAddr) -> Result<(), String> {
+        let visited = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
         self.history.retain(|item| *item != address);
         self.history.push(address);
+        self.history_last_visited.insert(address, visited);
         if self.history.len() > 64 {
             let excess = self.history.len() - 64;
-            self.history.drain(..excess);
+            for stale in self.history.drain(..excess) {
+                self.history_last_visited.remove(&stale);
+            }
         }
-        save_address_list(&self.history_path, &self.history)
+        save_history_list(&self.history_path, &self.history, &self.history_last_visited)
+    }
+
+    pub fn history_last_visited(&self, address: SocketAddr) -> Option<u64> {
+        self.history_last_visited.get(&address).copied()
+    }
+
+    /// Player count after the browser's player-row filters are applied.
+    /// `getinfo` does not expose per-player ping, so HIDE CONNECTING can only
+    /// improve the count once a getstatus row is cached; until then we preserve
+    /// the server-advertised count rather than guessing.
+    pub fn visible_client_count(&self, server: &ServerEntry) -> u32 {
+        if self.hide_connecting {
+            if let Some(status) = self
+                .status_cache
+                .get(&server.address)
+                .filter(|status| !status.fields.is_empty())
+            {
+                return status
+                    .players
+                    .iter()
+                    .filter(|player| (!self.hide_bots || player.ping != 0) && player.ping != 999)
+                    .count() as u32;
+            }
+        }
+        if self.hide_bots {
+            server.humans
+        } else {
+            server.clients
+        }
     }
 }
 
@@ -402,6 +456,8 @@ pub enum BrowserCommand {
         quiet: bool,
     },
     QueryStatus(SocketAddr),
+    /// Fresh full getstatus request initiated explicitly by the user.
+    GetServerInfo(SocketAddr),
     QueryStatusBatch(Vec<SocketAddr>),
 }
 
@@ -423,6 +479,8 @@ pub enum BrowserEvent {
         responded: usize,
     },
     Status(ServerStatus),
+    /// Full getstatus result requested from the server-row context menu.
+    ServerInfo(ServerStatus),
     StatusBatchFinished {
         requested: Vec<SocketAddr>,
     },
@@ -454,6 +512,7 @@ fn worker(commands: Receiver<BrowserCommand>, events: Sender<BrowserEvent>) {
                 refresh_server(&events, source, address, quiet)
             }
             BrowserCommand::QueryStatus(address) => query_status(&events, address),
+            BrowserCommand::GetServerInfo(address) => get_server_info(&events, address),
             BrowserCommand::QueryStatusBatch(addresses) => {
                 let requested = addresses.clone();
                 let result = query_status_batch(&events, addresses);
@@ -764,7 +823,7 @@ fn query_info_batch(
     Ok(())
 }
 
-fn query_status(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerResult {
+fn fetch_status(address: SocketAddr) -> Result<ServerStatus, (Option<ServerSource>, String)> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .map_err(|e| (None, format!("server status socket: {e}")))?;
     socket
@@ -779,10 +838,8 @@ fn query_status(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerRes
     while started.elapsed() < STATUS_WAIT {
         match socket.recv_from(&mut buf) {
             Ok((len, from)) if from == address => {
-                let status = parse_status_response(address, &buf[..len])
-                    .ok_or_else(|| (None, format!("Malformed getstatus response from {address}")))?;
-                let _ = events.send(BrowserEvent::Status(status));
-                return Ok(());
+                return parse_status_response(address, &buf[..len])
+                    .ok_or_else(|| (None, format!("Malformed getstatus response from {address}")));
             }
             Ok(_) => {}
             Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
@@ -790,6 +847,18 @@ fn query_status(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerRes
         }
     }
     Err((None, format!("Server status timed out: {address}")))
+}
+
+fn query_status(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerResult {
+    let status = fetch_status(address)?;
+    let _ = events.send(BrowserEvent::Status(status));
+    Ok(())
+}
+
+fn get_server_info(events: &Sender<BrowserEvent>, address: SocketAddr) -> WorkerResult {
+    let status = fetch_status(address)?;
+    let _ = events.send(BrowserEvent::ServerInfo(status));
+    Ok(())
 }
 
 fn query_status_batch(events: &Sender<BrowserEvent>, mut addresses: Vec<SocketAddr>) -> WorkerResult {
@@ -917,6 +986,44 @@ pub fn parse_getservers_response(packet: &[u8]) -> Vec<SocketAddr> {
     result
 }
 
+/// Render the complete getstatus payload in a readable, copyable form.
+/// Every server-info key and every returned player row is included.
+pub fn format_server_status(status: &ServerStatus) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("getstatus {}\n", status.address));
+    out.push_str("Server settings:\n");
+    if status.fields.is_empty() {
+        out.push_str("  <no server-info fields returned>\n");
+    } else {
+        let key_width = status
+            .fields
+            .iter()
+            .map(|(key, _)| key.len())
+            .max()
+            .unwrap_or(0)
+            .min(32);
+        for (key, value) in &status.fields {
+            out.push_str(&format!("  {key:<key_width$}  {value}\n"));
+        }
+    }
+
+    out.push_str("Players:\n");
+    if status.players.is_empty() {
+        out.push_str("  <no players returned>\n");
+    } else {
+        out.push_str("  #   score  ping  name\n");
+        for (index, player) in status.players.iter().enumerate() {
+            out.push_str(&format!(
+                "  {index:<3} {score:>5}  {ping:>4}  {name}\n",
+                score = player.score,
+                ping = player.ping,
+                name = player.name,
+            ));
+        }
+    }
+    out.trim_end().to_owned()
+}
+
 fn parse_status_response(address: SocketAddr, packet: &[u8]) -> Option<ServerStatus> {
     const PREFIX: &[u8] = b"\xff\xff\xff\xffstatusResponse\n";
     let body = packet.strip_prefix(PREFIX)?;
@@ -950,6 +1057,53 @@ fn parse_status_player(line: &str) -> Option<ServerPlayer> {
     let ping = parts.next()?.parse().ok()?;
     let name = parts.next()?.trim().trim_matches('"').to_owned();
     Some(ServerPlayer { name, score, ping })
+}
+
+fn parse_history_list(text: &str) -> Vec<(SocketAddr, Option<u64>)> {
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(address_text) = fields.next() else { continue };
+        let Ok(address) = address_text.parse::<SocketAddr>() else { continue };
+        if !seen.insert(address) {
+            continue;
+        }
+        let visited = fields.next().and_then(|value| value.parse::<u64>().ok());
+        rows.push((address, visited));
+    }
+    rows
+}
+
+fn load_history_list(path: &Path) -> Vec<(SocketAddr, Option<u64>)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    parse_history_list(&text)
+}
+
+fn save_history_list(
+    path: &Path,
+    addresses: &[SocketAddr],
+    last_visited: &HashMap<SocketAddr, u64>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let mut text = String::from("# address\tlast_visited_unix_ms\n");
+    for address in addresses {
+        text.push_str(&address.to_string());
+        if let Some(visited) = last_visited.get(address) {
+            text.push('\t');
+            text.push_str(&visited.to_string());
+        }
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 pub fn load_address_list(path: &Path) -> Vec<SocketAddr> {
@@ -1009,6 +1163,42 @@ mod tests {
         assert_eq!(player.score, 12);
         assert_eq!(player.ping, 54);
         assert_eq!(player.name, "^2Kyle Katarn");
+    }
+
+    #[test]
+    fn formats_full_getstatus_dump() {
+        let status = ServerStatus {
+            address: "127.0.0.1:29070".parse().unwrap(),
+            fields: vec![
+                ("sv_hostname".to_owned(), "^2Test Server".to_owned()),
+                ("mapname".to_owned(), "mp/ffa3".to_owned()),
+            ],
+            players: vec![ServerPlayer {
+                name: "^3Kyle Katarn".to_owned(),
+                score: 12,
+                ping: 54,
+            }],
+        };
+        let dump = format_server_status(&status);
+        assert!(dump.contains("getstatus 127.0.0.1:29070"));
+        assert!(dump.contains("sv_hostname"));
+        assert!(dump.contains("^2Test Server"));
+        assert!(dump.contains("12"));
+        assert!(dump.contains("54"));
+        assert!(dump.contains("^3Kyle Katarn"));
+    }
+
+    #[test]
+    fn history_parser_accepts_legacy_and_timestamped_rows() {
+        let rows = parse_history_list(
+            "127.0.0.1:29070\n10.20.30.40:29071\t1760000123456\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], ("127.0.0.1:29070".parse().unwrap(), None));
+        assert_eq!(
+            rows[1],
+            ("10.20.30.40:29071".parse().unwrap(), Some(1_760_000_123_456))
+        );
     }
 
 }

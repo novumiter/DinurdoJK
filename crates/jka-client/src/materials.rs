@@ -111,6 +111,8 @@ pub struct MaterialStage {
     pub tc_mods: Vec<TcMod>,
     pub depth_write: bool,
     pub depth_equal: bool,
+    /// Exact JKA shader-stage `glow` marker used by Dynamic Glow.
+    pub glow: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -164,6 +166,9 @@ pub struct SurfaceMaterial {
     pub planar_reflection: bool,
     /// True only for authored `surfaceparm water`.
     pub water: bool,
+    /// Geometric shader deformation amplitude used by promoted water, in map units.
+    pub water_amplitude: f32,
+    pub water_deformed: bool,
     /// q3map2 `surfaceparm alphashadow`.
     pub alpha_shadow: bool,
     /// q3map2 `surfaceparm lightfilter`.
@@ -211,6 +216,8 @@ impl Default for SurfaceMaterial {
             offset: false,
             planar_reflection: false,
             water: false,
+            water_amplitude: crate::ocean::appearance::DEFAULT_PROMOTED_AMPLITUDE,
+            water_deformed: false,
             alpha_shadow: false,
             light_filter: false,
             no_fog: false,
@@ -2048,6 +2055,7 @@ fn sky_cloud_stages(
             tc_mods: source.tc_mods.clone(),
             depth_write: source.depth_write,
             depth_equal: source.depth_equal,
+            glow: source.glow,
         });
     }
     stages
@@ -2296,6 +2304,7 @@ pub fn describe(
                     // removed base already populated depth. Once promoted to the
                     // base pass there is no earlier depth value to compare with.
                     depth_equal: source.depth_equal && !promote_to_base,
+                    glow: source.glow,
                 });
                 saw_authored_ordinary_stage |= authored_ordinary_stage;
             }
@@ -2329,6 +2338,7 @@ pub fn describe(
                     tc_mods: Vec::new(),
                     depth_write: true,
                     depth_equal: false,
+                                    glow: false,
                 });
             }
         } else {
@@ -2361,6 +2371,7 @@ pub fn describe(
                 tc_mods: Vec::new(),
                 depth_write: false,
                 depth_equal: false,
+                            glow: false,
             });
         }
     }
@@ -2416,6 +2427,8 @@ pub fn describe(
         offset: definition.polygon_offset,
         planar_reflection: definition.portal,
         water: definition.water,
+        water_amplitude: crate::ocean::appearance::amplitude_from_shader(definition),
+        water_deformed: crate::ocean::appearance::deformation_amplitude(definition).is_some(),
         alpha_shadow: definition.alpha_shadow,
         light_filter: definition.light_filter,
         no_fog: definition.no_fog,
@@ -2678,4 +2691,24 @@ blendFunc GL_ONE GL_ONE
         );
         assert!(effect.clamp);
     }
+
+    #[test]
+    fn promoted_water_amplitude_comes_from_geometry_not_texture_animation() {
+        let cases = [
+            ("", 4.0),
+            ("deformVertexes wave 100 sin 0 12 0 0.5", 12.0),
+            ("deformVertexes wave 100 sin 48 0 0 0", 4.0),
+            ("deformVertexes wave 100 sin 0 -8 0 0.5", 8.0),
+            ("deformVertexes bulge 32 6 1", 6.0),
+            ("deformVertexes bulge 0 6 0", 4.0),
+            ("deformVertexes wave 100 sin 0 0.25 0 0.5", 0.5),
+        ];
+        for (deform, amplitude) in cases {
+            let script = format!("test {{\nsurfaceparm water\n{deform}\n{{\nmap $whiteimage\ntcMod scroll 1 1\ntcMod turb 0 64 0 1\nrgbGen wave sin 0 1 0 1\n}}\n}}\n");
+            let water = material(&script);
+            assert!(water.water);
+            assert_eq!(water.water_amplitude, amplitude, "{deform}");
+        }
+    }
+
 }

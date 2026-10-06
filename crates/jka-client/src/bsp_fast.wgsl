@@ -19,6 +19,10 @@ struct Material {
     wave_rgb: vec4<f32>,
     wave_alpha: vec4<f32>,
     wave_funcs: vec4<u32>,
+    ocean_color: vec4<f32>, // linear authored texture tint, opacity; negative alpha = default
+    ocean_material: vec4<f32>, // xyz reflectance, w roughness; negative = default
+    ocean_waves: vec4<f32>, // xy reserved/amplitude hint, z/w authored blend factors
+    ocean_blend_color: vec4<f32>, // analyzed mean color/brightness; never a texture lookup
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
@@ -95,7 +99,7 @@ fn wave_value(func: u32, p: vec4<f32>, time: f32) -> f32 {
 
 fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
-    let time = camera.camera_pos_time.w;
+    let time = (camera.camera_pos_time.w - material.params.w);
     if ((material.header.z & 134217728u) != 0u) {
         let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
         out = vec4<f32>(vec3<f32>(g), out.a);
@@ -115,7 +119,7 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
 // using UV there aliases badly on any surface that tiles many times.
 fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = base_uv;
-    let time = camera.camera_pos_time.w;
+    let time = (camera.camera_pos_time.w - material.params.w);
     for (var i = 0u; i < 4u; i = i + 1u) {
         if (i >= material.header.y) {
             break;

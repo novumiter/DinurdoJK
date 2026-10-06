@@ -463,6 +463,8 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
         fx_gpu_sprites: None,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Additive,
+
+        authored_glow: false,
     })
 }
 

@@ -1430,9 +1430,15 @@ fn scan_demo_bytes(
                             {
                                 transient_notices.push((server_time, kind, raw_text));
                             }
-                            let text = console_text(&args, start);
-                            if !text.is_empty() {
-                                console.push((server_time, kind, text));
+                            // `cp` belongs in the transient demo timeline so seeks
+                            // can reconstruct the HUD centerprint, but it is not
+                            // console output in JKA/Tayst. Only real console-bearing
+                            // commands are indexed into the demo's CONSOLE pane.
+                            if kind != DemoConsoleKind::CenterPrint {
+                                let text = console_text(&args, start);
+                                if !text.is_empty() {
+                                    console.push((server_time, kind, text));
+                                }
                             }
                         }
                     }

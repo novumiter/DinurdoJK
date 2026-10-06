@@ -809,7 +809,9 @@ pub(in crate::scene) fn prepare_internal(
             // isolation while the reflection topology is enabled; tcGen
             // environment geometry that is itself planar is grouped by plane
             // instead of by individual BSP surface.
-            transparent_order: if preserve_unique_plane {
+            // Keep water brush faces separate: tops at different heights and
+            // undersides must not fail promotion as one combined batch.
+            transparent_order: if preserve_unique_plane || material.water {
                 batch_index + 1
             } else {
                 0
@@ -1677,6 +1679,9 @@ pub(in crate::scene) fn prepare_internal(
     load_timings.prepare_wall_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
 
     Ok(PreparedMap {
+        shader_library: Arc::new(library),
+        shader_origins: Arc::new(library_debug.origins.clone()),
+        sub_bsp_names: Vec::new(),
         debug_volumes,
         authored_oceans,
         movement,

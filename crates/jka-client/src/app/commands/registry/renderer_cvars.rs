@@ -1,0 +1,3417 @@
+//! Renderer cvars: declarative runtime and config bindings.
+use super::cvar_prelude::*;
+
+app_cvars! {
+    APP_DEVELOPER {
+        runtime: CvarDef::new("developer", "", "0..3", "Global diagnostic level: 0 quiet, 1 basic lifecycle, 2 verbose per-entity/job output, 3 trace. Levels above 0 also enable developer-only inspector/overlay tools.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_developer(app)), |app, value| App::cvar_set_developer(app, APP_DEVELOPER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_developer, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    let level = value
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .map(|level| level.min(3))
+                        .or_else(|| parse_bool(value).map(u8::from))
+                        .unwrap_or(settings.developer_level);
+                    settings.developer_level = level;
+                    settings.developer_tools = level != 0;
+                }),
+                archive: Some((19, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.developer_level)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_developer(&self) -> String {
+                    self.video.developer_level.to_string()
+                }
+                fn cvar_set_developer(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let level = match Self::parse_console_bool(value) {
+                            Some(enabled) => u8::from(enabled),
+                            None => value
+                                .trim()
+                                .parse::<u8>()
+                                .map_err(|_| format!("{name}: expected 0..3 (off/on are also accepted)"))?,
+                        };
+                        if level > 3 {
+                            return Err(format!("{name}: expected 0..3"));
+                        }
+                        self.video.developer_level = level;
+                        self.video.developer_tools = level != 0;
+                        crate::logging::set_developer_level(level);
+                        if !self.video.developer_tools {
+                            self.forget_trace();
+                            self.render_command(RenderCommand::ClearSurfaceInspection);
+                        }
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_FS_ALLOWASSETOVERRIDES {
+        runtime: CvarDef::new("fs_allowAssetOverrides", "", "0..1", "Allow higher-priority addon/loose assets to replace qpaths supplied by retail assets0.pk3 through assets3.pk3. Active .mtr dependencies remain source-affine.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart, |app| CvarValue::String(App::cvar_get_fs_allowassetoverrides(app)), |app, value| App::cvar_set_fs_allowassetoverrides(app, APP_FS_ALLOWASSETOVERRIDES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_fs_allowassetoverrides, Some(|name, value| { App::parse_cvar_bool(name, value).map(|enabled| u8::from(enabled).to_string()) })),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.allow_asset_overrides =
+                            parse_bool(value).unwrap_or(settings.allow_asset_overrides)
+                    }
+                }),
+                apply_latched: Some(|settings, value| {
+                    settings.allow_asset_overrides =
+                        App::parse_console_bool(value).unwrap_or(settings.allow_asset_overrides)
+                }),
+                archive: Some((137, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.allow_asset_overrides))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_fs_allowassetoverrides(&self) -> String {
+                    bool_value(self.video.allow_asset_overrides)
+                }
+                fn cvar_set_fs_allowassetoverrides(
+                    &mut self,
+                    name: &str,
+                    value: &str,
+                ) -> Result<(), String> {
+                    {
+                        self.video.allow_asset_overrides = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_BACKEND {
+        runtime: CvarDef::new(
+                "r_backend",
+                "",
+                "vulkan|dx12",
+                "Graphics backend selected for the next vid_restart.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::VidRestart,
+                |app| CvarValue::String(App::cvar_get_r_backend(app)),
+                |app, value| App::cvar_set_r_backend(app, APP_R_BACKEND.entry.name, &value.to_string()),
+            )
+            .with_text_setter(
+                App::cvar_set_r_backend,
+                Some(|name, value| {
+                    RendererBackend::from_config(value)
+                        .map(|backend| backend.config_value().to_owned())
+                        .ok_or_else(|| format!("{name}: expected vulkan or dx12"))
+                }),
+            ),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.renderer_backend =
+                            RendererBackend::from_config(value).unwrap_or(settings.renderer_backend)
+                    }
+                }),
+                apply_latched: Some(|settings, value| {
+                    if let Some(backend) = RendererBackend::from_config(value) {
+                        settings.renderer_backend = backend;
+                    }
+                }),
+                archive: Some((7, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.renderer_backend.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_backend(&self) -> String {
+                    self.video.renderer_backend.config_value().to_owned()
+                }
+                fn cvar_set_r_backend(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.renderer_backend = RendererBackend::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected vulkan or dx12"))?;
+                        self.mark_config_dirty();
+                        self.console_status = format!(
+                            "RENDER BACKEND: {} (RUN VID_RESTART TO APPLY)",
+                            self.video.renderer_backend.label()
+                        );
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CASCADEDSHADOWS {
+        runtime: CvarDef::new(
+                "r_cascadedShadows",
+                "",
+                "0..1",
+                "Legacy boolean alias for Dynamic Shadows: Cascaded Shadow Maps.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_cascadedshadows(app)),
+                |app, value| {
+                    App::cvar_set_r_cascadedshadows(
+                        app,
+                        APP_R_CASCADEDSHADOWS.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_cascadedshadows, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.cascaded_shadows = parse_bool(value).unwrap_or(settings.cascaded_shadows)
+                    }
+                }),
+                archive: Some((145, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.cascaded_shadows))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_cascadedshadows(&self) -> String {
+                    bool_value(self.video.cascaded_shadows)
+                }
+                fn cvar_set_r_cascadedshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.cascaded_shadows = Self::parse_cvar_bool(name, value)?;
+                        self.video.dynamic_shadows = if self.video.cascaded_shadows {
+                            DynamicShadowsMode::CascadedShadowMaps
+                        } else {
+                            DynamicShadowsMode::Off
+                        };
+                        self.sync_cascaded_shadows();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CUSTOMHEIGHT {
+        runtime: CvarDef::new(
+                "r_customheight",
+                "",
+                "240..",
+                "Windowed render height.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::VidRestart,
+                |app| CvarValue::String(App::cvar_get_r_customheight(app)),
+                |app, value| {
+                    App::cvar_set_r_customheight(app, APP_R_CUSTOMHEIGHT.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(
+                App::cvar_set_r_customheight,
+                Some(|name, value| {
+                    value
+                        .trim()
+                        .parse::<u32>()
+                        .map(|pixels| pixels.max(240).to_string())
+                        .map_err(|_| format!("{name}: expected an integer pixel size"))
+                }),
+            ),
+        config: CvarBinding {
+                load_video: Some(|_settings, _name, value, context| {
+                    context.custom_height = value.parse::<u32>().ok().filter(|v| *v >= 240)
+                }),
+                apply_latched: Some(|settings, value| {
+                    if let Ok(height) = value.parse::<u32>() {
+                        settings.resolution[1] = height.max(240);
+                    }
+                }),
+                archive: Some((2, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.resolution[1])
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_customheight(&self) -> String {
+                    self.video.resolution[1].to_string()
+                }
+                fn cvar_set_r_customheight(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_customheight".to_owned();
+                    {
+                        let parsed = value
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("{name}: expected an integer pixel size"))?;
+                        if lower == "r_customwidth" {
+                            self.video.resolution[0] = parsed.max(320);
+                        } else {
+                            self.video.resolution[1] = parsed.max(240);
+                        }
+                        self.mark_config_dirty();
+                        self.console_status = format!(
+                            "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
+                            self.video.resolution[0], self.video.resolution[1]
+                        );
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CUSTOMWIDTH {
+        runtime: CvarDef::new(
+                "r_customwidth",
+                "",
+                "320..",
+                "Windowed render width.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::VidRestart,
+                |app| CvarValue::String(App::cvar_get_r_customwidth(app)),
+                |app, value| {
+                    App::cvar_set_r_customwidth(app, APP_R_CUSTOMWIDTH.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(
+                App::cvar_set_r_customwidth,
+                Some(|name, value| {
+                    value
+                        .trim()
+                        .parse::<u32>()
+                        .map(|pixels| pixels.max(320).to_string())
+                        .map_err(|_| format!("{name}: expected an integer pixel size"))
+                }),
+            ),
+        config: CvarBinding {
+                load_video: Some(|_settings, _name, value, context| {
+                    context.custom_width = value.parse::<u32>().ok().filter(|v| *v >= 320)
+                }),
+                apply_latched: Some(|settings, value| {
+                    if let Ok(width) = value.parse::<u32>() {
+                        settings.resolution[0] = width.max(320);
+                    }
+                }),
+                archive: Some((1, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.resolution[0])
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_customwidth(&self) -> String {
+                    self.video.resolution[0].to_string()
+                }
+                fn cvar_set_r_customwidth(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_customwidth".to_owned();
+                    {
+                        let parsed = value
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("{name}: expected an integer pixel size"))?;
+                        if lower == "r_customwidth" {
+                            self.video.resolution[0] = parsed.max(320);
+                        } else {
+                            self.video.resolution[1] = parsed.max(240);
+                        }
+                        self.mark_config_dirty();
+                        self.console_status = format!(
+                            "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
+                            self.video.resolution[0], self.video.resolution[1]
+                        );
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DELUXEMAPPING {
+        runtime: CvarDef::new(
+                "r_deluxeMapping",
+                "",
+                "0..1",
+                "Use q3map2/Rend2 directional lightmaps when present, with BSP lightgrid fallback.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_deluxemapping(app)),
+                |app, value| {
+                    App::cvar_set_r_deluxemapping(app, APP_R_DELUXEMAPPING.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_deluxemapping, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.deluxe_mapping = parse_bool(value).unwrap_or(settings.deluxe_mapping)
+                    }
+                }),
+                archive: Some((139, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.deluxe_mapping))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_deluxemapping(&self) -> String {
+                    bool_value(self.video.deluxe_mapping)
+                }
+                fn cvar_set_r_deluxemapping(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.deluxe_mapping = Self::parse_cvar_bool(name, value)?;
+                        self.sync_pbr();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DELUXESPECULAR {
+        runtime: CvarDef::new(
+                "r_deluxeSpecular",
+                "",
+                "0..1",
+                "Scale specular response from directional baked lighting.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_deluxespecular(app)),
+                |app, value| {
+                    App::cvar_set_r_deluxespecular(app, APP_R_DELUXESPECULAR.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_deluxespecular, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.deluxe_specular = value
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v.clamp(0.0, 1.0))
+                        .unwrap_or(settings.deluxe_specular);
+                }),
+                archive: Some((140, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.deluxe_specular)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_deluxespecular(&self) -> String {
+                    format!("{:.3}", self.video.deluxe_specular)
+                }
+                fn cvar_set_r_deluxespecular(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let scale = value
+                            .parse::<f32>()
+                            .map_err(|_| format!("{name}: expected 0..1"))?;
+                        if !scale.is_finite() {
+                            return Err(format!("{name}: expected 0..1"));
+                        }
+                        self.video.deluxe_specular = scale.clamp(0.0, 1.0);
+                        self.sync_pbr();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DEPTHOFFIELD {
+        runtime: CvarDef::new(
+                "r_depthOfField",
+                "",
+                "0..1",
+                "Gaussian depth-of-field strength with crosshair autofocus.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_depthoffield(app)),
+                |app, value| {
+                    App::cvar_set_r_depthoffield(app, APP_R_DEPTHOFFIELD.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_depthoffield, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.depth_of_field_strength = value
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|strength| strength.is_finite())
+                            .map(|strength| strength.clamp(0.0, 1.0))
+                            .unwrap_or(settings.depth_of_field_strength)
+                    }
+                }),
+                archive: Some((112, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.depth_of_field_strength)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_depthoffield(&self) -> String {
+                    format!("{:.3}", self.video.depth_of_field_strength)
+                }
+                fn cvar_set_r_depthoffield(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let strength = value
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|_| format!("{name}: expected 0..1"))?;
+                        self.set_depth_of_field_strength(strength);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DISTANCECULLSCALE {
+        runtime: CvarDef::new(
+                "r_distanceCullScale",
+                "",
+                "0..10",
+                "0 uses the map/default distanceCull; nonzero values scale that distance.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_distancecullscale(app)),
+                |app, value| {
+                    App::cvar_set_r_distancecullscale(
+                        app,
+                        APP_R_DISTANCECULLSCALE.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_distancecullscale, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(scale) = value.parse::<f32>() {
+                        if scale.is_finite() {
+                            settings.distance_cull_scale = scale.clamp(0.0, MAX_DISTANCE_CULL_SCALE);
+                        }
+                    }
+                }),
+                archive: Some((63, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.distance_cull_scale)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_distancecullscale(&self) -> String {
+                    format!("{:.3}", self.video.distance_cull_scale)
+                }
+                fn cvar_set_r_distancecullscale(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let scale = value
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|_| format!("{name}: expected a number"))?;
+                        self.set_distance_cull_scale(scale);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DRAWCLIPBRUSHES {
+        runtime: CvarDef::new("r_drawClipBrushes", "", "0..1", "Draw clip-only brushes (player clip orange, shot clip magenta, monster/bot clip yellow). Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+         |app| CvarValue::String(App::cvar_get_r_drawclipbrushes(app)),
+         |app, value| App::cvar_set_r_drawclipbrushes(app, APP_R_DRAWCLIPBRUSHES.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_drawclipbrushes, None),
+        config: CvarBinding {
+                default: Some(|state| {
+                    bool_value(state.video.draw_clip_brushes)
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_drawclipbrushes(&self) -> String {
+                    bool_value(self.video.draw_clip_brushes)
+                }
+                fn cvar_set_r_drawclipbrushes(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.draw_clip_brushes = Self::parse_cvar_bool(name, value)?;
+                        self.sync_debug_volumes();
+                        self.console_status = format!(
+                            "DRAW CLIP BRUSHES: {}",
+                            if self.video.draw_clip_brushes {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DRAWENTITIES {
+        runtime: CvarDef::new("r_drawEntities", "", "0..1", "NetRadiant-style 3D overlay: a colored box and classname label above every map entity (same data as the `entities` command), colored by category, with lines to its target/targetname links. Brush movers track their live position when networked. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+         |app| CvarValue::String(App::cvar_get_r_drawentities(app)),
+         |app, value| App::cvar_set_r_drawentities(app, APP_R_DRAWENTITIES.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_drawentities, None),
+        config: CvarBinding {
+                default: Some(|state| {
+                    bool_value(state.video.draw_entities)
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_drawentities(&self) -> String {
+                    bool_value(self.video.draw_entities)
+                }
+                fn cvar_set_r_drawentities(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.set_draw_entities(Self::parse_cvar_bool(name, value)?);
+                        self.console_status = format!(
+                            "DRAW ENTITIES: {}",
+                            if self.video.draw_entities {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DRAWMAPMODELS {
+        runtime: CvarDef::new("r_drawMapModels", "", "0..1", "Draw server-placed MD3 map models (misc_model_* props). Brush models and geometry compiled into the BSP are unaffected.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_drawmapmodels(app)), |app, value| App::cvar_set_r_drawmapmodels(app, APP_R_DRAWMAPMODELS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_drawmapmodels, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.draw_map_models = parse_bool(value).unwrap_or(settings.draw_map_models);
+                }),
+                archive: Some((178, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.draw_map_models))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_drawmapmodels(&self) -> String {
+                    bool_value(self.video.draw_map_models)
+                }
+                fn cvar_set_r_drawmapmodels(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.draw_map_models = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            "MAP MODELS: {}",
+                            if self.video.draw_map_models {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DRAWTRIGGERS {
+        runtime: CvarDef::new("r_drawTriggers", "", "0..1", "Draw trigger_* volumes as colored translucent brushes (push green, teleport purple, hurt red, multiple blue, once cyan). Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+         |app| CvarValue::String(App::cvar_get_r_drawtriggers(app)),
+         |app, value| App::cvar_set_r_drawtriggers(app, APP_R_DRAWTRIGGERS.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_drawtriggers, None),
+        config: CvarBinding {
+                default: Some(|state| {
+                    bool_value(state.video.draw_triggers)
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_drawtriggers(&self) -> String {
+                    bool_value(self.video.draw_triggers)
+                }
+                fn cvar_set_r_drawtriggers(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.draw_triggers = Self::parse_cvar_bool(name, value)?;
+                        self.sync_debug_volumes();
+                        self.console_status = format!(
+                            "DRAW TRIGGERS: {}",
+                            if self.video.draw_triggers {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DYNAMICLIGHTFALLOFF {
+        runtime: CvarDef::new("r_dynamicLightFalloff", "", "0..1", "Falloff of runtime dynamic lights (sabers, blasters, explosions) in forward_plus/ray_traced. 0 stock JKA 1 - d^2/r^2, 1 physical inverse-square with a smooth window that reaches zero at the radius with no visible edge.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamiclightfalloff(app)), |app, value| App::cvar_set_r_dynamiclightfalloff(app, APP_R_DYNAMICLIGHTFALLOFF.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamiclightfalloff, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(mode @ (0 | 1)) = value.parse::<u32>() {
+                        settings.dynamic_light_falloff = mode;
+                    }
+                }),
+                archive: Some((164, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.dynamic_light_falloff)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dynamiclightfalloff(&self) -> String {
+                    self.video.dynamic_light_falloff.to_string()
+                }
+                fn cvar_set_r_dynamiclightfalloff(
+                    &mut self,
+                    name: &str,
+                    value: &str,
+                ) -> Result<(), String> {
+                    {
+                        let mode = value
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|n| matches!(n, 0 | 1))
+                            .ok_or_else(|| format!("{name}: expected 0|1"))?;
+                        self.video.dynamic_light_falloff = mode;
+                        self.render_command(RenderCommand::SetDynamicLightFalloff(mode));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DYNAMICLIGHTS {
+        runtime: CvarDef::new(
+                "r_dynamicLights",
+                "",
+                "off|legacy|vertex|clustered_lite|forward_plus|ray_traced",
+                "Dynamic-lighting technique for runtime-authored lights.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_dynamiclights(app)),
+                |app, value| {
+                    App::cvar_set_r_dynamiclights(app, APP_R_DYNAMICLIGHTS.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_dynamiclights, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Some(mode) = DynamicLightsMode::from_config(value) {
+                        settings.dynamic_lights = mode;
+                    }
+                }),
+                archive: Some((130, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.dynamic_lights.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dynamiclights(&self) -> String {
+                    self.video.dynamic_lights.config_value().to_owned()
+                }
+                fn cvar_set_r_dynamiclights(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.dynamic_lights = DynamicLightsMode::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected off|legacy|vertex|clustered_lite|forward_plus|ray_traced"))?;
+                        self.sync_dynamic_lighting();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DYNAMICSHADOWS {
+        runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm|ray_traced", "Dynamic-shadow mode; entity = entity-only shadow map aimed by the baked lightgrid; csm = Bevy-style cascaded shadow maps.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, context| {
+                    if let Some(mode) = DynamicShadowsMode::from_config(value) {
+                        settings.dynamic_shadows = mode;
+                        context.dynamic_shadows_mode_seen = true;
+                    }
+                }),
+                archive: Some((141, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.dynamic_shadows.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dynamicshadows(&self) -> String {
+                    self.video.dynamic_shadows.config_value().to_owned()
+                }
+                fn cvar_set_r_dynamicshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.dynamic_shadows = DynamicShadowsMode::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected off|blob|entity|csm|ray_traced"))?;
+                        self.video.cascaded_shadows =
+                            self.video.dynamic_shadows == DynamicShadowsMode::CascadedShadowMaps;
+                        self.sync_cascaded_shadows();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_EMISSIVEAREALIGHTS {
+        runtime: CvarDef::new(
+                "r_emissiveAreaLights",
+                "",
+                "0..1",
+                "Extract emissive surfaces as area lights.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_emissivearealights(app)),
+                |app, value| {
+                    App::cvar_set_r_emissivearealights(
+                        app,
+                        APP_R_EMISSIVEAREALIGHTS.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_emissivearealights, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.emissive_area_lights =
+                            parse_bool(value).unwrap_or(settings.emissive_area_lights)
+                    }
+                }),
+                archive: Some((142, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.emissive_area_lights))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_emissivearealights(&self) -> String {
+                    bool_value(self.video.emissive_area_lights)
+                }
+                fn cvar_set_r_emissivearealights(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.emissive_area_lights = Self::parse_cvar_bool(name, value)?;
+                        self.sync_emissive_area_lights();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_ENTITYAMBIENTLIGHTING {
+        runtime: CvarDef::new("r_entityAmbientLighting", "", "off|bsp_lightgrid|bevy_irradiance_volume", "Entity ambient-lighting source; bsp_lightgrid uses OpenJK-style classic BSP entity lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_entityambientlighting(app)), |app, value| App::cvar_set_r_entityambientlighting(app, APP_R_ENTITYAMBIENTLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_entityambientlighting, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.entity_ambient_lighting = EntityAmbientLightingMode::from_config(value)
+                            .unwrap_or(settings.entity_ambient_lighting)
+                    }
+                }),
+                archive: Some((129, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.entity_ambient_lighting.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_entityambientlighting(&self) -> String {
+                    {
+                        self.video.entity_ambient_lighting.config_value().to_owned()
+                    }
+                }
+                fn cvar_set_r_entityambientlighting(
+                    &mut self,
+                    name: &str,
+                    value: &str,
+                ) -> Result<(), String> {
+                    {
+                        self.video.entity_ambient_lighting = EntityAmbientLightingMode::from_config(value)
+                            .ok_or_else(|| {
+                                format!("{name}: expected off|bsp_lightgrid|bevy_irradiance_volume")
+                            })?;
+                        self.sync_entity_ambient_lighting();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_ENTITYSHADOWLIGHT {
+        runtime: CvarDef::new("r_entityShadowLight", "", "lightgrid|authored", "Entity-map shadow light: baked lightgrid direction, or the strongest authored map light's real position.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_entityshadowlight(app)), |app, value| App::cvar_set_r_entityshadowlight(app, APP_R_ENTITYSHADOWLIGHT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_entityshadowlight, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.entity_shadow_light =
+                            EntityShadowLight::from_config(value).unwrap_or(settings.entity_shadow_light)
+                    }
+                }),
+                archive: Some((146, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.entity_shadow_light.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_entityshadowlight(&self) -> String {
+                    self.video.entity_shadow_light.config_value().to_owned()
+                }
+                fn cvar_set_r_entityshadowlight(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.entity_shadow_light = EntityShadowLight::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected lightgrid|authored"))?;
+                        self.sync_entity_shadow_light();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_ENTITYSUNLIGHTING {
+        runtime: CvarDef::new("r_entitySunLighting", "", "0..1", "Remove the baked map sun from the entity lightgrid and re-light entities with the runtime sun (needs r_entityAmbientLighting bsp_lightgrid).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_entitysunlighting(app)), |app, value| App::cvar_set_r_entitysunlighting(app, APP_R_ENTITYSUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_entitysunlighting, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.entity_sun_lighting =
+                            parse_bool(value).unwrap_or(settings.entity_sun_lighting)
+                    }
+                }),
+                archive: Some((58, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.entity_sun_lighting))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_entitysunlighting(&self) -> String {
+                    bool_value(self.video.entity_sun_lighting)
+                }
+                fn cvar_set_r_entitysunlighting(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_entitysunlighting".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        match lower.as_str() {
+                            "r_hdr" => self.video.hdr = enabled,
+                            "r_tonemap" => self.video.tone_mapping = enabled,
+                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_halation" => self.video.halation = enabled,
+                            "r_ssao" => {
+                                self.video.ssao = enabled;
+                                if enabled {
+                                    self.video.static_bsp_ao = false;
+                                }
+                            }
+                            "r_staticbspao" => {
+                                self.video.static_bsp_ao = enabled;
+                                if enabled {
+                                    self.video.ssao = false;
+                                }
+                            }
+                            "r_fxaa" => {
+                                self.video.fxaa = enabled;
+                                if enabled {
+                                    self.video.smaa = false;
+                                    self.video.taa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_smaa" => {
+                                self.video.smaa = enabled;
+                                if enabled {
+                                    self.video.fxaa = false;
+                                    self.video.taa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_taa" => {
+                                self.video.taa = enabled;
+                                if enabled {
+                                    self.video.fxaa = false;
+                                    self.video.smaa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_contactshadows" => self.video.contact_shadows = enabled,
+                            "r_cloudshadows" => self.video.cloud_shadows = enabled,
+                            "r_cloudtemporal" => self.video.cloud_temporal = enabled,
+                            "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
+                            "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
+                            "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
+                            "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
+                            "r_rain" => self.video.rain = enabled,
+                            "r_sunoverride" => {
+                                self.set_sun_override(enabled, enabled);
+                                return Ok(());
+                            }
+                            "r_entitysunlighting" => self.video.entity_sun_lighting = enabled,
+                            "r_reflectiondebug" => self.video.reflection_debug = enabled,
+                            "r_vignette" => self.video.vignette = enabled,
+                            _ => unreachable!(),
+                        }
+                        self.sync_post_effects();
+                        if lower != "r_reflectiondebug" {
+                            self.mark_config_dirty();
+                        }
+                        // r_floatLightmap is only effective while HDR is active, matching
+                        // Rend2. If that changes the prepared lightmap representation,
+                        // video_restart_required() exposes the normal renderer-restart path.
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_EXT_MULTISAMPLE {
+        runtime: CvarDef::new(
+                "r_ext_multisample",
+                "",
+                "0|2|4|8...",
+                "MSAA sample count; 0 means off.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_ext_multisample(app)),
+                |app, value| {
+                    App::cvar_set_r_ext_multisample(
+                        app,
+                        APP_R_EXT_MULTISAMPLE.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_ext_multisample, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(samples) = value.parse::<u32>() {
+                        settings.msaa_samples = samples.max(1);
+                    }
+                }),
+                archive: Some((10, |state| {
+                    let settings = state.video;
+                    let msaa = if settings.msaa_samples <= 1 {
+                        0
+                    } else {
+                        settings.msaa_samples
+                    };
+                    format!("{}", msaa)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ext_multisample(&self) -> String {
+                    {
+                        if self.video.msaa_samples <= 1 {
+                            "0".into()
+                        } else {
+                            self.video.msaa_samples.to_string()
+                        }
+                    }
+                }
+                fn cvar_set_r_ext_multisample(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let samples = value
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("{name}: expected an integer sample count"))?;
+                        let samples = if samples <= 1 { 1 } else { samples };
+                        if !self.supported_msaa.contains(&samples) {
+                            return Err(format!(
+                                "{name}: unsupported sample count {samples}; supported {:?}",
+                                self.supported_msaa
+                            ));
+                        }
+                        self.video.msaa_samples = samples;
+                        if samples > 1 {
+                            self.video.fxaa = false;
+                            self.video.smaa = false;
+                            self.video.taa = false;
+                        }
+                        self.render_command(RenderCommand::SetMsaa(samples));
+                        self.sync_post_effects();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FILMGRAIN {
+        runtime: CvarDef::new(
+                "r_filmGrain",
+                "",
+                "0..1",
+                "Film grain strength.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_filmgrain(app)),
+                |app, value| App::cvar_set_r_filmgrain(app, APP_R_FILMGRAIN.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_filmgrain, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.film_grain_strength = value
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|strength| strength.is_finite())
+                            .map(|strength| strength.clamp(0.0, 1.0))
+                            .or_else(|| parse_bool(value).map(|enabled| if enabled { 0.35 } else { 0.0 }))
+                            .unwrap_or(settings.film_grain_strength)
+                    }
+                }),
+                archive: Some((110, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.film_grain_strength)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_filmgrain(&self) -> String {
+                    format!("{:.3}", self.video.film_grain_strength)
+                }
+                fn cvar_set_r_filmgrain(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let strength = value
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|_| format!("{name}: expected 0..1"))?;
+                        self.set_film_grain_strength(strength);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FLARES {
+        runtime: CvarDef::new(
+                "r_flares",
+                "",
+                "0..1",
+                "Screen-space saber flare overlay; does not disable authored saber impact FX.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_flares(app)),
+                |app, value| App::cvar_set_r_flares(app, APP_R_FLARES.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_flares, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.flares = parse_bool(value).unwrap_or(settings.flares)
+                }),
+                archive: Some((133, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.flares))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_flares(&self) -> String {
+                    bool_value(self.video.flares)
+                }
+                fn cvar_set_r_flares(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.flares = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status =
+                            format!("FLARES: {}", if self.video.flares { "ON" } else { "OFF" });
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FLOATLIGHTMAP {
+        runtime: CvarDef::new(
+                "r_floatLightmap",
+                "",
+                "0..1",
+                "Use FP16 lightmaps while HDR is enabled; prefer Rend2 .hdr companions when present.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::MapLoadOrVidRestart,
+                |app| CvarValue::String(App::cvar_get_r_floatlightmap(app)),
+                |app, value| {
+                    App::cvar_set_r_floatlightmap(app, APP_R_FLOATLIGHTMAP.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(
+                App::cvar_set_r_floatlightmap,
+                Some(|name, value| {
+                    App::parse_cvar_bool(name, value).map(|enabled| u8::from(enabled).to_string())
+                }),
+            ),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.float_lightmap = parse_bool(value).unwrap_or(settings.float_lightmap)
+                    }
+                }),
+                apply_latched: Some(|settings, value| {
+                    settings.float_lightmap =
+                        App::parse_console_bool(value).unwrap_or(settings.float_lightmap)
+                }),
+                archive: Some((38, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.float_lightmap))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_floatlightmap(&self) -> String {
+                    bool_value(self.video.float_lightmap)
+                }
+                fn cvar_set_r_floatlightmap(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.float_lightmap = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        if self.map_prepare_restart_required() {
+                            self.console_status =
+                                "FLOAT LIGHTMAPS: PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART".into();
+                        }
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FOOTPRINTS {
+        runtime: CvarDef::new(
+                "r_footprints",
+                "",
+                "off|2d|3d",
+                "Footprints: off, stock JKA 2D mark shader, or 3D snow deformation.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_footprints(app)),
+                |app, value| {
+                    App::cvar_set_r_footprints(app, APP_R_FOOTPRINTS.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_footprints, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.footprints =
+                            FootprintMode::from_config(value).unwrap_or(settings.footprints)
+                    }
+                }),
+                archive: Some((106, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.footprints.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_footprints(&self) -> String {
+                    self.video.footprints.config_value().to_owned()
+                }
+                fn cvar_set_r_footprints(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.footprints = FootprintMode::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected off|2d|3d"))?;
+                        self.render_command(RenderCommand::SetFootprintMode(self.video.footprints));
+                        self.footprints_chosen();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FULLBRIGHT {
+        runtime: CvarDef::new(
+                "r_fullbright",
+                "",
+                "0..1",
+                "Classic world-lighting master: 1 replaces baked lightmap contribution with white.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_fullbright(app)),
+                |app, value| {
+                    App::cvar_set_r_fullbright(app, APP_R_FULLBRIGHT.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_fullbright, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.world_lighting = !parse_bool(value).unwrap_or(!settings.world_lighting);
+                }),
+                archive: Some((166, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(!settings.world_lighting))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_fullbright(&self) -> String {
+                    bool_value(!self.video.world_lighting)
+                }
+                fn cvar_set_r_fullbright(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_fullbright".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        match lower.as_str() {
+                            "r_fullbright" => self.video.world_lighting = !enabled,
+                            "r_vertexlight" => self.video.vertex_lighting = enabled,
+                            "r_lightmap" => self.video.lightmap_only = enabled,
+                            _ => unreachable!(),
+                        }
+                        self.sync_classic_world_lighting();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FULLSCREEN {
+        runtime: CvarDef::new(
+                "r_fullscreen",
+                "",
+                "0|1|2",
+                "Fullscreen mode: 0 windowed, 1 borderless, 2 exclusive.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::VidRestart,
+                |app| CvarValue::String(App::cvar_get_r_fullscreen(app)),
+                |app, value| {
+                    App::cvar_set_r_fullscreen(app, APP_R_FULLSCREEN.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(
+                App::cvar_set_r_fullscreen,
+                Some(|name, value| {
+                    FullscreenMode::from_config(value)
+                        .map(|mode| mode.config_value().to_string())
+                        .ok_or_else(|| {
+                            format!("{name}: expected 0 (windowed), 1 (borderless), or 2 (exclusive)")
+                        })
+                }),
+            ),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.fullscreen =
+                            FullscreenMode::from_config(value).unwrap_or(settings.fullscreen)
+                    }
+                }),
+                apply_latched: Some(|settings, value| {
+                    if let Some(mode) = FullscreenMode::from_config(value) {
+                        settings.fullscreen = mode;
+                    }
+                }),
+                archive: Some((6, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.fullscreen.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_fullscreen(&self) -> String {
+                    self.video.fullscreen.config_value().to_string()
+                }
+                fn cvar_set_r_fullscreen(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let mode = FullscreenMode::from_config(value).ok_or_else(|| {
+                            format!("{name}: expected 0 (windowed), 1 (borderless), or 2 (exclusive)")
+                        })?;
+                        if mode != self.video.fullscreen {
+                            self.set_fullscreen_mode(mode);
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GENNORMALMAPS {
+        runtime: CvarDef::new(
+                "r_genNormalMaps",
+                "",
+                "0..1",
+                "Generate fallback normal maps from diffuse textures when authored normals are absent.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::MapLoadOrVidRestart,
+                |app| CvarValue::String(App::cvar_get_r_gennormalmaps(app)),
+                |app, value| {
+                    App::cvar_set_r_gennormalmaps(app, APP_R_GENNORMALMAPS.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(
+                App::cvar_set_r_gennormalmaps,
+                Some(|name, value| {
+                    App::parse_cvar_bool(name, value).map(|enabled| u8::from(enabled).to_string())
+                }),
+            ),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.gen_normal_maps = parse_bool(value).unwrap_or(settings.gen_normal_maps)
+                    }
+                }),
+                apply_latched: Some(|settings, value| {
+                    settings.gen_normal_maps =
+                        App::parse_console_bool(value).unwrap_or(settings.gen_normal_maps)
+                }),
+                archive: Some((138, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.gen_normal_maps))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_gennormalmaps(&self) -> String {
+                    bool_value(self.video.gen_normal_maps)
+                }
+                fn cvar_set_r_gennormalmaps(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.gen_normal_maps = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        if self.map_prepare_restart_required() {
+                            self.console_status =
+                                "GENERATED NORMAL MAPS: PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART"
+                                    .into();
+                        }
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GHOUL2ANIMSMOOTH {
+        runtime: CvarDef::new("r_ghoul2AnimSmooth", "", "0..1 (exclusive)", "jaPRO CBoneCache::SmoothLow renderer bone-history filter (jaPRO default 0.3): blends each player's final composed Ghoul2 pose toward last frame's filtered pose before skinning/attachments. Only active strictly between 0 and 1, matching jaPRO: 0 or >=1 disables it (1 is 'off', not 'maximum'). Does not apply while ragdolled.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_ghoul2animsmooth(app)), |app, value| App::cvar_set_r_ghoul2animsmooth(app, APP_R_GHOUL2ANIMSMOOTH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ghoul2animsmooth, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        // jaPRO stores this cvar unclamped and only activates smoothing
+                        // when it reads strictly inside (0, 1) at use; 1.0+ is a no-op
+                        // there, not "maximum". Don't clamp the upper bound here either.
+                        settings.ghoul2_anim_smooth = value
+                            .trim()
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|v| v.is_finite())
+                            .map(|v| v.max(0.0))
+                            .unwrap_or(settings.ghoul2_anim_smooth);
+                    }
+                }),
+                archive: Some((28, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.ghoul2_anim_smooth)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ghoul2animsmooth(&self) -> String {
+                    self.video.ghoul2_anim_smooth.to_string()
+                }
+                fn cvar_set_r_ghoul2animsmooth(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let factor = value
+                            .trim()
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|v| v.is_finite())
+                            .ok_or_else(|| format!("{name}: expected a number"))?;
+                        // jaPRO only activates smoothing strictly inside (0, 1); 1.0+
+                        // is a no-op there, not "maximum" smoothing, so don't clamp
+                        // the upper bound here either.
+                        self.video.ghoul2_anim_smooth = factor.max(0.0);
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status =
+                            format!("GHOUL2 ANIM SMOOTH: {}", self.video.ghoul2_anim_smooth);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GHOUL2BATCHDRAWS {
+        runtime: CvarDef::new("r_ghoul2BatchDraws", "", "0|1|2", "GPU Ghoul2 draw batching: 0 off, 1 adaptive, 2 force. Adaptive only groups repeated opaque/masked mesh/material/LOD surfaces when the crowd is likely to benefit.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_ghoul2batchdraws(app)), |app, value| App::cvar_set_r_ghoul2batchdraws(app, APP_R_GHOUL2BATCHDRAWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ghoul2batchdraws, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ghoul2_batch_draws =
+                        Ghoul2BatchMode::from_config(value).unwrap_or(settings.ghoul2_batch_draws);
+                }),
+                archive: Some((27, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.ghoul2_batch_draws.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ghoul2batchdraws(&self) -> String {
+                    self.video.ghoul2_batch_draws.config_value().to_owned()
+                }
+                fn cvar_set_r_ghoul2batchdraws(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.ghoul2_batch_draws = Ghoul2BatchMode::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected 0|1|2 or off|adaptive|force"))?;
+                        self.render_command(RenderCommand::SetGhoul2BatchDraws(
+                            self.video.ghoul2_batch_draws,
+                        ));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            "GHOUL2 BATCH DRAWS: {}",
+                            self.video.ghoul2_batch_draws.label()
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GHOUL2EARLYCULL {
+        runtime: CvarDef::new("r_ghoul2EarlyCull", "", "0..1", "Skip full Ghoul2 pose evaluation and render submission for models outside the view frustum while preserving lightweight animation state.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_ghoul2earlycull(app)), |app, value| App::cvar_set_r_ghoul2earlycull(app, APP_R_GHOUL2EARLYCULL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ghoul2earlycull, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ghoul2_early_cull = parse_bool(value).unwrap_or(settings.ghoul2_early_cull);
+                }),
+                archive: Some((25, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.ghoul2_early_cull))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ghoul2earlycull(&self) -> String {
+                    bool_value(self.video.ghoul2_early_cull)
+                }
+                fn cvar_set_r_ghoul2earlycull(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.ghoul2_early_cull = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            "GHOUL2 EARLY CULL: {}",
+                            if self.video.ghoul2_early_cull {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GHOUL2SKINNING {
+        runtime: CvarDef::new(
+                "r_ghoul2Skinning",
+                "",
+                "cpu|workers|gpu",
+                "Ghoul2 GLM skinning path: CPU reference, CPU worker pool, or WGPU vertex shader.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_ghoul2skinning(app)),
+                |app, value| {
+                    App::cvar_set_r_ghoul2skinning(app, APP_R_GHOUL2SKINNING.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_ghoul2skinning, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ghoul2_skinning =
+                        Ghoul2SkinningMode::from_config(value).unwrap_or(settings.ghoul2_skinning);
+                }),
+                archive: Some((24, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.ghoul2_skinning.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ghoul2skinning(&self) -> String {
+                    self.video.ghoul2_skinning.config_value().to_owned()
+                }
+                fn cvar_set_r_ghoul2skinning(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.ghoul2_skinning = Ghoul2SkinningMode::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected cpu|workers|gpu"))?;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status =
+                            format!("GHOUL2 SKINNING: {}", self.video.ghoul2_skinning.label());
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GPUDRIVEN {
+        runtime: CvarDef::new(
+                "r_gpuDriven",
+                "",
+                "0..1",
+                "GPU-visible draw compaction.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_gpudriven(app)),
+                |app, value| App::cvar_set_r_gpudriven(app, APP_R_GPUDRIVEN.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_gpudriven, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.gpu_driven = parse_bool(value).unwrap_or(settings.gpu_driven)
+                }),
+                archive: Some((127, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.gpu_driven))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_gpudriven(&self) -> String {
+                    bool_value(self.video.gpu_driven)
+                }
+                fn cvar_set_r_gpudriven(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_gpudriven".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        if lower == "r_gpudriven" {
+                            self.video.gpu_driven = enabled;
+                        } else {
+                            self.video.hiz_occlusion = enabled;
+                        }
+                        self.sync_gpu_visibility();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GPUTIMINGS {
+        runtime: CvarDef::new(
+                "r_gpuTimings",
+                "",
+                "0..1",
+                "GPU timestamp-query profiler; no per-frame query/readback cost when disabled.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_gputimings(app)),
+                |app, value| {
+                    App::cvar_set_r_gputimings(app, APP_R_GPUTIMINGS.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_gputimings, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.gpu_timings = parse_bool(value).unwrap_or(settings.gpu_timings);
+                }),
+                archive: Some((23, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.gpu_timings))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_gputimings(&self) -> String {
+                    bool_value(self.video.gpu_timings)
+                }
+                fn cvar_set_r_gputimings(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.gpu_timings = Self::parse_cvar_bool(name, value)?;
+                        self.render_command(RenderCommand::SetGpuTimings(self.video.gpu_timings));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_HIZOCCLUSION {
+        runtime: CvarDef::new(
+                "r_hizOcclusion",
+                "",
+                "0..1",
+                "Hi-Z occlusion culling.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_hizocclusion(app)),
+                |app, value| {
+                    App::cvar_set_r_hizocclusion(app, APP_R_HIZOCCLUSION.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_hizocclusion, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.hiz_occlusion = parse_bool(value).unwrap_or(settings.hiz_occlusion)
+                    }
+                }),
+                archive: Some((128, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.hiz_occlusion))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_hizocclusion(&self) -> String {
+                    bool_value(self.video.hiz_occlusion)
+                }
+                fn cvar_set_r_hizocclusion(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_hizocclusion".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        if lower == "r_gpudriven" {
+                            self.video.gpu_driven = enabled;
+                        } else {
+                            self.video.hiz_occlusion = enabled;
+                        }
+                        self.sync_gpu_visibility();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_JUMPHEIGHTSHADE {
+        runtime: CvarDef::new("r_jumpHeightShade", "", "0..1", "jaPRO SP physics: tint flat surfaces by jump height while airborne (green = ideal landing, red = deeper, blue = reachable above the jump line).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_jumpheightshade(app)), |app, value| App::cvar_set_r_jumpheightshade(app, APP_R_JUMPHEIGHTSHADE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_jumpheightshade, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, _name, value| {
+                    {
+                        settings.jump_height_shade = parse_bool(value).unwrap_or(settings.jump_height_shade)
+                    }
+                }),
+                archive: Some((292, |state| {
+                    let presentation = state.presentation;
+                    format!("{}", u8::from(presentation.jump_height_shade))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_jumpheightshade(&self) -> String {
+                    bool_value(self.jump_height_shade)
+                }
+                fn cvar_set_r_jumpheightshade(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.jump_height_shade = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        self.publish_snapshot();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_LIGHTMAP {
+        runtime: CvarDef::new(
+                "r_lightmap",
+                "",
+                "0..1",
+                "Show baked lightmap or vertex-light data without the diffuse texture where available.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_lightmap(app)),
+                |app, value| App::cvar_set_r_lightmap(app, APP_R_LIGHTMAP.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_lightmap, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.lightmap_only = parse_bool(value).unwrap_or(settings.lightmap_only);
+                }),
+                archive: Some((168, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.lightmap_only))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_lightmap(&self) -> String {
+                    bool_value(self.video.lightmap_only)
+                }
+                fn cvar_set_r_lightmap(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_lightmap".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        match lower.as_str() {
+                            "r_fullbright" => self.video.world_lighting = !enabled,
+                            "r_vertexlight" => self.video.vertex_lighting = enabled,
+                            "r_lightmap" => self.video.lightmap_only = enabled,
+                            _ => unreachable!(),
+                        }
+                        self.sync_classic_world_lighting();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_LOCALLIGHTSHADOWS {
+        runtime: CvarDef::new(
+                "r_localLightShadows",
+                "",
+                "0..1",
+                "Cubemap shadows for selected local lights.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_locallightshadows(app)),
+                |app, value| {
+                    App::cvar_set_r_locallightshadows(
+                        app,
+                        APP_R_LOCALLIGHTSHADOWS.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_locallightshadows, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.local_light_shadows =
+                            parse_bool(value).unwrap_or(settings.local_light_shadows)
+                    }
+                }),
+                archive: Some((144, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.local_light_shadows))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_locallightshadows(&self) -> String {
+                    bool_value(self.video.local_light_shadows)
+                }
+                fn cvar_set_r_locallightshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.local_light_shadows = Self::parse_cvar_bool(name, value)?;
+                        self.sync_local_light_shadows();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_LODBIAS {
+        runtime: CvarDef::new(
+                "r_lodbias",
+                "",
+                "0..8",
+                "JKA-style Ghoul2/model LOD bias; higher values select cheaper authored GLM LODs.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_lodbias(app)),
+                |app, value| App::cvar_set_r_lodbias(app, APP_R_LODBIAS.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_lodbias, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ghoul2_lod_bias = value
+                        .parse::<i32>()
+                        .ok()
+                        .map(|bias| bias.max(0))
+                        .unwrap_or(settings.ghoul2_lod_bias);
+                }),
+                archive: Some((26, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.ghoul2_lod_bias)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_lodbias(&self) -> String {
+                    self.video.ghoul2_lod_bias.to_string()
+                }
+                fn cvar_set_r_lodbias(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let bias = value
+                            .trim()
+                            .parse::<i32>()
+                            .map_err(|_| format!("{name}: expected a non-negative integer"))?;
+                        self.video.ghoul2_lod_bias = bias.max(0);
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!("MODEL LOD BIAS: {}", self.video.ghoul2_lod_bias);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_LODSCALE {
+        runtime: CvarDef::new("r_lodScale", "", "0.1..100", "Ghoul2 model LOD scale (OpenJK default 5). Larger keeps higher-detail GLM LODs at greater distances; smaller switches to cheaper LODs sooner. r_lodbias is added afterward.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_lodscale(app)), |app, value| App::cvar_set_r_lodscale(app, APP_R_LODSCALE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lodscale, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.lod_scale = normalize_lod_scale(value, settings.lod_scale);
+                }),
+                archive: Some((175, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.lod_scale)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_lodscale(&self) -> String {
+                    self.video.lod_scale.to_string()
+                }
+                fn cvar_set_r_lodscale(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    {
+                        value
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|_| "r_lodScale expects a number".to_owned())?;
+                        self.video.lod_scale = config::normalize_lod_scale(value, self.video.lod_scale);
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!("MODEL LOD SCALE: {}", self.video.lod_scale);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_MAPLIGHTSIMULATION {
+        runtime: CvarDef::new(
+                "r_mapLightSimulation",
+                "",
+                "0..1",
+                "Source .map only: preview authored light entities with the runtime clustered renderer.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_maplightsimulation(app)),
+                |app, value| {
+                    App::cvar_set_r_maplightsimulation(
+                        app,
+                        APP_R_MAPLIGHTSIMULATION.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_maplightsimulation, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.map_light_simulation =
+                        parse_bool(value).unwrap_or(settings.map_light_simulation);
+                }),
+                archive: Some((131, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.map_light_simulation))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_maplightsimulation(&self) -> String {
+                    bool_value(self.video.map_light_simulation)
+                }
+                fn cvar_set_r_maplightsimulation(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.map_light_simulation = Self::parse_cvar_bool(name, value)?;
+                        self.sync_map_light_simulation();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            ".MAP LIGHT SIMULATION: {}",
+                            if self.video.map_light_simulation {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_MAXFRAMELATENCY {
+        runtime: CvarDef::new("r_maxFrameLatency", "", "1|2|3", "Maximum WGPU surface frames in flight: 1 lowest latency, 2 balanced, 3 maximum throughput.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_maxframelatency(app)), |app, value| App::cvar_set_r_maxframelatency(app, APP_R_MAXFRAMELATENCY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_maxframelatency, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(value) = value.parse::<u32>() {
+                        if (1..=3).contains(&value) {
+                            settings.max_frame_latency = value;
+                        }
+                    }
+                }),
+                archive: Some((9, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.max_frame_latency)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_maxframelatency(&self) -> String {
+                    self.video.max_frame_latency.to_string()
+                }
+                fn cvar_set_r_maxframelatency(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let latency = value
+                            .trim()
+                            .parse::<u32>()
+                            .map_err(|_| format!("{name}: expected 1, 2, or 3"))?;
+                        if !(1..=3).contains(&latency) {
+                            return Err(format!("{name}: expected 1, 2, or 3"));
+                        }
+                        self.set_max_frame_latency(latency);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_MODE {
+        runtime: CvarDef::new(
+                "r_mode",
+                "",
+                "-1",
+                "Custom resolution marker; dimensions are controlled by r_customwidth and r_customheight.",
+                CvarType::Enum(&["-1"]),
+                CvarFlags::ARCHIVE.union(CvarFlags::FIXED),
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_mode(app)),
+                |app, value| App::cvar_set_r_mode(app, APP_R_MODE.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_mode, None),
+        config: CvarBinding {
+                archive: Some((0, |_state| "-1".to_owned())),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_mode(&self) -> String {
+                    "-1".into()
+                }
+                fn cvar_set_r_mode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let mode = value
+                            .trim()
+                            .parse::<i32>()
+                            .map_err(|_| format!("{name}: expected an integer"))?;
+                        if mode != -1 {
+                            return Err(format!(
+                                "{name}: only -1 (custom, r_customWidth/r_customHeight) is supported"
+                            ));
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_MODERNSABERS {
+        runtime: CvarDef::new("r_modernSabers", "", "0..1", "Continuous view-facing saber glow ribbon; 0 keeps the OpenJK-compatible sprite-chain presentation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_modernsabers(app)), |app, value| App::cvar_set_r_modernsabers(app, APP_R_MODERNSABERS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_modernsabers, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.modern_sabers = parse_bool(value).unwrap_or(settings.modern_sabers)
+                    }
+                }),
+                archive: Some((132, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.modern_sabers))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_modernsabers(&self) -> String {
+                    bool_value(self.video.modern_sabers)
+                }
+                fn cvar_set_r_modernsabers(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.modern_sabers = Self::parse_cvar_bool(name, value)?;
+                        if let Some(session) = self.game_session.as_mut() {
+                            session
+                                .weapon_fx
+                                .set_modern_sabers(self.video.modern_sabers);
+                        }
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            "MODERN SABER RENDERING: {}",
+                            if self.video.modern_sabers {
+                                "ON"
+                            } else {
+                                "OFF (OPENJK)"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_MOTIONBLUR {
+        runtime: CvarDef::new(
+                "r_motionBlur",
+                "",
+                "0..1",
+                "Camera/world motion blur strength.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_motionblur(app)),
+                |app, value| {
+                    App::cvar_set_r_motionblur(app, APP_R_MOTIONBLUR.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_motionblur, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.motion_blur_strength = value
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|strength| strength.is_finite())
+                            .map(|strength| strength.clamp(0.0, 1.0))
+                            .unwrap_or(settings.motion_blur_strength)
+                    }
+                }),
+                archive: Some((111, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.motion_blur_strength)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_motionblur(&self) -> String {
+                    format!("{:.3}", self.video.motion_blur_strength)
+                }
+                fn cvar_set_r_motionblur(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let strength = value
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|_| format!("{name}: expected 0..1"))?;
+                        self.set_motion_blur_strength(strength);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_NOVIS {
+        runtime: CvarDef::new(
+                "r_novis",
+                "",
+                "0..1",
+                "Disable PVS culling; legacy compatibility alias.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_novis(app)),
+                |app, value| App::cvar_set_r_novis(app, APP_R_NOVIS.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_novis, None),
+        config: CvarBinding {
+                load_video: Some(|_settings, _name, value, context| context.novis = parse_bool(value)),
+                archive: Some((29, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.pvs_mode == PvsMode::Off))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_novis(&self) -> String {
+                    bool_value(self.video.pvs_mode == PvsMode::Off)
+                }
+                fn cvar_set_r_novis(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.pvs_mode = if Self::parse_cvar_bool(name, value)? {
+                            PvsMode::Off
+                        } else {
+                            PvsMode::Auto
+                        };
+                        self.render_command(RenderCommand::SetPvsMode(self.video.pvs_mode));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PBR {
+        runtime: CvarDef::new(
+                "r_pbr",
+                "",
+                "0..1",
+                "Master Rend2-style PBR switch; when off, .mtr overrides are not used.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::MapLoadOrVidRestart,
+                |app| CvarValue::String(App::cvar_get_r_pbr(app)),
+                |app, value| App::cvar_set_r_pbr(app, APP_R_PBR.entry.name, &value.to_string()),
+            )
+            .with_text_setter(
+                App::cvar_set_r_pbr,
+                Some(|name, value| {
+                    App::parse_cvar_bool(name, value).map(|enabled| u8::from(enabled).to_string())
+                }),
+            ),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.pbr = parse_bool(value).unwrap_or(settings.pbr)
+                }),
+                apply_latched: Some(|settings, value| {
+                    settings.pbr = App::parse_console_bool(value).unwrap_or(settings.pbr)
+                }),
+                archive: Some((136, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.pbr))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_pbr(&self) -> String {
+                    bool_value(self.video.pbr)
+                }
+                fn cvar_set_r_pbr(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.pbr = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PERFTRACE {
+        runtime: CvarDef::new(
+                "r_perfTrace",
+                "",
+                "0..1",
+                "Periodic renderer performance trace in the console.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_perftrace(app)),
+                |app, value| App::cvar_set_r_perftrace(app, APP_R_PERFTRACE.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_perftrace, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.perf_trace = parse_bool(value).unwrap_or(settings.perf_trace);
+                }),
+                archive: Some((21, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.perf_trace))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_perftrace(&self) -> String {
+                    bool_value(self.video.perf_trace)
+                }
+                fn cvar_set_r_perftrace(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.perf_trace = Self::parse_cvar_bool(name, value)?;
+                        self.render_command(RenderCommand::SetPerfTrace(self.video.perf_trace));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PLANARDEBUG {
+        runtime: CvarDef::new(
+                "r_planardebug",
+                "off",
+                "off|candidates|selected|texture|applied|binding",
+                "Planar reflection debug view.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_planardebug(app)),
+                |app, value| {
+                    App::cvar_set_r_planardebug(app, APP_R_PLANARDEBUG.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_planardebug, None),
+        config: CvarBinding {
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_planardebug(&self) -> String {
+                    self.video
+                        .planar_reflection_debug
+                        .label()
+                        .to_ascii_lowercase()
+                }
+                fn cvar_set_r_planardebug(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.planar_reflection_debug = PlanarReflectionDebugMode::from_config(value)
+                            .ok_or_else(|| {
+                                format!("{name}: expected off|candidates|selected|texture|applied|binding")
+                            })?;
+                        self.sync_planar_reflection_debug();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_POM {
+        runtime: CvarDef::new("r_pom", "", "0..1", "Parallax occlusion mapping when r_pbr is on; 0 keeps PBR shading without POM height sampling. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+         |app| CvarValue::String(App::cvar_get_r_pom(app)),
+         |app, value| App::cvar_set_r_pom(app, APP_R_POM.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_pom, None),
+        config: CvarBinding {
+                default: Some(|state| {
+                    bool_value(state.video.pom)
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_pom(&self) -> String {
+                    bool_value(self.video.pom)
+                }
+                fn cvar_set_r_pom(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        // Session-only (not config-dirty): parallax occlusion with r_pbr.
+                        self.video.pom = Self::parse_cvar_bool(name, value)?;
+                        self.render_command(RenderCommand::SetPom(self.video.pom));
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PUDDLEQUALITY {
+        runtime: CvarDef::new("r_puddleQuality", "", "standard|high", "high shades puddles and wet ground with the GodotOcean water response and streaked reflections.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_puddlequality(app)), |app, value| App::cvar_set_r_puddlequality(app, APP_R_PUDDLEQUALITY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_puddlequality, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.puddle_quality =
+                            PuddleQuality::from_config(value).unwrap_or(settings.puddle_quality)
+                    }
+                }),
+                archive: Some((89, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.puddle_quality.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_puddlequality(&self) -> String {
+                    self.video.puddle_quality.config_value().to_owned()
+                }
+                fn cvar_set_r_puddlequality(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.puddle_quality = PuddleQuality::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected standard|high"))?;
+                        self.sync_post_effects();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PUDDLESCATTER {
+        runtime: CvarDef::new("r_puddleScatter", "", "0..1", "How readily rain collects in scattered puddles on large flat ground; 0 keeps only basin puddles.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_puddlescatter(app)), |app, value| App::cvar_set_r_puddlescatter(app, APP_R_PUDDLESCATTER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_puddlescatter, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.puddle_scatter = value
+                            .parse::<f32>()
+                            .ok()
+                            .filter(|amount| amount.is_finite())
+                            .map(|amount| amount.clamp(0.0, 1.0))
+                            .unwrap_or(settings.puddle_scatter)
+                    }
+                }),
+                archive: Some((90, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.puddle_scatter)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_puddlescatter(&self) -> String {
+                    format!("{:.3}", self.video.puddle_scatter)
+                }
+                fn cvar_set_r_puddlescatter(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let amount = value
+                            .trim()
+                            .parse::<f32>()
+                            .map_err(|_| format!("{name}: expected 0..1"))?;
+                        self.set_puddle_scatter(amount);
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PVSMODE {
+        runtime: CvarDef::new("r_pvsMode", "", "off|minimal|full|auto", "Potentially-visible-set culling mode; Auto uses map-load portal/cluster draw plans with shared compatible merged batches.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_pvsmode(app)), |app, value| App::cvar_set_r_pvsmode(app, APP_R_PVSMODE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_pvsmode, None),
+        config: CvarBinding {
+                load_video: Some(|_settings, _name, value, context| {
+                    {
+                        context.pvs_mode = match value.to_ascii_lowercase().as_str() {
+                            "off" | "0" => Some(PvsMode::Off),
+                            "minimal" | "1" => Some(PvsMode::Minimal),
+                            "full" | "2" => Some(PvsMode::Full),
+                            // Auto 1-3 were removed; Auto 4 became Auto.
+                            "auto" | "3" | "auto2" | "4" | "auto3" | "5" | "auto4" | "batched"
+                            | "pvsbatched" | "6" => Some(PvsMode::Auto),
+                            _ => context.pvs_mode,
+                        };
+                    }
+                }),
+                archive: Some((30, |state| {
+                    let settings = state.video;
+                    let pvs_mode = settings.pvs_mode.config_value();
+                    format!("{}", pvs_mode)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_pvsmode(&self) -> String {
+                    self.video.pvs_mode.config_value().to_owned()
+                }
+                fn cvar_set_r_pvsmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.pvs_mode = match value.trim().to_ascii_lowercase().as_str() {
+                            "off" | "0" => PvsMode::Off,
+                            "minimal" | "1" => PvsMode::Minimal,
+                            "full" | "2" => PvsMode::Full,
+                            "auto" | "3" | "auto2" | "4" | "auto3" | "5" | "auto4" | "batched"
+                            | "pvsbatched" | "6" => PvsMode::Auto,
+                            _ => return Err(format!("{name}: expected off|minimal|full|auto")),
+                        };
+                        self.render_command(RenderCommand::SetPvsMode(self.video.pvs_mode));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_REFLECTIONDEBUG {
+        runtime: CvarDef::new("r_reflectionDebug", "", "0..1", "Show per-surface reflection resolver result (magenta planar, green SSR, blue probe, gray SSR-eligible/no-hit).", CvarType::String, CvarFlags::NONE, LatchScope::None,
+         |app| CvarValue::String(App::cvar_get_r_reflectiondebug(app)),
+         |app, value| App::cvar_set_r_reflectiondebug(app, APP_R_REFLECTIONDEBUG.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_reflectiondebug, None),
+        config: CvarBinding {
+                default: Some(|state| {
+                    bool_value(state.video.reflection_debug)
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_reflectiondebug(&self) -> String {
+                    bool_value(self.video.reflection_debug)
+                }
+                fn cvar_set_r_reflectiondebug(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_reflectiondebug".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        match lower.as_str() {
+                            "r_hdr" => self.video.hdr = enabled,
+                            "r_tonemap" => self.video.tone_mapping = enabled,
+                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_halation" => self.video.halation = enabled,
+                            "r_ssao" => {
+                                self.video.ssao = enabled;
+                                if enabled {
+                                    self.video.static_bsp_ao = false;
+                                }
+                            }
+                            "r_staticbspao" => {
+                                self.video.static_bsp_ao = enabled;
+                                if enabled {
+                                    self.video.ssao = false;
+                                }
+                            }
+                            "r_fxaa" => {
+                                self.video.fxaa = enabled;
+                                if enabled {
+                                    self.video.smaa = false;
+                                    self.video.taa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_smaa" => {
+                                self.video.smaa = enabled;
+                                if enabled {
+                                    self.video.fxaa = false;
+                                    self.video.taa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_taa" => {
+                                self.video.taa = enabled;
+                                if enabled {
+                                    self.video.fxaa = false;
+                                    self.video.smaa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_contactshadows" => self.video.contact_shadows = enabled,
+                            "r_cloudshadows" => self.video.cloud_shadows = enabled,
+                            "r_cloudtemporal" => self.video.cloud_temporal = enabled,
+                            "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
+                            "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
+                            "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
+                            "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
+                            "r_rain" => self.video.rain = enabled,
+                            "r_sunoverride" => {
+                                self.set_sun_override(enabled, enabled);
+                                return Ok(());
+                            }
+                            "r_entitysunlighting" => self.video.entity_sun_lighting = enabled,
+                            "r_reflectiondebug" => self.video.reflection_debug = enabled,
+                            "r_vignette" => self.video.vignette = enabled,
+                            _ => unreachable!(),
+                        }
+                        self.sync_post_effects();
+                        if lower != "r_reflectiondebug" {
+                            self.mark_config_dirty();
+                        }
+                        // r_floatLightmap is only effective while HDR is active, matching
+                        // Rend2. If that changes the prepared lightmap representation,
+                        // video_restart_required() exposes the normal renderer-restart path.
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_REFLECTIONQUALITY {
+        runtime: CvarDef::new("r_reflectionQuality", "", "off|low|medium|high|ultra", "Master reflection resolver quality/budget: probes -> SSR -> dynamically allocated planar reflections.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_reflectionquality(app)), |app, value| App::cvar_set_r_reflectionquality(app, APP_R_REFLECTIONQUALITY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_reflectionquality, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.reflection_quality =
+                            ReflectionQuality::from_config(value).unwrap_or(settings.reflection_quality)
+                    }
+                }),
+                archive: Some((107, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.reflection_quality.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_reflectionquality(&self) -> String {
+                    self.video.reflection_quality.config_value().to_owned()
+                }
+                fn cvar_set_r_reflectionquality(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.reflection_quality = ReflectionQuality::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected off|legacy|low|medium|high|ultra"))?;
+                        self.reflection_quality_changed();
+                        self.publish_ui();
+                        return Ok(());
+                    }
+                }
+            }
+        ]
+    }
+
+    APP_R_SABERIMPACTFX {
+        runtime: CvarDef::new("r_saberImpactFx", "", "0..1", "Render authored saber hit/block EFX trees; useful for isolated FX performance A/B testing.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_saberimpactfx(app)), |app, value| App::cvar_set_r_saberimpactfx(app, APP_R_SABERIMPACTFX.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_saberimpactfx, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.saber_impact_fx = parse_bool(value).unwrap_or(settings.saber_impact_fx)
+                    }
+                }),
+                archive: Some((134, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.saber_impact_fx))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_saberimpactfx(&self) -> String {
+                    bool_value(self.video.saber_impact_fx)
+                }
+                fn cvar_set_r_saberimpactfx(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.saber_impact_fx = Self::parse_cvar_bool(name, value)?;
+                        if let Some(session) = self.game_session.as_mut() {
+                            session
+                                .weapon_fx
+                                .set_saber_impact_fx(self.video.saber_impact_fx);
+                        }
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            "SABER IMPACT EFFECTS: {}",
+                            if self.video.saber_impact_fx {
+                                "ON"
+                            } else {
+                                "OFF"
+                            }
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SABERMARKS {
+        runtime: CvarDef::new("r_saberMarks", "", "off|legacy|enhanced", "Saber/world contact effects: off, OpenJK-compatible marks, or a smooth heat-accumulating molten relief/sludge effect.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_sabermarks(app)), |app, value| App::cvar_set_r_sabermarks(app, APP_R_SABERMARKS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_sabermarks, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.saber_marks =
+                            SaberMarkMode::from_config(value).unwrap_or(settings.saber_marks)
+                    }
+                }),
+                archive: Some((135, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.saber_marks.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_sabermarks(&self) -> String {
+                    self.video.saber_marks.config_value().to_owned()
+                }
+                fn cvar_set_r_sabermarks(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.saber_marks = ui::SaberMarkMode::from_config(value)
+                            .ok_or_else(|| format!("{name}: expected off|legacy|enhanced"))?;
+                        if let Some(session) = self.game_session.as_mut() {
+                            session.weapon_fx.set_saber_marks(self.video.saber_marks);
+                        }
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            "SABER MARKS: {}",
+                            self.video.saber_marks.label().to_ascii_uppercase()
+                        );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SHOWTRIS {
+        runtime: CvarDef::new("r_showtris", "", "0..127", "Wireframe category bitmask: 1 map, 2 players, 4 entities, 8 effects, 16 grass, 32 ocean, 64 deformation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_showtris(app)), |app, value| App::cvar_set_r_showtris(app, APP_R_SHOWTRIS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_showtris, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(mask) = value.trim().parse::<u32>() {
+                        settings.wireframe_mask = mask & crate::ui::wireframe::ALL;
+                    } else if let Some(enabled) = parse_bool(value) {
+                        settings.wireframe_mask = if enabled {
+                            crate::ui::wireframe::MAP
+                        } else {
+                            0
+                        };
+                    }
+                }),
+                archive: Some((17, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.wireframe_mask)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_showtris(&self) -> String {
+                    self.video.wireframe_mask.to_string()
+                }
+                fn cvar_set_r_showtris(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let mask = value.trim().parse::<u32>().map_err(|_| {
+                            format!(
+                                "{name}: expected an integer bitmask (0..{})",
+                                ui::wireframe::ALL
+                            )
+                        })?;
+                        if mask & !ui::wireframe::ALL != 0 {
+                            return Err(format!(
+                                "{name}: unsupported wireframe bits; valid range is 0..{}",
+                                ui::wireframe::ALL
+                            ));
+                        }
+                        if mask != 0 && !self.wireframe_supported {
+                            return Err("r_showtris: wireframe overlay is not supported by this GPU".into());
+                        }
+                        self.video.wireframe_mask = mask;
+                        self.render_command(RenderCommand::SetWireframeMask(mask));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SKIPUI {
+        runtime: CvarDef::new(
+                "r_skipUi",
+                "",
+                "0..1",
+                "Diagnostic: skip all UI vertex generation and UI rendering.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_skipui(app)),
+                |app, value| App::cvar_set_r_skipui(app, APP_R_SKIPUI.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_skipui, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.skip_ui = parse_bool(value).unwrap_or(settings.skip_ui);
+                }),
+                archive: Some((18, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.skip_ui))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_skipui(&self) -> String {
+                    bool_value(self.video.skip_ui)
+                }
+                fn cvar_set_r_skipui(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.skip_ui = Self::parse_cvar_bool(name, value)?;
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SWAPINTERVAL {
+        runtime: CvarDef::new(
+                "r_swapInterval",
+                "",
+                "0|1|2|3",
+                "Presentation mode: 0 off, 1 on, 2 fast/mailbox, 3 adaptive.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_swapinterval(app)),
+                |app, value| {
+                    App::cvar_set_r_swapinterval(app, APP_R_SWAPINTERVAL.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_swapinterval, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.vsync = VsyncMode::from_config(value).unwrap_or(settings.vsync)
+                    }
+                }),
+                archive: Some((8, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.vsync.config_value())
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_swapinterval(&self) -> String {
+                    self.video.vsync.config_value().to_string()
+                }
+                fn cvar_set_r_swapinterval(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let previous_vsync = self.video.vsync;
+                        self.video.vsync = VsyncMode::from_config(value).ok_or_else(|| {
+                            format!("{name}: expected 0/off, 1/on, 2/fast, or 3/adaptive")
+                        })?;
+                        self.render_command(RenderCommand::SetVsync(self.video.vsync));
+                        self.mark_config_dirty();
+                        if self.video.vsync != previous_vsync {
+                            // Entering FAST on DX12 can make the standing cap unreachable.
+                            self.set_fps_cap(self.video.fps_cap);
+                        }
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_TERRAINLOD {
+        runtime: CvarDef::new(
+                "r_terrainLod",
+                "",
+                "0..1",
+                "Distance-based geometry LOD aggressiveness for q3map indexed terrain; 0 disables it.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_terrainlod(app)),
+                |app, value| {
+                    App::cvar_set_r_terrainlod(app, APP_R_TERRAINLOD.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_terrainlod, None),
+        config: CvarBinding {
+                default: Some(|_state| {
+                    "0.000".to_owned()
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_terrainlod(&self) -> String {
+                    "0.000".to_owned()
+                }
+                fn cvar_set_r_terrainlod(&mut self, name: &str, _value: &str) -> Result<(), String> {
+                    Err(format!("{name}: cvar is registered but has no setter yet"))
+                }
+            }
+        ]
+    }
+
+    APP_R_VERBOSE {
+        runtime: CvarDef::new("r_verbose", "", "0..3", "Renderer-only diagnostic level: 0 quiet, 1 basic renderer lifecycle, 2 verbose renderer internals, 3 trace. A matching developer level also enables renderer output.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_verbose(app)), |app, value| App::cvar_set_r_verbose(app, APP_R_VERBOSE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_verbose, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.renderer_verbose = value
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .map(|level| level.min(3))
+                        .or_else(|| parse_bool(value).map(u8::from))
+                        .unwrap_or(settings.renderer_verbose);
+                }),
+                archive: Some((20, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.renderer_verbose)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_verbose(&self) -> String {
+                    self.video.renderer_verbose.to_string()
+                }
+                fn cvar_set_r_verbose(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let level = match Self::parse_console_bool(value) {
+                            Some(enabled) => u8::from(enabled),
+                            None => value
+                                .trim()
+                                .parse::<u8>()
+                                .map_err(|_| format!("{name}: expected 0..3 (off/on are also accepted)"))?,
+                        };
+                        if level > 3 {
+                            return Err(format!("{name}: expected 0..3"));
+                        }
+                        self.video.renderer_verbose = level;
+                        crate::logging::set_renderer_verbose_level(level);
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_VERTEXLIGHT {
+        runtime: CvarDef::new("r_vertexLight", "", "0..1", "Use BSP vertex lighting instead of baked world lightmaps; as in JKA, runtime dlights are suppressed while enabled.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_vertexlight(app)), |app, value| App::cvar_set_r_vertexlight(app, APP_R_VERTEXLIGHT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_vertexlight, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.vertex_lighting = parse_bool(value).unwrap_or(settings.vertex_lighting);
+                }),
+                archive: Some((167, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.vertex_lighting))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_vertexlight(&self) -> String {
+                    bool_value(self.video.vertex_lighting)
+                }
+                fn cvar_set_r_vertexlight(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_vertexlight".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        match lower.as_str() {
+                            "r_fullbright" => self.video.world_lighting = !enabled,
+                            "r_vertexlight" => self.video.vertex_lighting = enabled,
+                            "r_lightmap" => self.video.lightmap_only = enabled,
+                            _ => unreachable!(),
+                        }
+                        self.sync_classic_world_lighting();
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_VIGNETTE {
+        runtime: CvarDef::new(
+                "r_vignette",
+                "",
+                "0..1",
+                "Vignette post effect.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_vignette(app)),
+                |app, value| App::cvar_set_r_vignette(app, APP_R_VIGNETTE.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_vignette, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.vignette = parse_bool(value).unwrap_or(settings.vignette)
+                }),
+                archive: Some((109, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.vignette))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_vignette(&self) -> String {
+                    bool_value(self.video.vignette)
+                }
+                fn cvar_set_r_vignette(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_vignette".to_owned();
+                    {
+                        let enabled = Self::parse_cvar_bool(name, value)?;
+                        match lower.as_str() {
+                            "r_hdr" => self.video.hdr = enabled,
+                            "r_tonemap" => self.video.tone_mapping = enabled,
+                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_halation" => self.video.halation = enabled,
+                            "r_ssao" => {
+                                self.video.ssao = enabled;
+                                if enabled {
+                                    self.video.static_bsp_ao = false;
+                                }
+                            }
+                            "r_staticbspao" => {
+                                self.video.static_bsp_ao = enabled;
+                                if enabled {
+                                    self.video.ssao = false;
+                                }
+                            }
+                            "r_fxaa" => {
+                                self.video.fxaa = enabled;
+                                if enabled {
+                                    self.video.smaa = false;
+                                    self.video.taa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_smaa" => {
+                                self.video.smaa = enabled;
+                                if enabled {
+                                    self.video.fxaa = false;
+                                    self.video.taa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_taa" => {
+                                self.video.taa = enabled;
+                                if enabled {
+                                    self.video.fxaa = false;
+                                    self.video.smaa = false;
+                                    self.video.msaa_samples = 1;
+                                    self.render_command(RenderCommand::SetMsaa(1));
+                                }
+                            }
+                            "r_contactshadows" => self.video.contact_shadows = enabled,
+                            "r_cloudshadows" => self.video.cloud_shadows = enabled,
+                            "r_cloudtemporal" => self.video.cloud_temporal = enabled,
+                            "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
+                            "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
+                            "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
+                            "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
+                            "r_rain" => self.video.rain = enabled,
+                            "r_sunoverride" => {
+                                self.set_sun_override(enabled, enabled);
+                                return Ok(());
+                            }
+                            "r_entitysunlighting" => self.video.entity_sun_lighting = enabled,
+                            "r_reflectiondebug" => self.video.reflection_debug = enabled,
+                            "r_vignette" => self.video.vignette = enabled,
+                            _ => unreachable!(),
+                        }
+                        self.sync_post_effects();
+                        if lower != "r_reflectiondebug" {
+                            self.mark_config_dirty();
+                        }
+                        // r_floatLightmap is only effective while HDR is active, matching
+                        // Rend2. If that changes the prepared lightmap representation,
+                        // video_restart_required() exposes the normal renderer-restart path.
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_VOXELPROBEGI {
+        runtime: CvarDef::new("r_voxelProbeGI", "", "0..1", "Voxel/probe indirect lighting; enabling it on a map prepared without GI requires vid_restart.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_voxelprobegi(app)), |app, value| App::cvar_set_r_voxelprobegi(app, APP_R_VOXELPROBEGI.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_voxelprobegi, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.voxel_probe_gi = parse_bool(value).unwrap_or(settings.voxel_probe_gi)
+                    }
+                }),
+                archive: Some((143, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.voxel_probe_gi))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_voxelprobegi(&self) -> String {
+                    bool_value(self.video.voxel_probe_gi)
+                }
+                fn cvar_set_r_voxelprobegi(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.voxel_probe_gi = Self::parse_cvar_bool(name, value)?;
+                        self.sync_voxel_probe_gi();
+                        self.mark_config_dirty();
+                        if self.map_prepare_restart_required() {
+                            self.console_status =
+                                "VOXEL / PROBE GI: PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART".into();
+                        }
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WINDOWMAXIMIZED {
+        runtime: CvarDef::new(
+                "r_windowMaximized",
+                "",
+                "0..1",
+                "Restore the window maximized on launch.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_windowmaximized(app)),
+                |app, value| {
+                    App::cvar_set_r_windowmaximized(
+                        app,
+                        APP_R_WINDOWMAXIMIZED.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_windowmaximized, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    {
+                        settings.window_maximized = parse_bool(value).unwrap_or(settings.window_maximized)
+                    }
+                }),
+                archive: Some((5, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.window_maximized))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_windowmaximized(&self) -> String {
+                    bool_value(self.video.window_maximized)
+                }
+                fn cvar_set_r_windowmaximized(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.window_maximized = Self::parse_cvar_bool(name, value)?;
+                        if self.applied_fullscreen.is_windowed() {
+                            if let Some(window) = &self.window {
+                                window.set_maximized(self.video.window_maximized);
+                            }
+                        }
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WINDOWX {
+        runtime: CvarDef::new(
+                "r_windowX",
+                "",
+                "desktop pixels",
+                "Last windowed X position; auto means automatic.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_windowx(app)),
+                |app, value| App::cvar_set_r_windowx(app, APP_R_WINDOWX.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_windowx, None),
+        config: CvarBinding {
+                load_video: Some(|_settings, _name, value, context| {
+                    context.window_x = value.parse::<i32>().ok()
+                }),
+                archive: Some((3, |state| {
+                    let settings = state.video;
+                    let window_x = settings
+                        .window_position
+                        .map(|p| p[0].to_string())
+                        .unwrap_or_else(|| "auto".into());
+                    format!("{}", window_x)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_windowx(&self) -> String {
+                    self.video
+                        .window_position
+                        .map_or_else(|| "auto".into(), |p| p[0].to_string())
+                }
+                fn cvar_set_r_windowx(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_windowx".to_owned();
+                    {
+                        if value.eq_ignore_ascii_case("auto") {
+                            self.video.window_position = None;
+                        } else {
+                            let parsed = value.trim().parse::<i32>().map_err(|_| {
+                                format!("{name}: expected a desktop pixel coordinate or auto")
+                            })?;
+                            let mut position = self.video.window_position.unwrap_or([0, 0]);
+                            if lower == "r_windowx" {
+                                position[0] = parsed;
+                            } else {
+                                position[1] = parsed;
+                            }
+                            self.video.window_position = Some(position);
+                            if self.applied_fullscreen.is_windowed() {
+                                if let Some(window) = &self.window {
+                                    window.set_outer_position(PhysicalPosition::new(
+                                        position[0],
+                                        position[1],
+                                    ));
+                                }
+                            }
+                        }
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WINDOWY {
+        runtime: CvarDef::new(
+                "r_windowY",
+                "",
+                "desktop pixels",
+                "Last windowed Y position; auto means automatic.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_windowy(app)),
+                |app, value| App::cvar_set_r_windowy(app, APP_R_WINDOWY.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_windowy, None),
+        config: CvarBinding {
+                load_video: Some(|_settings, _name, value, context| {
+                    context.window_y = value.parse::<i32>().ok()
+                }),
+                archive: Some((4, |state| {
+                    let settings = state.video;
+                    let window_y = settings
+                        .window_position
+                        .map(|p| p[1].to_string())
+                        .unwrap_or_else(|| "auto".into());
+                    format!("{}", window_y)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_windowy(&self) -> String {
+                    self.video
+                        .window_position
+                        .map_or_else(|| "auto".into(), |p| p[1].to_string())
+                }
+                fn cvar_set_r_windowy(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let lower = "r_windowy".to_owned();
+                    {
+                        if value.eq_ignore_ascii_case("auto") {
+                            self.video.window_position = None;
+                        } else {
+                            let parsed = value.trim().parse::<i32>().map_err(|_| {
+                                format!("{name}: expected a desktop pixel coordinate or auto")
+                            })?;
+                            let mut position = self.video.window_position.unwrap_or([0, 0]);
+                            if lower == "r_windowx" {
+                                position[0] = parsed;
+                            } else {
+                                position[1] = parsed;
+                            }
+                            self.video.window_position = Some(position);
+                            if self.applied_fullscreen.is_windowed() {
+                                if let Some(window) = &self.window {
+                                    window.set_outer_position(PhysicalPosition::new(
+                                        position[0],
+                                        position[1],
+                                    ));
+                                }
+                            }
+                        }
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WORLDPATH {
+        runtime: CvarDef::new("r_worldPath", "", "auto|unified", "World renderer: auto keeps the FastBaseline path when eligible; unified forces the general renderer (Minimal (Unified) preset).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_worldpath(app)), |app, value| App::cvar_set_r_worldpath(app, APP_R_WORLDPATH.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_worldpath, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.force_unified_world = value.trim().eq_ignore_ascii_case("unified");
+                }),
+                archive: Some((22, |state| {
+                    let settings = state.video;
+                    format!(
+                        "{}",
+                        if settings.force_unified_world {
+                            "unified"
+                        } else {
+                            "auto"
+                        }
+                    )
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_worldpath(&self) -> String {
+                    if self.video.force_unified_world {
+                        "unified"
+                    } else {
+                        "auto"
+                    }
+                    .to_owned()
+                }
+                fn cvar_set_r_worldpath(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.force_unified_world = match value.trim().to_ascii_lowercase().as_str() {
+                            "auto" => false,
+                            "unified" => true,
+                            _ => return Err(format!("{name}: expected auto|unified")),
+                        };
+                        self.render_command(RenderCommand::SetForceUnifiedWorld(
+                            self.video.force_unified_world,
+                        ));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+}

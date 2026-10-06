@@ -115,7 +115,7 @@ impl Renderer {
         }
         ocean
             .as_ref()
-            .map(|o| &o.render_bind_group)
+            .map(|o| o.render_bind_group_for(batch.ocean_clipmap_id as usize))
             .unwrap_or(inert)
     }
 
@@ -185,13 +185,15 @@ pub(in crate::renderer) fn ocean_surface_key(
     plane: f32,
     minimum: [f32; 2],
     maximum: [f32; 2],
-) -> [u32; 5] {
+    material: u32,
+) -> [u32; 6] {
     [
         plane.to_bits(),
         minimum[0].to_bits(),
         minimum[1].to_bits(),
         maximum[0].to_bits(),
         maximum[1].to_bits(),
+        material,
     ]
 }
 

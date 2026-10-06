@@ -264,7 +264,15 @@ fn cs_main(
             // that roof, do not let the stale drop rain inside. Put it above
             // the top-down cover so ordinary camera depth keeps it invisible.
             if (old_y < surface_y - 2.0) {
-                particle.position_state.y = surface_y + max(sim.spawn.z * 0.20, 24.0);
+                let parked = surface_y + max(sim.spawn.z * 0.20, 24.0);
+                if (parked - sim.camera_dt.y > sim.spawn.z) {
+                    // Cover far above the rain column: parking the drop there puts
+                    // it out in the void, where it draws for one frame before the
+                    // bounds test recycles it. Recycle it now instead.
+                    particles[index] = respawn(index, particle.misc.x, shared_wind_velocity);
+                    return;
+                }
+                particle.position_state.y = parked;
             } else if (particle.position_state.y <= surface_y + 2.0) {
                 if (index < sim.counts.w) {
                     // Only a representative subset needs visible splash state.

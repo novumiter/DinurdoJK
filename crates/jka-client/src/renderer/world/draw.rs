@@ -2,14 +2,11 @@
 use crate::renderer::WorldBatch;
 
 /// Whether the FFT ocean owns this authored water batch, so the ordinary passes
-/// must not draw it. The promoted face draws through its clipmap; sibling
-/// stages, undersides and sides are dropped on purpose. Water that qualified
-/// for promotion but got no clipmap (past the surface cap) is the one case the
-/// ocean does not own: it keeps its authored draw instead of vanishing.
+/// must not draw it. Suppress sibling passes only when their face actually
+/// received a replacement. Rejected faces and faces past the cap keep every
+/// authored stage, so enabling the feature cannot remove unpromoted water.
 pub(in crate::renderer) fn ocean_suppresses_batch(ocean_enabled: bool, batch: &WorldBatch) -> bool {
-    ocean_enabled
-        && batch.source.water
-        && !(batch.source.water_primary && batch.ocean_clipmap.is_none())
+    ocean_enabled && batch.ocean_replaced
 }
 
 /// Every face merged into one ocean surface points at the same clipmap, so a

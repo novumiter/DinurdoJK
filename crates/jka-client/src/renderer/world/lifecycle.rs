@@ -9,6 +9,7 @@ use crate::renderer::{
 impl Renderer {
     pub(in crate::renderer) fn load_map(&mut self, mut map: PreparedMap) -> WorldUploadTimings {
         let load_map_started = Instant::now();
+        self.promoted_ocean_overrides.clear();
         // A new world must not inherit transient RE_AddLightToScene submissions
         // from the previous map. The next CGame snapshot will repopulate them.
         self.transient_lights.clear();

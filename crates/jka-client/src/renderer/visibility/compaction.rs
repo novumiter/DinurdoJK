@@ -413,6 +413,7 @@ pub(in crate::renderer) fn instantiate_portal_draw_plans(
         batch.is_inline_entity = false;
         batch.ocean_clipmap = None;
         batch.ocean_clipmap_id = u8::MAX;
+        batch.ocean_replaced = false;
         batch.compact_group = None;
         batch.bounds_min = variant.bounds_min;
         batch.bounds_max = variant.bounds_max;

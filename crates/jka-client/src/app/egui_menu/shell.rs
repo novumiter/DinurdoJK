@@ -5,8 +5,8 @@ use crate::app::egui_menu::{
     OverlayMode, PhysicalKey, RenderCommand, VideoSection, Window, WindowEvent, CONTENT_MAX_W,
     GUTTER, PROFILE_COSMETICS, PROFILE_FORCE, PROFILE_IDENTITY, PROFILE_MODEL, PROFILE_SABER,
     SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
-    SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS, TOP_ITEMS, TOP_PROFILE, TOP_RESUME,
-    TOP_SETUP,
+    SETUP_TAB_MOD, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
+    TOP_ITEMS, TOP_MOD, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
 };
 
 impl App {
@@ -568,19 +568,24 @@ impl App {
                     FrontendPage::Profile
                 }
                 Some("controls") => FrontendPage::Controls,
+                Some("movement") => {
+                    self.setup_selected = SETUP_TAB_MOVEMENT;
+                    self.set_overlay(OverlayMode::Video);
+                    return;
+                }
                 Some("chatlogs") | Some("chatlog") => FrontendPage::ChatLogs,
                 Some("devtools") => FrontendPage::DeveloperTools,
                 Some("assets") => FrontendPage::AssetViewer,
                 Some("screenshots") | Some("shots") => FrontendPage::Screenshots,
                 Some("maps") => FrontendPage::MapViewer,
                 Some("setup") => {
-                    self.setup_selected = Self::setup_tab_index(tab.as_deref());
+                    self.setup_selected = self.setup_tab_index(tab.as_deref());
                     self.set_overlay(OverlayMode::Video);
                     return;
                 }
                 _ => {
                     self.console_status =
-                        "USAGE: uipage main|play|servers|solo|demo|profile|controls|chatlogs|devtools|assets|screenshots|maps|setup [tab]".into();
+                        "USAGE: uipage main|play|servers|solo|demo|profile|controls|movement|chatlogs|devtools|assets|screenshots|maps|setup [tab]".into();
                     return;
                 }
             };
@@ -591,7 +596,12 @@ impl App {
         match name.as_deref() {
             Some("setup") => {
                 self.menu_selected = TOP_SETUP;
-                self.setup_selected = Self::setup_tab_index(tab.as_deref());
+                self.setup_selected = self.setup_tab_index(tab.as_deref());
+                self.set_overlay(OverlayMode::Video);
+            }
+            Some("movement") => {
+                self.menu_selected = TOP_SETUP;
+                self.setup_selected = SETUP_TAB_MOVEMENT;
                 self.set_overlay(OverlayMode::Video);
             }
             Some(page @ ("resume" | "servers" | "profile" | "controls" | "vote" | "mod")) => {
@@ -610,25 +620,34 @@ impl App {
                     "servers" => 1,
                     "profile" => TOP_PROFILE,
                     "controls" => TOP_CONTROLS,
-                    "vote" => 5,
-                    _ => 6,
+                    "vote" => TOP_VOTE,
+                    "mod" => TOP_MOD,
+                    _ => TOP_RESUME,
                 };
                 self.set_overlay(OverlayMode::Game);
             }
             _ => {
                 self.console_status =
-                    "USAGE: uipage resume|servers|profile|controls|vote|mod|setup [game|camera|video|audio|network|interface]".into();
+                    "USAGE: uipage resume|servers|profile|controls|movement|vote|mod|setup [game|movement|camera|video|audio|network|interface|mod]".into();
             }
         }
     }
 
-    pub(in crate::app::egui_menu) fn setup_tab_index(tab: Option<&str>) -> usize {
-        tab.and_then(|tab| {
-            SETUP_TABS
-                .iter()
-                .position(|name| name.eq_ignore_ascii_case(tab))
-        })
-        .unwrap_or(SETUP_TAB_VIDEO)
+    pub(in crate::app::egui_menu) fn setup_tab_index(&self, tab: Option<&str>) -> usize {
+        let Some(tab) = tab else {
+            return SETUP_TAB_VIDEO;
+        };
+        if tab.eq_ignore_ascii_case("mod")
+            || self
+                .ui_mod()
+                .is_some_and(|active| active.label().eq_ignore_ascii_case(tab))
+        {
+            return SETUP_TAB_MOD;
+        }
+        SETUP_TABS
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(tab))
+            .unwrap_or(SETUP_TAB_VIDEO)
     }
 
     pub(in crate::app) fn remembered_in_game_menu_overlay(&mut self) -> OverlayMode {
@@ -646,6 +665,15 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_setup_tabs(&mut self, root: &mut egui::Ui) {
+        let active_mod = self.ui_mod();
+        if self.setup_selected == SETUP_TAB_MOD && active_mod.is_none() {
+            self.setup_selected = SETUP_TAB_VIDEO;
+        }
+        let mut tabs = SETUP_TABS.iter().map(|tab| (*tab).to_owned()).collect::<Vec<_>>();
+        if let Some(active) = active_mod {
+            tabs.push(active.label().to_uppercase());
+        }
+
         egui::Panel::top("jka_setup_tabs")
             .exact_size(theme::TAB_BAR_H)
             .frame(
@@ -660,7 +688,7 @@ impl App {
                     // `nav_item` centres its label, so back off half a label's
                     // worth of padding to land the first tab's text on GUTTER.
                     ui.add_space(GUTTER - 10.0);
-                    for (index, tab) in SETUP_TABS.iter().enumerate() {
+                    for (index, tab) in tabs.iter().enumerate() {
                         let width = 20.0 + tab.len() as f32 * 9.0;
                         if theme::nav_item(
                             ui,
@@ -859,12 +887,14 @@ impl App {
         if self.overlay == OverlayMode::Video {
             match self.setup_selected {
                 SETUP_TAB_GAME => self.egui_game_settings(ui),
+                SETUP_TAB_MOVEMENT => self.egui_movement_page(ui),
                 SETUP_TAB_CAMERA => self.egui_camera_page(ui),
                 SETUP_TAB_VIDEO => self.egui_video_page(ui),
                 SETUP_TAB_AUDIO => self.egui_audio_page(ui),
                 SETUP_TAB_NETWORK => self.egui_network_page(ui),
                 SETUP_TAB_INTERFACE => self.egui_interface_page(ui),
-                _ => unreachable!("setup tab index is bounded by SETUP_TABS"),
+                SETUP_TAB_MOD => self.egui_mod_setup_settings(ui),
+                _ => unreachable!("setup tab index is bounded by the visible setup tabs"),
             }
             return;
         }
@@ -874,8 +904,8 @@ impl App {
             1 => self.egui_server_browser_page(ui),
             TOP_PROFILE => self.egui_profile_page(ui),
             TOP_CONTROLS => self.egui_controls_page(ui),
-            5 => self.egui_vote_page(ui),
-            6 => self.egui_mod_settings(ui),
+            TOP_VOTE => self.egui_vote_page(ui),
+            TOP_MOD => self.egui_mod_settings(ui),
             _ => {}
         }
     }

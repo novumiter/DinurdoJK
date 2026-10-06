@@ -1,8 +1,41 @@
 //! Servers.
 use crate::app::egui_menu::{
-    jka_colored_text, mpsc, refresh_icon, server_browser, theme, App, BrowserCommand, Duration,
-    Instant, ServerSource,
+    jka_colored_text, mpsc, refresh_icon, server_browser, theme, App, BrowserCommand, BrowserEvent,
+    Duration, Instant, ServerSource,
 };
+
+/// Add a full-value tooltip only when egui had to truncate the displayed cell.
+///
+/// `Label::truncate()` does not expose a truncation bit on `Response`, so compare
+/// the untruncated galley width against the actual content width we gave the
+/// widget. This keeps ordinary server-browser rows quiet while still making an
+/// ellipsized value discoverable on hover. JKA color escapes are stripped for
+/// measurement because they do not occupy glyph width.
+fn hover_if_truncated(
+    ui: &egui::Ui,
+    response: egui::Response,
+    displayed_text: &str,
+    hover_text: impl Into<egui::WidgetText>,
+    font_size: f32,
+    horizontal_padding: f32,
+) -> egui::Response {
+    let measured = crate::logging::strip_jka_colors(displayed_text);
+    let full_width = ui
+        .painter()
+        .layout_no_wrap(
+            measured,
+            egui::FontId::proportional(font_size),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x;
+    let available_width = (response.rect.width() - horizontal_padding).max(0.0);
+    if full_width > available_width + 0.5 {
+        response.on_hover_text(hover_text)
+    } else {
+        response
+    }
+}
 
 impl App {
     pub(in crate::app::egui_menu) fn poll_server_browser_events(&mut self) {
@@ -10,7 +43,35 @@ impl App {
         loop {
             match self.server_browser_rx.try_recv() {
                 Ok(event) => {
+                    let completed_server_info = match &event {
+                        BrowserEvent::ServerInfo(status) => Some((
+                            status.address,
+                            server_browser::format_server_status(status),
+                        )),
+                        _ => None,
+                    };
                     self.server_browser.handle_event(event);
+                    if let Some((address, dump)) = completed_server_info {
+                        // `Get server info` is an explicit fresh getstatus request.
+                        // Copy the complete result and mirror the same text into
+                        // the console log without routing dozens of status rows
+                        // through the transient Con_DrawNotify-style overlay.
+                        self.egui_ctx.copy_text(dump.clone());
+                        for line in dump.lines() {
+                            crate::logging::write_line(
+                                crate::logging::Level::Info,
+                                format_args!("{line}"),
+                            );
+                        }
+                        self.sync_console_log();
+                        let text = format!(
+                            "Full getstatus for {address} copied to clipboard and console"
+                        );
+                        self.server_browser.status_text = text.clone();
+                        self.server_browser
+                            .source_status
+                            .insert(self.server_browser.source, text);
+                    }
                     changed = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -160,40 +221,53 @@ impl App {
         width: f32,
     ) {
         let selected = self.server_browser.sort == sort;
-        let label = sort.label();
         let color = if selected {
             theme::ACCENT
         } else {
             theme::TEXT_DIM
         };
-        let response = ui.add_sized(
-            [width, 20.0],
-            egui::Label::new(theme::plain(label, 10.5, color)).sense(egui::Sense::click()),
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 20.0), egui::Sense::click());
+        let painter = ui.painter().with_clip_rect(rect);
+
+        // Keep the sort indicator in a dedicated gutter.  The previous header
+        // painted the chevron over the label's full-width centered text, so
+        // narrow columns such as PLAYERS could visibly collide with it.
+        let arrow_gutter = if selected { 14.0 } else { 4.0 };
+        let text_rect = egui::Rect::from_min_max(
+            rect.min,
+            egui::pos2(rect.right() - arrow_gutter, rect.bottom()),
         );
+        painter.text(
+            text_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            sort.label(),
+            egui::FontId::proportional(10.5),
+            color,
+        );
+
         if selected {
-            // Do not rely on a font glyph for the sort arrow. The bundled UI
-            // font does not contain U+2191/U+2193 on some installs, which made
-            // the old arrow render as the familiar missing-glyph square.
-            let center = egui::pos2(response.rect.right() - 7.0, response.rect.center().y);
+            let center = egui::pos2(rect.right() - 6.0, rect.center().y);
             let points = if self.server_browser.sort_ascending {
                 vec![
-                    center + egui::vec2(-3.5, 2.0),
-                    center + egui::vec2(3.5, 2.0),
-                    center + egui::vec2(0.0, -2.5),
+                    center + egui::vec2(-3.0, 2.0),
+                    center + egui::vec2(3.0, 2.0),
+                    center + egui::vec2(0.0, -2.25),
                 ]
             } else {
                 vec![
-                    center + egui::vec2(-3.5, -2.0),
-                    center + egui::vec2(3.5, -2.0),
-                    center + egui::vec2(0.0, 2.5),
+                    center + egui::vec2(-3.0, -2.0),
+                    center + egui::vec2(3.0, -2.0),
+                    center + egui::vec2(0.0, 2.25),
                 ]
             };
-            ui.painter().add(egui::Shape::convex_polygon(
+            painter.add(egui::Shape::convex_polygon(
                 points,
                 theme::ACCENT,
                 egui::Stroke::NONE,
             ));
         }
+
         if response.clicked() {
             if selected {
                 self.server_browser.sort_ascending = !self.server_browser.sort_ascending;
@@ -210,10 +284,10 @@ impl App {
             self.egui_repaint_requested = true;
         }
         if response.hovered() {
-            ui.painter().rect_filled(
+            painter.rect_filled(
                 egui::Rect::from_min_size(
-                    egui::pos2(response.rect.left(), response.rect.bottom() - 1.0),
-                    egui::vec2(response.rect.width(), 1.0),
+                    egui::pos2(rect.left(), rect.bottom() - 1.0),
+                    egui::vec2(rect.width(), 1.0),
                 ),
                 egui::CornerRadius::ZERO,
                 if selected {
@@ -232,7 +306,7 @@ impl App {
         theme::page_title(
             ui,
             "SERVER BROWSER",
-            "Jedi Academy protocol 26 discovery with asynchronous Internet, LAN, favorites, and history queries.",
+            "Jedi Academy protocol 26 discovery with asynchronous Internet/LAN queries, favorites, player search, and visit history.",
         );
 
         // Source selector + refresh.
@@ -241,7 +315,6 @@ impl App {
                 ServerSource::Internet,
                 ServerSource::Lan,
                 ServerSource::Favorites,
-                ServerSource::History,
             ] {
                 if theme::chip(ui, source.label(), self.server_browser.source == source).clicked() {
                     self.server_browser.source = source;
@@ -372,39 +445,74 @@ impl App {
         }
         ui.add_space(7.0);
 
-        // Search and practical filters are all local and instantaneous.
+        // Search stays prominent; the boolean filters live in one compact menu
+        // rather than consuming most of the toolbar as independent chips.
         ui.horizontal(|ui| {
             theme::label(ui, theme::plain("SEARCH", 11.5, theme::TEXT_FAINT));
+            let search_width = (ui.available_width() - 150.0).clamp(260.0, 440.0);
             let response = ui.add_sized(
-                [260.0, 24.0],
+                [search_width, 24.0],
                 egui::TextEdit::singleline(&mut self.server_browser.search)
                     .hint_text("name, map, mod, address"),
             );
             if response.changed() {
                 self.egui_repaint_requested = true;
             }
-            ui.add_space(10.0);
-            if theme::chip(ui, "HIDE EMPTY", self.server_browser.hide_empty).clicked() {
-                self.server_browser.hide_empty = !self.server_browser.hide_empty;
-            }
-            if theme::chip(ui, "HIDE FULL", self.server_browser.hide_full).clicked() {
-                self.server_browser.hide_full = !self.server_browser.hide_full;
-            }
-            if theme::chip(ui, "HIDE BOTS", self.server_browser.hide_bots)
-                .on_hover_text("Exclude bots from player counts and hide 0-ping rows in the selected server's player list.")
-                .clicked()
-            {
-                self.server_browser.hide_bots = !self.server_browser.hide_bots;
-            }
-            ui.add_space(10.0);
-            theme::label(ui, theme::plain("MAX PING", 11.5, theme::TEXT_FAINT));
-            ui.add(
-                egui::DragValue::new(&mut self.server_browser.max_ping)
-                    .range(0..=999)
-                    .suffix(" ms")
-                    .speed(5),
-            )
-            .on_hover_text("0 disables the ping filter");
+            ui.add_space(8.0);
+
+            let active_filters = self.server_browser.hide_empty as usize
+                + self.server_browser.hide_full as usize
+                + self.server_browser.hide_bots as usize
+                + self.server_browser.hide_connecting as usize
+                + (self.server_browser.max_ping > 0) as usize;
+            let filter_label = if active_filters == 0 {
+                "FILTERS".to_owned()
+            } else {
+                format!("FILTERS ({active_filters})")
+            };
+            egui::ComboBox::from_id_salt("jka_server_browser_filters")
+                .selected_text(filter_label)
+                .width(126.0)
+                .show_ui(ui, |ui| {
+                    ui.set_min_width(230.0);
+                    theme::label(ui, theme::plain("SERVER FILTERS", 10.5, theme::TEXT_FAINT));
+                    ui.add_space(3.0);
+                    ui.checkbox(&mut self.server_browser.hide_empty, "Hide empty servers");
+                    ui.checkbox(&mut self.server_browser.hide_full, "Hide full servers");
+                    ui.checkbox(&mut self.server_browser.hide_bots, "Hide bots")
+                        .on_hover_text("Exclude bots from player counts and hide 0-ping player rows.");
+                    let connecting_changed = ui
+                        .checkbox(
+                            &mut self.server_browser.hide_connecting,
+                            "Hide connecting players (999 ping)",
+                        )
+                        .changed();
+                    if connecting_changed && self.server_browser.hide_connecting {
+                        // This filter needs getstatus player rows, not just getinfo.
+                        self.server_browser.player_search_last_query = None;
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        theme::label(ui, theme::plain("MAX PING", 10.5, theme::TEXT_FAINT));
+                        ui.add(
+                            egui::DragValue::new(&mut self.server_browser.max_ping)
+                                .range(0..=999)
+                                .suffix(" ms")
+                                .speed(5),
+                        )
+                        .on_hover_text("0 disables the ping filter");
+                    });
+                    if active_filters > 0 {
+                        ui.separator();
+                        if ui.button("Clear filters").clicked() {
+                            self.server_browser.hide_empty = false;
+                            self.server_browser.hide_full = false;
+                            self.server_browser.hide_bots = false;
+                            self.server_browser.hide_connecting = false;
+                            self.server_browser.max_ping = 0;
+                        }
+                    }
+                });
         });
 
         ui.horizontal(|ui| {
@@ -469,11 +577,7 @@ impl App {
             .servers_for_current_source()
             .into_iter()
             .filter(|server| {
-                let visible_clients = if self.server_browser.hide_bots {
-                    server.humans
-                } else {
-                    server.clients
-                };
+                let visible_clients = self.server_browser.visible_client_count(server);
                 if self.server_browser.hide_empty && visible_clients == 0 {
                     return false;
                 }
@@ -513,7 +617,9 @@ impl App {
             })
             .collect();
 
-        if !player_terms.is_empty() {
+        // Player-name filtering and HIDE CONNECTING both need per-player
+        // getstatus rows. Share one opportunistic status cache/update cadence.
+        if !player_terms.is_empty() || self.server_browser.hide_connecting {
             let missing_status = servers.iter().any(|server| {
                 !self
                     .server_browser
@@ -542,9 +648,12 @@ impl App {
                     }
                 }
             }
+        }
 
+        if !player_terms.is_empty() {
             let exact = self.server_browser.player_exact_match;
             let hide_bots = self.server_browser.hide_bots;
+            let hide_connecting = self.server_browser.hide_connecting;
             servers.retain(|server| {
                 let Some(status) = self.server_browser.status_cache.get(&server.address) else {
                     // Optimistically keep rows until the first status batch has
@@ -553,7 +662,9 @@ impl App {
                     return true;
                 };
                 status.players.iter().any(|player| {
-                    if hide_bots && player.ping == 0 {
+                    if (hide_bots && player.ping == 0)
+                        || (hide_connecting && player.ping == 999)
+                    {
                         return false;
                     }
                     let name = crate::logging::strip_jka_colors(&player.name).to_ascii_lowercase();
@@ -570,6 +681,27 @@ impl App {
 
         let sort = self.server_browser.sort;
         servers.sort_by(|a, b| {
+            if sort == server_browser::BrowserSort::LastVisited {
+                // Unknown/unvisited entries remain after visited entries in both
+                // directions; reversing this sort should mean newest-vs-oldest,
+                // not suddenly put every unknown server at the top.
+                return match (
+                    self.server_browser.history_last_visited(a.address),
+                    self.server_browser.history_last_visited(b.address),
+                ) {
+                    (Some(a_visited), Some(b_visited)) => {
+                        if self.server_browser.sort_ascending {
+                            a_visited.cmp(&b_visited)
+                        } else {
+                            b_visited.cmp(&a_visited)
+                        }
+                    }
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.address.cmp(&b.address),
+                };
+            }
+
             let order = match sort {
                 server_browser::BrowserSort::Ping => {
                     let ap = if a.ping_ms == 0 { u32::MAX } else { a.ping_ms };
@@ -577,16 +709,8 @@ impl App {
                     ap.cmp(&bp)
                 }
                 server_browser::BrowserSort::Players => {
-                    let ap = if self.server_browser.hide_bots {
-                        a.humans
-                    } else {
-                        a.clients
-                    };
-                    let bp = if self.server_browser.hide_bots {
-                        b.humans
-                    } else {
-                        b.clients
-                    };
+                    let ap = self.server_browser.visible_client_count(a);
+                    let bp = self.server_browser.visible_client_count(b);
                     ap.cmp(&bp)
                 }
                 server_browser::BrowserSort::Name => crate::logging::strip_jka_colors(&a.hostname)
@@ -596,6 +720,7 @@ impl App {
                     a.map.to_ascii_lowercase().cmp(&b.map.to_ascii_lowercase())
                 }
                 server_browser::BrowserSort::Gametype => a.gametype.cmp(&b.gametype),
+                server_browser::BrowserSort::LastVisited => unreachable!(),
             };
             if self.server_browser.sort_ascending {
                 order
@@ -610,11 +735,13 @@ impl App {
         let mut refresh_one_after = None;
         let mut favorite_after = None;
         let mut autojoin_after = None;
+        let mut get_server_info_after = None;
         ui.horizontal(|ui| {
             let list_width = (ui.available_width() * 0.67).max(560.0);
+            let last_visited_w = 104.0;
             // The name column absorbs whatever the fixed columns leave, so the
             // table always spans its pane instead of hugging the left edge.
-            let name_w = (list_width - 299.0 - 32.0 - 24.0).max(250.0);
+            let name_w = (list_width - 299.0 - last_visited_w - 32.0 - 24.0).max(190.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(list_width, browser_height),
                 egui::Layout::top_down(egui::Align::Min),
@@ -630,6 +757,11 @@ impl App {
                         self.server_browser_sort_header(ui, server_browser::BrowserSort::Gametype, 82.0);
                         self.server_browser_sort_header(ui, server_browser::BrowserSort::Players, 55.0);
                         self.server_browser_sort_header(ui, server_browser::BrowserSort::Ping, 44.0);
+                        self.server_browser_sort_header(
+                            ui,
+                            server_browser::BrowserSort::LastVisited,
+                            last_visited_w,
+                        );
                     });
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -657,30 +789,76 @@ impl App {
                                             hostname
                                         };
                                         let row_text = theme::TEXT;
-                                        let mut response = ui.add_sized(
+                                        let name_hover =
+                                            crate::logging::strip_jka_colors(&label);
+                                        let name_response = ui.add_sized(
                                             [name_w, 24.0],
                                             egui::Button::selectable(
                                                 selected,
                                                 jka_colored_text(&label, 11.5, theme::TEXT),
-                                            ),
+                                            )
+                                            .truncate(),
                                         );
-                                        response |= ui.add_sized(
+                                        let name_padding = ui.spacing().button_padding.x * 2.0;
+                                        let mut response = hover_if_truncated(
+                                            ui,
+                                            name_response,
+                                            &label,
+                                            name_hover,
+                                            11.5,
+                                            name_padding,
+                                        );
+
+                                        let map = if server.map.is_empty() { "—" } else { &server.map };
+                                        let map_response = ui.add_sized(
                                             [118.0, 24.0],
-                                            egui::Label::new(theme::plain(&server.map, 11.5, row_text))
+                                            egui::Label::new(theme::plain(map, 11.5, row_text))
+                                                .truncate()
                                                 .sense(egui::Sense::click()),
                                         );
-                                        response |= ui.add_sized(
+                                        response |= hover_if_truncated(
+                                            ui,
+                                            map_response,
+                                            map,
+                                            map,
+                                            11.5,
+                                            0.0,
+                                        );
+
+                                        let mode = server.gametype_label();
+                                        let mode_response = ui.add_sized(
                                             [82.0, 24.0],
-                                            egui::Label::new(theme::plain(server.gametype_label(), 10.8, row_text))
+                                            egui::Label::new(theme::plain(mode, 10.8, row_text))
+                                                .truncate()
                                                 .sense(egui::Sense::click()),
                                         );
-                                        let visible_clients = if self.server_browser.hide_bots { server.humans } else { server.clients };
+                                        response |= hover_if_truncated(
+                                            ui,
+                                            mode_response,
+                                            mode,
+                                            mode,
+                                            10.8,
+                                            0.0,
+                                        );
+
+                                        let visible_clients = self.server_browser.visible_client_count(server);
+                                        let players = format!("{}/{}", visible_clients, server.max_clients);
                                         let player_color = if full { theme::WARNING } else { row_text };
-                                        response |= ui.add_sized(
+                                        let players_response = ui.add_sized(
                                             [55.0, 24.0],
-                                            egui::Label::new(theme::plain(&format!("{}/{}", visible_clients, server.max_clients), 11.5, player_color))
+                                            egui::Label::new(theme::plain(&players, 11.5, player_color))
+                                                .truncate()
                                                 .sense(egui::Sense::click()),
                                         );
+                                        response |= hover_if_truncated(
+                                            ui,
+                                            players_response,
+                                            &players,
+                                            &players,
+                                            11.5,
+                                            0.0,
+                                        );
+
                                         let ping = if server.ping_ms == 0 { "—".to_owned() } else { server.ping_ms.to_string() };
                                         let ping_color = match server.ping_ms {
                                             0 => theme::TEXT_FAINT,
@@ -689,10 +867,52 @@ impl App {
                                             150..=249 => theme::WARNING,
                                             _ => theme::DANGER,
                                         };
-                                        response |= ui.add_sized(
+                                        let ping_response = ui.add_sized(
                                             [44.0, 24.0],
                                             egui::Label::new(theme::plain(&ping, 11.5, ping_color))
+                                                .truncate()
                                                 .sense(egui::Sense::click()),
+                                        );
+                                        response |= hover_if_truncated(
+                                            ui,
+                                            ping_response,
+                                            &ping,
+                                            &ping,
+                                            11.5,
+                                            0.0,
+                                        );
+                                        let (visited, hover) = self
+                                            .server_browser
+                                            .history_last_visited(server.address)
+                                            .map(|unix_ms| {
+                                                (
+                                                    crate::chat_log::format_local_date(unix_ms),
+                                                    format!(
+                                                        "Last visited {}",
+                                                        crate::chat_log::format_local_datetime_minute(unix_ms)
+                                                    ),
+                                                )
+                                            })
+                                            .unwrap_or_else(|| {
+                                                ("—".to_owned(), "This server has not been visited yet.".to_owned())
+                                            });
+                                        let visit_response = ui.add_sized(
+                                            [last_visited_w, 24.0],
+                                            egui::Label::new(theme::plain(
+                                                &visited,
+                                                10.8,
+                                                theme::TEXT_DIM,
+                                            ))
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        response |= hover_if_truncated(
+                                            ui,
+                                            visit_response,
+                                            &visited,
+                                            hover,
+                                            10.8,
+                                            0.0,
                                         );
                                         response
                                     })
@@ -735,6 +955,10 @@ impl App {
                                         refresh_one_after = Some(server.address);
                                         ui.close();
                                     }
+                                    if ui.button("Get server info").clicked() {
+                                        get_server_info_after = Some(server.address);
+                                        ui.close();
+                                    }
                                     if ui.button("Copy IP").clicked() {
                                         ui.ctx().copy_text(server.address.ip().to_string());
                                         ui.close();
@@ -769,21 +993,63 @@ impl App {
                     } else {
                         server.hostname.clone()
                     };
-                    ui.add(egui::Label::new(jka_colored_text(&hostname, 17.0, theme::TEXT)));
+                    let hostname_width = ui.available_width();
+                    let hostname_response = ui.add_sized(
+                        [hostname_width, 22.0],
+                        egui::Label::new(jka_colored_text(&hostname, 17.0, theme::TEXT))
+                            .truncate(),
+                    );
+                    hover_if_truncated(
+                        ui,
+                        hostname_response,
+                        &hostname,
+                        crate::logging::strip_jka_colors(&hostname),
+                        17.0,
+                        0.0,
+                    );
                     theme::label(ui, theme::plain(&address.to_string(), 11.5, theme::TEXT_FAINT));
                     ui.add_space(8.0);
                     theme::label(ui, theme::plain(&format!("Map: {}", if server.map.is_empty() { "—" } else { &server.map }), 12.0, theme::TEXT_DIM));
                     theme::label(ui, theme::plain(&format!("Mode: {}", server.gametype_label()), 12.0, theme::TEXT_DIM));
-                    let visible_clients = if self.server_browser.hide_bots { server.humans } else { server.clients };
-                    let composition = if self.server_browser.hide_bots && server.bots > 0 {
-                        format!("  •  {} bots hidden", server.bots)
-                    } else if server.bots > 0 {
-                        format!("  •  {} humans + {} bots", server.humans, server.bots)
+                    let visible_clients = self.server_browser.visible_client_count(&server);
+                    let connecting_hidden = if self.server_browser.hide_connecting {
+                        self.server_browser
+                            .status_cache
+                            .get(&address)
+                            .map(|status| status.players.iter().filter(|player| player.ping == 999).count())
+                            .unwrap_or(0)
                     } else {
+                        0
+                    };
+                    let mut composition_parts = Vec::new();
+                    if self.server_browser.hide_bots && server.bots > 0 {
+                        composition_parts.push(format!("{} bots hidden", server.bots));
+                    } else if server.bots > 0 {
+                        composition_parts.push(format!("{} humans + {} bots", server.humans, server.bots));
+                    }
+                    if connecting_hidden > 0 {
+                        composition_parts.push(format!("{connecting_hidden} connecting hidden"));
+                    }
+                    let composition = if composition_parts.is_empty() {
                         String::new()
+                    } else {
+                        format!("  •  {}", composition_parts.join("  •  "))
                     };
                     theme::label(ui, theme::plain(&format!("Players: {}/{}{}  •  Ping: {} ms", visible_clients, server.max_clients, composition, server.ping_ms), 12.0, theme::TEXT_DIM));
                     theme::label(ui, theme::plain(&format!("Game: {}  •  Protocol: {}", if server.game.is_empty() { "base" } else { &server.game }, server.protocol), 12.0, theme::TEXT_DIM));
+                    if let Some(last_visited) = self.server_browser.history_last_visited(address) {
+                        theme::label(
+                            ui,
+                            theme::plain(
+                                &format!(
+                                    "Last visited: {}",
+                                    crate::chat_log::format_local_datetime_minute(last_visited)
+                                ),
+                                12.0,
+                                theme::TEXT_DIM,
+                            ),
+                        );
+                    }
                     if server.need_password {
                         ui.add_space(7.0);
                         ui.horizontal(|ui| {
@@ -843,11 +1109,17 @@ impl App {
                         let visible_players: Vec<_> = status
                             .players
                             .iter()
-                            .filter(|player| !self.server_browser.hide_bots || player.ping != 0)
+                            .filter(|player| {
+                                (!self.server_browser.hide_bots || player.ping != 0)
+                                    && (!self.server_browser.hide_connecting || player.ping != 999)
+                            })
                             .collect();
                         if visible_players.is_empty() {
-                            let text = if self.server_browser.hide_bots && !status.players.is_empty() {
-                                "No human player rows returned (0-ping bot rows hidden)."
+                            let text = if !status.players.is_empty()
+                                && (self.server_browser.hide_bots
+                                    || self.server_browser.hide_connecting)
+                            {
+                                "No player rows remain after the active player filters."
                             } else {
                                 "No player rows returned."
                             };
@@ -875,11 +1147,24 @@ impl App {
                                                     theme::TEXT_DIM,
                                                 )),
                                             );
-                                            ui.add(egui::Label::new(jka_colored_text(
+                                            let player_name_width = ui.available_width();
+                                            let name_response = ui.add_sized(
+                                                [player_name_width, 20.0],
+                                                egui::Label::new(jka_colored_text(
+                                                    &player.name,
+                                                    11.5,
+                                                    theme::TEXT,
+                                                ))
+                                                .truncate(),
+                                            );
+                                            hover_if_truncated(
+                                                ui,
+                                                name_response,
                                                 &player.name,
+                                                crate::logging::strip_jka_colors(&player.name),
                                                 11.5,
-                                                theme::TEXT,
-                                            )));
+                                                0.0,
+                                            );
                                         });
                                     }
                                 });
@@ -893,6 +1178,20 @@ impl App {
 
         if let Some(address) = selected_after {
             self.select_browser_server(address);
+        }
+        if let Some(address) = get_server_info_after {
+            if self
+                .server_browser_tx
+                .send(BrowserCommand::GetServerInfo(address))
+                .is_ok()
+            {
+                self.server_browser.status_text =
+                    format!("Querying full getstatus from {address}…");
+            } else {
+                self.server_browser.status_text =
+                    "Server browser worker is unavailable".to_owned();
+            }
+            self.egui_repaint_requested = true;
         }
         if let Some(address) = refresh_one_after {
             if self

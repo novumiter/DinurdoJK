@@ -5,3 +5,5 @@ pub(in crate::renderer) mod pipelines;
 pub(in crate::renderer) mod settings;
 pub(in crate::renderer) mod state;
 pub(in crate::renderer) mod targets;
+
+pub(in crate::renderer) mod crt;

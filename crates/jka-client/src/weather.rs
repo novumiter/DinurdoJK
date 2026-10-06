@@ -2,6 +2,7 @@ mod cpu_field;
 mod field;
 pub(crate) mod fog;
 mod rain;
+mod rain_glass;
 pub(crate) mod wake;
 #[cfg(test)]
 pub(crate) use rain::layout_tests as rain_layout;
@@ -10,12 +11,15 @@ pub(crate) use fog::{FogSystem, FroxelUniform, FROXEL_X, FROXEL_Y, FROXEL_Z};
 pub(crate) use rain::{
     rain_haze_mask_dimensions, RainSystem, WeatherOcclusionCache, WeatherSurfaceEnvironment,
     WeatherSurfaceUniform,
-    RAIN_PUDDLE_EPSILON, RAIN_WETNESS_EPSILON, RAIN_WETNESS_FADE_END, RAIN_WETNESS_FADE_START,
+    RAIN_PUDDLE_EPSILON, RAIN_SKY_BLEND_CEILING, RAIN_SKY_BLEND_WINDOW, RAIN_WETNESS_EPSILON,
+    RAIN_WETNESS_FADE_END, RAIN_WETNESS_FADE_START,
 };
 
 const WEATHER_SURFACE_WGSL: &str = include_str!("weather_surface.wgsl");
 const WEATHER_SURFACE_WORLD_WGSL: &str = include_str!("weather_surface_world.wgsl");
 const WEATHER_WAKE_WGSL: &str = include_str!("weather_wake.wgsl");
+
+const MODEL_WEATHER_WGSL: &str = include_str!("model_weather.wgsl");
 
 const POST_SETTINGS_WGSL: &str = include_str!("post_settings.wgsl");
 
@@ -38,6 +42,15 @@ pub(crate) fn with_bound_weather_surface(base: &str) -> String {
     format!("{base}
 {WEATHER_SURFACE_WGSL}
 {WEATHER_WAKE_WGSL}")
+}
+
+/// `base` plus the shared weather maths and the entity wetness shading, for the
+/// model shaders (`md3`, `ghoul2_skin`). They carry no weather bindings of their
+/// own: the values ride in the entity-lighting uniform they already bind.
+pub(crate) fn with_model_weather(base: &str) -> String {
+    format!("{base}
+{WEATHER_SURFACE_WGSL}
+{MODEL_WEATHER_WGSL}")
 }
 
 /// `base` plus the shared weather maths and forward weather shading for the world

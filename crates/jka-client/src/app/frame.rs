@@ -69,7 +69,16 @@ impl App {
             .as_ref()
             .filter(|playback| playback.current_snapshot.is_some())
             .map(|playback| Arc::clone(&playback.inline_models));
-        let input_view_rotation = self.subframe_input_view_rotation();
+        // Profile/asset previews are isolated UI scenes, equivalent to the
+        // RDF_NOWORLDMODEL model widgets in the JKA UI. They must never inherit
+        // gameplay view rotation (including the render-thread subframe latch).
+        let isolated_preview = self.profile_preview_active
+            || (self.front_end && self.frontend_page == FrontendPage::AssetViewer);
+        let input_view_rotation = if isolated_preview {
+            None
+        } else {
+            self.subframe_input_view_rotation()
+        };
         RenderSnapshot {
             model_frame_source: self.network.model_frame_debug.then(|| {
                 let playback = self.game_session.as_ref();
@@ -80,9 +89,7 @@ impl App {
                     playback.and_then(|s| s.player_presenter.viewer_anim_debug()),
                 )
             }),
-            camera: if self.profile_preview_active
-                || (self.front_end && self.frontend_page == FrontendPage::AssetViewer)
-            {
+            camera: if isolated_preview {
                 self.asset_preview_camera()
             } else {
                 let mut camera = self.camera;
@@ -93,7 +100,7 @@ impl App {
                 }
                 camera
             },
-            view_latch: if self.front_end || input_view_rotation.is_none() {
+            view_latch: if isolated_preview || self.front_end || input_view_rotation.is_none() {
                 ViewLatchMode::Disabled
             } else {
                 self.render_view_latch
@@ -144,10 +151,13 @@ impl App {
             movement_hud: self.current_movement_hud_state(),
             player_names: self.world_player_names(),
             jump_shade: self.current_jump_shade(),
-            camera_shake: self
-                .game_session
-                .as_ref()
-                .and_then(|playback| playback.event_presenter.camera_shake()),
+            camera_shake: if isolated_preview {
+                None
+            } else {
+                self.game_session
+                    .as_ref()
+                    .and_then(|playback| playback.event_presenter.camera_shake())
+            },
         }
     }
 
@@ -285,6 +295,7 @@ impl App {
 
     pub(in crate::app) fn publish_transient_ui(&self) {
         let (mut chat_lines, mut center_print) = self.transient_ui_snapshot();
+        let console_notify_lines = self.console_notify_ui_snapshot();
         let demo_timeline = self.demo_timeline_ui(Instant::now());
         let prediction_debug = self.prediction_debug_ui();
         let mut crosshair_target = self.crosshair_target.clone();
@@ -312,6 +323,7 @@ impl App {
         }
         self.render_command(RenderCommand::SetTransientUi {
             chat_lines,
+            console_notify_lines,
             center_print,
             demo_timeline,
             prediction_debug,

@@ -43,6 +43,8 @@ pub struct FxView {
     /// forward, left, up.
     pub axis: [[f32; 3]; 3],
     pub fov_x: f32,
+    /// CGame presentation time, for authored texture animation.
+    pub seconds: f32,
 }
 
 impl FxView {
@@ -58,6 +60,7 @@ impl FxView {
             origin: scene::jka_position(camera.position.to_array()),
             axis: [forward, left, up],
             fov_x: 90.0,
+            seconds: 0.0,
         }
     }
 }
@@ -134,6 +137,11 @@ pub struct FxMaterial {
     pub alpha_vertex: bool,
     pub rgb_const: [f32; 3],
     pub alpha_const: f32,
+    pub tc_mods: Vec<jka_assets::shader::TcMod>,
+    /// OpenJK shader_t::timeOffset, subtracted from refdef time.
+    pub shader_time_offset: f32,
+    /// Exact JKA shader-stage `glow` marker.
+    pub authored_glow: bool,
 }
 
 /// One authored shader stage drawn in OpenJK's 640x480 virtual 2D space.
@@ -281,6 +289,7 @@ pub fn tessellate(
             fx_gpu_sprites: None,
             texture: mat.texture.clone(),
             alpha_mode: mat.blend.alpha_mode(),
+            authored_glow: mat.authored_glow,
         })
         .collect();
     surfaces.extend(lit_surfaces);
@@ -387,6 +396,7 @@ pub fn tessellate_workers(
                 fx_gpu_sprites: None,
                 texture: mat.texture.clone(),
                 alpha_mode: mat.blend.alpha_mode(),
+                authored_glow: mat.authored_glow,
             })
         })
         .collect());
@@ -431,6 +441,15 @@ pub fn tessellate_gpu_particles(
             .or_insert_with(|| materials(shader));
 
         for (stage_index, mat) in stages.iter().enumerate() {
+            // Compact sprite instances have fixed 0..1 UVs. Animated stages
+            // use the shared CPU path so tcMods match all FX backends.
+            if !mat.tc_mods.is_empty() {
+                let entry = cpu_batches
+                    .entry((shader_key.clone(), stage_index))
+                    .or_insert_with(|| (mat.clone(), Batch::default()));
+                append_draw(draw, view, mat, &mut entry.1);
+                continue;
+            }
             if let FxDraw::Sprite { origin, radius, rotation, rgba, .. } = draw {
                 let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
                 let origin = scene::render_position(*origin);
@@ -471,6 +490,7 @@ pub fn tessellate_gpu_particles(
             fx_gpu_sprites: None,
             texture: mat.texture.clone(),
             alpha_mode: mat.blend.alpha_mode(),
+            authored_glow: mat.authored_glow,
         })
         .collect();
 
@@ -491,6 +511,7 @@ pub fn tessellate_gpu_particles(
                 fx_gpu_sprites: Some(FxGpuSprites { instances: Arc::new(instances), blob_shadow: false }),
                 texture: mat.texture.clone(),
                 alpha_mode: mat.blend.alpha_mode(),
+                authored_glow: mat.authored_glow,
             }),
     );
 
@@ -550,6 +571,8 @@ fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
         fx_gpu_sprites: None,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Blend,
+
+        authored_glow: false,
     })
 }
 
@@ -561,6 +584,7 @@ fn append_batch(dst: &mut Batch, mut src: Batch) {
 }
 
 fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch) {
+    let first_vertex = batch.vertices.len();
     match draw {
         FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
@@ -637,6 +661,41 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         FxDraw::LitMesh { .. } => {}
         FxDraw::Cylinder { start, end, axis, start_radius, end_radius, rgba, .. } => {
             cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba), view);
+        }
+    }
+    for modifier in &mat.tc_mods {
+        for vertex in &mut batch.vertices[first_vertex..] {
+            vertex.uv = modified_uv(
+                vertex.uv,
+                vertex.position,
+                *modifier,
+                view.seconds - mat.shader_time_offset,
+            );
+        }
+    }
+}
+
+fn modified_uv(uv: [f32; 2], position: [f32; 3], modifier: jka_assets::shader::TcMod, seconds: f32) -> [f32; 2] {
+    use jka_assets::shader::TcMod;
+    match modifier {
+        TcMod::Scale(x, y) => [uv[0] * x, uv[1] * y],
+        TcMod::Scroll(x, y) => {
+            let scroll = [x * seconds, y * seconds];
+            [uv[0] + scroll[0] - scroll[0].floor(), uv[1] + scroll[1] - scroll[1].floor()]
+        }
+        TcMod::Rotate(degrees) => {
+            let (sin, cos) = (-degrees * seconds).to_radians().sin_cos();
+            let centered = [uv[0] - 0.5, uv[1] - 0.5];
+            [centered[0] * cos - centered[1] * sin + 0.5,
+             centered[0] * sin + centered[1] * cos + 0.5]
+        }
+        TcMod::Transform(m) => [uv[0] * m[0] + uv[1] * m[2] + m[4], uv[0] * m[1] + uv[1] * m[3] + m[5]],
+        TcMod::Turb { amplitude, phase, frequency, .. } => {
+            let position = scene::jka_position(position);
+            let phase = phase + seconds * frequency;
+            let tau = std::f32::consts::TAU;
+            [uv[0] + (((position[0] + position[2]) / 1024.0 + phase) * tau).sin() * amplitude,
+             uv[1] + ((position[1] / 1024.0 + phase) * tau).sin() * amplitude]
         }
     }
 }
@@ -720,11 +779,11 @@ mod tests {
     use super::*;
 
     fn white(blend: FxBlend) -> FxMaterial {
-        FxMaterial { texture: None, blend, rgb_vertex: true, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0 }
+        FxMaterial { texture: None, blend, rgb_vertex: true, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0, tc_mods: Vec::new(), shader_time_offset: 0.0, authored_glow: false }
     }
 
     fn view() -> FxView {
-        FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0 }
+        FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0 }
     }
 
     #[test]
@@ -828,6 +887,53 @@ mod tests {
         assert_eq!(instance.left[..3], scene::render_position([0.0, 2.0, 0.0]));
         assert_eq!(instance.up[..3], scene::render_position([0.0, 0.0, 2.0]));
         assert_eq!(instance.color, [1.0, 128.0 / 255.0, 0.0, 64.0 / 255.0]);
+    }
+
+    #[test]
+    fn repeater_ripple_tcmods_animate_both_passes_in_every_geometry_backend() {
+        use jka_assets::shader::TcMod;
+        let mut view = view();
+        view.seconds = 2.0;
+        let stages = vec![
+            FxMaterial { tc_mods: vec![TcMod::Scale(3.0, 1.0), TcMod::Scroll(0.9, 0.0)], ..white(FxBlend::Modulate2x) },
+            FxMaterial { tc_mods: vec![TcMod::Scale(2.0, 1.0), TcMod::Scroll(-0.4, 0.0)], ..white(FxBlend::Modulate2x) },
+        ];
+        let draw = FxDraw::Cylinder {
+            start: [100.0, 0.0, 0.0], end: [100.0, 0.0, 12.0],
+            axis: [0.0, 0.0, 1.0], start_radius: 24.0, end_radius: 60.0,
+            rgba: [255; 4], shader: "gfx/effects/shock_ripple".into(),
+        };
+        // More than 64 draws exercises the worker path and its chunk merging.
+        let draws = vec![draw; 128];
+        for surfaces in [
+            tessellate(&draws, &view, &mut |_| stages.clone()),
+            tessellate_workers(&draws, &view, &mut |_| stages.clone()),
+            tessellate_gpu_particles(&draws, &view, &mut |_| stages.clone()),
+        ] {
+            assert_eq!(surfaces.len(), 2);
+            let mut offsets: Vec<_> = surfaces.iter().map(|s| s.vertices[0].uv[0]).collect();
+            offsets.sort_by(f32::total_cmp);
+            assert!((offsets[0] - 0.2).abs() < 1e-5);
+            assert!((offsets[1] - 0.8).abs() < 1e-5);
+            for surface in &surfaces {
+                assert_eq!(surface.alpha_mode, DynamicModelAlphaMode::Modulate2x);
+                let vertices = &surface.vertices;
+                let max_u = vertices.iter().map(|v| v.uv[0]).fold(0.0, f32::max);
+                assert!((max_u - vertices[0].uv[0] - if vertices[0].uv[0] > 0.5 { 3.0 } else { 2.0 }).abs() < 1e-5);
+                let per_draw = vertices.len() / draws.len();
+                assert_eq!(vertices[0].uv, vertices[per_draw].uv, "tcMods apply once per draw");
+            }
+        }
+        let scroll_then_scale = FxMaterial {
+            tc_mods: vec![TcMod::Scroll(-0.4, 0.0), TcMod::Scale(2.0, 1.0)],
+            ..white(FxBlend::Modulate2x)
+        };
+        let sprite = FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0, rgba: [255; 4], shader: "animated".into() };
+        let cpu = tessellate(&[sprite.clone()], &view, &mut |_| vec![scroll_then_scale.clone()]);
+        let gpu = tessellate_gpu_particles(&[sprite], &view, &mut |_| vec![scroll_then_scale.clone()]);
+        assert!(gpu[0].fx_gpu_sprites.is_none(), "animated sprites use the UV-capable path");
+        assert!((gpu[0].vertices[0].uv[0] - 0.4).abs() < 1e-5, "modifier order is preserved");
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&*cpu[0].vertices), bytemuck::cast_slice::<_, u8>(&*gpu[0].vertices));
     }
 
     #[test]

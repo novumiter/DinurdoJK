@@ -24,7 +24,7 @@ impl PlayerPresenter {
         axis: [[f32; 3]; 3],
         origin: [f32; 3],
         rgba: [f32; 4],
-        custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode)>,
+        custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode, bool)>,
         apply_alpha_blend: bool,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         self.render_glm_surfaces_tinted(
@@ -64,7 +64,7 @@ impl PlayerPresenter {
         origin: [f32; 3],
         rgba: [f32; 4],
         entity_rgb: [f32; 3],
-        custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode)>,
+        custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode, bool)>,
         apply_alpha_blend: bool,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         self.render_glm_surfaces_tinted_selected(
@@ -100,7 +100,7 @@ impl PlayerPresenter {
         origin: [f32; 3],
         rgba: [f32; 4],
         entity_rgb: [f32; 3],
-        custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode)>,
+        custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode, bool)>,
         apply_alpha_blend: bool,
         surface_selection: Option<&HashSet<usize>>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
@@ -231,9 +231,9 @@ impl PlayerPresenter {
                 if draw_vertices.is_empty() || draw_indices.is_empty() {
                     continue;
                 }
-                let (texture, base_alpha_mode) = custom_material
+                let (texture, base_alpha_mode, authored_glow) = custom_material
                     .clone()
-                    .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode));
+                    .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode, asset.authored_glow));
                 let surface_rgba = if custom_material.is_none() && asset.fallback_gray {
                     [0.58, 0.58, 0.58, rgba[3]]
                 } else if tinted && asset.entity_tint {
@@ -270,6 +270,7 @@ impl PlayerPresenter {
                                 .then(|| Arc::clone(&gpu_mesh.base_key)),
                             ghoul2_gpu: None,
                             fx_gpu_sprites: None,
+                            authored_glow,
                             texture,
                             alpha_mode,
                         });
@@ -282,7 +283,7 @@ impl PlayerPresenter {
                                 overlay_at,
                                 asset,
                                 rgba[3],
-                                stage_seconds,
+                                stage_seconds - asset.shader_time_offset,
                                 &stage_frame,
                             );
                         }
@@ -319,6 +320,7 @@ impl PlayerPresenter {
                         jiggle_offsets: gpu_jiggle_offsets,
                     }),
                     fx_gpu_sprites: None,
+                    authored_glow,
                     texture,
                     alpha_mode,
                 });
@@ -331,7 +333,7 @@ impl PlayerPresenter {
                         overlay_at,
                         asset,
                         rgba[3],
-                        stage_seconds,
+                        stage_seconds - asset.shader_time_offset,
                         &stage_frame,
                     );
                 }
@@ -423,9 +425,9 @@ impl PlayerPresenter {
             if vertices.is_empty() || gpu_mesh.cpu_indices.is_empty() {
                 continue;
             }
-            let (texture, base_alpha_mode) = custom_material
+            let (texture, base_alpha_mode, authored_glow) = custom_material
                 .clone()
-                .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode));
+                .unwrap_or_else(|| (asset.texture.clone(), asset.alpha_mode, asset.authored_glow));
             let alpha_mode = if apply_alpha_blend {
                 blend_for_alpha(base_alpha_mode, surface_rgba[3])
             } else {
@@ -445,6 +447,7 @@ impl PlayerPresenter {
                     .then(|| Arc::clone(&gpu_mesh.base_key)),
                 ghoul2_gpu: None,
                 fx_gpu_sprites: None,
+                authored_glow,
                 texture,
                 alpha_mode,
             });
@@ -457,7 +460,7 @@ impl PlayerPresenter {
                     overlay_at,
                     asset,
                     rgba[3],
-                    stage_seconds,
+                    stage_seconds - asset.shader_time_offset,
                     &stage_frame,
                 );
             }
@@ -527,6 +530,7 @@ impl PlayerPresenter {
         }
         surface.texture = stage.texture.clone();
         surface.alpha_mode = stage.alpha_mode;
+        surface.authored_glow = stage.authored_glow;
         if let Some(skin) = surface.ghoul2_gpu.as_mut() {
             skin.color = color;
             skin.uv_xform = xform;
@@ -582,6 +586,7 @@ impl PlayerPresenter {
         );
         surface.rt_rigid = None;
         surface.rt_skinned_key = None;
+        surface.authored_glow = overlay.authored_glow;
         draws.push(surface);
     }
 
@@ -657,6 +662,7 @@ impl PlayerPresenter {
             rt_skinned_key: surface.rt_skinned_key.as_ref().map(Arc::clone),
             ghoul2_gpu,
             fx_gpu_sprites: None,
+            authored_glow: surface.authored_glow,
             texture,
             alpha_mode,
         }

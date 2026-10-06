@@ -45,9 +45,9 @@ pub struct ThirdPersonSettings {
     pub vert_offset: f32,
 }
 
-/// Client-only camera choice while following another player as a spectator.
-/// This is deliberately independent of `cg_thirdPerson`: changing how you
-/// watch somebody must not silently change the camera you use when you join.
+/// Internal decoded form of `cg_thirdPerson` for spectator/demo follow views.
+/// `cg_thirdPerson 2` means Orbit only while spectating; active-player camera
+/// policy still treats every nonzero value as ordinary third person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpectatorCameraMode {
     FirstPerson,

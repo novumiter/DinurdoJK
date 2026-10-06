@@ -353,21 +353,15 @@ impl App {
         }
         self.crosshair_scan_at = now;
 
-        // TaystJK uses cg.predictedPlayerState for the live viewer. Keep local
-        // in-process play on its snapshot path because it intentionally has no
-        // client predictor; remote live play uses the predictor when available.
-        let live_ps = self.live_player_state().cloned();
         let Some(session) = self.game_session.as_ref() else {
             return;
         };
         let Some(snapshot) = session.client_game.current_snapshot() else {
             return;
         };
-        let ps = if session.live {
-            live_ps.as_ref().unwrap_or(&snapshot.player_state)
-        } else {
-            &snapshot.player_state
-        };
+        let ps = session
+            .presented_player_state()
+            .unwrap_or(&snapshot.player_state);
         let entities = &session.presented_entities;
         let find = |number: i32| {
             entities
@@ -375,6 +369,7 @@ impl App {
                 .find(|entity| i32::from(entity.number) == number)
         };
         let snapshot_client = ps.field_i32("clientNum").unwrap_or(0);
+        let following = ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0;
         let (viewer, alive) = if session.live || self.demo_view_mode == DemoViewMode::Authoritative
         {
             (
@@ -468,7 +463,7 @@ impl App {
         // the Rust equivalent of both is the newest cl.viewangles sample that the
         // renderer itself will late-latch. Do not substitute lerpAngles here: those
         // are intentionally only the third-person muzzle-offset basis.
-        let newest_input_angles = if self.live_remote_view_forced() {
+        let newest_input_angles = if following || self.live_remote_view_forced() {
             None
         } else {
             self.live_view_angles().or_else(|| {
@@ -478,11 +473,13 @@ impl App {
                     .map(|server| server.subframe_view_angles())
             })
         };
-        let refdef_angles = newest_input_angles.unwrap_or([
-            -self.camera.pitch.to_degrees(),
-            self.camera.yaw.to_degrees(),
-            0.0,
-        ]);
+        let refdef_angles = newest_input_angles
+            .or_else(|| following.then_some(ps_angles))
+            .unwrap_or([
+                -self.camera.pitch.to_degrees(),
+                self.camera.yaw.to_degrees(),
+                0.0,
+            ]);
         let trace_angles = if third_person {
             newest_input_angles.unwrap_or(ps_angles)
         } else {
@@ -556,7 +553,8 @@ impl App {
                 muzzle[2] += offset_forward[2] * offset[0] + offset_right[2] * offset[1];
                 if !emplaced {
                     if third_person {
-                        muzzle[2] += ps.field_i32("viewheight").unwrap_or(0) as f32 + offset[2];
+                        let view_height = ps.field_i32("viewheight").unwrap_or(0);
+                        muzzle[2] += view_height as f32 + offset[2];
                     } else {
                         muzzle[2] += offset[2];
                     }

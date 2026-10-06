@@ -146,6 +146,7 @@ impl Renderer {
             split_dynamic_wireframe,
             false,
             false,
+            false,
         );
         self.ensure_prepared_wireframe_pipelines(
             prepared_grass.as_ref(),
@@ -248,7 +249,14 @@ impl Renderer {
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
         let use_gamma_post = self.frame_plan.use_post;
         let menu_backdrop_active = self.menu_backdrop_requested() && self.menu_backdrop.is_some();
-        let presentation_output = if menu_backdrop_active {
+        let crt_active = self.crt_scope != ui::CrtScope::Off;
+        if crt_active {
+            self.ensure_crt_resources();
+        }
+        let crt_view = self.crt_resources.as_ref().map(|resources| resources.view.clone());
+        let crt_everything = self.crt_scope == ui::CrtScope::Everything;
+        let crt_before_ui = crt_active && !crt_everything;
+        let direct_presentation_output = if menu_backdrop_active {
             &self
                 .menu_backdrop
                 .as_ref()
@@ -256,6 +264,12 @@ impl Renderer {
                 .view
         } else {
             &frame_view
+        };
+        let crt_scene_target = crt_active && !(crt_everything && menu_backdrop_active);
+        let presentation_output = if crt_scene_target {
+            crt_view.as_ref().expect("CRT resources must exist while enabled")
+        } else {
+            direct_presentation_output
         };
         let scene_output = if use_gamma_post {
             &self.targets.scene_view
@@ -666,10 +680,14 @@ impl Renderer {
                 .write_encoder_timestamp(&mut encoder, GpuPass::Post, true);
         }
 
-        // Deferred to `submit_ui_overlay` whenever a menu is drawn over the
-        // frame, so the readout ends up above it rather than beneath.
-        if !menu_backdrop_active
-            && !self.egui_active
+        let native_ui_in_main = !menu_backdrop_active
+            && match self.crt_scope {
+                ui::CrtScope::Off => !self.egui_active,
+                ui::CrtScope::Scene => false,
+                ui::CrtScope::SceneHud => true,
+                ui::CrtScope::Everything => !self.egui_active,
+            };
+        if native_ui_in_main
             && (self.screen_fx_vertex_count != 0
                 || self.ui_vertex_count != 0
                 || self.ui_dynamic_vertex_count != 0
@@ -713,7 +731,7 @@ impl Renderer {
             );
         }
 
-        if !menu_backdrop_active && !self.egui_active {
+        if !menu_backdrop_active && !self.egui_active && !crt_active {
             if let Some(readback) = screenshot_readback.as_mut() {
                 let staging_buffer = &self
                     .screenshot_readback_buffer
@@ -728,6 +746,12 @@ impl Renderer {
                 );
                 readback.inline_copy = true;
             }
+        }
+        let crt_encoded_in_main = crt_before_ui;
+        if crt_encoded_in_main {
+            // FastBaseline has no external SMAA resolve, so CRT can stay in the
+            // same command buffer and costs no additional queue submit.
+            self.encode_crt(&mut encoder, direct_presentation_output);
         }
         let companion_scene_frame = companion_scene
             .and_then(|view| self.encode_companion_scene(&mut encoder, view, area_mask));
@@ -753,12 +777,22 @@ impl Renderer {
         {
             readback.submission_index = Some(frame_submission.clone());
         }
+        let ui_composite_target = if crt_everything {
+            crt_view.as_ref().expect("CRT resources must exist while enabled")
+        } else {
+            &frame_view
+        };
         if menu_backdrop_active {
-            self.submit_menu_backdrop(&frame_view);
+            self.submit_menu_backdrop(ui_composite_target);
         }
-        self.submit_egui(&frame_view);
-        if menu_backdrop_active || self.egui_active {
-            self.submit_ui_overlay(&frame_view);
+        self.submit_egui(ui_composite_target);
+        let late_native_ui = !native_ui_in_main
+            && (menu_backdrop_active || self.egui_active || self.crt_scope == ui::CrtScope::Scene);
+        if late_native_ui {
+            self.submit_ui_overlay(ui_composite_target);
+        }
+        if crt_everything {
+            self.submit_crt(&frame_view);
         }
         if let Some(readback) = screenshot_readback
             .as_mut()

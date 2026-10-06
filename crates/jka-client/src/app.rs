@@ -5,6 +5,7 @@ pub(crate) use display::AntiAliasingChoice;
 mod capture;
 mod chat;
 mod commands;
+pub(crate) use commands::registry::{cvar_definition, cvar_definitions, network_cvars, japro_cvars, command_registry, cvar_registry, video_cvar_registry, CommandScope, GameCommand};
 mod configuration;
 mod connection;
 mod console_completion;
@@ -63,9 +64,10 @@ use map_loading::{
 };
 use notices::{
     charset_glyph_uv, ActiveReward, CenterPrintRecord, ChatPlayerCompletionCycle, ChatRecord,
-    CrosshairSeen, RewardSpec, REWARD_BLOB_MS, REWARD_ICON_SIZE, REWARD_TIME_MS,
+    ConsoleNotifyRecord, CrosshairSeen, RewardSpec, REWARD_BLOB_MS, REWARD_ICON_SIZE,
+    REWARD_TIME_MS,
 };
-use session::sampling::{playerstate_vec3, sample_player_state, strafehelper_walking_anim};
+use session::sampling::{playerstate_vec3, strafehelper_walking_anim, PlayerPresentationInput};
 use session::types::{
     snapshot_owns_playerstate_events, GameSession, LiveCgamePrepared, LiveJoinTiming,
     LivePredictionFrame,
@@ -136,14 +138,14 @@ use crate::{
     server_browser::{self, BrowserCommand, BrowserEvent, BrowserUiState, ServerSource},
     ui::{
         self, ChatMode, CloudRenderResolution, CloudType, ColorLutPreset, ConsolePathLinkUi,
-        ConsoleSearchMatch, ConsoleSelection, ConsoleSize, CullDebugMode, DemoKillMarkerUi,
+        ConsoleSearchMatch, ConsoleSelection, ConsoleSize, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode, DemoKillMarkerUi,
         DemoTimelineUi, DetailTextureMode, DofQuality, DynamicLightsMode, DynamicShadowsMode,
         EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FullscreenMode,
-        FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, HudElementId, HudElementLayout,
+        FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, GlowMode, HudElementId, HudElementLayout,
         HudLayout, HudState,
         MapLoadingBar, MapLoadingUi, OverlayMode, PerfStats, PlanarReflectionDebugMode,
         PredictionDebugUi, PuddleQuality, PvsMode, RainIntensity, ReflectionQuality,
-        RendererBackend, SunVisibilityMode, TextureFilter, ThreadPerfStats, UiChatLine,
+        RendererBackend, TextureFilter, ThreadPerfStats, UiChatLine,
         UiScoreEntry, UiScoreboard, UiSnapshot, VideoSettings, VsyncMode,
     },
 };
@@ -177,6 +179,17 @@ use jka_protocol::{
         Decoder as ServerMessageDecoder, Event as ServerMessageEvent, Snapshot as ProtocolSnapshot,
     },
 };
+
+#[derive(Clone, Debug)]
+struct JaproLoginEditor {
+    server: SocketAddr,
+    server_name: String,
+    username: String,
+    /// Empty while editing means "keep the saved password". New entries must
+    /// provide one before they can be written to Credential Manager.
+    password: String,
+    new_entry: bool,
+}
 
 pub struct App {
     base: PathBuf,
@@ -291,6 +304,12 @@ pub struct App {
     /// "Too many info changes" throttle.
     console_buffer_running: bool,
     console_userinfo_dirty: bool,
+    /// TaystJK CG_UpdateNetUserinfo-style 8 second gate for the jaPRO ROM
+    /// userinfo mirrors. Camera/net input edits coalesce until this server-time
+    /// deadline instead of emitting a reliable userinfo command per key press.
+    japro_userinfo_update_debounce: i32,
+    japro_camera_userinfo_dirty: bool,
+    japro_net_userinfo_dirty: bool,
     /// The Force loadout changed; APPLY sends `cmd forcechanged` (UI_UpdateClientForcePowers).
     profile_force_pending: bool,
     profile_dynamic_models: Arc<Vec<DynamicModelSurface>>,
@@ -391,11 +410,12 @@ pub struct App {
     live_join_timing: Option<LiveJoinTiming>,
     network: crate::net::NetworkSettings,
     /// Secure jaPRO credentials discovered in the OS credential store. Secrets
-    /// themselves are never cached here; this list contains only endpoint/user.
+    /// themselves are never cached here; this list contains endpoint/user/label.
     japro_saved_logins: Vec<crate::credential_store::SavedLogin>,
     japro_credential_error: Option<String>,
-    /// Exact resolved endpoint already auto-login-attempted for this connection.
-    japro_autologin_attempted: Option<SocketAddr>,
+    /// Local editor state for one saved jaPRO login. Existing passwords are not
+    /// copied into this state; a blank password keeps the stored secret.
+    japro_login_editor: Option<JaproLoginEditor>,
     /// jaPRO cgame options (`cg_stylePlayer`, race timer, spectator aids).
     japro_cg: crate::japro_cg::JaproCgame,
     /// The camera editor's undo state while `OverlayMode::CameraEdit` is open.
@@ -405,6 +425,9 @@ pub struct App {
     live_input: crate::net::LiveInput,
     /// Lowercased `+command` kbuttons currently held (IN_KeyDown state).
     live_buttons: HashSet<String>,
+    /// Per-button input sources, mirroring OpenJK/TaystJK kbutton_t::down[].
+    /// A button remains active until every key/button that pressed it releases.
+    live_button_sources: HashMap<String, HashSet<String>>,
     predictor: crate::net::Predictor,
     /// Rolling per-frame prediction/view history behind `hitchmark`.
     hitch: hitch::HitchRecorder,
@@ -414,9 +437,11 @@ pub struct App {
     demo_recording: Option<DemoRecording>,
     /// Pmove context for the loaded map (humanoid animation.cfg timings).
     map_movement: Option<jka_movement::PmoveContext>,
-    last_center_print: Vec<u8>,
     center_print: Option<CenterPrintRecord>,
     last_center_refresh: Instant,
+    /// TaystJK/OpenJK-style transparent top-left console notify queue.
+    console_notify: VecDeque<ConsoleNotifyRecord>,
+    last_console_notify_refresh: Instant,
     /// Most recently parsed OpenJK `scores` response. Kept cached while hidden.
     scoreboard: Option<UiScoreboard>,
     /// CG `showScores`: true while +scores is held (or explicitly invoked).
@@ -554,11 +579,28 @@ pub struct App {
     console_cursor: usize,
     console_status: String,
     console_lines: VecDeque<String>,
+    /// Explicit semantic presentation class for each console row. Kept parallel
+    /// to `console_lines`; never inferred from player-controlled `^N` colours.
+    console_line_kinds: VecDeque<crate::logging::ConsoleLineKind>,
     /// Per-line trusted local filesystem links. Kept parallel to `console_lines`.
     /// Only explicit engine metadata can populate this; console text is never parsed
     /// speculatively for path-looking strings.
     console_path_links: VecDeque<Vec<ConsolePathLink>>,
     console_timestamps: bool,
+    /// TaystJK `con_notifytime`: seconds a recent console row remains over gameplay.
+    /// Session-only, matching upstream's non-archive cvar flag.
+    console_notify_time: f32,
+    /// TaystJK `con_notifylines`: number of recent console rows considered.
+    console_notify_lines: i32,
+    /// TaystJK chat/desktop notification controls.
+    console_notify_words: String,
+    /// Parsed `con_notifywords` cache, rebuilt when the cvar changes just like
+    /// TaystJK's `CL_UpdateNotificationWords` (maximum eight 31-byte terms).
+    console_notify_terms: Vec<String>,
+    console_notify_connect: bool,
+    console_notify_vote: bool,
+    /// DinurdoJK extension: one talk beep when an alert condition fires.
+    console_notify_beep: bool,
     /// `con_suggest`: live command/cvar filter popup above the input line.
     console_suggest: bool,
     /// `cg_chatboxCompletion`: Tab in the chat input completes player names.
@@ -601,9 +643,9 @@ pub struct App {
     /// OpenJK Cbuf-style pending commands. `exec` and `vstr` insert at the
     /// front; interactive/startup commands append at the back.
     console_command_buffer: VecDeque<String>,
-    /// OpenJK cmd_wait countdown. A value of 1 delays the remainder until the
-    /// next main/client frame.
-    console_wait_frames: u32,
+    /// Command-buffer `wait` deadline. DinurdoJK decouples rendering from
+    /// usercmd production, so one wait "frame" is one cl_commandRate interval.
+    console_wait_until: Option<Instant>,
     /// OpenJK `map`/`devmap` block inside Cbuf_Execute until the level is
     /// spawned, so the rest of a script (`+devmap x +setviewpos ...`) runs
     /// against the new world. Map preparation here is asynchronous; while this
@@ -645,6 +687,9 @@ pub struct App {
     authored_ocean_selected: usize,
     authored_ocean_preview: bool,
     ocean_selected: usize,
+    ocean_settings_target: i32, // -1 shared, >=0 promoted slot, <=-2 authored index
+    promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
+    promoted_ocean_overrides: Vec<(usize, crate::ocean::OceanSettings)>,
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,
     video: VideoSettings,
@@ -734,6 +779,16 @@ pub struct App {
     latest_request_id: u64,
     latest_prepare_options: scene::MapPrepareOptions,
     prepared_map_cache: Option<PreparedMapCache>,
+    /// Active OpenJK/TaystJK R_RemapShader state. Changes are resolved into a
+    /// prepared-map upload, so ordinary frames pay no remap lookup cost.
+    shader_remaps: scene::ShaderRemapState,
+    /// The next LoadMap is a visual-only remap rebuild. Keep the cached map as
+    /// the immutable unremapped source instead of replacing it with the derived
+    /// presentation copy when WorldUploaded comes back.
+    shader_remap_upload: bool,
+    /// A remap changed while another map upload was in flight. Coalesce any
+    /// number of such changes into one rebuild when that upload completes.
+    shader_remap_dirty: bool,
     /// Map label whose Rapier world mesh is present or being built by a worker.
     /// Stops repeated toggles from queueing duplicate builds.
     physics_mesh_label: Option<String>,
@@ -751,7 +806,11 @@ pub struct App {
     /// `surface_inspector` always mirrors `trace_menu_entries[trace_menu_selected]`.
     trace_menu_entries: Vec<SurfaceInspectorInfo>,
     trace_menu_selected: Option<usize>,
-    puddle_debug_visualization: bool,
+    /// Selected `puddle_debug` diagnostic view; 0 is off. See
+    /// `weather_surface_debug` in weather_surface_world.wgsl.
+    puddle_debug_mode: u32,
+    /// Live `puddle_sky` tuning of the puddle coat's probe-to-skybox handover.
+    puddle_sky_blend: (f32, f32),
     dof_focus_target: f32,
     config_path: PathBuf,
     config_dirty: bool,
@@ -760,9 +819,6 @@ pub struct App {
     fps_cap_input: String,
     fps_cap_editing: bool,
     fps_cap_replace_on_type: bool,
-    physics_fps_input: String,
-    physics_fps_editing: bool,
-    physics_fps_replace_on_type: bool,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     egui_last_frame: Instant,

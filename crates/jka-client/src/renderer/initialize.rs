@@ -1,7 +1,7 @@
 //! Initialize.
 use crate::renderer::{
     comparison_sampler_entry, compose_world_shader, create_auto_exposure_bind_group,
-    create_bloom_bind_groups, create_bloom_pipeline, create_cloud_fallback_resources,
+    create_bloom_bind_groups, create_cloud_fallback_resources,
     create_cloud_pass_pipeline, create_cloud_resolve_bind_group, create_color_lut_texture,
     create_depth_prepass_mask_pipeline, create_depth_prepass_pipeline, create_dof_bind_group,
     create_dof_pipeline, create_fast_post_bind_group, create_gamma_post_bind_group,
@@ -20,7 +20,7 @@ use crate::renderer::{
     sampler_entry, sampler_entry_stages, storage_buffer_entry, supported_msaa,
     texture_2d_array_entry, texture_3d_entry, texture_3d_entry_stages, texture_entry,
     texture_entry_stages, thread, timed_init_step, unfilterable_texture_entry,
-    unfilterable_texture_entry_stages, uniform_entry, upload_texture, weather, Arc,
+    unfilterable_texture_entry_stages, uniform_entry, upload_texture, weather, ui, Arc,
     AutoExposureState, AutoExposureUniform, BTreeMap, CameraUniform, CloudLayerSettings,
     CloudRenderResolution, CloudRenderSettings, CloudSunSettings, CloudType, ColorLutPreset,
     CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DetailTextureMode, DofQuality,
@@ -40,6 +40,7 @@ use crate::renderer::{
     PBR_PROFILE_PARALLAX_OCCLUSION, PLANAR_REFLECTION_SLOTS, SCREEN_FX_BUFFER_BYTES,
     SHADOW_CASTER_CULL, UI_BUFFER_BYTES, UI_DYNAMIC_BUFFER_BYTES, UI_TRANSIENT_BUFFER_BYTES,
 };
+use crate::ui::GlowMode;
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 
@@ -242,12 +243,19 @@ impl Renderer {
 
         // A lost device (TDR, driver reset, removed adapter) otherwise shows up
         // only as downstream validation noise or a dead screen. `Destroyed` is
-        // the normal teardown notification and is logged as such.
+        // the normal teardown notification and is logged as such. Everything
+        // else is latched in `DEVICE_LOST` so the render loop stops on this
+        // frame instead of submitting into a dead device until some third-party
+        // assertion fires with an unrelated message.
+        super::clear_device_lost();
         device.set_device_lost_callback(|reason, message| match reason {
             wgpu::DeviceLostReason::Destroyed => {
                 rverbose!(1, "[GPU] device destroyed: {message}");
             }
-            reason => eprintln!("[GPU DEVICE LOST] reason={reason:?}: {message}"),
+            reason => {
+                eprintln!("[GPU DEVICE LOST] reason={reason:?}: {message}");
+                super::note_device_lost(format!("{reason:?}: {message}"));
+            }
         });
 
         // Diagnostics should print the actual wgpu validation reason instead of
@@ -381,6 +389,7 @@ impl Renderer {
             config.height,
             config.format,
             msaa_samples,
+            false,
             false,
             false,
             false,
@@ -1536,6 +1545,7 @@ impl Renderer {
             ColorLutPreset::Off,
             1.0,
             Default::default(),
+            Default::default(),
             1.0,
             base,
             game,
@@ -1560,30 +1570,17 @@ impl Renderer {
         // does not allocate the targets and records no bloom passes.
         let bloom_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JKA bloom downsample layout"),
-            entries: &[texture_entry(0), sampler_entry(1)],
+            entries: &[texture_entry(0), texture_entry(1), sampler_entry(2)],
         });
         init_mark!("post shaders/pipelines");
-        let bloom_shader = create_shader_module_timed(
-            &device,
-            wgpu::ShaderModuleDescriptor {
-                label: Some("JKA low-resolution bloom shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../bloom.wgsl").into()),
-            },
-        );
         let bloom_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("JKA bloom downsample pipeline layout"),
                 bind_group_layouts: &[Some(&bloom_layout)],
                 immediate_size: 0,
             });
-        let bloom_extract_pipeline =
-            create_bloom_pipeline(&device, &bloom_pipeline_layout, &bloom_shader, "fs_extract");
-        let bloom_downsample_pipeline = create_bloom_pipeline(
-            &device,
-            &bloom_pipeline_layout,
-            &bloom_shader,
-            "fs_downsample",
-        );
+        // Glow/bloom shaders and PSOs compile on the shared workers only
+        // when an enabled effect requests its extraction variant.
 
         // Fast DOF follows Bevy's Gaussian mode structurally: one horizontal
         // separable pass here, with the vertical pass fused into post.wgsl.
@@ -1891,6 +1888,7 @@ impl Renderer {
             &bloom_layout,
             &post_sampler,
             &targets.scene_view,
+            targets.authored_glow.as_ref().map(|target| &target.view),
             targets.bloom.as_ref(),
         );
         let dof_bind_group = create_dof_bind_group(
@@ -2261,6 +2259,7 @@ impl Renderer {
             camera_water_surface: NO_WATER_SURFACE,
             ocean_enabled: false,
             ocean_settings: crate::ocean::OceanSettings::default(),
+            promoted_ocean_overrides: Vec::new(),
             world_pipeline_layout,
             world_pipeline_layout_lean,
             fast_world_pipeline_layout,
@@ -2357,7 +2356,7 @@ impl Renderer {
             hdr_enabled: false,
             tone_mapping_enabled: false,
             auto_exposure_enabled: false,
-            bloom_enabled: false,
+            glow_mode: GlowMode::Off,
             halation_enabled: false,
             ssao_enabled: false,
             static_bsp_ao_enabled: false,
@@ -2414,6 +2413,7 @@ impl Renderer {
             grass_mid_lod_enabled: true,
             grass_front_to_back_enabled: true,
             contact_shadow_debug: 0,
+            ssr_debug: 0,
             cloud_history_valid: false,
             cloud_history_key: None,
             cloud_history_read_index: 0,
@@ -2426,6 +2426,17 @@ impl Renderer {
             film_grain_strength: 0.0,
             motion_blur_strength: 0.0,
             depth_of_field_strength: 0.0,
+            crt_scope: ui::CrtScope::Off,
+            crt_style: ui::CrtStyle::LottesFast,
+            crt_quality: ui::CrtQuality::Fast,
+            crt_reference: ui::CrtReferenceResolution::P480,
+            crt_mask: ui::CrtMask::GrilleLite,
+            crt_scanline: 0.5,
+            crt_sharpness: 2.5,
+            crt_mask_intensity: 0.5,
+            crt_curvature: 0.02,
+            crt_corner: 3.0,
+            crt_resources: None,
             dof_quality: DofQuality::Adaptive,
             dof_focus_distance: 4096.0,
             dof_focus_valid: false,
@@ -2433,6 +2444,7 @@ impl Renderer {
             previous_frame_time: 0.0,
             color_lut_preset: ColorLutPreset::Off,
             color_lut_strength: 1.0,
+            color_grade: Default::default(),
             split_toning: Default::default(),
             color_lut_effective_strength: 0.0,
             _color_lut_texture: color_lut_texture,
@@ -2558,8 +2570,12 @@ impl Renderer {
             ssr_visibility_pipeline,
             ssr_visibility_bind_group,
             bloom_layout,
-            bloom_extract_pipeline,
-            bloom_downsample_pipeline,
+            bloom_pipeline_layout,
+            bloom_extract_modern_pipeline: None,
+            bloom_extract_authored_pipeline: None,
+            bloom_extract_authored_halation_pipeline: None,
+            bloom_extract_combined_pipeline: None,
+            bloom_downsample_pipeline: None,
             bloom_bind_groups,
             dof_layout,
             dof_pipeline,

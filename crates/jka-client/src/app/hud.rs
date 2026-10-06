@@ -21,6 +21,13 @@ impl App {
             .take(console_end - console_start)
             .cloned()
             .collect();
+        let console_line_kinds: Vec<crate::logging::ConsoleLineKind> = self
+            .console_line_kinds
+            .iter()
+            .skip(console_start)
+            .take(console_end - console_start)
+            .copied()
+            .collect();
         let console_selection = match (self.console_selection_anchor, self.console_selection_focus)
         {
             (Some(mut start), Some(mut end)) if console_start < console_end => {
@@ -94,6 +101,7 @@ impl App {
             .collect();
 
         let (mut chat_lines, mut center_print) = self.transient_ui_snapshot();
+        let console_notify_lines = self.console_notify_ui_snapshot();
         let hud = self.current_hud_state();
         let mut follow_name = self.current_follow_name();
         let mut race_timer = self
@@ -151,6 +159,7 @@ impl App {
             console_cursor: self.console_cursor,
             console_status: self.console_status.clone(),
             console_lines,
+            console_line_kinds,
             console_scroll: 0,
             console_size: self.console_size,
             console_selection,
@@ -172,6 +181,7 @@ impl App {
             chat_mode: self.chat_mode,
             chat_input: self.chat_input.clone(),
             chat_lines,
+            console_notify_lines,
             center_print,
             follow_name,
             game_timer: self.game_timer_text(),
@@ -640,11 +650,7 @@ impl App {
         // suppresses the jaPRO race-mode overlay. GT_POWERDUEL is excluded by
         // the GT_DUEL gate above, as in TaystJK.
         let snapshot_ps = &session.current_snapshot.as_ref()?.player_state;
-        let ps = if session.live {
-            self.live_player_state().unwrap_or(snapshot_ps)
-        } else {
-            snapshot_ps
-        };
+        let ps = session.presented_player_state().unwrap_or(snapshot_ps);
         if ps.stats[0] <= 0 {
             return None;
         }
@@ -807,12 +813,8 @@ impl App {
             return false;
         }
         let snapshot = session.client_game.current_snapshot();
-        let ps = if session.live {
-            self.live_player_state()
-                .or_else(|| snapshot.map(|snapshot| &snapshot.player_state))
-        } else {
-            snapshot.map(|snapshot| &snapshot.player_state)
-        };
+        let ps = session.presented_player_state()
+            .or_else(|| snapshot.map(|snapshot| &snapshot.player_state));
         let pm_type = ps.and_then(|ps| ps.field_i32("pm_type")).unwrap_or(0);
         pm_type == PM_DEAD || pm_type == crate::cgame::PM_INTERMISSION
     }
@@ -946,8 +948,10 @@ impl App {
                         return self.demo_fake_hud_state(client);
                     }
                 }
-                if let Some(snapshot) = session.current_snapshot.as_ref() {
-                    return Some(self.hud_state_from_player_state(&snapshot.player_state));
+                if let Some(ps) = session.presented_player_state().or_else(|| {
+                    session.current_snapshot.as_ref().map(|snapshot| &snapshot.player_state)
+                }) {
+                    return Some(self.hud_state_from_player_state(ps));
                 }
             }
         }
@@ -1288,9 +1292,8 @@ impl App {
             .net
             .as_ref()
             .map_or(viewer, |net| net.session().client_num());
-        let start = session
-            .race_ghost_live_sample
-            .map(|sample| sample.origin)
+        let start = session.presented_player_state()
+            .and_then(|ps| playerstate_vec3(ps, "origin"))
             .or_else(|| playerstate_vec3(&snapshot.player_state, "origin"))
             .unwrap_or_default();
         let viewer_state = session
@@ -1556,6 +1559,9 @@ pub(in crate::app) fn generic_timer_bar(
         alpha_vertex: true,
         rgb_const: [1.0; 3],
         alpha_const: 1.0,
+        tc_mods: Vec::new(),
+        shader_time_offset: 0.0,
+        authored_glow: false,
     };
     let mut rect = |rect: [f32; 4], color: [f32; 4]| {
         draws.push(ScreenFxDraw {

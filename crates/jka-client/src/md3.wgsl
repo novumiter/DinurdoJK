@@ -9,6 +9,10 @@ struct Camera {
 // Pipeline-specialized: false compiles the self-applied Legacy fog out entirely.
 // Rebuilt only when FogSystem::legacy_self_fog toggles, never checked per frame.
 override ENABLE_LEGACY_FOG: bool = false;
+// OpenJK Dynamic Glow temporarily overrides the fog colour to black while
+// replaying explicitly-authored `glow` stages. Pipeline-specialize that replay
+// rather than changing material classification or blend behavior.
+override FORCE_FOG_BLACK: bool = false;
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
@@ -23,6 +27,13 @@ struct EntityLightingSettings {
     // Cloud ground shadow: xyz = unit direction toward the sun (render space),
     // w = 1 while projected cloud shadows are active, else 0.
     cloud_shadow_sun: vec4<f32>,
+    // Wet weather on entities (model_weather.wgsl). xyz = the sun's travel
+    // direction in render space, w = relative sun intensity (250 = 1), matching
+    // WeatherSurfaceUniform so a model and the ground agree on the light.
+    weather_sun_direction: vec4<f32>,
+    // rgb = linear sun colour, w = model wetness 0..1, already faded by rain
+    // intensity and by the camera's own exposure to the rain.
+    weather_sun_radiance: vec4<f32>,
 };
 @group(1) @binding(2) var<uniform> entity_lighting: EntityLightingSettings;
 
@@ -111,7 +122,7 @@ fn apply_self_legacy_fog(rgb: vec3<f32>, world_position: vec3<f32>, fog_to_black
 }
 
 fn fogged(color: vec4<f32>, world_position: vec3<f32>, fog_to_black: bool) -> vec4<f32> {
-    return vec4<f32>(apply_self_legacy_fog(color.rgb, world_position, fog_to_black), color.a);
+    return vec4<f32>(apply_self_legacy_fog(color.rgb, world_position, fog_to_black || FORCE_FOG_BLACK), color.a);
 }
 
 @fragment
@@ -122,7 +133,11 @@ fn fs_wireframe() -> @location(0) vec4<f32> {
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
-    return fogged(lit_color(input.normal, tex) * input.color, input.world_position, false);
+    return fogged(
+        model_wet_color(lit_color(input.normal, tex) * input.color, input.normal, input.world_position),
+        input.world_position,
+        false
+    );
 }
 
 @fragment
@@ -131,7 +146,11 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
     if tex.a < 0.5 {
         discard;
     }
-    return fogged(lit_color(input.normal, tex) * input.color, input.world_position, false);
+    return fogged(
+        model_wet_color(lit_color(input.normal, tex) * input.color, input.normal, input.world_position),
+        input.world_position,
+        false
+    );
 }
 
 @fragment

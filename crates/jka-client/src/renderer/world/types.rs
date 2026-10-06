@@ -107,10 +107,20 @@ pub(in crate::renderer) struct WorldBatch {
     /// Which promoted surface `ocean_clipmap` belongs to. Every face merged into
     /// one surface shares that clipmap, so a pass draws it once, not per face.
     pub(in crate::renderer) ocean_clipmap_id: u8,
+    /// An uploaded ocean replaces this stage, including its sibling passes.
+    pub(in crate::renderer) ocean_replaced: bool,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
+    /// Same authored stage resources as `bind_group`, but with OpenJK's
+    /// Dynamic Glow fog override: glow stages fog toward black during replay.
+    /// Only allocated for exact `.shader` stages marked `glow`.
+    pub(in crate::renderer) authored_glow_bind_group: Option<wgpu::BindGroup>,
+    /// Diffuse-stage appearance used only when the ocean draws its replacement.
+    pub(in crate::renderer) ocean_surface_bind_group: Option<wgpu::BindGroup>,
+    pub(in crate::renderer) _ocean_material_buffer: Option<UniformSlot>,
     pub(in crate::renderer) fast_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) _material_buffer: UniformSlot,
     pub(in crate::renderer) _fog_buffer: UniformSlot,
+    pub(in crate::renderer) _authored_glow_fog_buffer: Option<UniformSlot>,
     pub(in crate::renderer) cull_index: u32,
     pub(in crate::renderer) compact_group: Option<u32>,
     /// Draw-state class shared by mover (inline model) batches, or `u32::MAX`.
@@ -306,6 +316,7 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) primary_skybox: Option<[usize; 6]>,
     /// Distinct promoted water planes/footprints; also drives Godot-style spray placement.
     pub(in crate::renderer) ocean_surfaces: Vec<crate::ocean::OceanSurface>,
+    pub(in crate::renderer) promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     /// Real outlines of `ocean_surfaces`, by the slot baked into each clipmap.
     pub(in crate::renderer) ocean_masks: Arc<crate::ocean::OceanMasks>,
     pub(in crate::renderer) inline_models: Vec<InlineModelGpu>,

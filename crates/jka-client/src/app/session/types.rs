@@ -1,10 +1,10 @@
 //! Session types.
 use crate::app::{
-    race_ghost, ActiveReward, Arc, BTreeMap, ClientFramePerf, ClientGameState, Cursor,
-    DemoEventStat, DemoIndex, DemoReader, DemoTimeline, DynamicModelSurface, EntityEvent,
-    EntityPresenter, EventPresenter, ForcedPlayerModels, HashMap, Instant, PlayerPresenter,
-    PresentedEntity, ProtocolSnapshot, RewardSpec, ServerMessageDecoder, SessionPhase,
-    SpectatorCameraMode, TransientLight, VecDeque,
+    race_ghost, ActiveReward, Arc, BTreeMap, ClientFramePerf, ClientGameState, Cursor, DemoEventStat,
+    DemoIndex, DemoReader, DemoTimeline, DynamicModelSurface, EntityEvent, EntityPresenter,
+    EventPresenter, ForcedPlayerModels, HashMap, Instant, PlayerPresenter, PresentedEntity,
+    ProtocolSnapshot, RewardSpec, ServerMessageDecoder, SessionPhase, SpectatorCameraMode,
+    TransientLight, VecDeque,
 };
 
 /// One CGame lifetime (OpenJK CL_InitCGame .. CL_ShutdownCGame) fed either by
@@ -17,6 +17,8 @@ pub(in crate::app) struct LivePredictionFrame {
     /// The state presented on the previous frame (CG_TransitionPlayerState's ops).
     pub(in crate::app) previous_display: jka_protocol::server::PlayerState,
     pub(in crate::app) error: [f32; 3],
+    pub(in crate::app) command_angles: Option<[i32; 3]>,
+    pub(in crate::app) view_forced: bool,
 }
 
 pub(in crate::app) fn snapshot_owns_playerstate_events(
@@ -58,6 +60,11 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) next_snapshot: Option<ProtocolSnapshot>,
     pub(in crate::app) first_server_time: Option<i32>,
     pub(in crate::app) timeline: Option<DemoTimeline>,
+    /// Last successfully presented CGame time (`cg.time` in OpenJK/jaPRO).
+    pub(in crate::app) cgame_time: i32,
+    /// jaPRO `/do`: one pending vstr and its cg.time deadline. Scheduling a
+    /// second `/do` replaces the first, matching cg.doVstr/cg.doVstrTime.
+    pub(in crate::app) japro_do: Option<(String, i32)>,
     pub(in crate::app) eof: bool,
     pub(in crate::app) seeking_demo: bool,
     /// Presentation-only audio gate used while interactively scrubbing a demo.
@@ -70,6 +77,10 @@ pub(in crate::app) struct GameSession {
     /// Client-side obituary counts used by TaystJK cg_scoreDeaths modes 2/3.
     pub(in crate::app) client_deaths: [i32; 32],
     pub(in crate::app) player_position: Option<glam::Vec3>,
+    /// Canonical current player, analogous to cg.predictedPlayerState. Computed
+    /// once per presentation frame from prediction's provisional display state
+    /// or snapshot interpolation, with input-owned view angles applied.
+    pub(in crate::app) presented_player_state: Option<jka_protocol::server::PlayerState>,
     pub(in crate::app) client_game: ClientGameState,
     pub(in crate::app) siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
     pub(in crate::app) presented_entities: Vec<PresentedEntity>,

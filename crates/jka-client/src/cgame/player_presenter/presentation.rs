@@ -1327,7 +1327,7 @@ impl PlayerPresenter {
             let body = draws.clone();
             let seconds = self.stage_time_ms as f32 * 0.001;
             for (shader, rgba, force_alpha_blend) in shells {
-                let (texture, mut alpha_mode) = self.custom_shader_material(shader);
+                let (texture, mut alpha_mode, authored_glow) = self.custom_shader_material(shader);
                 if force_alpha_blend {
                     // RF_FORCE_ENT_ALPHA: the team-power shell draws with
                     // standard alpha blending regardless of its own shader's
@@ -1353,10 +1353,11 @@ impl PlayerPresenter {
                     // scene-light-independent overlays (RF_RGB_TINT forces the
                     // color outright) and never their own shadow casters.
                     shell.lighting_origin = None;
+                    shell.authored_glow = authored_glow;
                     shell.rt_rigid = None;
                     shell.rt_skinned_key = None;
                     draws.push(shell);
-                    for (overlay_texture, overlay_mode, overlay_uv) in &overlays {
+                    for (overlay_texture, overlay_mode, overlay_uv, overlay_glow) in &overlays {
                         let mut overlay = Self::clone_surface_with_material_xform(
                             surface,
                             overlay_texture.clone(),
@@ -1367,6 +1368,7 @@ impl PlayerPresenter {
                             Some(env_map),
                         );
                         overlay.lighting_origin = None;
+                        overlay.authored_glow = *overlay_glow;
                         overlay.rt_rigid = None;
                         overlay.rt_skinned_key = None;
                         draws.push(overlay);

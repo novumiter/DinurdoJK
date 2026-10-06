@@ -452,7 +452,12 @@ pub(in crate::renderer) fn create_shadow_resources(
             ],
             // The film fade is rewritten with the rest of the look on first use;
             // a non-zero range keeps the shader's smoothstep well defined until then.
-            film_fade: [1.0, 2.0, 0.0, 0.0],
+            film_fade: [
+                1.0,
+                2.0,
+                weather::RAIN_SKY_BLEND_WINDOW,
+                weather::RAIN_SKY_BLEND_CEILING,
+            ],
             ..bytemuck::Zeroable::zeroed()
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,

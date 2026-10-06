@@ -1,70 +1,9 @@
-//! Color grading controls, separate from lens and spatial post effects.
+//! HDR, color grading and output controls, separate from lens and spatial post effects.
 use crate::app::egui_settings::{percent, theme, ui, App, ColorLutPreset};
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_color_settings(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "LOOK", "Choose a film look or an external color grade.");
-        theme::row(
-            ui,
-            "Color LUT",
-            "Colour grade applied as a 3D lookup table, the same way a film \
-             print is graded. This sets the overall mood of the image.",
-            theme::Reset::Video(ui::VIDEO_ROW_COLOR_LUT),
-            |ui| {
-                egui::ComboBox::from_id_salt("color_lut")
-                    .selected_text(self.video.color_lut.label())
-                    .width(230.0)
-                    .show_ui(ui, |ui| {
-                        for preset in ColorLutPreset::all() {
-                            if ui
-                                .selectable_label(preset == self.video.color_lut, preset.label())
-                                .clicked()
-                            {
-                                self.set_color_lut(preset);
-                            }
-                        }
-                    });
-            },
-        );
-        theme::row(
-            ui,
-            "LUT strength",
-            "How far the image is pushed toward the selected grade. 0% is the \
-             ungraded frame.",
-            theme::Reset::Video(ui::VIDEO_ROW_LUT_STRENGTH),
-            |ui| {
-                let mut value = self.video.color_lut_strength;
-                let readout = percent(value);
-                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
-                    self.set_color_lut_strength(value);
-                }
-            },
-        );
-
-        self.egui_split_toning(ui);
-        theme::section(ui, "BRIGHTNESS", "Scene adaptation and output brightness.");
-        ui.add_enabled_ui(self.video.hdr, |ui| {
-            self.egui_toggle_row(
-                ui,
-                "Tone mapping",
-                "Maps the HDR frame down to what the display can show, rolling off \
-             highlights instead of clipping them. Needs HDR rendering to have \
-             anything to roll off.",
-                ui::VIDEO_ROW_TONE_MAPPING,
-                self.video.tone_mapping,
-            );
-        });
-        ui.add_enabled_ui(self.video.hdr && self.video.tone_mapping, |ui| {
-            self.egui_toggle_row(
-                ui,
-                "Auto exposure",
-                "Meters HDR scene luminance and smoothly adapts exposure before tone \
-             mapping, similar to eye/camera adaptation. Effective only with HDR \
-             rendering and tone mapping enabled.",
-                ui::VIDEO_ROW_AUTO_EXPOSURE,
-                self.video.auto_exposure,
-            );
-        });
+        theme::section(ui, "BRIGHTNESS", "Output brightness and per-lighting-class scaling.");
         theme::row(
             ui,
             "Brightness method",
@@ -146,6 +85,230 @@ impl App {
                 }
             },
         );
+
+        theme::section(
+            ui,
+            "HDR",
+            "Scene precision, HDR baked lighting and highlight rolloff.",
+        );
+        // HDR is a framebuffer format decision: it determines the precision
+        // used by lighting and every downstream color/post-processing pass.
+        self.egui_toggle_row(
+            ui,
+            "HDR rendering",
+            "Renders into a floating-point buffer so highlights can exceed white \
+             instead of clipping. Costs bandwidth, and is what gives bloom and \
+             tone mapping something to work with.",
+            ui::VIDEO_ROW_HDR,
+            self.video.hdr,
+        );
+        ui.add_enabled_ui(self.video.hdr, |ui| {
+            self.egui_toggle_row(
+                ui,
+                "Float lightmaps",
+                "Rend2-compatible HDR baked lighting. While HDR rendering is enabled, \
+                 load maps/<map>/lm_XXXX.hdr companions into FP16 when they exist; \
+                 ordinary JKA lightmaps are promoted to FP16 as the fallback. While a map is loaded, Apply Video Settings reloads it with the new setting.",
+                ui::VIDEO_ROW_FLOAT_LIGHTMAP,
+                self.video.float_lightmap,
+            );
+            self.egui_toggle_row(
+                ui,
+                "Tone mapping",
+                "Maps the HDR frame down to what the display can show, rolling off \
+                 highlights instead of clipping them.",
+                ui::VIDEO_ROW_TONE_MAPPING,
+                self.video.tone_mapping,
+            );
+        });
+        ui.add_enabled_ui(self.video.hdr && self.video.tone_mapping, |ui| {
+            self.egui_toggle_row(
+                ui,
+                "Auto exposure",
+                "Meters HDR scene luminance and smoothly adapts exposure before tone \
+                 mapping, similar to eye/camera adaptation.",
+                ui::VIDEO_ROW_AUTO_EXPOSURE,
+                self.video.auto_exposure,
+            );
+        });
+
+        theme::section(
+            ui,
+            "COLOR GRADING",
+            "Primary image controls. Exposure is scene-referred; the other controls are baked into the existing 3-D LUT.",
+        );
+        let grade = self.video.color_grade;
+        self.egui_color_grade_slider(
+            ui,
+            "Exposure",
+            "Manual scene exposure in stops. Applied before tone mapping, so +1 EV doubles scene light and -1 EV halves it. Auto exposure is added on top when enabled.",
+            "r_colorExposure",
+            grade.exposure_ev,
+            -4.0..=4.0,
+            |v| format!("{v:+.2} EV"),
+            false,
+        );
+        self.egui_color_grade_slider(
+            ui,
+            "Contrast",
+            "Global contrast around middle grey. 100% is neutral.",
+            "r_colorContrast",
+            grade.contrast,
+            0.0..=2.0,
+            percent,
+            true,
+        );
+        self.egui_color_grade_slider(
+            ui,
+            "Saturation",
+            "Global color saturation. 100% is neutral; 0% is greyscale.",
+            "r_colorSaturation",
+            grade.saturation,
+            0.0..=2.0,
+            percent,
+            true,
+        );
+        self.egui_color_grade_slider(
+            ui,
+            "Vibrance",
+            "Selective saturation that favors muted colors and protects already-vivid colors such as sabers and neon.",
+            "r_colorVibrance",
+            grade.vibrance,
+            -1.0..=1.0,
+            |v| format!("{:+.0}%", v * 100.0),
+            true,
+        );
+        self.egui_color_grade_slider(
+            ui,
+            "Temperature",
+            "White-balance temperature. 6500 K is neutral; lower values warm the image and higher values cool it.",
+            "r_colorTemperature",
+            grade.temperature,
+            2000.0..=11000.0,
+            |v| format!("{v:.0} K"),
+            true,
+        );
+        self.egui_color_grade_slider(
+            ui,
+            "Tint",
+            "Green/magenta white-balance axis. Negative is greener; positive is more magenta.",
+            "r_colorTint",
+            grade.tint,
+            -1.0..=1.0,
+            |v| format!("{:+.0}%", v * 100.0),
+            true,
+        );
+        self.egui_color_grade_slider(
+            ui,
+            "Shadow brightness",
+            "Brightness of darker tonal ranges, in stops, with a smooth falloff into the midtones.",
+            "r_colorShadows",
+            grade.shadows,
+            -2.0..=2.0,
+            |v| format!("{v:+.2} EV"),
+            true,
+        );
+        self.egui_color_grade_slider(
+            ui,
+            "Highlight brightness",
+            "Brightness of brighter tonal ranges, in stops, with a smooth falloff into the midtones.",
+            "r_colorHighlights",
+            grade.highlights,
+            -2.0..=2.0,
+            |v| format!("{v:+.2} EV"),
+            true,
+        );
+
+        theme::section(ui, "LOOK", "Choose a film look or an external color grade.");
+        theme::row(
+            ui,
+            "Color LUT",
+            "Colour grade applied as a 3D lookup table, the same way a film \
+             print is graded. This sets the overall mood of the image.",
+            theme::Reset::Video(ui::VIDEO_ROW_COLOR_LUT),
+            |ui| {
+                egui::ComboBox::from_id_salt("color_lut")
+                    .selected_text(self.video.color_lut.label())
+                    .width(230.0)
+                    .show_ui(ui, |ui| {
+                        for preset in ColorLutPreset::all() {
+                            if ui
+                                .selectable_label(preset == self.video.color_lut, preset.label())
+                                .clicked()
+                            {
+                                self.set_color_lut(preset);
+                            }
+                        }
+                    });
+            },
+        );
+        theme::row(
+            ui,
+            "LUT strength",
+            "How far the image is pushed toward the selected grade. 0% is the \
+             ungraded frame.",
+            theme::Reset::Video(ui::VIDEO_ROW_LUT_STRENGTH),
+            |ui| {
+                let mut value = self.video.color_lut_strength;
+                let readout = percent(value);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    self.set_color_lut_strength(value);
+                }
+            },
+        );
+
+        self.egui_split_toning(ui);
+    }
+
+    fn egui_color_grade_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        tip: &str,
+        name: &'static str,
+        committed: f32,
+        range: std::ops::RangeInclusive<f32>,
+        readout: fn(f32) -> String,
+        deferred: bool,
+    ) {
+        theme::row(ui, label, tip, theme::Reset::Color(name), |ui| {
+            let state_id = ui.id().with(name);
+            let mut value = if deferred {
+                ui.ctx()
+                    .data(|data| data.get_temp::<f32>(state_id))
+                    .unwrap_or(committed)
+            } else {
+                committed
+            };
+            let text = readout(value);
+            let changed = theme::slider(ui, &mut value, range, &text);
+            if !deferred {
+                if changed {
+                    let _ = self.set_console_cvar(name, &value.to_string());
+                }
+                return;
+            }
+            if changed {
+                ui.ctx().data_mut(|data| data.insert_temp(state_id, value));
+            }
+            let (primary_down, primary_released) = ui.input(|input| {
+                (input.pointer.primary_down(), input.pointer.primary_released())
+            });
+            let staged = ui.ctx().data(|data| data.get_temp::<f32>(state_id));
+            let commit = if changed && !primary_down {
+                Some(value)
+            } else if primary_released {
+                staged
+            } else {
+                None
+            };
+            if let Some(value) = commit {
+                ui.ctx().data_mut(|data| {
+                    data.remove::<f32>(state_id);
+                });
+                let _ = self.set_console_cvar(name, &value.to_string());
+            }
+        });
     }
 
     fn egui_split_toning(&mut self, ui: &mut egui::Ui) {

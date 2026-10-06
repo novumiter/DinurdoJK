@@ -20,6 +20,7 @@ pub(in crate::cgame::player_presenter) struct Ghoul2GpuMeshSource {
 pub(in crate::cgame::player_presenter) struct SurfaceOverlay {
     pub(in crate::cgame::player_presenter) texture: Option<Arc<TextureData>>,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
+    pub(in crate::cgame::player_presenter) authored_glow: bool,
 }
 
 /// One stage of a fully blended (additive/glow) shader, drawn as its own
@@ -38,6 +39,7 @@ pub(in crate::cgame::player_presenter) struct ResolvedStage {
     pub(in crate::cgame::player_presenter) specular_alpha: bool,
     /// Only `tcMod scale` / `tcMod scroll` are applied.
     pub(in crate::cgame::player_presenter) tc_mods: Vec<TcMod>,
+    pub(in crate::cgame::player_presenter) authored_glow: bool,
 }
 
 /// A surface's resolved material: the primary stage plus the entity-tint layers.
@@ -52,6 +54,10 @@ pub(in crate::cgame::player_presenter) struct ResolvedMaterial {
     /// `cull twosided` on a translucent surface (wings): the mesh also needs its
     /// reversed-winding triangles because the pipelines always cull back faces.
     pub(in crate::cgame::player_presenter) two_sided: bool,
+    /// Exact `glow` marker for the single-stage/base path.
+    pub(in crate::cgame::player_presenter) authored_glow: bool,
+    /// OpenJK renderer `shader->timeOffset`, in seconds.
+    pub(in crate::cgame::player_presenter) shader_time_offset: f32,
 }
 
 #[derive(Clone)]
@@ -65,6 +71,9 @@ pub(in crate::cgame::player_presenter) struct PlayerSurfaceAsset {
     pub(in crate::cgame::player_presenter) surface_name: String,
     pub(in crate::cgame::player_presenter) texture: Option<Arc<TextureData>>,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
+    pub(in crate::cgame::player_presenter) authored_glow: bool,
+    /// OpenJK renderer `shader->timeOffset`, in seconds.
+    pub(in crate::cgame::player_presenter) shader_time_offset: f32,
     /// Asset Viewer only: this surface had no usable authored material, so
     /// render it neutral gray instead of disappearing into the black preview.
     pub(in crate::cgame::player_presenter) fallback_gray: bool,

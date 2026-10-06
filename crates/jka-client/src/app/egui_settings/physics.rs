@@ -1,6 +1,6 @@
 //! Physics.
 use crate::app::egui_settings::{
-    config, quality_table_row, segmented_row, theme, ui, App, PHYS_CCD, PHYS_CLIENT_ENABLED,
+    quality_table_row, segmented_row, theme, App, PHYS_CCD, PHYS_CLIENT_ENABLED,
     PHYS_CLOTH, PHYS_CLOTH_AIR, PHYS_CLOTH_ANIMATION, PHYS_CLOTH_BODY_COLLISION,
     PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
     PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT, PHYS_DISMEMBER_LIFETIME,
@@ -19,37 +19,6 @@ impl App {
             ui,
             "RAPIER IS CLIENT-ONLY VISUAL PHYSICS — OPENJK/JKA MOVEMENT AND SERVER SNAPSHOTS STAY AUTHORITATIVE.",
             theme::TEXT_FAINT,
-        );
-
-        theme::section(
-            ui,
-            "PLAYER MOVEMENT",
-            "Gameplay, not visuals: the fixed tick the local player is simulated at.",
-        );
-        theme::row(
-            ui,
-            "Player movement rate",
-            "Fixed OpenJK/JKA player movement tick. Stock Jedi Academy runs 125 Hz; \
-             changing it changes movement feel, including strafe jump behaviour. \
-             This is separate from client-side Rapier visual physics.",
-            theme::Reset::Video(ui::VIDEO_ROW_PHYSICS_FPS),
-            |ui| {
-                let mut fps = config::physics_fps_from_msec(self.video.physics_msec);
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut fps)
-                            .range(20..=1000)
-                            .speed(1.0)
-                            .suffix(" Hz")
-                            .update_while_editing(false),
-                    )
-                    .changed()
-                {
-                    let msec =
-                        config::physics_msec_from_fps(&fps.to_string(), self.video.physics_msec);
-                    self.set_physics_msec(msec);
-                }
-            },
         );
 
         theme::section(

@@ -1,5 +1,6 @@
 //! renderer module facade. Implementations are grouped by responsibility.
 use api::{FrameInfo, RenderError};
+use crate::ui::GlowMode;
 use frame::plan::FramePlan;
 use lighting::legacy_dlights::legacy_dlight_runs_for_batch;
 use overlay::ScreenFxBatch;
@@ -29,14 +30,14 @@ mod visibility;
 mod world;
 use api::{
     dynamic_model_writes_depth, Ghoul2RtInputVertex, LegacyDlightPerfStats, RenderBatchTiming,
-    DYNAMIC_MODEL_ALPHA_ORDER, MAX_CLOUD_FOREGROUND_BLADES,
+    DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_WORDS, MAX_CLOUD_FOREGROUND_BLADES,
 };
 pub use api::{
     ClientFramePerf, CloudForegroundBlade, CompanionId, CompanionSceneView, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData,
     FxGpuSpriteInstance, FxGpuSprites, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand,
-    RenderSnapshot, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
+    RenderSnapshot, ScreenshotFormat, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
     PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
     PBR_PROFILE_POM_ADAPTIVE_STEPS, PBR_PROFILE_POM_MIP_AWARE, PBR_PROFILE_SHARED_MATERIAL_EVAL,
     PBR_PROFILE_SHARED_TANGENT_FRAME, PBR_PROFILE_VERTEX_LIGHTGRID,
@@ -73,6 +74,7 @@ use environment::surface_sprites::{
     ghoul2_specular_light, ghoul2_specular_viewer, PreparedSurfaceSpriteEffects,
     SurfaceSpriteEffectGpu, SurfaceSpriteEffectRenderer, DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
     FX_GPU_SPRITE_INSTANCE_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
+    RT_RECEIVER_RAW_COLOR_ATTRIBUTES, RT_RECEIVER_RAW_COLOR_LOCATION,
 };
 use environment::water::{
     is_upward_water_face, ocean_surface_key, water_surface_extent, MAX_OCEAN_SURFACES,
@@ -114,7 +116,7 @@ use models::pipelines::{
     create_dynamic_model_pipeline_inner, create_fast_world_wireframe_pipeline,
     create_world_pipeline, create_world_wireframe_pipeline, project_blob_shadow_mark,
 };
-pub(crate) use models::types::EntityLegacyFog;
+pub(crate) use models::types::{EntityLegacyFog, EntityWeather};
 use models::types::{
     classic_vertex_illumination, sample_entity_classic_light, DynamicEntityLightingUniform,
     DynamicGpuTexture, DynamicModelRenderer, DynamicPreparedDraw, EntitySunRelight,
@@ -133,6 +135,7 @@ use post::bindings::{
     create_ssao_temporal_bind_groups, create_ssr_temporal_bind_groups,
 };
 use post::color_lut::create_color_lut_texture;
+use post::crt::CrtResources;
 use post::pipelines::{
     create_bloom_pipeline, create_cloud_pass_pipeline, create_cloud_resolve_bind_group,
     create_cull_debug_pipeline, create_dof_pipeline, create_gamma_post_pipeline,
@@ -474,6 +477,48 @@ fn env_flag(name: &str) -> bool {
     })
 }
 
+/// A lost device (driver reset/TDR, removed adapter) fails every later WGPU
+/// call, but wgpu reports that *only* through the device-lost callback: its
+/// error sink maps `ErrorType::DeviceLost` to a silent return, on the grounds
+/// that the callback already covers it. Queue writes then hand back `None` with
+/// no explanation, and third-party code turns that into a misleading panic -
+/// `egui_wgpu` asserts "Failed to create staging buffer for index data" while
+/// printing buffer sizes that are perfectly valid. Record the loss here instead
+/// so the render loop can stop on the frame it happens and report the real
+/// reason.
+static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DEVICE_LOST_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Called from the device-lost callback installed in [`Renderer::new`].
+fn note_device_lost(detail: String) {
+    if let Ok(mut reason) = DEVICE_LOST_REASON.lock() {
+        // Only the first loss is diagnostic; later calls describe the fallout.
+        if reason.is_none() {
+            *reason = Some(detail);
+        }
+    }
+    DEVICE_LOST.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Cleared for every freshly created device so a backend restart starts clean.
+fn clear_device_lost() {
+    if let Ok(mut reason) = DEVICE_LOST_REASON.lock() {
+        *reason = None;
+    }
+    DEVICE_LOST.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn device_lost() -> bool {
+    DEVICE_LOST.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn device_lost_reason() -> String {
+    match DEVICE_LOST_REASON.lock() {
+        Ok(reason) => reason.as_deref().unwrap_or("unknown reason").to_owned(),
+        Err(_) => "unknown reason".to_owned(),
+    }
+}
+
 struct Renderer {
     model_frame_log: crate::model_frame_log::ModelFrameLog,
     base: PathBuf,
@@ -540,6 +585,7 @@ struct Renderer {
     camera_water_surface: f32,
     ocean_enabled: bool,
     ocean_settings: crate::ocean::OceanSettings,
+    promoted_ocean_overrides: Vec<(usize, crate::ocean::OceanSettings)>,
     world_pipeline_layout: wgpu::PipelineLayout,
     world_pipeline_layout_lean: wgpu::PipelineLayout,
     fast_world_pipeline_layout: wgpu::PipelineLayout,
@@ -656,7 +702,7 @@ struct Renderer {
     hdr_enabled: bool,
     tone_mapping_enabled: bool,
     auto_exposure_enabled: bool,
-    bloom_enabled: bool,
+    glow_mode: GlowMode,
     halation_enabled: bool,
     ssao_enabled: bool,
     static_bsp_ao_enabled: bool,
@@ -710,6 +756,7 @@ struct Renderer {
     grass_mid_lod_enabled: bool,
     grass_front_to_back_enabled: bool,
     contact_shadow_debug: u8,
+    ssr_debug: u8,
     cloud_history_valid: bool,
     cloud_history_key: Option<CloudHistoryKey>,
     cloud_history_read_index: usize,
@@ -722,6 +769,17 @@ struct Renderer {
     film_grain_strength: f32,
     motion_blur_strength: f32,
     depth_of_field_strength: f32,
+    crt_scope: ui::CrtScope,
+    crt_style: ui::CrtStyle,
+    crt_quality: ui::CrtQuality,
+    crt_reference: ui::CrtReferenceResolution,
+    crt_mask: ui::CrtMask,
+    crt_scanline: f32,
+    crt_sharpness: f32,
+    crt_mask_intensity: f32,
+    crt_curvature: f32,
+    crt_corner: f32,
+    crt_resources: Option<CrtResources>,
     dof_quality: DofQuality,
     dof_focus_distance: f32,
     dof_focus_valid: bool,
@@ -729,6 +787,7 @@ struct Renderer {
     previous_frame_time: f32,
     color_lut_preset: ColorLutPreset,
     color_lut_strength: f32,
+    color_grade: crate::color_grading::ColorGradeSettings,
     split_toning: crate::color_grading::SplitToningSettings,
     color_lut_effective_strength: f32,
     _color_lut_texture: wgpu::Texture,
@@ -757,7 +816,7 @@ struct Renderer {
     /// written its displaced depth. Stores positions in the already-selected
     /// active draw list so no second visibility/PVS traversal is required.
     post_ocean_transparent_scratch: Vec<usize>,
-    inline_pose_scratch: Vec<Option<InlineModelInstance>>,
+    inline_pose_scratch: Vec<Vec<InlineModelInstance>>,
     inline_draw_scratch: InlineDrawScratch,
     gpu_driven_enabled: bool,
     hiz_occlusion_enabled: bool,
@@ -874,8 +933,12 @@ struct Renderer {
     ssr_visibility_pipeline: Option<wgpu::RenderPipeline>,
     ssr_visibility_bind_group: Option<wgpu::BindGroup>,
     bloom_layout: wgpu::BindGroupLayout,
-    bloom_extract_pipeline: wgpu::RenderPipeline,
-    bloom_downsample_pipeline: wgpu::RenderPipeline,
+    bloom_pipeline_layout: wgpu::PipelineLayout,
+    bloom_extract_modern_pipeline: Option<wgpu::RenderPipeline>,
+    bloom_extract_authored_pipeline: Option<wgpu::RenderPipeline>,
+    bloom_extract_authored_halation_pipeline: Option<wgpu::RenderPipeline>,
+    bloom_extract_combined_pipeline: Option<wgpu::RenderPipeline>,
+    bloom_downsample_pipeline: Option<wgpu::RenderPipeline>,
     bloom_bind_groups: Option<[wgpu::BindGroup; 3]>,
     dof_layout: wgpu::BindGroupLayout,
     dof_pipeline: wgpu::RenderPipeline,

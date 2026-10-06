@@ -516,7 +516,7 @@ impl Renderer {
         rain.enabled
             || rain.surface_wetness > 0.001
             || rain.puddle_amount > 0.001
-            || rain.puddle_debug_visualization
+            || rain.puddle_debug_mode != 0
     }
 
     /// Keeps the active world variant in step with the flags whose source can change
@@ -695,15 +695,23 @@ impl Renderer {
         println!("Planar reflection debug: {}", mode.label());
     }
 
-    pub(in crate::renderer) fn set_puddle_debug(&mut self, enabled: bool) {
-        if self.weather.rain.puddle_debug_visualization == enabled {
+    pub(in crate::renderer) fn set_puddle_debug(&mut self, mode: u32) {
+        if self.weather.rain.puddle_debug_mode == mode {
             return;
         }
-        self.weather.rain.puddle_debug_visualization = enabled;
+        self.weather.rain.puddle_debug_mode = mode;
         self.update_weather_surface_uniform();
         self.history_valid = false;
         self.ssr_history_valid = false;
         self.rebuild_frame_plan();
+    }
+
+    /// Live tuning for the puddle coat's probe-to-skybox handover. Uniform-only:
+    /// no pipeline or history depends on it.
+    pub(in crate::renderer) fn set_puddle_sky_blend(&mut self, window: f32, ceiling: f32) {
+        self.weather.rain.sky_blend_window = window;
+        self.weather.rain.sky_blend_ceiling = ceiling;
+        self.update_weather_surface_uniform();
     }
 
     pub(in crate::renderer) fn set_entity_markers(

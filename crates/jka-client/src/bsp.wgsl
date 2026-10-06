@@ -22,6 +22,10 @@ struct Material {
     wave_rgb: vec4<f32>,
     wave_alpha: vec4<f32>,
     wave_funcs: vec4<u32>,
+    ocean_color: vec4<f32>, // linear authored texture tint, opacity; negative alpha = default
+    ocean_material: vec4<f32>, // xyz reflectance, w roughness; negative = default
+    ocean_waves: vec4<f32>, // xy reserved/amplitude hint, z/w authored blend factors
+    ocean_blend_color: vec4<f32>, // analyzed mean color/brightness; never a texture lookup
 };
 struct PlanarReflectionSettings {
     planes: array<vec4<f32>, 4>,
@@ -302,7 +306,7 @@ fn wave_value(func: u32, p: vec4<f32>, time: f32) -> f32 {
 
 fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
-    let time = camera.camera_pos_time.w;
+    let time = (camera.camera_pos_time.w - material.params.w);
     if ((material.header.z & 134217728u) != 0u) {
         let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
         out = vec4<f32>(vec3<f32>(g), out.a);
@@ -322,7 +326,7 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
 // using UV there aliases badly on any surface that tiles many times.
 fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = base_uv;
-    let time = camera.camera_pos_time.w;
+    let time = (camera.camera_pos_time.w - material.params.w);
     for (var i = 0u; i < 4u; i = i + 1u) {
         if (i >= material.header.y) {
             break;
@@ -484,6 +488,8 @@ fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool) -> vec4<f32> {
     let phase = dot(world_m, ocean.swell.xy) * ocean.swell.z - ocean.swell_motion.x * ocean.swell_motion.w;
     let horizontal = ocean.swell.w * ocean.swell_motion.y * cos(phase);
     displacement_m += vec3<f32>(ocean.swell.x * horizontal, ocean.swell.w * sin(phase), ocean.swell.y * horizontal);
+    // The selected pool's render uniform carries its effective amplitude;
+    // no material multiplier attenuates the wave controls a second time.
     return vec4<f32>(displacement_m * distance_factor, displacement_m.y);
 }
 
@@ -648,7 +654,10 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     let ocean_displacement_m = ocean_sample.xyz;
     let world_position = deformation.xyz + ocean_displacement_m * max(ocean.ocean_info.z, 0.001);
     output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
-    output.uv = generated_uv(input);
+    output.uv = vec2<f32>(0.0);
+    if (!ocean_vertex) {
+        output.uv = generated_uv(input);
+    }
     output.lightmap_uv = input.lightmap_uv;
     output.color = input.color;
     output.sky_dir_ao = vec4<f32>(world_position - camera.camera_pos_time.xyz, input.static_ao);
@@ -1514,7 +1523,7 @@ fn default_pbr_surface(input: VertexOut, albedo: vec3<f32>, weather: WeatherSurf
     result.n = geometric;
     result.specular_n = weather_reflection_normal(geometric, weather);
     result.v = normalize(camera.camera_pos_time.xyz - input.world_position);
-    result.roughness = weather_wet_roughness(0.65, weather.wetness, weather.puddle);
+    result.roughness = weather_wet_roughness(0.65, weather);
     result.metallic = 0.0;
     result.ao = 1.0;
     result.f0 = vec3<f32>(0.04);
@@ -1532,7 +1541,7 @@ fn evaluate_pbr_surface(
     result.n = cotangent_normal(input, uv, shared_frame);
     result.specular_n = weather_reflection_normal(result.n, weather);
     let pbr = sample_pbr_material(uv);
-    result.roughness = weather_wet_roughness(pbr.roughness, weather.wetness, weather.puddle);
+    result.roughness = weather_wet_roughness(pbr.roughness, weather);
     result.metallic = pbr.metallic;
     result.ao = pbr.ao;
     result.f0 = mix(pbr.dielectric_f0, albedo, pbr.metallic) * pbr.specular_scale;
@@ -2474,6 +2483,29 @@ fn ocean_indirect_lighting(input: VertexOut, n: vec3<f32>, albedo: vec3<f32>) ->
     return indirect;
 }
 
+// Reproduce the authored blend against the captured scene. Transparency may
+// live in RGB (screen/additive/modulate), independent of texture/alphaGen alpha.
+fn ocean_authored_blend_factor(id: u32, src: vec4<f32>, dst: vec4<f32>) -> vec3<f32> {
+    switch id {
+        case 0u: { return vec3<f32>(0.0); }
+        case 1u: { return vec3<f32>(1.0); }
+        case 2u: { return src.rgb; }
+        case 3u: { return vec3<f32>(1.0)-src.rgb; }
+        case 4u: { return vec3<f32>(src.a); }
+        case 5u: { return vec3<f32>(1.0-src.a); }
+        case 6u: { return dst.rgb; }
+        case 7u: { return vec3<f32>(1.0)-dst.rgb; }
+        case 8u: { return vec3<f32>(dst.a); }
+        case 9u: { return vec3<f32>(1.0-dst.a); }
+        default: { return vec3<f32>(min(src.a,1.0-dst.a)); }
+    }
+}
+
+fn ocean_authored_blend(src: vec4<f32>, dst: vec4<f32>, factors: vec2<u32>) -> vec3<f32> {
+    return src.rgb * ocean_authored_blend_factor(factors.x,src,dst)
+        + dst.rgb * ocean_authored_blend_factor(factors.y,src,dst);
+}
+
 fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     let units_per_meter = max(ocean.ocean_info.z, 0.001);
     let world_m = input.ocean_uv_m;
@@ -2495,6 +2527,11 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
 
     let phase = dot(world_m, ocean.swell.xy) * ocean.swell.z - ocean.swell_motion.x * ocean.swell_motion.w;
     gradient_foam = vec3<f32>(gradient_foam.xy + ocean.swell.xy * ocean.swell.w * ocean.swell.z * cos(phase), gradient_foam.z);
+    let wave_activity = select(1.0, ocean.spray_planes[0].y, ocean.authored_plane.w > 0.5);
+    // Match the wave normals to the displaced geometry, and avoid ocean-sized
+    // whitecaps on an almost-flat promoted pool.
+    let foam_gain = select(1.0, ocean.spray_planes[0].w, ocean.authored_plane.w > 0.5);
+    gradient_foam = vec3<f32>(gradient_foam.xy, gradient_foam.z * wave_activity * foam_gain);
     let breaker_foam = smoothstep(0.0, 1.0, gradient_foam.z*0.75) * exp(-dist*0.0075);
     var windrow_foam = 0.0;
     if (ocean.surface.w > 0.5) {
@@ -2520,15 +2557,22 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         // sub-texel structure before it reaches the horizon.
         windrow_foam = smoothstep(0.08, 0.72, transported) * exp(-dist*0.0022);
     }
+    windrow_foam *= wave_activity * foam_gain;
     let foam_factor = 1.0 - (1.0-breaker_foam) * (1.0-windrow_foam);
     let normal_fade = mix(0.015, ocean.surface.y, exp(-dist*0.0175));
     var n = normalize(vec3<f32>(-gradient_foam.x*normal_fade, 1.0, -gradient_foam.y*normal_fade));
     let view_dir = normalize(camera.camera_pos_time.xyz - input.world_position);
     n = select(n, -n, below);
     let dot_nv = max(dot(n, view_dir), 2e-5);
-    let roughness = clamp(ocean.surface.x, 0.001, 1.0);
+    let authored_water = material.ocean_color.a >= 0.0;
+    let roughness = clamp(select(ocean.surface.x, material.ocean_material.w,
+        authored_water && material.ocean_material.w >= 0.0 && ocean.authored_plane.z < 0.5), 0.001, 1.0);
     // Shared with wet ground and puddles (weather_surface.wgsl): one water Fresnel.
     var fresnel = water_fresnel(dot_nv, roughness);
+    if (authored_water && material.ocean_material.x >= 0.0) {
+        let f0 = clamp(dot(material.ocean_material.rgb, vec3<f32>(1.0/3.0)), 0.0, 1.0);
+        fresnel = f0 + (1.0-f0)*pow(1.0-dot_nv, 5.0);
+    }
     // Water -> air: total internal reflection outside Snell's window.
     if (below && 1.333 * 1.333 * (1.0 - dot_nv * dot_nv) > 1.0) { fresnel = 1.0; }
 
@@ -2565,7 +2609,22 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     let direct_diffuse = mix(water_diffuse, ocean.foam_color.rgb, foam_factor)
         * (1.0 - fresnel) * attenuation * sun_radiance;
 
-    let albedo = mix(ocean.water_color.rgb, ocean.foam_color.rgb, foam_factor);
+    // Keep the global water color control as a tint relative to its
+    // default, while the authored texture supplies each pool's base color.
+    let default_water_color = vec3<f32>(0.010022826, 0.01960665, 0.02721178);
+    var body_color = select(ocean.water_color.rgb,
+        material.ocean_color.rgb * ocean.water_color.rgb / default_water_color,
+        authored_water && ocean.authored_plane.w < 0.5);
+    var body_opacity = select(0.0, material.ocean_color.a, authored_water);
+    // Generators remain live; clipmap vertex colors contain mesh metadata,
+    // so their authored averages were resolved at upload instead.
+    if (authored_water && (material.header.z & 134217728u) != 0u) {
+        body_color *= clamp(wave_value(material.wave_funcs.x, material.wave_rgb, (camera.camera_pos_time.w - material.params.w)), 0.0, 1.0);
+    }
+    if (authored_water && (material.header.z & 268435456u) != 0u) {
+        body_opacity *= clamp(wave_value(material.wave_funcs.y, material.wave_alpha, (camera.camera_pos_time.w - material.params.w)), 0.0, 1.0);
+    }
+    let albedo = mix(body_color, ocean.foam_color.rgb, foam_factor);
     let environment = ocean_environment(input, n, view_dir, ibl_roughness);
     let indirect = ocean_indirect_lighting(input, n, albedo);
     let local_lights = ocean_dynamic_lighting(input, n, view_dir, albedo, roughness);
@@ -2585,7 +2644,20 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     // The snapshot already contains water-path absorption. Do not charge it twice.
     let transmission = textureSampleLevel(ocean_scene, ocean_scene_sampler, refracted_uv, 0.0).rgb;
     let surface_light = indirect + albedo * direct_diffuse + local_lights;
-    var color = transmission * (1.0-fresnel) * (1.0-foam_factor)
+    // alphaGen/texture alpha controls how much lit water replaces the
+    // transmitted scene. Fresnel and foam still use the FFT ocean response.
+    var body_transmission = mix(transmission, surface_light, clamp(body_opacity, 0.0, 1.0));
+    let authored_blend = authored_water && material.ocean_waves.z > 0.0;
+    let factors = vec2<u32>(u32(max(material.ocean_waves.z-1.0,0.0)),u32(material.ocean_waves.w));
+    var stage = vec4<f32>(0.0);
+    if (authored_blend) {
+        // Use only the CPU-analyzed mean. The original image and its tcMods
+        // never appear on the promoted surface; FFT supplies all wave detail.
+        let tint = body_color / max(material.ocean_color.rgb,vec3<f32>(0.0001));
+        stage = vec4<f32>(material.ocean_blend_color.rgb*tint,body_opacity);
+        body_transmission = ocean_authored_blend(stage,vec4<f32>(transmission,1.0),factors);
+    }
+    var color = body_transmission * (1.0-fresnel) * (1.0-foam_factor)
         + surface_light * foam_factor + specular + environment * fresnel;
     if (below) {
         // Reflected/surface light travels from the interface to the eye through water.
@@ -2593,7 +2665,11 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         let t = exp2(-4.321928 * ratios * length(input.world_position-camera.camera_pos_time.xyz) / max(ocean_optics.fog.w, 1.0));
         let depth = max(input.world_position.y-camera.camera_pos_time.y, 0.0);
         let ambient = ocean_optics.fog.rgb * exp2(-4.321928 * ratios * depth / max(ocean_optics.params.x, 1.0));
-        color = transmission * (1.0-fresnel) * (1.0-foam_factor)
+        var below_body = mix(transmission, surface_light * t + ambient * (1.0-t), clamp(body_opacity, 0.0, 1.0));
+        if (authored_blend) {
+            below_body = ocean_authored_blend(vec4<f32>(stage.rgb*t,stage.a),vec4<f32>(transmission,1.0),factors);
+        }
+        color = below_body * (1.0-fresnel) * (1.0-foam_factor)
             + (surface_light * foam_factor + specular + environment * fresnel) * t
             + ambient * (1.0-t) * (fresnel + (1.0-fresnel)*foam_factor);
     }
@@ -2839,12 +2915,10 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     let weather = weather_surface_response(input);
     let wetness = weather.wetness;
     let puddle = weather.puddle;
-    if (ENABLE_WEATHER_SURFACE && weather_surface.puddle.w > 0.5) {
-        let film_only = clamp(wetness - puddle * 0.65, 0.0, 1.0);
-        let dry = vec3<f32>(0.05, 0.05, 0.05);
-        let wet_film = vec3<f32>(0.12, 0.48, 0.14);
-        let puddle_debug = vec3<f32>(0.05, 0.72, 1.0);
-        return vec4<f32>(mix(mix(dry, wet_film, film_only), puddle_debug, puddle), 1.0);
+    // `puddle_debug <mode>`; see weather_surface_debug for what each mode paints.
+    let weather_debug_mode = u32(max(weather_surface.puddle.w, 0.0) + 0.5);
+    if (ENABLE_WEATHER_SURFACE && weather_debug_mode != 0u) {
+        return vec4<f32>(weather_surface_debug(input, weather, weather_debug_mode), 1.0);
     }
     if (ENABLE_WEATHER_SURFACE && wetness > 0.001) {
         base = vec4<f32>(weather_wet_albedo(base.rgb, weather) * weather_ripple_relief(weather) * weather_water_depth_tint(weather), base.a);

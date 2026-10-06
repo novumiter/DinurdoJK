@@ -14,6 +14,9 @@ pub use source_map::prepare::{prepare_map_asset, prepare_map_file};
 pub use vegetation::SurfaceSpriteEffectTriangle;
 mod cache;
 mod collision;
+mod sub_bsp;
+mod inline_instances;
+pub(crate) use sub_bsp::{prepare_source_with_sub_bsps, server_bsp_names, sub_bsp_configstring_command};
 mod coordinates;
 mod entities;
 mod environment;
@@ -23,11 +26,15 @@ mod lightmaps;
 mod material_batches;
 mod prepare;
 mod reflections;
+mod shader_remap;
 mod source;
 mod source_map;
 mod vegetation;
 mod visibility;
 pub(crate) use cache::FoldHasher;
+pub(crate) use shader_remap::{
+    apply_shader_remaps, apply_shader_remaps_in_place, canonical_shader_name, ShaderRemapState,
+};
 use cache::{map_content_hash, static_bsp_ao_cache_info, StageFingerprint};
 pub use cache::{PrepStageKeys, StaticBspAoCacheInfo};
 use collision::bsp_physics_collision_mesh;
@@ -249,6 +256,13 @@ pub struct DrawBatch {
     pub alpha_gen: AlphaGen,
     pub color: [f32; 4],
     pub alpha_cutoff: f32,
+    /// OpenJK/TaystJK shader remap animation origin. Renderer shader time is
+    /// `refdef.floatTime - timeOffset`; zero is the normal authored timeline.
+    /// This is resolved on the cold remap path, so normal draw submission has
+    /// no shader-name lookup or remap branch.
+    pub shader_time_offset: f32,
+    /// Exact JKA shader-stage `glow` marker.
+    pub authored_glow: bool,
     /// Map-authored fog color and distance-to-opaque for the surface.
     pub fog: [f32; 4],
     /// This surface explicitly references the BSP global-fog record.
@@ -266,6 +280,9 @@ pub struct DrawBatch {
     pub planar_reflection: bool,
     /// Authored `surfaceparm water`; eligible for FFT-ocean promotion.
     pub water: bool,
+    /// Amplitude hint for ordinary water promotion, in map units.
+    pub water_amplitude: f32,
+    pub water_deformed: bool,
     /// q3map2 lighting-only transparency metadata retained for future fidelity
     /// work; runtime sun visibility does not consume these authored compile flags yet.
     #[allow(dead_code)]
@@ -1249,6 +1266,15 @@ pub struct LegacyDlightSurface {
 
 #[derive(Clone)]
 pub struct PreparedMap {
+    /// Parsed renderer shader table retained on the CPU so runtime
+    /// R_RemapShader-style redirects can resolve a replacement material
+    /// without reparsing every .shader/.mtr file or taxing the render loop.
+    pub shader_library: Arc<BTreeMap<String, Shader>>,
+    /// Definition provenance paired with `shader_library`; needed by the
+    /// existing material resolver for package-scoped PBR overrides.
+    pub shader_origins: Arc<BTreeMap<String, materials::ShaderDefinitionOrigin>>,
+    /// Server CS_BSP_MODELS assets, in the order used for collision/render handles.
+    pub sub_bsp_names: Vec<String>,
     pub authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
     pub movement: Option<jka_movement::PmoveContext>,
     pub collision: Option<jka_movement::CollisionWorld>,

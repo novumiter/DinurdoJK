@@ -2,7 +2,7 @@
 use crate::renderer::{
     create_rt_receiver_bind_group, create_shadow_receiver_bind_group,
     create_world_froxel_bind_group, scene, weather, Camera, DynamicModelSurface,
-    DynamicShadowsMode, DynamicWireframeClass, Renderer, Vec3, NO_WATER_SURFACE,
+    DynamicShadowsMode, DynamicWireframeClass, EntityWeather, Renderer, Vec3, NO_WATER_SURFACE,
 };
 
 impl Renderer {
@@ -44,6 +44,37 @@ impl Renderer {
         self.weather
             .rain
             .advance_surface_wetness(frame_time, camera_position.to_array())
+    }
+
+    /// Wet weather on players, props and the view model (model_weather.wgsl).
+    /// Unlike the world surfaces this is pushed every frame rather than only
+    /// while the weather uniform is being advanced: the setter compares before it
+    /// uploads, so a dry map pays one struct comparison, and a frame where the
+    /// rain has just stopped still gets its last update instead of leaving models
+    /// permanently wet.
+    pub(in crate::renderer) fn update_entity_weather(&mut self) {
+        let wetness = self.weather.rain.entity_wetness();
+        let weather = if wetness <= weather::RAIN_WETNESS_EPSILON {
+            EntityWeather::default()
+        } else {
+            let sun = self.active_sun();
+            EntityWeather {
+                sun_direction: [
+                    sun.direction[0],
+                    sun.direction[1],
+                    sun.direction[2],
+                    (sun.intensity / 250.0).clamp(0.0, 4.0),
+                ],
+                sun_radiance: [
+                    sun.color[0].max(0.0),
+                    sun.color[1].max(0.0),
+                    sun.color[2].max(0.0),
+                    wetness,
+                ],
+            }
+        };
+        self.dynamic_model_renderer
+            .set_entity_weather(&self.queue, weather);
     }
 
     pub(in crate::renderer) fn update_weather_surface_uniform(&self) {
@@ -210,6 +241,19 @@ impl Renderer {
                 &[]
             },
             self.ocean_enabled && self.camera_water_surface > NO_WATER_SURFACE,
+        );
+        // Toadstorm's original shader fades rivulets off horizontal glass with
+        // abs(dot(worldNormal, worldUp)). For a camera lens the glass normal is
+        // the view direction; renderer space is already Y-up.
+        self.weather.rain.prepare_lens_glass(
+            &mut self.pipeline_jobs,
+            &self.device,
+            &self.queue,
+            self.config.width,
+            self.config.height,
+            self.config.format,
+            frame_time,
+            camera.forward().y,
         );
     }
 }

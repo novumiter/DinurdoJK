@@ -138,28 +138,6 @@ impl App {
             );
         }
 
-        // HDR is a framebuffer format decision, not a post effect: it decides
-        // the precision everything downstream (bloom, tone mapping) works in.
-        self.egui_toggle_row(
-            ui,
-            "HDR rendering",
-            "Renders into a floating-point buffer so highlights can exceed white \
-             instead of clipping. Costs bandwidth, and is what gives bloom and \
-             tone mapping something to work with.",
-            ui::VIDEO_ROW_HDR,
-            self.video.hdr,
-        );
-        ui.add_enabled_ui(self.video.hdr, |ui| {
-        self.egui_toggle_row(
-            ui,
-            "Float lightmaps",
-            "Rend2-compatible HDR baked lighting. While HDR rendering is enabled, \
-             load maps/<map>/lm_XXXX.hdr companions into FP16 when they exist; \
-             ordinary JKA lightmaps are promoted to FP16 as the fallback. While a map is loaded, Apply Video Settings reloads it with the new setting.",
-            ui::VIDEO_ROW_FLOAT_LIGHTMAP,
-            self.video.float_lightmap,
-        );
-        });
     }
 
     pub(in crate::app::egui_settings) fn egui_visibility(&mut self, ui: &mut egui::Ui) {

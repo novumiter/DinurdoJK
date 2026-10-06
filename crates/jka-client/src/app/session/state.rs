@@ -29,16 +29,8 @@ impl GameSession {
     }
 
     /// jaPRO `DF_RaceTimer`: refresh this frame's race readout.
-    pub(in crate::app) fn update_race_timer(
-        &mut self,
-        now: i32,
-        predicted: Option<&jka_protocol::server::PlayerState>,
-    ) {
-        let ps = predicted.or_else(|| {
-            self.current_snapshot
-                .as_ref()
-                .map(|snapshot| &snapshot.player_state)
-        });
+    pub(in crate::app) fn update_race_timer(&mut self, now: i32) {
+        let ps = self.presented_player_state.as_ref();
         let ui = ps.and_then(|ps| {
             let racemode =
                 self.client_game.is_japro() && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0;
@@ -128,6 +120,8 @@ impl GameSession {
             next_snapshot: None,
             first_server_time: None,
             timeline: None,
+            cgame_time: 0,
+            japro_do: None,
             eof: false,
             seeking_demo: false,
             suppress_audio: false,
@@ -135,6 +129,7 @@ impl GameSession {
             demo_spectator_camera_mode: None,
             client_deaths: [0; 32],
             player_position: None,
+            presented_player_state: None,
             client_game: ClientGameState::new(),
             siege_classes,
             presented_entities: Vec::new(),

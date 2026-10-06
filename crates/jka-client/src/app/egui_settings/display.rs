@@ -40,7 +40,10 @@ impl App {
                 "REFLECTIONS",
                 "Environment probes, screen-space reflections and dynamically budgeted planar views.",
             ),
-            VideoSection::Color => ("COLOR", "Film looks, shadow and highlight tints, and brightness."),
+            VideoSection::Color => (
+                "COLOR & HDR",
+                "HDR precision, grading, split toning and output brightness.",
+            ),
             VideoSection::PostProcessing => (
                 "POST PROCESSING",
                 "Lens effects, blur and film texture.",

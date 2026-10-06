@@ -41,7 +41,6 @@ impl App {
                     .to_vec()
             })
             .unwrap_or_default();
-        self.refresh_japro_userinfo_state();
         let info = self
             .network
             .userinfo_for_server(&self.solo_client_info.model_cvar(), &server_info);
@@ -188,165 +187,54 @@ impl App {
 
     /// Engine and cgame commands that only exist for a live connection.
     /// Returns true when the line was consumed.
-    pub(in crate::app) fn execute_network_command(&mut self, line: &str) -> bool {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let Some(&verb) = words.first() else {
-            return false;
-        };
-        let verb_lower = verb.to_ascii_lowercase();
-        match verb_lower.as_str() {
-            "connect" => {
-                match words.get(1) {
-                    Some(target) if words.len() == 2 => self.connect_to_server(target),
-                    _ => self.push_console_line("^3usage:^7 connect [server]"),
-                }
-                return true;
-            }
-            "reconnect" => {
-                if let Some(target) = self.reconnect_target.clone() {
-                    self.connect_to_server(&target);
-                }
-                return true;
-            }
-            "cmd" => {
-                // CL_ForwardToServer_f: requires CA_ACTIVE; argv(0) is not sent.
-                let active = self.net.as_ref().is_some_and(|net| {
-                    net.state() == jka_protocol::session::ConnectionState::Active
-                });
-                if !active {
-                    self.push_console_line("Not connected to a server.");
-                } else if let Some(rest) = line
-                    .split_once(char::is_whitespace)
-                    .map(|(_, rest)| rest.trim())
-                {
-                    if !rest.is_empty() {
-                        if let Some(net) = self.net.as_mut() {
-                            let _ = net
-                                .session_mut()
-                                .add_reliable_command(rest.as_bytes(), false);
-                        }
+    pub(in crate::app) fn execute_game_command(&mut self, line: &str) -> bool {
+        use crate::app::GameCommand;
+        let words: Vec<_> = line.split_whitespace().collect();
+        let Some(&verb) = words.first() else { return false; };
+        let local_active = self.game_session.as_ref().is_some_and(|session| session.live && session.local);
+        if !self.live_connected() && !local_active { return false; }
+        let action = crate::app::command_registry().find(verb).and_then(|def| def.game_command);
+        match action {
+            Some(GameCommand::AmRun) => {
+                if self.active_server_mod() == crate::net::mod_support::ServerMod::Japro {
+                    let bits = crate::japro_cg::toggle_run_animation(self.network.plugin_disable);
+                    if let Err(error) = self.set_console_cvar("cp_pluginDisable", &bits.to_string()) {
+                        self.push_console_line(format!("^1amrun:^7 {error}"));
                     }
                 }
                 return true;
             }
-            "userinfo" => {
-                let info = self.network.userinfo(&self.solo_client_info.model_cvar());
-                self.push_console_line(format!("^3userinfo:^7 {}", String::from_utf8_lossy(&info)));
-                return true;
-            }
-            "serverdump" => {
-                self.server_dump();
-                return true;
-            }
-            "serverinfo" | "systeminfo" if self.live_connected() => {
-                let index = if verb_lower == "serverinfo" { 0 } else { 1 };
-                let text = self
-                    .net
-                    .as_ref()
-                    .and_then(|net| net.session().decoder().configstrings.get(&index).cloned())
-                    .unwrap_or_default();
-                // Keep empty values (`\fs_game\\`), or every later pair shifts by a field.
-                let fields: Vec<&[u8]> = text
-                    .split(|&b| b == b'\\')
-                    .skip(usize::from(text.first() == Some(&b'\\')))
-                    .collect();
-                for pair in fields.chunks(2).filter(|pair| !pair[0].is_empty()) {
-                    let key = String::from_utf8_lossy(pair[0]);
-                    let value = pair
-                        .get(1)
-                        .map(|v| String::from_utf8_lossy(v).into_owned())
-                        .unwrap_or_default();
-                    self.push_console_line(format!("{key:<24} {value}"));
-                }
-                return true;
-            }
-            _ => {}
-        }
-        // Commands such as saberAttackCycle/weapnext are CL_CreateCmd inputs,
-        // not reliable server strings.  The local-server shim must accept the
-        // same client-side commands even though there is deliberately no netchan.
-        let local_active = self
-            .game_session
-            .as_ref()
-            .is_some_and(|session| session.live && session.local);
-        if !self.live_connected() && !local_active {
-            return false;
-        }
-        // TaystJK CG_AmRun_f is a local CGame command: on jaPRO it XORs
-        // JAPRO_PLUGIN_JAWARUN in cp_pluginDisable after masking to the
-        // supported plugin-disable range. It is never forwarded to the server.
-        if verb_lower == "amrun" {
-            if self.active_server_mod() == crate::net::mod_support::ServerMod::Japro {
-                let bits = crate::japro_cg::toggle_run_animation(self.network.plugin_disable);
-                if let Err(error) = self.set_console_cvar("cp_pluginDisable", &bits.to_string()) {
-                    self.push_console_line(format!("^1amrun:^7 {error}"));
-                }
-            }
-            return true;
-        }
-
-        // TaystJK registers flipkick as a local CGame command. It arms the
-        // CG_DoAsync jump-tap sequence and is never forwarded to the server.
-        if verb_lower == "flipkick" {
-            self.start_japro_flipkick();
-            return true;
-        }
-
-        // cgame commands that only change the next usercmd. Remote servers own
-        // the whole generic-command table. The lightweight local authority
-        // advertises only the game-side cases it actually implements so older
-        // local handlers (currently force_speed/force_rage) still fall through.
-        if let Some(value) = crate::net::generic_command(&verb_lower) {
-            let local_supported = local_active
-                && self
-                    .local_server
-                    .as_ref()
+            Some(GameCommand::Flipkick) => { self.start_japro_flipkick(); return true; }
+            Some(GameCommand::Generic(value)) => {
+                let local_supported = local_active && self.local_server.as_ref()
                     .is_some_and(|server| server.supports_generic_command(value));
-            if self.live_connected() || local_supported {
-                self.live_input.queue_generic_command(value);
-                return true;
-            }
-        }
-        if matches!(
-            verb_lower.as_str(),
-            "weapnext" | "weapprev" | "weapon" | "forcenext" | "forceprev"
-        ) {
-            if let Some(ps) = self.live_player_state().cloned() {
-                match verb_lower.as_str() {
-                    "weapnext" => self.live_input.cycle_weapon(&ps, true),
-                    "weapprev" => self.live_input.cycle_weapon(&ps, false),
-                    "forcenext" => {
-                        self.live_input.cycle_force(&ps, true);
-                        self.force_select_until =
-                            Some(Instant::now() + Duration::from_millis(1400));
-                        self.publish_transient_ui();
-                    }
-                    "forceprev" => {
-                        self.live_input.cycle_force(&ps, false);
-                        self.force_select_until =
-                            Some(Instant::now() + Duration::from_millis(1400));
-                        self.publish_transient_ui();
-                    }
-                    _ => {
-                        if let Some(slot) = words.get(1) {
-                            self.live_input.select_weapon_slot(&ps, slot);
-                        }
-                    }
+                if self.live_connected() || local_supported {
+                    self.live_input.queue_generic_command(value); return true;
                 }
             }
-            return true;
+            Some(action @ (GameCommand::WeaponNext | GameCommand::WeaponPrev |
+                GameCommand::ForceNext | GameCommand::ForcePrev | GameCommand::Weapon)) => {
+                if let Some(ps) = self.live_player_state().cloned() {
+                    match action {
+                        GameCommand::WeaponNext => self.live_input.cycle_weapon(&ps, true),
+                        GameCommand::WeaponPrev => self.live_input.cycle_weapon(&ps, false),
+                        GameCommand::ForceNext | GameCommand::ForcePrev => {
+                            self.live_input.cycle_force(&ps, matches!(action, GameCommand::ForceNext));
+                            self.force_select_until = Some(Instant::now() + Duration::from_millis(1400));
+                            self.publish_transient_ui();
+                        }
+                        GameCommand::Weapon => if let Some(slot) = words.get(1) { self.live_input.select_weapon_slot(&ps, slot); },
+                        _ => unreachable!(),
+                    }
+                }
+                return true;
+            }
+            None => {}
         }
-        // Registered game/server commands are reliable strings only for a real
-        // remote connection.  A local-server session deliberately has no
-        // netchan, so consuming them here would prevent the local command
-        // dispatcher below from handling commands such as noclip/force_speed.
-        //
-        // Keep local CL_CreateCmd commands (generic_cmd/weapon selection) above,
-        // but let all other local commands fall through to the lightweight
-        // authority's explicit handlers instead of feeding CL_ForwardCommandToServer.
+        // Remote reliable commands retain priority over lightweight local
+        // authority handlers, which have no netchan and must still fall through.
         if self.live_connected() && crate::console::is_server_command(verb) {
-            self.forward_command_to_server(line);
-            return true;
+            self.forward_command_to_server(line); return true;
         }
         false
     }

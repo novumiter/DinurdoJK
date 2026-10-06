@@ -17,6 +17,7 @@ use wgpu::util::DeviceExt;
 const G: f32 = 9.81;
 pub mod authoring;
 pub mod optics;
+pub mod appearance;
 pub use authoring::{OceanAuthoring, OceanWind};
 pub const OCEAN_CASCADES: usize = 3;
 pub const OCEAN_DEFAULT_MAP_SIZE: u32 = 1024;
@@ -32,14 +33,19 @@ pub const OCEAN_HIGH_MESH_SPACING_UNITS: f32 = 0.25 * OCEAN_UNITS_PER_METER;
 pub const OCEAN_LOW_MESH_SPACING_UNITS: f32 = 1.0 * OCEAN_UNITS_PER_METER;
 const DEPTH_METERS: f32 = 20.0;
 
-/// Half-width of every clipmap level, in cells. Each level nests exactly inside
-/// the next because a level's hole is half its own cell count at twice the cell
-/// size, so `hole * spacing` always equals the finer level's full extent.
+/// Legacy half-width of every clipmap level, in cells. Authored oceans keep
+/// this exact Godot-style footprint. Automatically promoted water may use a
+/// smaller camera-centred ring width when its displacement amplitude is low.
 const CLIPMAP_HALF_CELLS: i32 = 128;
-/// Levels beyond the first double their cell size, so the covered radius is
-/// `HALF_CELLS * spacing * 2^(LEVELS-1)`. Six levels at the HIGH 10-unit inner
-/// cell reach +/-40960 units, which covers a full-size JKA map from anywhere.
+/// The original six-level design remains the authored-ocean profile and, more
+/// importantly, the CPU clipmap-centre snap cadence. Calm promoted water may
+/// add two cheaper outer rings so shrinking the inner LOD radii never shrinks
+/// the world-space coverage of the mesh.
 const CLIPMAP_LEVELS: u32 = 6;
+const PROMOTED_CLIPMAP_MAX_LEVELS: u32 = CLIPMAP_LEVELS + 2;
+const PROMOTED_CLIPMAP_MIN_HALF_CELLS: i32 = 32;
+const PROMOTED_CLIPMAP_CELL_QUANTUM: i32 = 8;
+const PROMOTED_CLIPMAP_FULL_DETAIL_AMPLITUDE: f32 = 64.0;
 
 /// One clipmap vertex, expressed in the world vertex format so the ocean can be
 /// drawn by the existing BSP pipeline instead of needing its own.
@@ -72,14 +78,37 @@ pub const OCEAN_CLIPMAP_VERTEX_MARKER: f32 = -1.0;
 /// outermost level therefore has to reach `extent + step / 2` from the centre:
 /// `HALF * step >= extent + step / 2`. Anything beyond that would be vertices
 /// folded onto the footprint edge as zero-area triangles.
-fn clipmap_levels_for(base_spacing: f32, extent: f32) -> u32 {
+fn clipmap_levels_for(base_spacing: f32, extent: f32, half_cells: i32, max_levels: u32) -> u32 {
     if !extent.is_finite() {
-        return CLIPMAP_LEVELS;
+        return max_levels;
     }
-    let reach = CLIPMAP_HALF_CELLS as f32 - 0.5;
-    (1..=CLIPMAP_LEVELS)
+    let reach = half_cells as f32 - 0.5;
+    (1..=max_levels)
         .find(|&levels| base_spacing * (1u32 << (levels - 1)) as f32 * reach >= extent)
-        .unwrap_or(CLIPMAP_LEVELS)
+        .unwrap_or(max_levels)
+}
+
+/// Camera-distance LOD radius for automatically promoted water.
+///
+/// Amplitude is the useful signal here: a five-unit ripple does not need the
+/// same 1280-unit radius of 10-unit triangles as a 64+-unit ocean swell. Keep
+/// the exact finest spacing beside the viewer, but make each 2:1 clipmap ring
+/// physically narrower for calm water. `sqrt` is deliberately conservative:
+/// medium seas recover detail radius faster than a linear rule would.
+pub fn promoted_clipmap_half_cells(amplitude: f32) -> i32 {
+    if !amplitude.is_finite() {
+        return CLIPMAP_HALF_CELLS;
+    }
+    let minimum_amplitude = appearance::MIN_PROMOTED_AMPLITUDE;
+    let t = ((amplitude.max(minimum_amplitude) - minimum_amplitude)
+        / (PROMOTED_CLIPMAP_FULL_DETAIL_AMPLITUDE - minimum_amplitude))
+        .clamp(0.0, 1.0)
+        .sqrt();
+    let cells = PROMOTED_CLIPMAP_MIN_HALF_CELLS as f32
+        + (CLIPMAP_HALF_CELLS - PROMOTED_CLIPMAP_MIN_HALF_CELLS) as f32 * t;
+    (((cells / PROMOTED_CLIPMAP_CELL_QUANTUM as f32).ceil() as i32)
+        * PROMOTED_CLIPMAP_CELL_QUANTUM)
+        .clamp(PROMOTED_CLIPMAP_MIN_HALF_CELLS, CLIPMAP_HALF_CELLS)
 }
 
 /// Builds the clipmap for one promoted water surface. Everything the vertex
@@ -104,24 +133,70 @@ pub fn build_clipmap(
     footprint_maximum: [f32; 2],
     mask_slot: Option<usize>,
 ) -> OceanClipmap {
+    build_clipmap_profile(
+        base_spacing,
+        plane_height,
+        footprint_minimum,
+        footprint_maximum,
+        mask_slot,
+        CLIPMAP_HALF_CELLS,
+        CLIPMAP_LEVELS,
+    )
+}
+
+/// Amplitude-aware clipmap used only for ordinary BSP water promoted into the
+/// FFT ocean. Authored oceans deliberately keep `build_clipmap`'s reference
+/// profile. A calm pool retains the same 0.25 m / 1 m innermost cell spacing,
+/// but its fine rings end much sooner; extra very-coarse rings preserve the old
+/// maximum world-space reach without paying for huge near-field grids.
+pub fn build_promoted_clipmap(
+    base_spacing: f32,
+    plane_height: f32,
+    footprint_minimum: [f32; 2],
+    footprint_maximum: [f32; 2],
+    mask_slot: Option<usize>,
+    amplitude: f32,
+) -> OceanClipmap {
+    build_clipmap_profile(
+        base_spacing,
+        plane_height,
+        footprint_minimum,
+        footprint_maximum,
+        mask_slot,
+        promoted_clipmap_half_cells(amplitude),
+        PROMOTED_CLIPMAP_MAX_LEVELS,
+    )
+}
+
+fn build_clipmap_profile(
+    base_spacing: f32,
+    plane_height: f32,
+    footprint_minimum: [f32; 2],
+    footprint_maximum: [f32; 2],
+    mask_slot: Option<usize>,
+    half_cells: i32,
+    max_levels: u32,
+) -> OceanClipmap {
+    debug_assert!(half_cells > 0 && half_cells % 2 == 0);
     let mask_slot = mask_slot.map_or(-1.0, |slot| slot as f32);
     let extent = (footprint_maximum[0] - footprint_minimum[0])
         .max(footprint_maximum[1] - footprint_minimum[1]);
-    let levels = clipmap_levels_for(base_spacing, extent);
+    let levels = clipmap_levels_for(base_spacing, extent, half_cells, max_levels);
     let snap_step = base_spacing * (1u32 << (levels - 1)) as f32;
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     for level in 0..levels {
         let spacing = base_spacing * (1u32 << level) as f32;
-        // Level 0 is solid; every outer level is an annulus whose hole is
-        // exactly the extent of the level it nests around.
-        let hole = if level == 0 { 0 } else { CLIPMAP_HALF_CELLS / 2 };
+        // Every outer level's hole is half its own cell radius. At twice the
+        // spacing that lands exactly on the previous level's outer boundary,
+        // even when calm-water LOD uses a narrower ring than the reference.
+        let hole = if level == 0 { 0 } else { half_cells / 2 };
         // Only a lone level has no neighbour whose hole it must match, so only
-        // it may shrink below the full width.
+        // it may shrink below the selected profile width.
         let half = if levels == 1 {
-            (((extent + spacing * 0.5) / spacing).ceil() as i32).clamp(1, CLIPMAP_HALF_CELLS)
+            (((extent + spacing * 0.5) / spacing).ceil() as i32).clamp(1, half_cells)
         } else {
-            CLIPMAP_HALF_CELLS
+            half_cells
         };
         let parent = if level + 1 < levels { spacing * 2.0 } else { 0.0 };
         let side = (half * 2 + 1) as usize;
@@ -164,9 +239,11 @@ pub fn build_clipmap(
     OceanClipmap {
         vertices,
         indices,
-        // The lattice the uniform's clipmap centre is snapped to. It stays the
-        // full-design value, not `snap_step`, so every surface of one quality
-        // shares one centre however many levels it actually built.
+        // Keep the CPU centre's update/snap cadence at the original design.
+        // Adaptive promoted meshes may have extra coarse outer rings, but using
+        // those for camera snapping would make the fine inner grid jump by
+        // thousands of units. The shader still re-snaps each surface to its
+        // actual outermost lattice through color.b.
         coarsest_spacing: base_spacing * (1u32 << (CLIPMAP_LEVELS - 1)) as f32,
     }
 }
@@ -223,6 +300,8 @@ pub struct WaterFace {
     /// Faces of different map-authored oceans never merge: each has its own
     /// wave settings.
     pub authored_ocean: Option<usize>,
+    /// Different shader appearances require separate replacement draws.
+    pub material: u32,
 }
 
 /// Contiguous water on one plane, promoted as a single ocean surface.
@@ -246,6 +325,7 @@ const WATER_TOUCH_UNITS: f32 = 1.0;
 
 fn faces_touch(a: &WaterFace, b: &WaterFace) -> bool {
     a.authored_ocean == b.authored_ocean
+        && a.material == b.material
         && (a.plane - b.plane).abs() < WATER_TOUCH_UNITS
         && a.minimum[0] <= b.maximum[0] + WATER_TOUCH_UNITS
         && b.minimum[0] <= a.maximum[0] + WATER_TOUCH_UNITS
@@ -476,14 +556,22 @@ pub struct OceanRenderUniform {
     pub sky_ambient: [f32; 4], // rgb linear map-sky average, w map has real skybox
     pub spray_info: [f32; 4],  // surface count, total particles, visible lifetime, lifetime randomness
     pub spray_bounds: [[f32; 4]; OCEAN_MAX_SURFACES], // min xz, max xz in world units
-    pub spray_planes: [[f32; 4]; OCEAN_MAX_SURFACES], // x plane height, remaining reserved
+    pub spray_planes: [[f32; 4]; OCEAN_MAX_SURFACES], // height, promoted activity, mask slot, foam gain
     pub swell: [f32; 4], // render XZ direction, wave number / metre, amplitude metres
     pub swell_motion: [f32; 4], // angular speed, primary chop, FFT chop, seconds
     pub wind_motion: [f32; 4], // render XZ wind m/s, spray multiplier, reserved
     pub authored_bounds: [f32;4],
-    pub authored_plane: [f32;4], // enabled, height, reserved
+    pub authored_plane: [f32;4], // bounds enabled, height, manual appearance, promoted view
     pub mask_ranges: [[f32; 4]; OCEAN_MAX_SURFACES], // first triangle, triangle count
     pub mask_triangles: [[f32; 4]; OCEAN_MASK_VEC4S], // per triangle: a.xy b.xy / c.xy
+}
+
+struct PromotedRenderSurface {
+    descriptor: appearance::PromotedOcean,
+    settings: OceanSettings,
+    manual: bool,
+    buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
 }
 
 pub struct OceanGpu {
@@ -521,6 +609,12 @@ pub struct OceanGpu {
     windrow_front: usize,
     render_buffer: wgpu::Buffer,
     pub render_bind_group: wgpu::BindGroup,
+    render_layout: wgpu::BindGroupLayout,
+    render_displacement_view: wgpu::TextureView,
+    render_normal_view: wgpu::TextureView,
+    render_sampler: wgpu::Sampler,
+    spray_view: wgpu::TextureView,
+    promoted_surfaces: Vec<PromotedRenderSurface>,
 }
 
 fn jonswap_alpha(wind_speed: f32, fetch_m: f32) -> f32 {
@@ -810,7 +904,9 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,remaining:0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group };
+        let mut ocean = Self { enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,remaining:0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+            render_displacement_view:displacement_view, render_normal_view:normal_view,
+            render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new() };
         ocean.upload_params(queue,0.0);
         let mut encoder=device.create_command_encoder(&wgpu::CommandEncoderDescriptor{label:Some("Ocean FFT init")});
         {
@@ -852,6 +948,104 @@ impl OceanGpu {
         uniform.mask_ranges = self.masks.ranges;
         uniform.mask_triangles[..self.masks.triangles.len()].copy_from_slice(&self.masks.triangles);
         queue.write_buffer(&self.render_buffer,0,bytemuck::bytes_of(&uniform));
+        for surface in &self.promoted_surfaces {
+            let local = make_promoted_render_uniform(&uniform, &surface.settings,
+                &surface.descriptor, surface.manual, self.promoted_surfaces.len());
+            queue.write_buffer(&surface.buffer,0,bytemuck::bytes_of(&local));
+        }
+    }
+
+    pub fn render_bind_group_for(&self, index: usize) -> &wgpu::BindGroup {
+        self.promoted_surfaces
+            .iter()
+            .find(|s| s.descriptor.index == index)
+            .map_or(&self.render_bind_group, |s| &s.bind_group)
+    }
+
+    pub fn set_promoted_surfaces(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        descriptors: &[appearance::PromotedOcean],
+        overrides: &[(usize, OceanSettings)],
+    ) {
+        let desired_settings = |p: &appearance::PromotedOcean| {
+            let local = overrides
+                .iter()
+                .find(|(index, _)| *index == p.index)
+                .map(|(_, s)| *s);
+            (
+                appearance::surface_settings(self.settings, p, local),
+                local.is_some(),
+            )
+        };
+        if self.promoted_surfaces.len() == descriptors.len()
+            && self
+                .promoted_surfaces
+                .iter()
+                .zip(descriptors)
+                .all(|(s, p)| {
+                    let (settings, manual) = desired_settings(p);
+                    s.descriptor == *p && s.settings == settings && s.manual == manual
+                })
+        {
+            return;
+        }
+        let mut previous = std::mem::take(&mut self.promoted_surfaces);
+        for descriptor in descriptors {
+            let (settings, manual) = desired_settings(descriptor);
+            let mut view = if let Some(i) = previous
+                .iter()
+                .position(|s| s.descriptor.index == descriptor.index)
+            {
+                previous.swap_remove(i)
+            } else {
+                let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Promoted ocean render parameters"),
+                    size: std::mem::size_of::<OceanRenderUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Promoted ocean shared FFT view"),
+                    layout: &self.render_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(
+                                &self.render_displacement_view,
+                            ),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&self.render_normal_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.render_sampler),
+                        },
+                        bg_buffer(3, &buffer),
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&self.spray_view),
+                        },
+                        bg_buffer(5, &self._windrow_field_buffer),
+                    ],
+                });
+                PromotedRenderSurface {
+                    descriptor: descriptor.clone(),
+                    settings,
+                    manual,
+                    buffer,
+                    bind_group,
+                }
+            };
+            view.descriptor = descriptor.clone();
+            view.settings = settings;
+            view.manual = manual;
+            self.promoted_surfaces.push(view);
+        }
+        self.write_render_uniform(queue);
     }
 
     /// Hands the ocean the outlines of the world's promoted surfaces. They are
@@ -984,7 +1178,7 @@ impl OceanGpu {
 
     /// Whether this ocean will draw sea spray, i.e. needs the shared spray pipeline.
     pub fn spray_active(&self) -> bool {
-        self.enabled && self.settings.sea_spray
+        self.enabled && (self.settings.sea_spray || self.promoted_surfaces.iter().any(|s| s.settings.sea_spray))
     }
 
     pub fn draw_spray<'a>(
@@ -993,7 +1187,7 @@ impl OceanGpu {
         camera_bind_group: &'a wgpu::BindGroup,
         spray_pipeline: Option<&'a wgpu::RenderPipeline>,
     ) {
-        if !self.enabled || !self.settings.sea_spray || self.surface_count == 0 {
+        if !self.spray_active() || self.surface_count == 0 {
             return;
         }
         let Some(spray_pipeline) = spray_pipeline else {
@@ -1001,10 +1195,19 @@ impl OceanGpu {
         };
         pass.set_pipeline(spray_pipeline);
         pass.set_bind_group(0, camera_bind_group, &[]);
-        pass.set_bind_group(1, &self.render_bind_group, &[]);
-        // Upstream uses one 32,768-particle GPUParticles3D emitter. Keep that
-        // total fixed and distribute particles across promoted water surfaces.
-        pass.draw(0..6, 0..32_768);
+        // Each promoted emitter binds the very same wave controls as its
+        // surface. Share the original particle budget and FFT textures.
+        if self.promoted_surfaces.is_empty() {
+            pass.set_bind_group(1, &self.render_bind_group, &[]);
+            pass.draw(0..6, 0..32_768);
+        } else {
+            let particles = 32768 / self.promoted_surfaces.len().max(1) as u32;
+            for surface in &self.promoted_surfaces {
+                if !surface.settings.sea_spray { continue; }
+                pass.set_bind_group(1, &surface.bind_group, &[]);
+                pass.draw(0..6, 0..particles);
+            }
+        }
     }
 
     pub fn encode_frame(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32) {
@@ -1054,7 +1257,7 @@ impl OceanGpu {
             self.encode_one(encoder,self.remaining);
         }
         self.elapsed=now+delta;
-        if self.settings.wind_foam_streaks {
+        if self.settings.wind_foam_streaks || self.promoted_surfaces.iter().any(|s| s.settings.wind_foam_streaks) {
             self.encode_windrow(queue, encoder, delta);
         }
         // Publish the layer produced above. Keeping the feature bit in the same
@@ -1177,6 +1380,47 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
     }
 }
 
+/// Use the same render view for the water and its spray emitter. Finest wind
+/// chop must follow local amplitude too, rather than retaining full ocean size.
+fn make_promoted_render_uniform(
+    shared: &OceanRenderUniform,
+    settings: &OceanSettings,
+    descriptor: &appearance::PromotedOcean,
+    manual: bool,
+    surface_count: usize,
+) -> OceanRenderUniform {
+    let mut local = make_render_uniform(shared.ocean_info[0] > 0.5, settings);
+    let amplitude_scale = settings.authored.amplitude / 128.0;
+    local.map_scales[2][2] *= amplitude_scale;
+    local.map_scales[2][3] *= amplitude_scale;
+    local.clipmap = shared.clipmap;
+    local.swell_motion[3] = shared.swell_motion[3];
+    local.sun_direction_intensity = shared.sun_direction_intensity;
+    local.sun_color = shared.sun_color;
+    local.sky_ambient = shared.sky_ambient;
+    local.wind_motion = [
+        shared.wind_motion[0],
+        shared.wind_motion[1],
+        settings.authored.spray,
+        0.0,
+    ];
+    // x/y are authored bounds; z marks a manual roughness override, w a promoted view.
+    local.authored_plane = [0.0, 0.0, if manual { 1.0 } else { 0.0 }, 1.0];
+    local.spray_info[0] = 1.0;
+    local.spray_info[1] = (32768 / surface_count.max(1)) as f32;
+    let s = descriptor.surface;
+    local.spray_bounds[0] = [s.minimum[0], s.minimum[1], s.maximum[0], s.maximum[1]];
+    local.spray_planes[0] = [
+        s.plane_height,
+        amplitude_scale.clamp(0.0, 1.0),
+        descriptor.index as f32,
+        settings.authored.foam,
+    ];
+    local.mask_ranges = shared.mask_ranges;
+    local.mask_triangles = shared.mask_triangles;
+    local
+}
+
 fn apply_scene_context(
     uniform: &mut OceanRenderUniform,
     environment: OceanEnvironment,
@@ -1201,6 +1445,31 @@ fn bg_buffer<'a>(binding:u32,buffer:&'a wgpu::Buffer)->wgpu::BindGroupEntry<'a> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn promoted_water_amplitude_controls_all_displacement_and_spray_views() {
+        let shared = OceanSettings::default();
+        let mut context = make_render_uniform(true,&shared);
+        context.swell_motion[3] = 37.0;
+        context.mask_ranges[3] = [2.0,1.0,0.0,0.0];
+        let pool = appearance::tests::pool(3,0.0);
+        let mut settings = pool.settings(shared);
+        let calm = make_promoted_render_uniform(&context,&settings,&pool,false,2);
+        assert!(calm.swell[3] > 0.0 && calm.map_scales[0][2] > 0.0);
+        settings.authored.amplitude *= 2.0;
+        let larger = make_promoted_render_uniform(&context,&settings,&pool,true,2);
+        assert_eq!(larger.swell[3],calm.swell[3]*2.0);
+        for i in 0..3 {
+            assert_eq!(larger.map_scales[i][2],calm.map_scales[i][2]*2.0,"cascade {i} height");
+            assert_eq!(larger.map_scales[i][3],calm.map_scales[i][3]*2.0,"cascade {i} normals");
+        }
+        assert_eq!(larger.spray_planes[0][1],calm.spray_planes[0][1]*2.0);
+        assert_eq!(larger.spray_planes[0][2],3.0);
+        assert_eq!(larger.spray_bounds[0],[0.0,0.0,1024.0,1024.0]);
+        assert_eq!(larger.mask_ranges[3],context.mask_ranges[3]);
+        assert_eq!(larger.spray_info[1],16384.0);
+        assert_eq!(larger.swell_motion[3],37.0);
+    }
 
     #[test]
     fn authored_swell_size_is_independent_of_weather_wind() {
@@ -1278,6 +1547,45 @@ mod tests {
     }
 
     #[test]
+    fn calm_promoted_water_shrinks_lod_rings_without_losing_coverage() {
+        assert_eq!(promoted_clipmap_half_cells(appearance::MIN_PROMOTED_AMPLITUDE), 32);
+        assert_eq!(promoted_clipmap_half_cells(PROMOTED_CLIPMAP_FULL_DETAIL_AMPLITUDE), 128);
+        assert!(promoted_clipmap_half_cells(16.0) > 32);
+        assert!(promoted_clipmap_half_cells(16.0) < 128);
+
+        let minimum = [0.0; 2];
+        let maximum = [40_000.0; 2];
+        let reference = build_clipmap(10.0, 0.0, minimum, maximum, None);
+        let calm = build_promoted_clipmap(
+            10.0,
+            0.0,
+            minimum,
+            maximum,
+            None,
+            appearance::MIN_PROMOTED_AMPLITUDE,
+        );
+        // 32-cell rings need two extra coarse levels to retain the old map
+        // reach, but still submit dramatically less geometry than six 128-cell
+        // levels. This is the actual FPS win the calm-water profile is for.
+        assert!(calm.indices.len() * 8 < reference.indices.len());
+        let step = calm.vertices[0].color[2];
+        assert!(reach(&calm) >= 40_000.0 + step * 0.5);
+
+        // By 64 units of displacement promotion is back on the original mesh
+        // profile, so violent water does not lose geometric fidelity.
+        let rough = build_promoted_clipmap(
+            10.0,
+            0.0,
+            minimum,
+            maximum,
+            None,
+            PROMOTED_CLIPMAP_FULL_DETAIL_AMPLITUDE,
+        );
+        assert_eq!(rough.vertices.len(), reference.vertices.len());
+        assert_eq!(rough.indices.len(), reference.indices.len());
+    }
+
+    #[test]
     fn clipmap_cell_size_does_not_depend_on_footprint() {
         let finest = |c: &OceanClipmap| c.vertices.iter().map(|v| v.color[0]).fold(f32::INFINITY, f32::min);
         let pool = build_clipmap(10.0, 0.0, [0.0, 0.0], [320.0, 384.0], None);
@@ -1309,7 +1617,7 @@ mod tests {
     #[test]
     fn contiguous_water_merges_and_biggest_comes_first() {
         let face = |plane: f32, x: [f32; 2], z: [f32; 2]| WaterFace {
-            plane, minimum: [x[0], z[0]], maximum: [x[1], z[1]], authored_ocean: None,
+            plane, minimum: [x[0], z[0]], maximum: [x[1], z[1]], authored_ocean: None, material: 0,
         };
         let faces = [
             face(0.0, [0.0, 100.0], [0.0, 100.0]),       // small pool
@@ -1330,6 +1638,9 @@ mod tests {
 
         // Different authored oceans, or different planes, never merge.
         let mut other = faces[2];
+        other.material = 1;
+        assert_eq!(cluster_water_faces(&[faces[1], other]).len(), 2);
+        other.material = 0;
         other.authored_ocean = Some(0);
         assert_eq!(cluster_water_faces(&[faces[1], other]).len(), 2);
         assert_eq!(cluster_water_faces(&[faces[1], face(900.0, [0.0, 4000.0], [0.0, 4000.0])]).len(), 2);

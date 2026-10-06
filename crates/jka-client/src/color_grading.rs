@@ -1,5 +1,149 @@
 //! Linear-light split toning baked into the existing color LUT.
 
+/// Primary creative grading controls. Exposure stays scene-referred in the
+/// post shader; the remaining controls are baked into the existing 3-D LUT so
+/// they add no extra per-pixel passes or texture samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorGradeSettings {
+    /// Manual scene exposure in stops (EV), applied before tone mapping.
+    pub exposure_ev: f32,
+    /// Display-referred contrast multiplier. 1.0 is neutral.
+    pub contrast: f32,
+    /// Global saturation multiplier. 1.0 is neutral.
+    pub saturation: f32,
+    /// Selective saturation. Positive values favor muted colors.
+    pub vibrance: f32,
+    /// White-balance target in kelvin. 6500 K is neutral.
+    pub temperature: f32,
+    /// Green/magenta tint. 0.0 is neutral; positive is magenta.
+    pub tint: f32,
+    /// Shadow-only brightness in stops.
+    pub shadows: f32,
+    /// Highlight-only brightness in stops.
+    pub highlights: f32,
+}
+
+impl Default for ColorGradeSettings {
+    fn default() -> Self {
+        Self {
+            exposure_ev: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            vibrance: 0.0,
+            temperature: 6500.0,
+            tint: 0.0,
+            shadows: 0.0,
+            highlights: 0.0,
+        }
+    }
+}
+
+impl ColorGradeSettings {
+    pub fn sanitize(self) -> Self {
+        let d = Self::default();
+        let finite = |v: f32, fallback: f32, min: f32, max: f32| {
+            if v.is_finite() { v.clamp(min, max) } else { fallback }
+        };
+        Self {
+            exposure_ev: finite(self.exposure_ev, d.exposure_ev, -4.0, 4.0),
+            contrast: finite(self.contrast, d.contrast, 0.0, 2.0),
+            saturation: finite(self.saturation, d.saturation, 0.0, 2.0),
+            vibrance: finite(self.vibrance, d.vibrance, -1.0, 1.0),
+            temperature: finite(self.temperature, d.temperature, 2000.0, 11000.0),
+            tint: finite(self.tint, d.tint, -1.0, 1.0),
+            shadows: finite(self.shadows, d.shadows, -2.0, 2.0),
+            highlights: finite(self.highlights, d.highlights, -2.0, 2.0),
+        }
+    }
+
+    pub fn lut_active(self) -> bool {
+        let s = self.sanitize();
+        (s.contrast - 1.0).abs() > 0.0005
+            || (s.saturation - 1.0).abs() > 0.0005
+            || s.vibrance.abs() > 0.0005
+            || (s.temperature - 6500.0).abs() > 0.5
+            || s.tint.abs() > 0.0005
+            || s.shadows.abs() > 0.0005
+            || s.highlights.abs() > 0.0005
+    }
+
+    /// Creative controls evaluated in display-referred RGB, matching where the
+    /// existing 3-D LUT is sampled. Exposure is deliberately excluded here.
+    pub fn apply_display(self, mut rgb: [f64; 3]) -> [f64; 3] {
+        let s = self.sanitize();
+        if !s.lut_active() {
+            return rgb;
+        }
+
+        // Use OxiMedia's white-balance matrix rather than inventing a bespoke
+        // temperature curve. 6500 K is the neutral source white.
+        if (s.temperature - 6500.0).abs() > 0.5 {
+            if let Ok(shifted) = oximedia_lut::temperature::apply_temperature_shift(
+                &rgb,
+                6500.0,
+                s.temperature as f64,
+            ) {
+                rgb = shifted.map(|v| v.clamp(0.0, 1.0));
+            }
+        }
+
+        // Tint is the complementary green <-> magenta axis. Use a zero-luma
+        // chroma vector, then fit the whole vector into gamut together.
+        if s.tint.abs() > 0.0005 {
+            let amount = s.tint as f64 * 0.16;
+            let axis = [1.0, -0.398_208_892, 1.0];
+            let delta = axis.map(|v| v * amount);
+            rgb = add_chroma_gamut_safe(rgb, delta);
+        }
+
+        let luma = luminance(rgb).clamp(0.0, 1.0);
+        let shadow_mask = 1.0 - smoothstep(0.08, 0.58, luma);
+        let highlight_mask = smoothstep(0.42, 0.92, luma);
+        let range_ev = s.shadows as f64 * shadow_mask + s.highlights as f64 * highlight_mask;
+        rgb = rgb.map(|v| v * 2.0f64.powf(range_ev));
+
+        // Contrast about perceptual middle grey, then saturation around Rec.709 luma.
+        rgb = rgb.map(|v| (v - 0.5) * s.contrast as f64 + 0.5);
+        let luma = luminance(rgb);
+        rgb = rgb.map(|v| luma + (v - luma) * s.saturation as f64);
+
+        // Vibrance protects already-saturated colours. This is especially useful
+        // for JKA where sabers/neon are often near gamut while world textures are not.
+        if s.vibrance.abs() > 0.0005 {
+            let max = rgb[0].max(rgb[1]).max(rgb[2]);
+            let min = rgb[0].min(rgb[1]).min(rgb[2]);
+            let chroma = (max - min).clamp(0.0, 1.0);
+            let amount = s.vibrance as f64;
+            let gain = if amount >= 0.0 {
+                1.0 + amount * (1.0 - chroma)
+            } else {
+                1.0 + amount
+            };
+            let luma = luminance(rgb);
+            rgb = rgb.map(|v| luma + (v - luma) * gain);
+        }
+
+        rgb.map(|v| v.clamp(0.0, 1.0))
+    }
+}
+
+fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn add_chroma_gamut_safe(rgb: [f64; 3], delta: [f64; 3]) -> [f64; 3] {
+    let mut scale: f64 = 1.0;
+    for c in 0..3 {
+        if delta[c] > 0.0 {
+            scale = scale.min((1.0 - rgb[c]) / delta[c]);
+        } else if delta[c] < 0.0 {
+            scale = scale.min(rgb[c] / -delta[c]);
+        }
+    }
+    std::array::from_fn(|c| (rgb[c] + delta[c] * scale.max(0.0)).clamp(0.0, 1.0))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SplitToningSettings {
     pub enabled: bool,
@@ -140,6 +284,84 @@ fn hue_chroma(hue: f64) -> [f64; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_primary_grade_is_identity() {
+        let rgb = [0.12, 0.4, 0.85];
+        assert_eq!(ColorGradeSettings::default().apply_display(rgb), rgb);
+        assert!(!ColorGradeSettings::default().lut_active());
+    }
+
+    #[test]
+    fn saturation_zero_is_greyscale() {
+        let settings = ColorGradeSettings {
+            saturation: 0.0,
+            ..Default::default()
+        };
+        let output = settings.apply_display([0.2, 0.5, 0.8]);
+        assert!((output[0] - output[1]).abs() < 1e-10);
+        assert!((output[1] - output[2]).abs() < 1e-10);
+    }
+
+    #[test]
+    fn vibrance_increases_muted_chroma() {
+        let input = [0.42, 0.50, 0.46];
+        let settings = ColorGradeSettings {
+            vibrance: 1.0,
+            ..Default::default()
+        };
+        let output = settings.apply_display(input);
+        let chroma = |rgb: [f64; 3]| {
+            rgb[0].max(rgb[1]).max(rgb[2]) - rgb[0].min(rgb[1]).min(rgb[2])
+        };
+        assert!(chroma(output) > chroma(input));
+    }
+
+    #[test]
+    fn shadows_and_highlights_brightness_target_opposite_ends() {
+        let shadows = ColorGradeSettings {
+            shadows: 1.0,
+            ..Default::default()
+        };
+        let highlights = ColorGradeSettings {
+            highlights: 1.0,
+            ..Default::default()
+        };
+        let dark = [0.15; 3];
+        let bright = [0.85; 3];
+        assert!(luminance(shadows.apply_display(dark)) - luminance(dark)
+            > luminance(shadows.apply_display(bright)) - luminance(bright));
+        assert!(luminance(highlights.apply_display(bright)) - luminance(bright)
+            > luminance(highlights.apply_display(dark)) - luminance(dark));
+    }
+
+    #[test]
+    fn primary_grade_sanitizes_invalid_values() {
+        let settings = ColorGradeSettings {
+            exposure_ev: f32::NAN,
+            contrast: f32::INFINITY,
+            saturation: -1.0,
+            vibrance: 3.0,
+            temperature: f32::NEG_INFINITY,
+            tint: -3.0,
+            shadows: 9.0,
+            highlights: -9.0,
+        }
+        .sanitize();
+        assert_eq!(settings.exposure_ev, 0.0);
+        assert_eq!(settings.contrast, 1.0);
+        assert_eq!(settings.saturation, 0.0);
+        assert_eq!(settings.vibrance, 1.0);
+        assert_eq!(settings.temperature, 6500.0);
+        assert_eq!(settings.tint, -1.0);
+        assert_eq!(settings.shadows, 2.0);
+        assert_eq!(settings.highlights, -2.0);
+        assert!(settings
+            .apply_display([0.4; 3])
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v)));
+    }
+
     #[test]
     fn disabled_zero_strength_and_zero_saturation_are_identity() {
         let rgb = [0.12, 0.4, 0.85];

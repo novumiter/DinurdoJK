@@ -99,6 +99,7 @@ impl SaberBladeLengthState {
     }
 }
 
+#[derive(Clone)]
 pub(in crate::cgame::player_presenter) struct EntityPlayerState {
     pub(in crate::cgame::player_presenter) model_key: String,
     /// False while `model` is only a stand-in (previous model or default

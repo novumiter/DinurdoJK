@@ -7,10 +7,12 @@ use crate::{
 use jka_movement::{
     angle_to_short, CollisionWorld, JoinMode, MovementPower, PlayerState, PlayerView,
     PmoveContext, SaberMovementInfo, TraceQuery, TraceResult, TraceWorld, UserCmd,
-    BUTTON_WALKING, ENTITY_NONE, MAX_TICK_MSEC, MIN_TICK_MSEC, TICK_MSEC,
+    BUTTON_WALKING, ENTITY_NONE,
 };
 use std::{collections::HashSet, time::Duration};
 use winit::keyboard::KeyCode;
+#[cfg(test)]
+use jka_movement::TICK_MSEC;
 
 const SHORT_TO_DEGREES: f32 = 360.0 / 65536.0;
 // Stock OpenJK PM_UpdateViewAngles clamps PITCH to +/-16000 in 16-bit angle space.
@@ -160,7 +162,8 @@ pub struct LocalPlayer {
     player: Option<PlayerState>,
     spectator: PlayerState,
     accumulated: Duration,
-    tick_msec: i32,
+    command_rate: u32,
+    command_time_remainder: u32,
     input_angles: [f32; 3],
     // Usercmd angle basis that produced the current local Pmove state.
     // Subframe presentation advances from ps.viewangles by only mouse motion
@@ -174,11 +177,11 @@ pub struct LocalPlayer {
     previous_command_time: i32,
     current_command_time: i32,
     pending_power: Option<MovementPower>,
-    // CL_CreateCmd can run on a render frame where no fixed Pmove tick is due
+    // CL_CreateCmd can run on a render frame where no authored command is due
     // (especially at the very high render rates this client supports). Keep
-    // one-shot button/generic-command input alive until at least one Pmove
+    // one-shot button/generic-command input alive until at least one command
     // step consumes it, matching idTech's "wasPressed" behavior instead of
-    // dropping a click between physics ticks.
+    // dropping a click between command steps.
     pending_cmd_buttons: i32,
     pending_generic_command: u8,
     // JKA cl_idrive 1 semantics: when opposite directions are both held,
@@ -220,7 +223,8 @@ impl LocalPlayer {
             player: None,
             spectator,
             accumulated: Duration::ZERO,
-            tick_msec: TICK_MSEC,
+            command_rate: 125,
+            command_time_remainder: 0,
             input_angles: [0.0, spawn.yaw.to_degrees(), 0.0],
             subframe_base_cmd_angles: [
                 angle_to_short(0.0),
@@ -330,18 +334,34 @@ impl LocalPlayer {
     pub(crate) fn network_state(&self) -> jka_movement::NetworkPlayerState {
         self.state().network()
     }
-    pub fn set_physics_tick_msec(&mut self, tick_msec: u32) -> Result<(), String> {
-        let tick_msec = i32::try_from(tick_msec).map_err(|_| "Invalid physics tick")?;
-        if !(MIN_TICK_MSEC..=MAX_TICK_MSEC).contains(&tick_msec) {
-            return Err(format!(
-                "Physics tick must be {MIN_TICK_MSEC}..={MAX_TICK_MSEC} milliseconds"
-            ));
+    /// Set the cadence at which the local authority authors movement commands.
+    /// This is the solo/local equivalent of `cl_commandRate`; rendering and raw
+    /// subframe mouse sampling remain completely independent.
+    pub fn set_command_rate(&mut self, command_rate: u32) -> Result<(), String> {
+        if !(15..=1000).contains(&command_rate) {
+            return Err("Command rate must be 15..=1000 Hz".into());
         }
-        if self.tick_msec != tick_msec {
-            self.tick_msec = tick_msec;
+        if self.command_rate != command_rate {
+            self.command_rate = command_rate;
             self.pause();
         }
         Ok(())
+    }
+
+    fn command_interval(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / f64::from(self.command_rate.max(15)))
+    }
+
+    /// Integer usercmd time delta for the next command while retaining the
+    /// exact rational cadence. For example 144 Hz produces the same 6/7 ms
+    /// pattern as timestamping commands on a 1000/144 ms timeline rather than
+    /// silently becoming a fixed 7 ms (~142.86 Hz) simulation.
+    fn next_command_msec(&mut self) -> i32 {
+        let rate = self.command_rate.max(15);
+        self.command_time_remainder += 1000;
+        let msec = self.command_time_remainder / rate;
+        self.command_time_remainder %= rate;
+        msec.max(1) as i32
     }
     fn state(&self) -> &PlayerState {
         match self.mode {
@@ -419,6 +439,7 @@ impl LocalPlayer {
     }
     pub fn pause(&mut self) {
         self.accumulated = Duration::ZERO;
+        self.command_time_remainder = 0;
         self.previous_eye = self.current_eye;
         self.previous_origin = self.current_origin;
         self.previous_command_time = self.current_command_time;
@@ -473,7 +494,7 @@ impl LocalPlayer {
         self.update_with_game(elapsed, keys, mouse, client_cmd, &mut NoGame)
     }
 
-    /// [`Self::update`] with server game logic running around every fixed step.
+    /// [`Self::update`] with server game logic running around every authored command step.
     pub fn update_with_game(
         &mut self,
         elapsed: Duration,
@@ -483,18 +504,19 @@ impl LocalPlayer {
         game: &mut dyn SoloGame,
     ) -> Result<(), String> {
         self.apply_mouse_look_timed(mouse, elapsed);
-        // Preserve tapped +commands until a fixed Pmove step actually runs.
+        // Preserve tapped +commands until an authored command step actually runs.
         // Held buttons are present in client_cmd again on later frames; ORing
-        // here is specifically what protects short taps at >physics-rate FPS.
+        // here is specifically what protects short taps at render rates above command rate.
         self.pending_cmd_buttons |= client_cmd.buttons;
         if client_cmd.generic_command != 0 {
             self.pending_generic_command = client_cmd.generic_command;
         }
         self.accumulated += elapsed.min(Duration::from_millis(250));
-        let tick = Duration::from_millis(self.tick_msec as u64);
+        let command_interval = self.command_interval();
         let mut first_step = true;
-        while self.accumulated >= tick {
-            self.accumulated -= tick;
+        while self.accumulated >= command_interval {
+            self.accumulated -= command_interval;
+            let command_msec = self.next_command_msec();
             let move_priority = self.move_priority;
             let foot_bolts = self.foot_bolts;
             let state = match self.mode {
@@ -526,7 +548,7 @@ impl LocalPlayer {
                 buttons &= !BUTTON_WALKING;
             }
             let cmd = UserCmd {
-                server_time: state.view().command_time + self.tick_msec,
+                server_time: state.view().command_time + command_msec,
                 angles: self.input_angles.map(angle_to_short),
                 buttons,
                 weapon: client_cmd.weapon,
@@ -565,14 +587,14 @@ impl LocalPlayer {
             state.offline_force_tick_with_msec(
                 cmd.server_time,
                 self.pending_power.take(),
-                self.tick_msec,
+                command_msec,
             )?;
             let view = if clipping {
                 let mut traced = GameWorld { world: &mut self.world, solids: game.solids() };
-                self.movement.step_with_msec(state, cmd, self.tick_msec, &mut traced)?
+                self.movement.step_command_with_msec(state, cmd, command_msec, &mut traced)?
             } else {
                 self.movement
-                    .step_with_msec(state, cmd, self.tick_msec, &mut self.world)?
+                    .step_command_with_msec(state, cmd, command_msec, &mut self.world)?
             };
             if let Some(collision) = self.world.0.as_mut() {
                 let alive = clipping && view.health > 0;
@@ -621,12 +643,18 @@ impl LocalPlayer {
     }
 
     fn presentation_alpha(&self) -> f32 {
-        let tick_seconds = self.tick_msec as f32 * 0.001;
-        if tick_seconds <= 0.0 {
+        let interval = self.command_interval().as_secs_f32();
+        if interval <= 0.0 {
             0.0
         } else {
-            (self.accumulated.as_secs_f32() / tick_seconds).clamp(0.0, 1.0)
+            (self.accumulated.as_secs_f32() / interval).clamp(0.0, 1.0)
         }
+    }
+
+    pub fn latest_command_msec(&self) -> i32 {
+        self.current_command_time
+            .saturating_sub(self.previous_command_time)
+            .max(1)
     }
 
     /// Fixed-step player origin interpolated on the presentation timeline. The
@@ -755,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_commands_are_independent_of_render_frequency() {
+    fn command_cadence_is_independent_of_render_frequency() {
         let mut states = Vec::new();
         let keys = HashSet::from([KeyCode::KeyW, KeyCode::Space]);
         for fps in [30, 60, 125, 144, 240] {
@@ -779,7 +807,7 @@ mod tests {
         assert!(states.windows(2).all(|pair| pair[0] == pair[1]));
     }
     #[test]
-    fn subframe_camera_uses_mouse_input_before_a_physics_tick() {
+    fn subframe_camera_uses_mouse_input_before_a_command_step() {
         let (mut player, _) = local();
         let mut camera = Camera::new([0.0, 0.0, 0.0], 0.0);
         player.camera(&mut camera);
@@ -847,6 +875,21 @@ mod tests {
     }
 
     #[test]
+    fn command_rate_does_not_gate_subframe_mouse_look() {
+        let (mut player, _) = local();
+        player.set_command_rate(15).unwrap();
+        let before_time = player.state().view().command_time;
+        let before_angles = player.subframe_view_angles();
+
+        // A 1 ms raw-input sample is far shorter than the ~66.7 ms command
+        // interval, but presentation must still rotate immediately.
+        player.apply_mouse_look_timed((10.0, 0.0), Duration::from_millis(1));
+        let after_angles = player.subframe_view_angles();
+        assert_ne!(before_angles[1], after_angles[1]);
+        assert_eq!(player.state().view().command_time, before_time);
+    }
+
+    #[test]
     fn wrapped_delta_angles_use_jka_short_semantics() {
         // This is the value OpenJK produces when a command around -89 degrees
         // gets clamped to -16000: -65335 is circularly the same as +201.
@@ -855,17 +898,34 @@ mod tests {
     }
 
     #[test]
-    fn physics_tick_can_change_from_stock_8ms() {
+    fn local_command_rate_drives_authoritative_command_cadence() {
         let (mut player, _) = local();
-        player.set_physics_tick_msec(7).unwrap();
+        player.set_command_rate(125).unwrap();
         let keys = HashSet::from([KeyCode::KeyW]);
-        for _ in 0..100 {
+        for _ in 0..125 {
             player
-                .update(Duration::from_millis(7), &keys, (0.0, 0.0), UserCmd::default())
+                .update(Duration::from_millis(8), &keys, (0.0, 0.0), UserCmd::default())
                 .unwrap();
         }
-        assert_eq!(player.state().view().command_time, 700);
-        assert_eq!(player.tick_msec, 7);
+        assert_eq!(player.state().view().command_time, 1000);
+        assert_eq!(player.command_rate, 125);
+    }
+
+    #[test]
+    fn non_divisor_command_rate_keeps_fractional_timeline() {
+        let (mut player, _) = local();
+        player.set_command_rate(144).unwrap();
+        let mut deltas = Vec::new();
+        for _ in 0..144 {
+            let before = player.state().view().command_time;
+            player
+                .update(player.command_interval(), &HashSet::new(), (0.0, 0.0), UserCmd::default())
+                .unwrap();
+            deltas.push(player.state().view().command_time - before);
+        }
+        assert_eq!(player.state().view().command_time, 1000);
+        assert!(deltas.iter().all(|msec| matches!(*msec, 6 | 7)));
+        assert!(deltas.contains(&6) && deltas.contains(&7));
     }
     #[test]
     fn menu_pause_and_spectator_switch_preserve_player_state() {
@@ -895,7 +955,7 @@ mod tests {
         assert_eq!(saved, player.state().view());
     }
     #[test]
-    fn tapped_attack_survives_until_the_next_fixed_pmove_tick() {
+    fn tapped_attack_survives_until_the_next_command_step() {
         let (mut player, _) = local();
         let before = player.entity_view().saber_move;
         let attack = UserCmd {
@@ -903,8 +963,8 @@ mod tests {
             ..UserCmd::default()
         };
 
-        // At very high render FPS this frame is shorter than the 8 ms physics
-        // tick, so CL_CreateCmd input must not be consumed and forgotten.
+        // At very high render FPS this frame is shorter than the 8 ms command
+        // interval, so CL_CreateCmd input must not be consumed and forgotten.
         player
             .update(Duration::from_millis(1), &HashSet::new(), (0.0, 0.0), attack)
             .unwrap();

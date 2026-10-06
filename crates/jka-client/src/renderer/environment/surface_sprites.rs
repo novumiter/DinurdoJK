@@ -634,6 +634,19 @@ pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_ATTRIBUTES: [wgpu::VertexAttr
     4 => Float32
 ];
 
+/// The RT receiver variant of the dynamic-model pipeline binds a second vertex
+/// buffer holding each vertex's pre-lighting material colour. It has to sit past
+/// every DynamicModelVertex attribute: md3.wgsl declares those by literal
+/// location, so a new vertex field silently shadows this one otherwise.
+pub(in crate::renderer) const RT_RECEIVER_RAW_COLOR_LOCATION: u32 =
+    DYNAMIC_MODEL_VERTEX_ATTRIBUTES.len() as u32;
+pub(in crate::renderer) const RT_RECEIVER_RAW_COLOR_ATTRIBUTES: [wgpu::VertexAttribute; 1] =
+    [wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x4,
+        offset: 0,
+        shader_location: RT_RECEIVER_RAW_COLOR_LOCATION,
+    }];
+
 pub(in crate::renderer) const FX_GPU_SPRITE_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
     0 => Float32x4,
     1 => Float32x4,

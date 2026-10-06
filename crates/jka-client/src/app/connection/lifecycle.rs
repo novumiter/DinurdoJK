@@ -60,7 +60,6 @@ impl App {
         self.pending_live_gamestate = false;
         self.pending_live_server_commands.clear();
         self.live_join_timing = None;
-        self.japro_autologin_attempted = None;
         self.restore_startup_game();
         if let Some(mut net) = self.net.take() {
             net.disconnect();
@@ -72,7 +71,6 @@ impl App {
         self.last_scores_request = None;
         self.mark_companion_dirty();
         self.center_print = None;
-        self.last_center_print.clear();
 
         self.local_server = None;
         self.map_collision = None;
@@ -159,7 +157,6 @@ impl App {
         self.last_scores_request = None;
         self.mark_companion_dirty();
         self.center_print = None;
-        self.last_center_print.clear();
 
         self.local_server = None;
         self.map_collision = None;

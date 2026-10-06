@@ -384,10 +384,16 @@ pub(in crate::renderer) fn create_bloom_bind_groups(
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
     scene_view: &wgpu::TextureView,
+    authored_glow_view: Option<&wgpu::TextureView>,
     bloom: Option<&BloomPyramid>,
 ) -> Option<[wgpu::BindGroup; 3]> {
     let bloom = bloom?;
     let sources = [scene_view, &bloom.views[0], &bloom.views[1]];
+    let authored_sources = [
+        authored_glow_view.unwrap_or(scene_view),
+        &bloom.views[0],
+        &bloom.views[1],
+    ];
     Some(std::array::from_fn(|level| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA bloom downsample bind group"),
@@ -399,6 +405,10 @@ pub(in crate::renderer) fn create_bloom_bind_groups(
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::TextureView(authored_sources[level]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 },
             ],

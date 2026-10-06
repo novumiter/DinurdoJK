@@ -28,7 +28,7 @@ pub mod plugin_disable {
     pub const CONSOLE_CP: i32 = 1 << 28;
 }
 
-/// One jaPRO plugin-disable preference shown by both `/plugin` and the MOD page.
+/// One jaPRO plugin-disable preference shown by both `/plugin` and the settings pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PluginDisableOption {
     pub bit: u8,
@@ -198,6 +198,10 @@ pub const GHOST_TOGGLES: &[(u32, bool, &str, &str)] = &[
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JaproCgame {
+    /// TaystJK `cg_remaps`: 0 blocks server shader remaps, 1 blocks only
+    /// `models/players/*`, every other non-zero value allows all server remaps.
+    /// The local `/remapShader` command is intentionally independent of this.
+    pub remaps: i32,
     /// `cg_stylePlayer` bit mask (see [`style`]).
     pub style_player: u32,
     /// `cg_raceTimer`: 0 off, 1 time, 2 time + max/avg/start speed, 3 same with milliseconds.
@@ -226,6 +230,7 @@ pub struct JaproCgame {
 impl Default for JaproCgame {
     fn default() -> Self {
         Self {
+            remaps: 1,
             style_player: 0,
             race_timer: 2,
             race_timer_size: 0.75,
@@ -249,109 +254,24 @@ impl JaproCgame {
     }
 
     pub fn cvar_value(&self, name: &str) -> Option<String> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "cg_styleplayer" => self.style_player.to_string(),
-            "cg_racetimer" => self.race_timer.to_string(),
-            "cg_racetimersize" => format!("{}", self.race_timer_size),
-            "cg_racetimerx" => format!("{}", self.race_timer_x),
-            "cg_racetimery" => format!("{}", self.race_timer_y),
-            "cg_racestart" => u8::from(self.race_start).to_string(),
-            "cg_racestartx" => format!("{}", self.race_start_x),
-            "cg_racestarty" => format!("{}", self.race_start_y),
-            "cg_startgoal" => format!("{}", self.start_goal),
-            "cg_specfollowfastest" => u8::from(self.follow_fastest).to_string(),
-            "cg_speedometer" => self.speedometer.flags.to_string(),
-            "cg_speedometerx" => format!("{}", self.speedometer.x),
-            "cg_speedometery" => format!("{}", self.speedometer.y),
-            "cg_speedometersize" => format!("{}", self.speedometer.size),
-            "cg_speedometerjumps" => self.speedometer.jumps.to_string(),
-            "cg_speedometerjumpsx" => format!("{}", self.speedometer.jumps_x),
-            "cg_speedometerjumpsy" => format!("{}", self.speedometer.jumps_y),
-            "cg_jumpgoal" => format!("{}", self.speedometer.jump_goal),
-            "cg_lagometer" => self.lagometer.mode.to_string(),
-            "cg_lagometerx" => self.lagometer.x.to_string(),
-            "cg_lagometery" => self.lagometer.y.to_string(),
-            "cl_commandsize" => self.lagometer.command_size.to_string(),
-            "cg_drainfx" => self.drain_fx.to_string(),
-            _ => return None,
-        })
+        crate::app::japro_cvars::settings_registry().get(self, name).map(|value| value.to_string())
     }
-
-    /// `None` when `name` is not one of ours; otherwise whether parsing succeeded.
     pub fn set_cvar(&mut self, name: &str, value: &str) -> Option<Result<(), String>> {
-        let integer = || {
-            value
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .filter(|number| number.is_finite())
-                .map(|number| number as i64)
-                .ok_or_else(|| format!("{name}: expected a number"))
-        };
-        let float = || {
-            value
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .filter(|number| number.is_finite())
-                .ok_or_else(|| format!("{name}: expected a number"))
-        };
-        let boolean = || integer().map(|number| number != 0);
-        let result = match name.to_ascii_lowercase().as_str() {
-            "cg_styleplayer" => integer().map(|v| self.style_player = v.clamp(0, i64::from(i32::MAX)) as u32),
-            "cg_racetimer" => integer().map(|v| self.race_timer = v.clamp(0, 3) as u8),
-            "cg_racetimersize" => float().map(|v| self.race_timer_size = v.clamp(0.1, 3.0)),
-            "cg_racetimerx" => float().map(|v| self.race_timer_x = v.clamp(-640.0, 1280.0)),
-            "cg_racetimery" => float().map(|v| self.race_timer_y = v.clamp(-480.0, 960.0)),
-            "cg_racestart" => boolean().map(|v| self.race_start = v),
-            "cg_racestartx" => float().map(|v| self.race_start_x = v.clamp(-640.0, 1280.0)),
-            "cg_racestarty" => float().map(|v| self.race_start_y = v.clamp(-480.0, 960.0)),
-            "cg_startgoal" => float().map(|v| self.start_goal = v.max(0.0)),
-            "cg_specfollowfastest" => boolean().map(|v| self.follow_fastest = v),
-            "cg_speedometer" => integer().map(|v| self.speedometer.flags = v.clamp(0, i64::from(i32::MAX)) as u32),
-            "cg_speedometerx" => float().map(|v| self.speedometer.x = v.clamp(-640.0, 1280.0)),
-            "cg_speedometery" => float().map(|v| self.speedometer.y = v.clamp(-480.0, 960.0)),
-            "cg_speedometersize" => float().map(|v| self.speedometer.size = v.clamp(0.1, 3.0)),
-            "cg_speedometerjumps" => integer().map(|v| self.speedometer.jumps = v.clamp(0, 511) as i32),
-            "cg_speedometerjumpsx" => float().map(|v| self.speedometer.jumps_x = v.clamp(-640.0, 1280.0)),
-            "cg_speedometerjumpsy" => float().map(|v| self.speedometer.jumps_y = v.clamp(-480.0, 960.0)),
-            "cg_jumpgoal" => float().map(|v| self.speedometer.jump_goal = v.max(0.0)),
-            // Plain integer cvars in jaPRO: any value is accepted.
-            "cg_lagometer" => integer().map(|v| self.lagometer.mode = v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32),
-            "cg_lagometerx" => integer().map(|v| self.lagometer.x = v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32),
-            "cg_lagometery" => integer().map(|v| self.lagometer.y = v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32),
-            "cl_commandsize" => integer().map(|v| self.lagometer.command_size = v.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32),
-            "cg_drainfx" => integer().map(|v| self.drain_fx = v.clamp(0, 2) as u8),
-            _ => return None,
-        };
-        Some(result)
+        let registry = crate::app::japro_cvars::settings_registry();
+        registry.find(name)?;
+        Some(registry.set(self, name, value))
     }
 
     pub fn write_cfg(&self, out: &mut String) {
-        let _ = writeln!(out, "seta cg_stylePlayer \"{}\"", self.style_player);
-        let _ = writeln!(out, "seta cg_raceTimer \"{}\"", self.race_timer);
-        let _ = writeln!(out, "seta cg_raceTimerSize \"{}\"", self.race_timer_size);
-        let _ = writeln!(out, "seta cg_raceTimerX \"{}\"", self.race_timer_x);
-        let _ = writeln!(out, "seta cg_raceTimerY \"{}\"", self.race_timer_y);
-        let _ = writeln!(out, "seta cg_raceStart \"{}\"", u8::from(self.race_start));
-        let _ = writeln!(out, "seta cg_raceStartX \"{}\"", self.race_start_x);
-        let _ = writeln!(out, "seta cg_raceStartY \"{}\"", self.race_start_y);
-        let _ = writeln!(out, "seta cg_startGoal \"{}\"", self.start_goal);
-        let _ = writeln!(out, "seta cg_specFollowFastest \"{}\"", u8::from(self.follow_fastest));
-        let speedometer = &self.speedometer;
-        let _ = writeln!(out, "seta cg_speedometer \"{}\"", speedometer.flags);
-        let _ = writeln!(out, "seta cg_speedometerX \"{}\"", speedometer.x);
-        let _ = writeln!(out, "seta cg_speedometerY \"{}\"", speedometer.y);
-        let _ = writeln!(out, "seta cg_speedometerSize \"{}\"", speedometer.size);
-        let _ = writeln!(out, "seta cg_speedometerJumps \"{}\"", speedometer.jumps);
-        let _ = writeln!(out, "seta cg_speedometerJumpsX \"{}\"", speedometer.jumps_x);
-        let _ = writeln!(out, "seta cg_speedometerJumpsY \"{}\"", speedometer.jumps_y);
-        let _ = writeln!(out, "seta cg_jumpGoal \"{}\"", speedometer.jump_goal);
-        let _ = writeln!(out, "seta cg_lagometer \"{}\"", self.lagometer.mode);
-        let _ = writeln!(out, "seta cg_lagometerX \"{}\"", self.lagometer.x);
-        let _ = writeln!(out, "seta cg_lagometerY \"{}\"", self.lagometer.y);
-        let _ = writeln!(out, "seta cl_commandsize \"{}\"", self.lagometer.command_size);
-        let _ = writeln!(out, "seta cg_drainFX \"{}\"", self.drain_fx);
+        use std::fmt::Write;
+        let mut definitions: Vec<_> = crate::app::japro_cvars::DEFINITIONS.iter().filter(|def| def.config.archive.is_some()).collect();
+        definitions.sort_by_key(|def| def.config.archive.unwrap().0);
+        let mut presentation = crate::config::ClientPresentationSettings::default();
+        presentation.japro = self.clone();
+        let video = crate::ui::VideoSettings::default();
+        let audio = crate::config::AudioSettings::default();
+        let state = crate::config::cvars::ArchiveState { video: &video, presentation: &presentation, audio: &audio };
+        for def in definitions { let _ = writeln!(out, "seta {} \"{}\"", def.runtime.entry.name, (def.config.archive.unwrap().1)(&state)); }
     }
 }
 
@@ -987,7 +907,7 @@ mod tests {
         let mut text = String::new();
         settings.write_cfg(&mut text);
         assert!(text.contains("seta cg_stylePlayer \"260\""));
-        assert!(text.contains("seta cg_lagometer \"2\"") && text.contains("seta cg_lagometerX \"60\""));
+        assert!(text.contains("seta cg_lagometer \"4\"") && text.contains("seta cg_lagometerX \"60\""));
         assert!(text.contains("seta cg_drainFX \"2\""));
     }
 

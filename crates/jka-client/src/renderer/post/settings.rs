@@ -9,7 +9,8 @@ impl Renderer {
         let old_scene_format = self.scene_format();
         let old_auto_exposure_effective =
             self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled;
-        let old_bloom_pyramid = self.bloom_enabled || self.halation_enabled;
+        let old_bloom_pyramid = self.glow_mode.enabled() || self.halation_enabled;
+        let old_authored_glow = self.glow_mode.authored();
         let old_ssao_enabled = self.ssao_enabled;
         let old_static_bsp_ao_enabled = self.static_bsp_ao_enabled;
         let old_ssr_enabled = self.ssr_enabled;
@@ -22,17 +23,26 @@ impl Renderer {
         let desired_fxaa = effects.fxaa && !desired_taa && !desired_smaa;
         let taa_changed = self.taa_enabled != desired_taa;
         let smaa_changed = self.smaa_enabled != desired_smaa;
+        let color_grade = effects.color_grade.sanitize();
         let split_toning = effects.split_toning.sanitize();
         let lut_strength = if effects.color_lut_strength.is_finite() {
             effects.color_lut_strength.clamp(0.0, 1.0)
         } else {
             self.color_lut_strength
         };
+        let mut old_lut_grade = self.color_grade.sanitize();
+        old_lut_grade.exposure_ev = 0.0;
+        let mut new_lut_grade = color_grade;
+        new_lut_grade.exposure_ev = 0.0;
+        let grade_changed = (old_lut_grade.lut_active() || new_lut_grade.lut_active())
+            && old_lut_grade != new_lut_grade;
         let split_changed = (self.split_toning.active() || split_toning.active())
             && self.split_toning != split_toning;
+        let grading_active = new_lut_grade.lut_active() || split_toning.active();
         let lut_changed = self.color_lut_preset != effects.color_lut
+            || grade_changed
             || split_changed
-            || (split_toning.active() && self.color_lut_strength != lut_strength);
+            || (grading_active && self.color_lut_strength != lut_strength);
         let old_legacy_fog_effective = self.weather.fog.legacy_effective();
         let rain_history_changed = self.weather.rain.enabled != effects.rain
             || self.weather.rain.intensity != effects.rain_intensity
@@ -63,7 +73,7 @@ impl Renderer {
                 }),
             );
         }
-        self.bloom_enabled = effects.bloom;
+        self.glow_mode = effects.glow;
         self.halation_enabled = effects.halation;
         self.ssao_enabled = effects.ssao;
         self.static_bsp_ao_enabled = effects.static_bsp_ao;
@@ -153,6 +163,7 @@ impl Renderer {
         self.cloud_thickness_variation = effects.cloud_thickness_variation;
         self.cloud_size = effects.cloud_size;
         self.weather.rain.enabled = effects.rain;
+        self.weather.rain.glass_enabled = effects.rain_glass;
         self.weather.rain.intensity = effects.rain_intensity;
         self.weather.rain.puddle_quality = effects.puddle_quality;
         self.weather.rain.puddle_scatter = effects.puddle_scatter.clamp(0.0, 1.0);
@@ -182,6 +193,27 @@ impl Renderer {
         self.film_grain_strength = effects.film_grain_strength.clamp(0.0, 1.0);
         self.motion_blur_strength = effects.motion_blur_strength.clamp(0.0, 1.0);
         self.depth_of_field_strength = effects.depth_of_field_strength.clamp(0.0, 1.0);
+        let old_crt_scope = self.crt_scope;
+        self.crt_scope = effects.crt_scope;
+        self.crt_style = effects.crt_style;
+        self.crt_quality = effects.crt_quality;
+        self.crt_reference = effects.crt_reference;
+        self.crt_mask = effects.crt_mask;
+        self.crt_scanline = effects.crt_scanline.clamp(0.0, 1.0);
+        self.crt_sharpness = effects.crt_sharpness.clamp(1.0, 6.0);
+        self.crt_mask_intensity = effects.crt_mask_intensity.clamp(0.0, 1.0);
+        self.crt_curvature = effects.crt_curvature.clamp(0.0, 0.25);
+        self.crt_corner = effects.crt_corner.clamp(0.0, 11.0);
+        if self.crt_scope == ui::CrtScope::Off {
+            // CRT is genuinely zero-resource when disabled, even after it has
+            // previously been used in this session.
+            self.crt_resources = None;
+        } else {
+            self.ensure_crt_resources();
+        }
+        if old_crt_scope != self.crt_scope {
+            rverbose!(1, "CRT: {}", self.crt_scope.label());
+        }
         self.dof_quality = effects.dof_quality;
         if (old_motion_blur - self.motion_blur_strength).abs() > 0.001 {
             self.motion_blur_runtime_scale = 0.0;
@@ -190,9 +222,11 @@ impl Renderer {
             self.dof_focus_valid = false;
         }
         self.color_lut_strength = lut_strength;
+        self.color_grade = color_grade;
         self.split_toning = split_toning;
-        self.color_lut_effective_strength = if split_toning.active() {
-            // LUT strength is already baked before split toning is applied.
+        self.color_lut_effective_strength = if grading_active {
+            // Film-LUT intensity and all grading controls are already baked into
+            // one cube, so the runtime lookup must be applied at full strength.
             1.0
         } else if effects.color_lut != ColorLutPreset::Off {
             lut_strength
@@ -212,7 +246,7 @@ impl Renderer {
                     self.output_gamma(),
                     self.color_lut_effective_strength,
                     if self.vignette_enabled { 1.0 } else { 0.0 },
-                    0.0,
+                    self.color_grade.exposure_ev,
                 ],
             }),
         );
@@ -231,7 +265,8 @@ impl Renderer {
             self.msaa_samples = 1;
         }
         let bloom_pyramid_changed =
-            old_bloom_pyramid != (self.bloom_enabled || self.halation_enabled);
+            old_bloom_pyramid != (self.glow_mode.enabled() || self.halation_enabled);
+        let authored_glow_resources_changed = old_authored_glow != self.glow_mode.authored();
         let ssao_resources_changed = old_ssao_enabled != self.ssao_enabled;
         let ssr_resources_changed = old_ssr_enabled != self.ssr_enabled;
         let reflection_policy_changed = old_reflection_quality != self.reflection_quality;
@@ -254,6 +289,7 @@ impl Renderer {
         let dof_resources_changed = old_dof_enabled != (self.depth_of_field_strength > 0.001);
         if old_scene_format != self.scene_format()
             || bloom_pyramid_changed
+            || authored_glow_resources_changed
             || dof_resources_changed
             || ssao_resources_changed
             || ssr_resources_changed

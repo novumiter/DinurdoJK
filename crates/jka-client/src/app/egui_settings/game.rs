@@ -6,7 +6,7 @@ impl App {
         theme::page_title(
             ui,
             "GAME / VIEW",
-            "Weapon, view-effect and jaPRO gameplay options. Camera controls live on the Camera tab.",
+            "Weapon and view-effect options. Camera controls live on the Camera tab.",
         );
 
         egui::ScrollArea::vertical()
@@ -57,8 +57,6 @@ impl App {
                 ) {
                     let _ = self.set_console_cvar("cg_screenShake", &value.to_string());
                 }
-
-                self.egui_japro_game_settings(ui);
             });
     }
 }

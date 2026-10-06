@@ -152,7 +152,7 @@ impl PlayerPresenter {
             } else {
                 1.0
             };
-            let (texture, alpha_mode) = self.custom_shader_material(shader);
+            let (texture, alpha_mode, _) = self.custom_shader_material(shader);
             for surface in surfaces {
                 let Some(body) = draws.iter().find(|draw| {
                     draw.ghoul2_gpu
@@ -191,6 +191,8 @@ impl PlayerPresenter {
                     fx_gpu_sprites: None,
                     texture: texture.clone(),
                     alpha_mode: blend_for_alpha(alpha_mode, fade),
+
+                    authored_glow: false,
                 });
             }
         }

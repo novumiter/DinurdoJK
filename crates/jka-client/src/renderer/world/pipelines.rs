@@ -12,7 +12,7 @@ use crate::renderer::{
 impl Renderer {
     /// Format the gameplay scene renders into, ignoring the asset viewer.
     pub(in crate::renderer) fn gameplay_scene_format(&self) -> wgpu::TextureFormat {
-        if self.hdr_enabled || self.bloom_enabled || self.halation_enabled {
+        if self.hdr_enabled || self.glow_mode.enabled() || self.halation_enabled {
             wgpu::TextureFormat::Rgba16Float
         } else {
             self.config.format
@@ -262,7 +262,8 @@ impl Renderer {
             self.config.height,
             scene_format,
             samples,
-            self.bloom_enabled || self.halation_enabled,
+            self.glow_mode.enabled() || self.halation_enabled,
+            self.glow_mode.authored(),
             self.depth_of_field_strength > 0.001,
             self.ssao_enabled,
             self.ssr_enabled,
@@ -539,6 +540,9 @@ pub(in crate::renderer) fn material_uniform(
     if pbr_eligible && source.height_from_alpha {
         out.header[2] |= 1024;
     }
+    if source.water && source.authored_ocean.is_none() {
+        out.ocean_waves = [1.0, source.water_amplitude, 0.0, 0.0];
+    }
     if source.water_primary {
         // Enhanced-water promotion: the authored first stage becomes the single
         // GodotOceanWaves surface pass while sibling authored stages are skipped.
@@ -587,6 +591,10 @@ pub(in crate::renderer) fn material_uniform(
     out.color = source.color;
     out.params[0] = source.alpha_cutoff;
     out.params[1] = source.parallax_depth;
+    // Tayst/OpenJK R_RemapShader's timeOffset is subtracted from shader time.
+    // params.w was intentionally unused by world materials, so carrying it
+    // here does not grow MaterialUniform or alter bind-group layouts.
+    out.params[3] = source.shader_time_offset;
     out.pbr_params0 = [
         source.normal_scale[0],
         source.normal_scale[1],

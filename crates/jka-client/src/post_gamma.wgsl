@@ -1,5 +1,5 @@
 struct GammaSettings {
-    values: vec4<f32>, // gamma, LUT strength, vignette, reserved
+    values: vec4<f32>, // gamma, LUT strength, vignette, manual exposure EV
 };
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -48,9 +48,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         clamp(input.uv, vec2<f32>(0.0), vec2<f32>(1.0))
     ).rgb;
     let gamma = max(settings.values.x, 0.05);
-    var corrected = color;
+    var corrected = color * exp2(settings.values.w);
     if (abs(gamma - 1.0) > 0.001) {
-        corrected = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+        corrected = pow(max(corrected, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     }
     corrected = apply_color_lut(corrected);
     if (settings.values.z > 0.5) {

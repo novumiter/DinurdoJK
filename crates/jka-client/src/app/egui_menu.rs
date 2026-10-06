@@ -9,6 +9,7 @@ mod dialogs;
 mod editors;
 mod frontend_pages;
 mod maps;
+mod movement;
 mod profile;
 mod resume;
 mod screenshots;
@@ -35,19 +36,25 @@ use super::*;
 const TOP_ITEMS: [&str; 7] = [
     "GAME", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE", "MOD",
 ];
-const SETUP_TABS: [&str; 6] = ["GAME", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE"];
+const SETUP_TABS: [&str; 7] = [
+    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE",
+];
 
 const TOP_RESUME: usize = 0;
 const TOP_PROFILE: usize = 2;
 const TOP_CONTROLS: usize = 3;
 pub(super) const TOP_SETUP: usize = 4;
+const TOP_VOTE: usize = 5;
+const TOP_MOD: usize = 6;
 
 const SETUP_TAB_GAME: usize = 0;
-pub(super) const SETUP_TAB_CAMERA: usize = 1;
-const SETUP_TAB_VIDEO: usize = 2;
-const SETUP_TAB_AUDIO: usize = 3;
-const SETUP_TAB_NETWORK: usize = 4;
-const SETUP_TAB_INTERFACE: usize = 5;
+const SETUP_TAB_MOVEMENT: usize = 1;
+pub(super) const SETUP_TAB_CAMERA: usize = 2;
+const SETUP_TAB_VIDEO: usize = 3;
+const SETUP_TAB_AUDIO: usize = 4;
+const SETUP_TAB_NETWORK: usize = 5;
+const SETUP_TAB_INTERFACE: usize = 6;
+const SETUP_TAB_MOD: usize = 7;
 
 /// Widest the settings/page column is allowed to get. Sized to just fit a
 /// label, a full-width meter and its readout: on the Video page the world
@@ -328,15 +335,15 @@ pub(super) enum VideoSection {
 impl VideoSection {
     const RENDERING: [(Self, &'static str); 11] = [
         (Self::Display, "Display"),
+        (Self::Color, "Color & HDR"),
         (Self::ImageQuality, "Image quality"),
         (Self::Visibility, "Visibility"),
         (Self::Models, "Models"),
         (Self::Lighting, "Lighting"),
-        (Self::Effects, "Effects"),
         (Self::Shadows, "Shadows"),
+        (Self::Effects, "Effects"),
         (Self::Reflections, "Reflections"),
         (Self::PostProcessing, "Post processing"),
-        (Self::Color, "Color"),
         (Self::Physics, "Physics"),
     ];
     const ENVIRONMENT: [(Self, &'static str); 5] = [

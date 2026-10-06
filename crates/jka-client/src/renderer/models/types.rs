@@ -131,6 +131,7 @@ pub(in crate::renderer) struct Ghoul2PreparedDraw {
     pub(in crate::renderer) texture_key: Option<Arc<str>>,
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
+    pub(in crate::renderer) authored_glow: bool,
     pub(in crate::renderer) first_instance: u32,
     pub(in crate::renderer) instance_count: u32,
 }
@@ -141,6 +142,7 @@ pub(in crate::renderer) struct Ghoul2PendingDraw {
     pub(in crate::renderer) texture_key: Option<Arc<str>>,
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
+    pub(in crate::renderer) authored_glow: bool,
     pub(in crate::renderer) uniform: Ghoul2GpuDrawUniform,
     pub(in crate::renderer) sequence: u32,
     // Adaptive batching starts by hashing a bounded distributed sample.  If
@@ -166,6 +168,23 @@ pub(in crate::renderer) struct DynamicEntityLightingUniform {
     // w = 1 while projected cloud shadows are active. The entity depth prepass
     // uses it to publish a smooth sun-facing value (md3.wgsl).
     pub(in crate::renderer) cloud_shadow_sun: [f32; 4],
+    // Wet weather on entities, see model_weather.wgsl. Models carry no weather
+    // bindings of their own, so the few values they need ride here, in the uniform
+    // every model draw already binds.
+    pub(in crate::renderer) weather: EntityWeather,
+}
+
+/// Wet weather applied to entities. Zeroed (wetness 0) disables it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub(crate) struct EntityWeather {
+    /// xyz: the sun's travel direction in render space; w: relative sun intensity
+    /// (250 = 1). Matches `WeatherSurfaceUniform`, so a model and the ground it
+    /// stands on are lit by the same sun.
+    pub sun_direction: [f32; 4],
+    /// rgb: linear sun colour; w: wetness 0..1, already faded by rain intensity
+    /// and by the camera's own exposure to the rain.
+    pub sun_radiance: [f32; 4],
 }
 
 /// Legacy fog applied in the entity/grass shaders. Zeroed (mode 0) disables it.
@@ -184,6 +203,7 @@ impl DynamicEntityLightingUniform {
         legacy_fog: EntityLegacyFog,
         brightness: f32,
         cloud_shadow_sun: [f32; 4],
+        weather: EntityWeather,
     ) -> Self {
         let value = match mode {
             EntityAmbientLightingMode::Off => 0,
@@ -194,6 +214,7 @@ impl DynamicEntityLightingUniform {
             values: [value, brightness.to_bits(), 0, 0],
             legacy_fog,
             cloud_shadow_sun,
+            weather,
         }
     }
 }
@@ -217,6 +238,8 @@ pub(in crate::renderer) struct FxGpuSpritePreparedDraw {
     pub(in crate::renderer) texture_key: Option<Arc<str>>,
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
+    pub(in crate::renderer) authored_glow: bool,
+
 }
 
 pub(in crate::renderer) struct DynamicPreparedDraw {
@@ -227,6 +250,8 @@ pub(in crate::renderer) struct DynamicPreparedDraw {
     pub(in crate::renderer) texture_key: Option<Arc<str>>,
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
+    pub(in crate::renderer) authored_glow: bool,
+
 }
 
 /// Dynamic indexed-mesh path used by cgame entities. CPU-skinned surfaces use
@@ -244,6 +269,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) entity_sun_relight: Option<EntitySunRelight>,
     pub(in crate::renderer) model_brightness: f32,
     pub(in crate::renderer) entity_legacy_fog: EntityLegacyFog,
+    pub(in crate::renderer) entity_weather: EntityWeather,
     /// Last value written to the uniform's `cloud_shadow_sun`; w = 0 when off.
     pub(in crate::renderer) cloud_shadow_sun: [f32; 4],
     /// Whether the colour pipelines were built with ENABLE_LEGACY_FOG.
@@ -253,6 +279,10 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) wireframe_pipeline: Option<wgpu::RenderPipeline>,
     /// Lazy per-alpha-mode pipelines; built only for modes with draws.
     pub(in crate::renderer) model_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// Lazy authored-glow replay variants. They preserve each stage's normal
+    /// blend/depth/material behavior but force the OpenJK glow-pass black fog.
+    pub(in crate::renderer) model_glow_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     /// Bit per `DynamicModelAlphaMode::index` with a prepared MD3 draw this frame.
     pub(in crate::renderer) model_alpha_mask: u16,
@@ -271,12 +301,16 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) fx_sprite_dst_color_add_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) fx_sprite_modulate2x_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) fx_sprite_darken_pipeline: Option<wgpu::RenderPipeline>,
+    pub(in crate::renderer) fx_sprite_glow_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     pub(in crate::renderer) fx_zero_alpha_discard: bool,
     pub(in crate::renderer) skin_layout: wgpu::BindGroupLayout,
     pub(in crate::renderer) skin_pipeline_layout: wgpu::PipelineLayout,
     pub(in crate::renderer) skin_shader: wgpu::ShaderModule,
     pub(in crate::renderer) skin_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) skin_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    pub(in crate::renderer) skin_glow_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     /// Bit per `DynamicModelAlphaMode::index` with a prepared Ghoul2 draw this frame.
     pub(in crate::renderer) skin_alpha_mask: u16,

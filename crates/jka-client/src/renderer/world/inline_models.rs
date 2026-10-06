@@ -29,28 +29,14 @@ impl Renderer {
         } = world;
         let stride = std::mem::size_of::<GpuVertex>() as u64;
         let record_stride = std::mem::size_of::<GpuCullRecord>() as u64;
-        // Index the snapshot by model number once (first instance wins, as the
-        // previous linear search did) instead of scanning it for every model.
         let poses = &mut self.inline_pose_scratch;
-        poses.clear();
-        if let Some(list) = instances {
-            let slots = inline_models
-                .iter()
-                .map(|model| model.model as usize + 1)
-                .max()
-                .unwrap_or(0);
-            poses.resize(slots, None);
-            for instance in list {
-                if let Some(slot) = poses.get_mut(instance.model as usize) {
-                    slot.get_or_insert(*instance);
-                }
-            }
-        }
+        collect_inline_poses(
+            poses,
+            inline_models.iter().map(|model| model.model),
+            instances,
+        );
         for model in inline_models.iter_mut() {
-            let target = match instances {
-                None => Some(InlineModelInstance::compiled(model.model)),
-                Some(_) => poses.get(model.model as usize).copied().flatten(),
-            };
+            let target = poses.get_mut(model.model as usize).and_then(Vec::pop);
             if model.uploaded == Some(target) {
                 continue;
             }
@@ -95,6 +81,69 @@ impl Renderer {
                 }
             }
         }
+    }
+}
+
+/// One pose per render slot, preserving every server submission for a shared
+/// handle. Vectors retain their storage across frames.
+fn collect_inline_poses(
+    poses: &mut Vec<Vec<InlineModelInstance>>,
+    models: impl Iterator<Item = u32> + Clone,
+    instances: Option<&[InlineModelInstance]>,
+) {
+    for slot in poses.iter_mut() {
+        slot.clear();
+    }
+    let slots = models
+        .clone()
+        .map(|model| model as usize + 1)
+        .max()
+        .unwrap_or(0);
+    if poses.len() < slots {
+        poses.resize_with(slots, Vec::new);
+    }
+    if let Some(list) = instances {
+        // Pop in submission order without per-model cursors.
+        for instance in list.iter().rev() {
+            if let Some(slot) = poses.get_mut(instance.model as usize) {
+                slot.push(*instance);
+            }
+        }
+    } else {
+        // A solo preview shows one compiled pose per model, not spare copies.
+        for model in models {
+            let slot = &mut poses[model as usize];
+            if slot.is_empty() {
+                slot.push(InlineModelInstance::compiled(model));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+
+    #[test]
+    fn shared_bsp_handles_keep_both_poses_and_hide_removed_instances() {
+        let mut first = InlineModelInstance::compiled(9);
+        first.origin = [2109.0, -1837.0, -851.0];
+        let mut second = first;
+        second.origin = [49805.0, -41942.0, -4245.0];
+        let mut poses = Vec::new();
+        collect_inline_poses(&mut poses, [8, 9, 9].into_iter(), Some(&[first, second]));
+        assert_eq!(poses[9].pop(), Some(first));
+        assert_eq!(poses[9].pop(), Some(second));
+        assert_eq!(poses[9].pop(), None);
+        assert_eq!(poses[8].pop(), None);
+        collect_inline_poses(&mut poses, [8, 9, 9].into_iter(), Some(&[second]));
+        assert_eq!(poses[9].pop(), Some(second));
+        assert_eq!(poses[9].pop(), None);
+        collect_inline_poses(&mut poses, [8, 9, 9].into_iter(), None);
+        assert_eq!(poses[9].pop(), Some(InlineModelInstance::compiled(9)));
+        assert_eq!(poses[9].pop(), None);
+        collect_inline_poses(&mut poses, [8, 9, 9].into_iter(), Some(&[]));
+        assert!(poses.iter().all(Vec::is_empty));
     }
 }
 

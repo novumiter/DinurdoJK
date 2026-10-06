@@ -245,7 +245,7 @@ impl PlayerPresenter {
     pub(in crate::cgame::player_presenter) fn ghost_material(
         &mut self,
         ghost: crate::japro_cg::Ghost,
-    ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
+    ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode, bool) {
         let name = crate::japro_cg::ghost_shader(ghost).unwrap_or("powerups/forceshell");
         if jka_assets::shader::find_shader(&self.shaders, name).is_some() {
             self.custom_shader_material(name)

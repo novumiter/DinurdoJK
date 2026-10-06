@@ -13,6 +13,7 @@ fn dot_crosshair_is_circular_and_exactly_centered() {
                 ..CrosshairSettings::default()
             },
             None,
+            None,
             1.0,
             width,
             height,

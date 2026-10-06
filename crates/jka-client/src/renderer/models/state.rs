@@ -3,7 +3,8 @@ use crate::renderer::{
     create_entity_prepass_pipeline, dynamic_model_writes_depth, sampler_entry,
     storage_buffer_entry, texture_entry, uniform_entry, upload_texture, Arc,
     DynamicEntityLightingUniform, DynamicGpuTexture, DynamicModelAlphaMode, DynamicModelRenderer,
-    DynamicModelVertex, EntityAmbientLightingMode, EntityLegacyFog, Entry, Ghoul2BatchMode,
+    DynamicModelVertex, EntityAmbientLightingMode, EntityLegacyFog, EntityWeather, Entry,
+    Ghoul2BatchMode,
     Ghoul2GpuVertex, Ghoul2PendingDraw, GpuImage, HashMap, PipelineJobManager, TextureData,
     DYNAMIC_MODEL_VERTEX_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
 };
@@ -34,6 +35,7 @@ impl DynamicModelRenderer {
                 EntityLegacyFog::default(),
                 1.0,
                 [0.0; 4],
+                EntityWeather::default(),
             )),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -44,7 +46,9 @@ impl DynamicModelRenderer {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA dynamic model shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../md3.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::weather::with_model_weather(include_str!("../../md3.wgsl")).into(),
+            ),
         });
         let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JKA Ghoul2 GPU skinning layout"),
@@ -64,7 +68,10 @@ impl DynamicModelRenderer {
         });
         let skin_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA Ghoul2 GPU skinning shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../ghoul2_skin.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::weather::with_model_weather(include_str!("../../ghoul2_skin.wgsl"))
+                    .into(),
+            ),
         });
         let repeat_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA dynamic model repeat sampler"),
@@ -204,12 +211,14 @@ impl DynamicModelRenderer {
             entity_sun_relight: None,
             model_brightness: 1.0,
             entity_legacy_fog: EntityLegacyFog::default(),
+            entity_weather: EntityWeather::default(),
             cloud_shadow_sun: [0.0; 4],
             legacy_fog_compiled: false,
             pipeline_layout,
             shader,
             wireframe_pipeline: None,
             model_pipelines: Default::default(),
+            model_glow_pipelines: Default::default(),
             model_alpha_mask: 0,
             fx_sprite_shader: None,
             fx_sprite_surface_format: surface_format,
@@ -226,12 +235,14 @@ impl DynamicModelRenderer {
             fx_sprite_dst_color_add_pipeline: None,
             fx_sprite_modulate2x_pipeline: None,
             fx_sprite_darken_pipeline: None,
+            fx_sprite_glow_pipelines: Default::default(),
             fx_zero_alpha_discard: false,
             skin_layout,
             skin_pipeline_layout,
             skin_shader,
             skin_wireframe_pipeline: None,
             skin_pipelines: Default::default(),
+            skin_glow_pipelines: Default::default(),
             skin_alpha_mask: 0,
             prepass_pipeline,
             prepass_mask_pipeline,
@@ -282,15 +293,25 @@ impl DynamicModelRenderer {
         self.ghoul2_batch_draws = mode;
     }
 
-    pub(in crate::renderer) fn ghoul2_batch_hash(draw: &Ghoul2PendingDraw) -> u64 {
+    pub(in crate::renderer) fn ghoul2_batch_hash(
+        draw: &Ghoul2PendingDraw,
+        prepare_authored_glow: bool,
+    ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         draw.alpha_mode.hash(&mut hasher);
         draw.mesh_key.hash(&mut hasher);
         draw.texture_key.hash(&mut hasher);
+        // Glow Off keeps the original batching key and grouping behavior.
+        if prepare_authored_glow {
+            draw.authored_glow.hash(&mut hasher);
+        }
         hasher.finish()
     }
 
-    pub(in crate::renderer) fn should_adaptively_batch(pending: &mut [Ghoul2PendingDraw]) -> bool {
+    pub(in crate::renderer) fn should_adaptively_batch(
+        pending: &mut [Ghoul2PendingDraw],
+        prepare_authored_glow: bool,
+    ) -> bool {
         const MIN_SURFACES: usize = 32;
         const SAMPLE_SURFACES: usize = 64;
         const MIN_MATCHING_INSTANCES: u8 = 3;
@@ -321,7 +342,7 @@ impl DynamicModelRenderer {
             let hash = if let Some(hash) = draw.batch_hash {
                 hash
             } else {
-                let hash = Self::ghoul2_batch_hash(draw);
+                let hash = Self::ghoul2_batch_hash(draw, prepare_authored_glow);
                 draw.batch_hash = Some(hash);
                 hash
             };
@@ -549,8 +570,24 @@ impl DynamicModelRenderer {
                 self.entity_legacy_fog,
                 self.model_brightness,
                 self.cloud_shadow_sun,
+                self.entity_weather,
             )),
         );
+    }
+
+    /// Wet weather on entities (model_weather.wgsl). Called every frame; only
+    /// touches the GPU when the sun or the wetness actually changes, so a dry map
+    /// costs one struct comparison a frame and no upload.
+    pub(in crate::renderer) fn set_entity_weather(
+        &mut self,
+        queue: &wgpu::Queue,
+        weather: EntityWeather,
+    ) {
+        if weather == self.entity_weather {
+            return;
+        }
+        self.entity_weather = weather;
+        self.write_entity_lighting(queue);
     }
 
     /// Entity prepass input for projected cloud shadows. Called every frame but

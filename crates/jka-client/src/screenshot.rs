@@ -1,9 +1,10 @@
 //! DinurdoJK screenshot metadata and filesystem catalog.
 //!
-//! `/screenshot` remains an ordinary JPEG.  A small APP15 segment immediately
-//! after SOI carries versioned JSON for DinurdoJK-aware tools; normal image
-//! viewers ignore it.  Keeping the metadata in the image avoids sidecars that
-//! can be separated from the screenshot when it is copied or uploaded.
+//! `/screenshot` remains an ordinary JPEG and `/screenshot_png` an ordinary
+//! PNG. JPEG uses an APP15 segment immediately after SOI; PNG uses an iTXt
+//! chunk immediately after IHDR. Both carry the same versioned JSON for
+//! DinurdoJK-aware tools, while ordinary image viewers ignore it. Keeping the
+//! metadata in the image avoids sidecars that can be separated from captures.
 
 use serde_json::{json, Value};
 use std::{
@@ -15,7 +16,10 @@ use std::{
 
 const JPEG_SOI: [u8; 2] = [0xff, 0xd8];
 const JPEG_APP15: [u8; 2] = [0xff, 0xef];
+const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+const PNG_ITXT: [u8; 4] = *b"iTXt";
 const SIGNATURE: &[u8] = b"DinurdoJK-Screenshot\0";
+const PNG_KEYWORD: &[u8] = b"DinurdoJK-Screenshot";
 const MAX_APP_PAYLOAD: usize = 65_533;
 pub const METADATA_VERSION: u32 = 1;
 
@@ -224,31 +228,94 @@ pub fn embed_metadata(jpeg: &mut Vec<u8>, metadata: &ScreenshotMetadata) -> Resu
     Ok(())
 }
 
-pub fn read_metadata(bytes: &[u8]) -> Result<Option<ScreenshotMetadata>, String> {
-    if !bytes.starts_with(&JPEG_SOI) {
-        return Ok(None);
+fn png_crc32(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in chunk_type.iter().chain(data.iter()) {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
     }
+    !crc
+}
+
+pub fn embed_png_metadata(
+    png: &mut Vec<u8>,
+    metadata: &ScreenshotMetadata,
+) -> Result<(), String> {
+    if !png.starts_with(&PNG_SIGNATURE) {
+        return Err("encoded screenshot is not a PNG".into());
+    }
+    if png.len() < 33 || &png[12..16] != b"IHDR" {
+        return Err("encoded screenshot has no valid PNG IHDR".into());
+    }
+    let ihdr_len = u32::from_be_bytes([png[8], png[9], png[10], png[11]]) as usize;
+    let insert_at = 8usize
+        .checked_add(12)
+        .and_then(|value| value.checked_add(ihdr_len))
+        .ok_or_else(|| "PNG IHDR size overflowed usize".to_owned())?;
+    if insert_at > png.len() {
+        return Err("encoded screenshot has a truncated PNG IHDR".into());
+    }
+
+    let json = serde_json::to_vec(&metadata.to_value())
+        .map_err(|error| format!("screenshot metadata encode failed: {error}"))?;
+    if json.len() > MAX_APP_PAYLOAD {
+        return Err(format!(
+            "screenshot metadata is too large ({} bytes)",
+            json.len()
+        ));
+    }
+    let mut data = Vec::with_capacity(PNG_KEYWORD.len() + 5 + json.len());
+    data.extend_from_slice(PNG_KEYWORD);
+    // iTXt: keyword NUL, uncompressed flag/method, empty language tag,
+    // empty translated keyword, then UTF-8 JSON text.
+    data.extend_from_slice(&[0, 0, 0, 0, 0]);
+    data.extend_from_slice(&json);
+    let length = u32::try_from(data.len())
+        .map_err(|_| "screenshot PNG metadata chunk is too large".to_owned())?;
+    let crc = png_crc32(&PNG_ITXT, &data);
+    let mut chunk = Vec::with_capacity(data.len() + 12);
+    chunk.extend_from_slice(&length.to_be_bytes());
+    chunk.extend_from_slice(&PNG_ITXT);
+    chunk.extend_from_slice(&data);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+    png.splice(insert_at..insert_at, chunk);
+    Ok(())
+}
+
+fn read_jpeg_metadata(bytes: &[u8]) -> Result<Option<ScreenshotMetadata>, String> {
     let mut cursor = 2usize;
     while cursor + 4 <= bytes.len() {
         if bytes[cursor] != 0xff {
             break;
         }
-        while cursor < bytes.len() && bytes[cursor] == 0xff { cursor += 1; }
-        let Some(&marker) = bytes.get(cursor) else { break };
+        while cursor < bytes.len() && bytes[cursor] == 0xff {
+            cursor += 1;
+        }
+        let Some(&marker) = bytes.get(cursor) else {
+            break;
+        };
         cursor += 1;
-        if marker == 0xda || marker == 0xd9 { // SOS / EOI
+        if marker == 0xda || marker == 0xd9 {
             break;
         }
-        // Standalone markers have no length field.
         if marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
             continue;
         }
-        if cursor + 2 > bytes.len() { break; }
+        if cursor + 2 > bytes.len() {
+            break;
+        }
         let length = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]) as usize;
-        if length < 2 { return Err("invalid JPEG marker length".into()); }
+        if length < 2 {
+            return Err("invalid JPEG marker length".into());
+        }
         let payload_start = cursor + 2;
         let payload_end = payload_start.saturating_add(length - 2);
-        if payload_end > bytes.len() { break; }
+        if payload_end > bytes.len() {
+            break;
+        }
         if marker == 0xef {
             let payload = &bytes[payload_start..payload_end];
             if let Some(json) = payload.strip_prefix(SIGNATURE) {
@@ -262,9 +329,81 @@ pub fn read_metadata(bytes: &[u8]) -> Result<Option<ScreenshotMetadata>, String>
     Ok(None)
 }
 
-/// Metadata is placed immediately after SOI, so there is no reason to read a
-/// multi-megabyte image just to index it.  96 KiB covers the maximum APP marker
-/// plus ordinary JFIF/EXIF headers from copied/re-encoded files.
+fn read_png_metadata(bytes: &[u8]) -> Result<Option<ScreenshotMetadata>, String> {
+    let mut cursor = PNG_SIGNATURE.len();
+    while cursor + 12 <= bytes.len() {
+        let length = u32::from_be_bytes([
+            bytes[cursor],
+            bytes[cursor + 1],
+            bytes[cursor + 2],
+            bytes[cursor + 3],
+        ]) as usize;
+        let chunk_type_start = cursor + 4;
+        let data_start = chunk_type_start + 4;
+        let data_end = data_start
+            .checked_add(length)
+            .ok_or_else(|| "PNG chunk size overflowed usize".to_owned())?;
+        let chunk_end = data_end
+            .checked_add(4)
+            .ok_or_else(|| "PNG chunk size overflowed usize".to_owned())?;
+        if chunk_end > bytes.len() {
+            break;
+        }
+        let chunk_type = &bytes[chunk_type_start..data_start];
+        if chunk_type == PNG_ITXT.as_slice() {
+            let data = &bytes[data_start..data_end];
+            let Some(keyword_end) = data.iter().position(|&byte| byte == 0) else {
+                cursor = chunk_end;
+                continue;
+            };
+            if &data[..keyword_end] == PNG_KEYWORD {
+                let fields = &data[keyword_end + 1..];
+                if fields.len() < 4 {
+                    return Err("invalid DinurdoJK PNG metadata iTXt chunk".into());
+                }
+                if fields[0] != 0 || fields[1] != 0 {
+                    return Err("compressed DinurdoJK PNG metadata is unsupported".into());
+                }
+                let language_end = fields[2..]
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .map(|offset| offset + 2)
+                    .ok_or_else(|| "invalid DinurdoJK PNG metadata language tag".to_owned())?;
+                let translated_start = language_end + 1;
+                let translated_end = fields[translated_start..]
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .map(|offset| translated_start + offset)
+                    .ok_or_else(|| {
+                        "invalid DinurdoJK PNG metadata translated keyword".to_owned()
+                    })?;
+                let json = &fields[translated_end + 1..];
+                let value: Value = serde_json::from_slice(json)
+                    .map_err(|error| format!("invalid DinurdoJK screenshot metadata: {error}"))?;
+                return ScreenshotMetadata::from_value(&value).map(Some);
+            }
+        }
+        if chunk_type == b"IDAT" || chunk_type == b"IEND" {
+            break;
+        }
+        cursor = chunk_end;
+    }
+    Ok(None)
+}
+
+pub fn read_metadata(bytes: &[u8]) -> Result<Option<ScreenshotMetadata>, String> {
+    if bytes.starts_with(&JPEG_SOI) {
+        read_jpeg_metadata(bytes)
+    } else if bytes.starts_with(&PNG_SIGNATURE) {
+        read_png_metadata(bytes)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Metadata is placed at the front of either file type (after JPEG SOI or PNG
+/// IHDR), so there is no reason to read a multi-megabyte image just to index it.
+/// 96 KiB covers the maximum JPEG APP marker and our PNG iTXt payload.
 pub fn read_metadata_file(path: &Path) -> Result<Option<ScreenshotMetadata>, String> {
     let mut file = File::open(path).map_err(|error| format!("could not open {}: {error}", path.display()))?;
     let mut bytes = Vec::with_capacity(96 * 1024);
@@ -395,6 +534,32 @@ mod tests {
         assert_eq!(decoded.camera_origin, Some([1.0, 2.0, 3.0]));
         assert_eq!(decoded.players[0].score, Some(12));
         assert!(decoded.can_go_to_spot());
+    }
+
+    #[test]
+    fn png_itxt_metadata_round_trips() {
+        use image::ImageEncoder;
+
+        let mut png = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut png)
+            .write_image(
+                &[10, 20, 30, 255],
+                1,
+                1,
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        let mut metadata = ScreenshotMetadata::default();
+        metadata.map_name = Some("mp/ffa3".into());
+        metadata.player_origin = Some([7.0, 8.0, 9.0]);
+        metadata.view_angles = Some([10.0, 20.0, 0.0]);
+        embed_png_metadata(&mut png, &metadata).unwrap();
+
+        let decoded = read_metadata(&png).unwrap().unwrap();
+        assert_eq!(decoded.map_name.as_deref(), Some("mp/ffa3"));
+        assert_eq!(decoded.player_origin, Some([7.0, 8.0, 9.0]));
+        assert!(decoded.can_go_to_spot());
+        assert!(image::load_from_memory_with_format(&png, image::ImageFormat::Png).is_ok());
     }
 
     #[test]

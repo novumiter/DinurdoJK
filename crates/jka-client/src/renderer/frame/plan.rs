@@ -11,10 +11,11 @@ impl Renderer {
         let legacy1_global_post = self.weather.fog.legacy1_global_post_active();
         let gamma_enabled = (self.output_gamma() - 1.0).abs() > 0.001;
         let lut_enabled = self.color_lut_effective_strength > 0.001;
+        let manual_exposure = self.color_grade.exposure_ev.abs() > 0.001;
         let full_post_effects = self.ocean_enabled
             || self.hdr_enabled
             || self.tone_mapping_enabled
-            || self.bloom_enabled
+            || self.glow_mode.enabled()
             || self.halation_enabled
             || self.ssao_enabled
             || self.fxaa_enabled
@@ -35,7 +36,7 @@ impl Renderer {
         // chosen output path. It does not by itself require our post-process
         // intermediate: with gamma/effects off the world can render directly
         // into the SMAA color target before SMAA resolves to the surface.
-        let use_post = gamma_enabled || lut_enabled || full_post_effects;
+        let use_post = gamma_enabled || lut_enabled || manual_exposure || full_post_effects;
         // Gamma and color LUTs affect only the final image. Keep the fast BSP
         // shaders/frame recorder and reuse one compact post pass for both.
         let use_hiz = self.gpu_driven_enabled && self.hiz_occlusion_enabled;
@@ -48,7 +49,7 @@ impl Renderer {
         let fast_baseline = !self.force_unified_world
             && !self.hdr_enabled
             && !self.tone_mapping_enabled
-            && !self.bloom_enabled
+            && !self.glow_mode.enabled()
             && !self.halation_enabled
             && !self.ssao_enabled
             && !self.fxaa_enabled
@@ -118,7 +119,7 @@ impl Renderer {
             // The tiny post path handles display gamma and/or one trilinear 3-D
             // LUT sample. If that path is already required it also applies the
             // vignette, but vignette alone does not force an offscreen scene copy.
-            gamma_only_post: (gamma_enabled || lut_enabled) && !full_post_effects,
+            gamma_only_post: (gamma_enabled || lut_enabled || manual_exposure) && !full_post_effects,
             needs_linear_depth,
             use_hiz,
             hiz_early: use_hiz && !needs_linear_depth,

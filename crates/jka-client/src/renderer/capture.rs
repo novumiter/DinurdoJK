@@ -1,5 +1,8 @@
 //! Capture.
-use crate::renderer::{mpsc, Duration, Instant, PathBuf, Renderer, ScreenshotOutput};
+use crate::renderer::{
+    mpsc, Duration, Instant, PathBuf, Renderer, ScreenshotFormat, ScreenshotOutput,
+};
+use image::ImageEncoder;
 
 pub(in crate::renderer) struct ScreenshotReadbackBuffer {
     pub(in crate::renderer) buffer: wgpu::Buffer,
@@ -10,6 +13,7 @@ pub(in crate::renderer) enum ScreenshotDestination {
     File {
         directory: PathBuf,
         metadata: crate::screenshot::ScreenshotMetadata,
+        format: ScreenshotFormat,
     },
     Clipboard,
 }
@@ -161,6 +165,59 @@ pub(in crate::renderer) fn encode_screenshot_jpeg(
     }
 }
 
+/// Encodes the same post-processed WGPU surface used by `/screenshot` as a
+/// lossless RGBA PNG. WGPU rows are padded to COPY_BYTES_PER_ROW_ALIGNMENT and
+/// Windows' common surface format is BGRA, so normalize both here on the worker.
+pub(in crate::renderer) fn encode_screenshot_png(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    pixel_format: ScreenshotPixelFormat,
+) -> Result<Vec<u8>, String> {
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let row_bytes = width_usize
+        .checked_mul(4)
+        .ok_or_else(|| "screenshot row size overflowed usize".to_owned())?;
+    let padded_row_bytes = padded_bytes_per_row as usize;
+    let byte_len = row_bytes
+        .checked_mul(height_usize)
+        .ok_or_else(|| "screenshot byte size overflowed usize".to_owned())?;
+    let mut rgba = Vec::with_capacity(byte_len);
+
+    for row_index in 0..height_usize {
+        let row_start = row_index
+            .checked_mul(padded_row_bytes)
+            .ok_or_else(|| "screenshot row offset overflowed usize".to_owned())?;
+        let row_end = row_start
+            .checked_add(row_bytes)
+            .ok_or_else(|| "screenshot row end overflowed usize".to_owned())?;
+        let row = pixels
+            .get(row_start..row_end)
+            .ok_or_else(|| "screenshot readback buffer is shorter than expected".to_owned())?;
+        match pixel_format {
+            ScreenshotPixelFormat::Rgba => rgba.extend_from_slice(row),
+            ScreenshotPixelFormat::Bgra => {
+                for pixel in row.chunks_exact(4) {
+                    rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+            }
+        }
+    }
+
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            &rgba,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| format!("PNG encode failed: {error}"))?;
+    Ok(png)
+}
+
 /// Writes the clipboard screenshot's JPEG to the temp directory so it can ride
 /// on the clipboard as a file drop. Older copies are swept first; a pasted file
 /// is read immediately by chat apps, so a day of grace is plenty.
@@ -197,30 +254,51 @@ pub(in crate::renderer) fn encode_screenshot_job(
         ScreenshotDestination::File {
             directory: screenshot_dir,
             metadata,
+            format,
         } => {
-            let jpeg_started = Instant::now();
-            let (mut jpeg, jpeg_input_mode) = encode_screenshot_jpeg(
-                &job.pixels,
-                job.width,
-                job.height,
-                job.padded_bytes_per_row,
-                job.pixel_format,
-            )?;
-            crate::screenshot::embed_metadata(&mut jpeg, &metadata)?;
-            let jpeg_ms = jpeg_started.elapsed().as_secs_f64() * 1000.0;
+            let encode_started = Instant::now();
+            let (bytes, extension, codec_detail) = match format {
+                ScreenshotFormat::Jpeg => {
+                    let (mut jpeg, input_mode) = encode_screenshot_jpeg(
+                        &job.pixels,
+                        job.width,
+                        job.height,
+                        job.padded_bytes_per_row,
+                        job.pixel_format,
+                    )?;
+                    crate::screenshot::embed_metadata(&mut jpeg, &metadata)?;
+                    (jpeg, "jpg", input_mode)
+                }
+                ScreenshotFormat::Png => {
+                    let mut png = encode_screenshot_png(
+                        &job.pixels,
+                        job.width,
+                        job.height,
+                        job.padded_bytes_per_row,
+                        job.pixel_format,
+                    )?;
+                    crate::screenshot::embed_png_metadata(&mut png, &metadata)?;
+                    (png, "png", "rgba8")
+                }
+            };
+            let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
 
             let file_io_started = Instant::now();
             std::fs::create_dir_all(&screenshot_dir).map_err(|error| {
                 format!("could not create {}: {error}", screenshot_dir.display())
             })?;
-            let path = screenshot_dir.join(format!("shot{}.jpg", screenshot_timestamp()));
-            std::fs::write(&path, &jpeg)
+            let path = screenshot_dir.join(format!(
+                "shot{}.{}",
+                screenshot_timestamp(),
+                extension
+            ));
+            std::fs::write(&path, &bytes)
                 .map_err(|error| format!("could not write {}: {error}", path.display()))?;
             let file_io_ms = file_io_started.elapsed().as_secs_f64() * 1000.0;
 
             let total_ms = job.started.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
-                "[JKA SCREENSHOT] {}x{} copy_record={:.3}ms copy_submit={:.3}ms map_request={:.3}ms gpu_wait={:.3}ms readback_copy={:.3}ms jpeg_420={:.3}ms file_io={:.3}ms total={:.3}ms buffer={} copy={} jpeg_input={} output=file encode=worker",
+                "[JKA SCREENSHOT] {}x{} copy_record={:.3}ms copy_submit={:.3}ms map_request={:.3}ms gpu_wait={:.3}ms readback_copy={:.3}ms encode={:.3}ms file_io={:.3}ms total={:.3}ms buffer={} copy={} codec={} codec_detail={} output=file encode=worker",
                 job.width,
                 job.height,
                 job.copy_record_ms,
@@ -228,12 +306,13 @@ pub(in crate::renderer) fn encode_screenshot_job(
                 job.map_request_ms,
                 job.gpu_wait_ms,
                 job.readback_copy_ms,
-                jpeg_ms,
+                encode_ms,
                 file_io_ms,
                 total_ms,
                 if job.reused_buffer { "reused" } else { "new" },
                 if job.inline_copy { "inline" } else { "late-submit" },
-                jpeg_input_mode,
+                extension,
+                codec_detail,
             );
             Ok(ScreenshotOutput::Saved(path))
         }
@@ -295,6 +374,7 @@ impl Renderer {
         &mut self,
         directory: PathBuf,
         metadata: crate::screenshot::ScreenshotMetadata,
+        format: ScreenshotFormat,
     ) {
         // Capture the destination together with the request. `fs_game` can change
         // without a renderer restart, so renderer construction time is not a safe
@@ -302,6 +382,7 @@ impl Renderer {
         self.request_screenshot_capture(ScreenshotDestination::File {
             directory,
             metadata,
+            format,
         });
     }
 
@@ -338,8 +419,13 @@ impl Renderer {
         let started = Instant::now();
         let width = self.config.width.max(1);
         let height = self.config.height.max(1);
-        if matches!(&destination, ScreenshotDestination::File { .. })
-            && (width > u16::MAX as u32 || height > u16::MAX as u32)
+        if matches!(
+            &destination,
+            ScreenshotDestination::File {
+                format: ScreenshotFormat::Jpeg,
+                ..
+            }
+        ) && (width > u16::MAX as u32 || height > u16::MAX as u32)
         {
             self.screenshot_result = Some(Err(format!(
                 "screenshot dimensions {width}x{height} exceed JPEG's 65535-pixel limit"

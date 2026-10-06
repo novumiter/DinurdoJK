@@ -63,7 +63,9 @@ struct InputVertex {
 @group(0) @binding(1) var<storage, read> draw_indices: array<u32>;
 @group(1) @binding(0) var<storage, read> bones: array<BoneMatrix>;
 @group(1) @binding(1) var<storage, read> skin_draws: array<SkinDraw>;
-// Packed DynamicModelVertex words: position3, normal3, uv2, color4 = 12 words.
+// Packed DynamicModelVertex words: position3, normal3, uv2, color4, depth_hack1
+// = 13 words. DYNAMIC_MODEL_VERTEX_WORDS in api.rs static-asserts the match;
+// a new DynamicModelVertex field must be added to write_vertex below as well.
 @group(1) @binding(2) var<storage, read_write> output_words: array<u32>;
 
 fn transform_point(bone: BoneMatrix, point: vec3<f32>) -> vec3<f32> {
@@ -151,7 +153,7 @@ fn write_vertex(
     uv: vec2<f32>,
     color: vec4<f32>,
 ) {
-    let base = output_vertex * 12u;
+    let base = output_vertex * 13u;
     write_f32(base + 0u, position.x);
     write_f32(base + 1u, position.y);
     write_f32(base + 2u, position.z);
@@ -164,6 +166,10 @@ fn write_vertex(
     write_f32(base + 9u, color.y);
     write_f32(base + 10u, color.z);
     write_f32(base + 11u, color.w);
+    // RF_DEPTHHACK never applies to a skinned Ghoul2 surface, but the slot is
+    // part of the stride and the reserved range is only zero-filled on the CPU,
+    // so write it rather than leaving the previous frame's value behind.
+    write_f32(base + 12u, 0.0);
 }
 
 @compute @workgroup_size(64, 1, 1)

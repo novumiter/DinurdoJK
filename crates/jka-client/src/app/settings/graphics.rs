@@ -1,9 +1,9 @@
 //! Settings graphics.
 use crate::app::{
-    scene, ui, App, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode,
+    scene, ui, App, CloudRenderResolution, CloudType, ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
     DetailTextureMode, DofQuality, DynamicLightsMode, DynamicShadowsMode,
     EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FxGeometryMode,
-    Ghoul2BatchMode, Ghoul2SkinningMode, Instant, PlanarReflectionDebugMode, PostEffects,
+    Ghoul2BatchMode, Ghoul2SkinningMode, GlowMode, Instant, PlanarReflectionDebugMode, PostEffects,
     PuddleQuality, PvsMode, RainIntensity, ReflectionQuality, RenderCommand, VsyncMode,
 };
 
@@ -171,6 +171,76 @@ impl App {
             .unwrap_or(1) as i32;
         let next = (current + direction).rem_euclid(DofQuality::ALL.len() as i32) as usize;
         self.video.dof_quality = DofQuality::ALL[next];
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_scope(&mut self, scope: CrtScope) {
+        self.video.crt_scope = scope;
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_style(&mut self, style: CrtStyle) {
+        self.video.crt_style = style;
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_quality(&mut self, quality: CrtQuality) {
+        self.video.crt_quality = quality;
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_reference(&mut self, reference: CrtReferenceResolution) {
+        self.video.crt_reference = reference;
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_mask(&mut self, mask: CrtMask) {
+        self.video.crt_mask = mask;
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_scanline(&mut self, value: f32) {
+        self.video.crt_scanline = value.clamp(0.0, 1.0);
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_sharpness(&mut self, value: f32) {
+        self.video.crt_sharpness = value.clamp(1.0, 6.0);
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_mask_intensity(&mut self, value: f32) {
+        self.video.crt_mask_intensity = value.clamp(0.0, 1.0);
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_curvature(&mut self, value: f32) {
+        self.video.crt_curvature = value.clamp(0.0, 0.25);
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_crt_corner(&mut self, value: f32) {
+        self.video.crt_corner = value.clamp(0.0, 11.0);
         self.sync_post_effects();
         self.mark_config_dirty();
         self.publish_ui();
@@ -464,7 +534,7 @@ impl App {
             hdr: self.video.hdr,
             auto_exposure: self.video.auto_exposure,
             tone_mapping: self.video.tone_mapping,
-            bloom: self.video.bloom,
+            glow: self.video.glow,
             halation: self.video.halation,
             ssao: self.video.ssao,
             static_bsp_ao: self.video.static_bsp_ao,
@@ -512,6 +582,7 @@ impl App {
             cloud_size: self.video.cloud_size,
             rain: self.video.rain,
             rain_intensity: self.video.rain_intensity,
+            rain_glass: self.video.rain_glass,
             puddle_quality: self.video.puddle_quality,
             puddle_scatter: self.video.puddle_scatter,
             rain_grade: self.video.rain_grade,
@@ -524,9 +595,20 @@ impl App {
             film_grain_strength: self.video.film_grain_strength,
             motion_blur_strength: self.video.motion_blur_strength,
             depth_of_field_strength: self.video.depth_of_field_strength,
+            crt_scope: self.video.crt_scope,
+            crt_style: self.video.crt_style,
+            crt_quality: self.video.crt_quality,
+            crt_reference: self.video.crt_reference,
+            crt_mask: self.video.crt_mask,
+            crt_scanline: self.video.crt_scanline,
+            crt_sharpness: self.video.crt_sharpness,
+            crt_mask_intensity: self.video.crt_mask_intensity,
+            crt_curvature: self.video.crt_curvature,
+            crt_corner: self.video.crt_corner,
             dof_quality: self.video.dof_quality,
             color_lut: self.video.color_lut,
             color_lut_strength: self.video.color_lut_strength,
+            color_grade: self.video.color_grade,
             split_toning: self.video.split_toning,
         }));
     }
@@ -636,7 +718,6 @@ impl App {
                 self.set_max_frame_latency(next as u32);
             }
             ui::VIDEO_ROW_FPS_CAP => self.begin_fps_cap_edit(),
-            ui::VIDEO_ROW_PHYSICS_FPS => self.begin_physics_fps_edit(),
             ui::VIDEO_ROW_BRIGHTNESS => self.set_gamma(self.video.gamma + direction as f32 * 0.05),
             ui::VIDEO_ROW_ANTI_ALIASING => self.cycle_anti_aliasing(direction),
             ui::VIDEO_ROW_TEXTURE_FILTER => self.cycle_texture_filter(direction),
@@ -1002,8 +1083,13 @@ impl App {
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
-            ui::VIDEO_ROW_BLOOM => {
-                self.video.bloom = !self.video.bloom;
+            ui::VIDEO_ROW_GLOW => {
+                let current = GlowMode::ALL
+                    .iter()
+                    .position(|mode| *mode == self.video.glow)
+                    .unwrap_or(0) as i32;
+                let next = (current + direction).rem_euclid(GlowMode::ALL.len() as i32) as usize;
+                self.video.glow = GlowMode::ALL[next];
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
@@ -1014,6 +1100,36 @@ impl App {
                 self.video.depth_of_field_strength + direction as f32 * 0.05,
             ),
             ui::VIDEO_ROW_DOF_QUALITY => self.cycle_dof_quality(direction),
+            ui::VIDEO_ROW_CRT_STYLE => {
+                let current = CrtStyle::ALL.iter().position(|v| *v == self.video.crt_style).unwrap_or(0) as i32;
+                let next = (current + direction).rem_euclid(CrtStyle::ALL.len() as i32) as usize;
+                self.set_crt_style(CrtStyle::ALL[next]);
+            }
+            ui::VIDEO_ROW_CRT_SCOPE => {
+                let current = CrtScope::ALL.iter().position(|v| *v == self.video.crt_scope).unwrap_or(0) as i32;
+                let next = (current + direction).rem_euclid(CrtScope::ALL.len() as i32) as usize;
+                self.set_crt_scope(CrtScope::ALL[next]);
+            }
+            ui::VIDEO_ROW_CRT_QUALITY => {
+                let current = CrtQuality::ALL.iter().position(|v| *v == self.video.crt_quality).unwrap_or(0) as i32;
+                let next = (current + direction).rem_euclid(CrtQuality::ALL.len() as i32) as usize;
+                self.set_crt_quality(CrtQuality::ALL[next]);
+            }
+            ui::VIDEO_ROW_CRT_REFERENCE => {
+                let current = CrtReferenceResolution::ALL.iter().position(|v| *v == self.video.crt_reference).unwrap_or(0) as i32;
+                let next = (current + direction).rem_euclid(CrtReferenceResolution::ALL.len() as i32) as usize;
+                self.set_crt_reference(CrtReferenceResolution::ALL[next]);
+            }
+            ui::VIDEO_ROW_CRT_MASK => {
+                let current = CrtMask::ALL.iter().position(|v| *v == self.video.crt_mask).unwrap_or(1) as i32;
+                let next = (current + direction).rem_euclid(CrtMask::ALL.len() as i32) as usize;
+                self.set_crt_mask(CrtMask::ALL[next]);
+            }
+            ui::VIDEO_ROW_CRT_SCANLINE => self.set_crt_scanline(self.video.crt_scanline + direction as f32 * 0.05),
+            ui::VIDEO_ROW_CRT_SHARPNESS => self.set_crt_sharpness(self.video.crt_sharpness + direction as f32 * 0.25),
+            ui::VIDEO_ROW_CRT_MASK_INTENSITY => self.set_crt_mask_intensity(self.video.crt_mask_intensity + direction as f32 * 0.05),
+            ui::VIDEO_ROW_CRT_CURVATURE => self.set_crt_curvature(self.video.crt_curvature + direction as f32 * 0.01),
+            ui::VIDEO_ROW_CRT_CORNER => self.set_crt_corner(self.video.crt_corner + direction as f32 * 0.5),
             ui::VIDEO_ROW_HALATION => {
                 self.video.halation = !self.video.halation;
                 self.sync_post_effects();
@@ -1502,6 +1618,11 @@ impl App {
             }
             ui::ENV_ROW_RAIN => {
                 self.video.rain = !self.video.rain;
+                self.sync_post_effects();
+                self.mark_config_dirty();
+            }
+            ui::ENV_ROW_RAIN_GLASS => {
+                self.video.rain_glass = !self.video.rain_glass;
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }

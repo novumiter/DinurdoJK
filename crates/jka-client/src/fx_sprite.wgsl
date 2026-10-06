@@ -7,6 +7,10 @@ struct Camera {
 };
 
 override ENABLE_LEGACY_FOG: bool = false;
+// OpenJK Dynamic Glow temporarily overrides the fog colour to black while
+// replaying explicitly-authored `glow` stages. Pipeline-specialize that replay
+// rather than changing material classification or blend behavior.
+override FORCE_FOG_BLACK: bool = false;
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
@@ -91,7 +95,7 @@ fn apply_self_legacy_fog(rgb: vec3<f32>, world_position: vec3<f32>, fog_to_black
 }
 
 fn fogged(color: vec4<f32>, world_position: vec3<f32>, fog_to_black: bool) -> vec4<f32> {
-    return vec4<f32>(apply_self_legacy_fog(color.rgb, world_position, fog_to_black), color.a);
+    return vec4<f32>(apply_self_legacy_fog(color.rgb, world_position, fog_to_black || FORCE_FOG_BLACK), color.a);
 }
 
 @fragment

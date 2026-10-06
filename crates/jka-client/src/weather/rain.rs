@@ -6,6 +6,7 @@ use crate::{
 };
 use super::{
     cpu_field::CpuField,
+    rain_glass::RainGlassResources,
     wake::{WakeEvent, WakeTracker, WAKE_LIFETIME, WAKE_MAX_EVENTS, WAKE_RING_SPEED},
 };
 use bytemuck::{Pod, Zeroable};
@@ -33,6 +34,13 @@ const RAIN_FILM_FADE_START: f32 = 1400.0;
 const RAIN_FILM_FADE_END: f32 = 4200.0;
 // Extra reflectivity of a wet film under High puddle water.
 const RAIN_FILM_GLOSS_HIGH: f32 = 1.5;
+// Where the puddle coat hands its environment over from the reflection probe to
+// the map's skybox, as the vertical component of the mirror ray, and the largest
+// share the skybox is ever allowed. See `weather_coat_sky_share` in
+// weather_surface_world.wgsl for the geometry these came from; `puddle_sky` edits
+// them live so the look can be judged from a screenshot instead of guessed.
+pub(crate) const RAIN_SKY_BLEND_WINDOW: f32 = 0.60;
+pub(crate) const RAIN_SKY_BLEND_CEILING: f32 = 0.70;
 pub(crate) const RAIN_WETNESS_RISE_SECONDS: f32 = 2.5;
 pub(crate) const RAIN_WETNESS_DRY_SECONDS: f32 = 12.0;
 pub(crate) const RAIN_WETNESS_EPSILON: f32 = 0.002;
@@ -95,14 +103,15 @@ fn filtering_sampler_entry_compute(binding: u32) -> wgpu::BindGroupLayoutEntry {
 pub(crate) struct WeatherSurfaceUniform {
     /// Wetness, grass fade start/end, rain-intensity response.
     pub amount_distance: [f32; 4],
-    /// Puddle accumulation, ripple time, ripple strength, debug view.
+    /// Puddle accumulation, ripple time, ripple strength, debug view mode.
     pub puddle: [f32; 4],
     pub occlusion_uv: [f32; 4],
     pub occlusion_size: [u32; 4],
     /// Scattered puddle amount, reflection streak strength, high-quality water,
     /// wet-film gloss.
     pub look: [f32; 4],
-    /// Wet-film fade start/end in world units.
+    /// Wet-film fade start/end in world units, then the coat's probe-to-skybox
+    /// handover window and the skybox's share ceiling.
     pub film_fade: [f32; 4],
     /// Light travel direction (render space) and relative intensity (250 = 1).
     pub sun_direction: [f32; 4],
@@ -208,7 +217,13 @@ pub(crate) struct RainSystem {
     pub intensity: RainIntensity,
     pub surface_wetness: f32,
     pub puddle_amount: f32,
-    pub puddle_debug_visualization: bool,
+    /// `puddle_debug <mode>`: 0 off, otherwise the diagnostic view the world
+    /// shaders paint instead of the lit colour (`weather_surface_debug`).
+    pub puddle_debug_mode: u32,
+    /// Live tuning for the coat's probe/skybox handover, defaulted from
+    /// `RAIN_SKY_BLEND_WINDOW`/`_CEILING`.
+    pub sky_blend_window: f32,
+    pub sky_blend_ceiling: f32,
     pub puddle_quality: PuddleQuality,
     /// How readily rain collects in scattered puddles on large flat ground, 0..1.
     pub puddle_scatter: f32,
@@ -221,6 +236,12 @@ pub(crate) struct RainSystem {
     camera_exposure: f32,
     pub wake: WakeTracker,
     pub surface_wetness_last_time: f32,
+    /// Lazily allocated on first exposed-rain frame. This is the native WGPU
+    /// port of Toadstorm/RainyGlassShader's fullscreen GrabPass refraction.
+    glass: Option<RainGlassResources>,
+    /// Setup > Environment > Rain on lens. Separate from `enabled` so the lens
+    /// can be turned off without losing the rain itself.
+    pub glass_enabled: bool,
 }
 
 impl RainSystem {
@@ -247,7 +268,9 @@ impl RainSystem {
             intensity: RainIntensity::Rain,
             surface_wetness: 0.0,
             puddle_amount: 0.0,
-            puddle_debug_visualization: false,
+            puddle_debug_mode: 0,
+            sky_blend_window: RAIN_SKY_BLEND_WINDOW,
+            sky_blend_ceiling: RAIN_SKY_BLEND_CEILING,
             puddle_quality: PuddleQuality::default(),
             puddle_scatter: 0.0,
             wet_grade: 0.0,
@@ -255,6 +278,8 @@ impl RainSystem {
             camera_exposure: 1.0,
             wake: WakeTracker::default(),
             surface_wetness_last_time: 0.0,
+            glass: None,
+            glass_enabled: true,
         }
     }
 
@@ -265,6 +290,87 @@ impl RainSystem {
             RainIntensity::Rain => 0.88,
             RainIntensity::Heavy => 1.0,
         }
+    }
+
+    /// How hard rain is reaching the camera itself: the rain's own intensity faded
+    /// by the camera's exposure to it, so it drops off a second or two after
+    /// stepping under a roof. Deliberately not `grade_amount`, which is scaled by
+    /// `r_rainGrade` - a colour preference a player may turn off without meaning
+    /// anything by it.
+    ///
+    /// This drives the Toadstorm RainyGlass lens pass and is also published in
+    /// `weather_look.w` so all weather consumers share the same camera exposure.
+    pub(crate) fn lens_drop_amount(&self) -> f32 {
+        if !self.enabled {
+            return 0.0;
+        }
+        (self.intensity_response() * self.camera_exposure).clamp(0.0, 1.0)
+    }
+
+    pub(crate) fn prepare_lens_glass(
+        &mut self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        frame_time: f32,
+        lens_up_alignment: f32,
+    ) {
+        let amount = if self.glass_enabled {
+            self.lens_drop_amount()
+        } else {
+            0.0
+        };
+        // Do not allocate the two authored masks, scratch target or PSO until
+        // rain actually reaches the camera at least once.
+        if amount <= 0.001 && self.glass.is_none() {
+            return;
+        }
+        let glass = self.glass.get_or_insert_with(|| {
+            RainGlassResources::new(device, queue, width, height, format)
+        });
+        glass.prepare(
+            jobs, device, queue, width, height, format, frame_time, amount,
+            lens_up_alignment,
+        );
+    }
+
+    pub(crate) fn lens_glass_active(&self) -> bool {
+        self.enabled
+            && self.glass_enabled
+            && self.glass.as_ref().is_some_and(RainGlassResources::active)
+    }
+
+    pub(crate) fn lens_glass_source_view(&self) -> Option<&wgpu::TextureView> {
+        self.lens_glass_active().then(|| {
+            self.glass
+                .as_ref()
+                .expect("active RainyGlass resources")
+                .source_view()
+        })
+    }
+
+    pub(crate) fn render_lens_glass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+    ) {
+        if !self.enabled || !self.glass_enabled {
+            return;
+        }
+        if let Some(glass) = self.glass.as_ref() {
+            glass.render(encoder, output);
+        }
+    }
+
+    /// How wet entities are (model_weather.wgsl). Models cannot read the weather
+    /// field - they have no binding for it - so the camera's own exposure to the
+    /// rain stands in for per-entity cover: right whenever the camera and the
+    /// model share shelter, which is the case a player notices.
+    pub(crate) fn entity_wetness(&self) -> f32 {
+        (self.surface_wetness * self.intensity_response() * self.camera_exposure).clamp(0.0, 1.0)
     }
 
     /// How far the wet-weather colour grade is faded in: it follows the surface
@@ -522,7 +628,7 @@ impl RainSystem {
                     self.puddle_amount,
                     self.surface_wetness_last_time,
                     if self.enabled { ripple_intensity } else { 0.0 },
-                    if self.puddle_debug_visualization { 1.0 } else { 0.0 },
+                    self.puddle_debug_mode as f32,
                 ],
                 occlusion_uv,
                 occlusion_size: [width, height, active, 0],
@@ -535,7 +641,12 @@ impl RainSystem {
                         if high { RAIN_FILM_GLOSS_HIGH } else { 1.0 },
                     ]
                 },
-                film_fade: [RAIN_FILM_FADE_START, RAIN_FILM_FADE_END, 0.0, 0.0],
+                film_fade: [
+                    RAIN_FILM_FADE_START,
+                    RAIN_FILM_FADE_END,
+                    self.sky_blend_window,
+                    self.sky_blend_ceiling,
+                ],
                 sun_direction: [
                     environment.sun_direction[0],
                     environment.sun_direction[1],

@@ -287,7 +287,8 @@ fn one_zero_world_base_is_opaque_and_seeds_depth() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     let material = SurfaceMaterial {
         stages: vec![stage.clone()],
         explicit: true,
@@ -419,7 +420,8 @@ fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     let mut diffuse = MaterialStage {
         texture: StageTexture::Image(7),
         enhancements: Default::default(),
@@ -436,7 +438,8 @@ fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     if enhanced {
         diffuse.enhancements.normal_texture = Some(8);
     }
@@ -477,7 +480,8 @@ fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
         tc_mods: Vec::new(),
         depth_write: true,
         depth_equal: false,
-    };
+            glow: false,
+};
     let lightmap = MaterialStage {
         texture: StageTexture::Lightmap,
         enhancements: Default::default(),
@@ -494,7 +498,8 @@ fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     let material = SurfaceMaterial {
         stages: vec![diffuse, lightmap],
         explicit: true,
@@ -539,7 +544,8 @@ fn vertex_lit_pbr_override_consumes_bsp_vertex_lighting() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     base.enhancements.normal_texture = Some(8);
     base.enhancements.roughness_texture = Some(9);
 
@@ -559,7 +565,8 @@ fn vertex_lit_pbr_override_consumes_bsp_vertex_lighting() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     let material = SurfaceMaterial {
         stages: vec![base, glow],
         explicit: true,
@@ -586,7 +593,8 @@ fn classic_explicit_vertex_lit_identity_stage_is_not_forced() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     let material = SurfaceMaterial {
         stages: vec![base],
         explicit: true,
@@ -613,7 +621,8 @@ fn guaranteed_alpha_discard_render_cull_keeps_surface_light_semantics() {
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
-        }],
+                    glow: false,
+}],
         surface_light: Some(materials::SurfaceLight {
             value: 750.0,
             color: [1.0; 3],
@@ -647,7 +656,8 @@ fn black_additive_surface_light_render_cull_keeps_surface_light_semantics() {
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
-        }],
+                    glow: false,
+}],
         surface_light: Some(materials::SurfaceLight {
             value: 500.0,
             color: [1.0; 3],
@@ -681,7 +691,8 @@ fn black_additive_non_light_shader_is_not_mapload_culled() {
             tc_mods: Vec::new(),
             depth_write: false,
             depth_equal: false,
-        }],
+                    glow: false,
+}],
         explicit: true,
         ..Default::default()
     };
@@ -704,7 +715,8 @@ fn guaranteed_alpha_discard_render_cull_requires_every_stage_to_discard() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
-    };
+            glow: false,
+};
     let visible = MaterialStage {
         opacity: 1.0,
         alpha_gen: AlphaGen::Identity,
@@ -1293,4 +1305,68 @@ fn dynamic_light_entities_are_bounded_and_finite() {
     assert!(
         dynamic_light_from_values("info_player_deathmatch", Some("0 0 0"), None, None).is_none()
     );
+}
+
+
+#[test]
+fn promoted_water_inherits_stage_tint_alpha_and_material_hints() {
+    let mut enhancements = materials::StageEnhancements::default();
+    enhancements.roughness_override = Some(0.65);
+    enhancements.specular_reflectance = Some([0.08, 0.06, 0.04]);
+    let stage = MaterialStage {
+        texture: StageTexture::White, enhancements, blend: None,
+        alpha_cutoff: 0.0, opacity: 0.4, color: [0.2, 0.4, 0.8],
+        rgb_gen: RgbGen::Const, alpha_gen: AlphaGen::Vertex,
+        tc_gen: TcGen::Base, tc_mods: Vec::new(),
+        depth_write: false, depth_equal: false, glow: false,
+    };
+    let material = SurfaceMaterial { water: true, stages: vec![stage.clone()], ..Default::default() };
+    let batch = stage_batch(&material, &stage, true, false, 0..3,
+        Some(0), None, None, &[], [0; 4], [0.0; 4], false);
+    let vertices = vec![GpuVertex { position: [0.0; 3], uv: [0.0; 2],
+        lightmap_uv: [0.0; 2], normal: [0.0, 1.0, 0.0],
+        color: [1.0, 1.0, 1.0, 0.25], alpha_cutoff: 1.0 }; 3];
+    let appearance = crate::ocean::appearance::from_stage(&batch, &vertices, &[]);
+    assert_eq!(appearance.color, [0.2, 0.4, 0.8, 0.1]);
+    assert_eq!(appearance.material, [0.08, 0.06, 0.04, 0.65]);
+    assert_eq!(appearance.waves, [1.0, 4.0, 0.0, 0.0]);
+    let mut wavy_material = material.clone();
+    wavy_material.water_amplitude = 12.0;
+    wavy_material.water_deformed = true;
+    let wavy_batch = stage_batch(&wavy_material, &stage, true, false, 0..3,
+        Some(0), None, None, &[], [0; 4], [0.0; 4], false);
+    let wavy = crate::ocean::appearance::from_stage(&wavy_batch, &vertices, &[]);
+    assert_eq!(wavy.waves, [1.0, 12.0, 0.0, 0.0]);
+
+    let mut clear = batch.clone();
+    clear.alpha_gen = AlphaGen::Const;
+    clear.color[3] = 0.0;
+    assert_eq!(crate::ocean::appearance::from_stage(&clear, &vertices, &[]).color[3], 0.0);
+    clear.color[3] = 1.0;
+    assert_eq!(crate::ocean::appearance::from_stage(&clear, &vertices, &[]).color[3], 1.0);
+}
+
+#[test]
+fn promoted_water_screen_stage_uses_analyzed_color_without_texture_mapping() {
+    let stage = MaterialStage {
+        texture:StageTexture::White,enhancements:Default::default(),
+        blend:Some(materials::BlendFunc {src:materials::BlendFactor::OneMinusDstColor,dst:materials::BlendFactor::One}),
+        alpha_cutoff:0.0,opacity:1.0,color:[1.0;3],rgb_gen:RgbGen::Vertex,alpha_gen:AlphaGen::Identity,
+        tc_gen:TcGen::Base,tc_mods:vec![TcMod::Turb {base:0.5,amplitude:0.03,phase:0.0,frequency:0.3}],
+        depth_write:false,depth_equal:false,glow:false,
+    };
+    let material = SurfaceMaterial {water:true,stages:vec![stage.clone()],..Default::default()};
+    let batch = stage_batch(&material,&stage,true,false,0..3,None,None,None,&[],[0;4],[0.0;4],false);
+    let vertex = |x:f32,z:f32,uv:[f32;2]| GpuVertex {position:[x,-5058.0,z],uv,
+        lightmap_uv:[-1.0;2],normal:[0.0,1.0,0.0],color:[0.2,0.3,0.4,1.0],alpha_cutoff:1.0};
+    let vertices = vec![vertex(10000.0,15000.0,[-34.0,32.0]),
+        vertex(10512.0,15000.0,[-30.0,33.0]),vertex(10000.0,15512.0,[-32.0,36.0])];
+    let appearance = crate::ocean::appearance::from_stage(&batch,&vertices,&[]);
+    assert_eq!(appearance.waves[2..],[8.0,1.0],"screen blend is controlled by RGB, regardless of opaque image alpha");
+    assert_eq!(appearance.blend_color,[0.2,0.3,0.4,1.0],"analyzed mean preserves baked brightness");
+    let mut different_uvs = vertices.clone();
+    for vertex in &mut different_uvs {vertex.uv = [1000.0,-1000.0];}
+    let no_uv = crate::ocean::appearance::from_stage(&batch,&different_uvs,&[]);
+    assert_eq!(appearance.blend_color,no_uv.blend_color);
+    assert_eq!(appearance.heuristic,no_uv.heuristic);
 }

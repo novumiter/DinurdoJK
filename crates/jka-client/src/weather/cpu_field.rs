@@ -107,8 +107,8 @@ pub(crate) fn puddle_shape(
     }
     let submerged = level - relief(x, z);
     (
-        smoothstep(0.0, 0.22, submerged),
-        (submerged / 0.35).clamp(0.0, 1.0),
+        smoothstep(0.0, 0.055, submerged),
+        (submerged / 0.10).clamp(0.0, 1.0),
     )
 }
 
@@ -279,6 +279,41 @@ mod tests {
         }
         assert!(roofed.exposure_at([400.0, 0.0, 400.0]) < 0.01);
         assert!(open.exposure_at([400.0, 0.0, 400.0]) > 0.99);
+    }
+
+    /// The shoreline and depth windows must stay small enough that a scattered
+    /// puddle's interior is water, not a permanent shoreline ramp. When they were
+    /// 0.22 / 0.35 against a level that only reaches ~0.42 on flat ground, mean
+    /// coverage inside the water was 0.33 and mean depth 0.23, so the reflection
+    /// normal, roughness, ripples and post film all ran at a third of their
+    /// intended authority. Guard the interior, not just the flooded share.
+    #[test]
+    fn scattered_puddles_have_a_fully_submerged_interior() {
+        let open = plaza(WEATHER_NO_SURFACE_HEIGHT);
+        let mut wet = Vec::new();
+        for i in 0..80 {
+            for j in 0..80 {
+                let sample = open.puddle_at([40.0 + i as f32 * 9.0, 0.0, 40.0 + j as f32 * 9.0], 1.0, 1.0);
+                if sample.coverage > 0.01 {
+                    wet.push(sample);
+                }
+            }
+        }
+        assert!(!wet.is_empty(), "heavy rain put no water on open flat ground");
+        let mean = |f: fn(&PuddleSample) -> f32| wet.iter().map(f).sum::<f32>() / wet.len() as f32;
+        let mean_coverage = mean(|s| s.coverage);
+        let mean_depth = mean(|s| s.depth);
+        assert!(mean_coverage > 0.65, "mean coverage inside water {mean_coverage}");
+        assert!(mean_depth > 0.45, "mean depth inside water {mean_depth}");
+        // Most of the water must be fully covered, or the mirror response and the
+        // full-strength ripples are never reached anywhere.
+        let share = |keep: fn(&PuddleSample) -> bool| {
+            wet.iter().filter(|s| keep(s)).count() as f32 / wet.len() as f32
+        };
+        let full_coverage = share(|s| s.coverage > 0.99);
+        let full_depth = share(|s| s.depth > 0.99);
+        assert!(full_coverage > 0.35, "share of water at full coverage {full_coverage}");
+        assert!(full_depth > 0.15, "share of water at full depth {full_depth}");
     }
 
     #[test]

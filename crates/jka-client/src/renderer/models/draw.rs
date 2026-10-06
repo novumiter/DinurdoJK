@@ -21,6 +21,7 @@ impl DynamicModelRenderer {
         separate_wireframe_classes: bool,
         ray_traced_shadows: bool,
         rt_receivers: bool,
+        prepare_authored_glow: bool,
     ) {
         self.rt_prepared = false;
         if ray_traced_shadows
@@ -32,6 +33,7 @@ impl DynamicModelRenderer {
                 surfaces,
                 classic_grid,
                 rt_receivers,
+                prepare_authored_glow,
             )
         {
             return;
@@ -100,6 +102,7 @@ impl DynamicModelRenderer {
                             texture_key,
                             alpha_mode: surface.alpha_mode,
                             wireframe_class: surface.wireframe_class,
+                            authored_glow: surface.authored_glow,
                         });
                         self.blob_mesh_vertices.clear();
                         self.blob_mesh_indices.clear();
@@ -119,6 +122,7 @@ impl DynamicModelRenderer {
                     texture_key,
                     alpha_mode: surface.alpha_mode,
                     wireframe_class: surface.wireframe_class,
+                    authored_glow: surface.authored_glow,
                 });
                 continue;
             }
@@ -240,6 +244,7 @@ impl DynamicModelRenderer {
                     texture_key,
                     alpha_mode: surface.alpha_mode,
                     wireframe_class: surface.wireframe_class,
+                    authored_glow: surface.authored_glow,
                     uniform,
                     sequence: u32::try_from(skin_pending.len()).unwrap_or(u32::MAX),
                     batch_hash: None,
@@ -279,13 +284,16 @@ impl DynamicModelRenderer {
                 texture_key,
                 alpha_mode: surface.alpha_mode,
                 wireframe_class: surface.wireframe_class,
+                authored_glow: surface.authored_glow,
             });
         }
 
         self.ghoul2_input_instances = u32::try_from(skin_pending.len()).unwrap_or(u32::MAX);
         let batching_active = match self.ghoul2_batch_draws {
             Ghoul2BatchMode::Off => false,
-            Ghoul2BatchMode::Adaptive => Self::should_adaptively_batch(&mut skin_pending),
+            Ghoul2BatchMode::Adaptive => {
+                Self::should_adaptively_batch(&mut skin_pending, prepare_authored_glow)
+            },
             Ghoul2BatchMode::Force => true,
         };
         if batching_active {
@@ -299,7 +307,7 @@ impl DynamicModelRenderer {
                 ) && Some(draw.entity_num) != self.companion_excluded_entity
                     && draw.batch_hash.is_none()
                 {
-                    draw.batch_hash = Some(Self::ghoul2_batch_hash(draw));
+                    draw.batch_hash = Some(Self::ghoul2_batch_hash(draw, prepare_authored_glow));
                 }
             }
             let companion_excluded_entity = self.companion_excluded_entity;
@@ -357,6 +365,8 @@ impl DynamicModelRenderer {
                             && next.wireframe_class != pending.wireframe_class)
                         || next.mesh_key != pending.mesh_key
                         || next.texture_key != pending.texture_key
+                        || (prepare_authored_glow
+                            && next.authored_glow != pending.authored_glow)
                     {
                         break;
                     }
@@ -383,6 +393,7 @@ impl DynamicModelRenderer {
                     texture_key: pending.texture_key.as_ref().map(Arc::clone),
                     alpha_mode: pending.alpha_mode,
                     wireframe_class: pending.wireframe_class,
+                    authored_glow: pending.authored_glow,
                     first_instance,
                     instance_count: u32::try_from(group_len).unwrap_or(u32::MAX),
                 });
@@ -396,6 +407,7 @@ impl DynamicModelRenderer {
                         texture_key: item.texture_key.as_ref().map(Arc::clone),
                         alpha_mode: item.alpha_mode,
                         wireframe_class: item.wireframe_class,
+                        authored_glow: item.authored_glow,
                         first_instance,
                         instance_count: 1,
                     });
@@ -416,7 +428,7 @@ impl DynamicModelRenderer {
             queue.write_buffer(&self.index_buffer, 0, index_bytes);
         }
 
-        self.ensure_model_pipelines(jobs, device);
+        self.ensure_model_pipelines(jobs, device, prepare_authored_glow);
         if !self.fx_sprite_draws.is_empty() {
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
                 if self
@@ -425,6 +437,14 @@ impl DynamicModelRenderer {
                     .any(|draw| draw.alpha_mode == alpha_mode)
                 {
                     self.ensure_fx_sprite_pipeline(jobs, device, alpha_mode);
+                    if prepare_authored_glow
+                        && self
+                            .fx_sprite_draws
+                            .iter()
+                            .any(|draw| draw.alpha_mode == alpha_mode && draw.authored_glow)
+                    {
+                        self.ensure_fx_sprite_glow_pipeline(jobs, device, alpha_mode);
+                    }
                 }
             }
         }
@@ -470,6 +490,7 @@ impl DynamicModelRenderer {
         rt_receivers: Option<(&'a rt_models::RtModelReceivers, &'a wgpu::BindGroup)>,
         mut gpu_profiler: Option<&mut GpuProfiler>,
         excluded_entity: Option<u16>,
+        authored_glow_only: bool,
     ) {
         // Match the renderer-wide opaque-before-blended contract across both
         // dynamic geometry backends. The phase split is also used by water:
@@ -488,7 +509,12 @@ impl DynamicModelRenderer {
                 // Pipelines are lazy: only modes with draws were compiled.
                 .filter(|mode| self.model_alpha_mask & (1 << mode.index()) != 0)
             {
-                let Some(pipeline) = self.model_pipelines[alpha_mode.index()].as_ref() else {
+                let pipeline = if authored_glow_only {
+                    self.model_glow_pipelines[alpha_mode.index()].as_ref()
+                } else {
+                    self.model_pipelines[alpha_mode.index()].as_ref()
+                };
+                let Some(pipeline) = pipeline else {
                     continue;
                 };
                 let pipeline =
@@ -519,7 +545,9 @@ impl DynamicModelRenderer {
                     };
                 pass.set_pipeline(pipeline);
                 for draw in self.draws.iter().filter(|draw| {
-                    draw.alpha_mode == alpha_mode && Some(draw.entity_num) != excluded_entity
+                    draw.alpha_mode == alpha_mode
+                        && Some(draw.entity_num) != excluded_entity
+                        && (!authored_glow_only || draw.authored_glow)
                 }) {
                     let bind_group = draw
                         .texture_key
@@ -539,6 +567,7 @@ impl DynamicModelRenderer {
         let has_fx_sprites_in_phase = self.fx_sprite_draws.iter().any(|draw| {
             dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
                 && Some(draw.entity_num) != excluded_entity
+                && (!authored_glow_only || draw.authored_glow)
         });
         if has_fx_sprites_in_phase {
             let timed_pass = if depth_writing_phase {
@@ -560,18 +589,27 @@ impl DynamicModelRenderer {
                 // error when GPU FX is enabled.
                 .filter(|mode| {
                     self.fx_sprite_draws.iter().any(|draw| {
-                        draw.alpha_mode == *mode && Some(draw.entity_num) != excluded_entity
+                        draw.alpha_mode == *mode
+                            && Some(draw.entity_num) != excluded_entity
+                            && (!authored_glow_only || draw.authored_glow)
                     })
                 })
             {
-                let Some(pipeline) = self.fx_sprite_pipeline(alpha_mode) else {
+                let pipeline = if authored_glow_only {
+                    self.fx_sprite_glow_pipelines[alpha_mode.index()].as_ref()
+                } else {
+                    self.fx_sprite_pipeline(alpha_mode)
+                };
+                let Some(pipeline) = pipeline else {
                     // Runtime-lazy PSO still compiling; skip this FX variant for
                     // the handful of frames needed to finish rather than hitch.
                     continue;
                 };
                 pass.set_pipeline(pipeline);
                 for draw in self.fx_sprite_draws.iter().filter(|draw| {
-                    draw.alpha_mode == alpha_mode && Some(draw.entity_num) != excluded_entity
+                    draw.alpha_mode == alpha_mode
+                        && Some(draw.entity_num) != excluded_entity
+                        && (!authored_glow_only || draw.authored_glow)
                 }) {
                     let bind_group = draw
                         .texture_key
@@ -598,13 +636,20 @@ impl DynamicModelRenderer {
                 .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
                 .filter(|mode| self.skin_alpha_mask & (1 << mode.index()) != 0)
             {
-                let Some(pipeline) = self.skin_pipelines[alpha_mode.index()].as_ref() else {
+                let pipeline = if authored_glow_only {
+                    self.skin_glow_pipelines[alpha_mode.index()].as_ref()
+                } else {
+                    self.skin_pipelines[alpha_mode.index()].as_ref()
+                };
+                let Some(pipeline) = pipeline else {
                     continue;
                 };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(2, &self.skin_bind_group, &[]);
                 for draw in self.skin_draws.iter().filter(|draw| {
-                    draw.alpha_mode == alpha_mode && Some(draw.entity_num) != excluded_entity
+                    draw.alpha_mode == alpha_mode
+                        && Some(draw.entity_num) != excluded_entity
+                        && (!authored_glow_only || draw.authored_glow)
                 }) {
                     let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else {
                         continue;
@@ -634,7 +679,7 @@ impl DynamicModelRenderer {
         camera: &'a wgpu::BindGroup,
     ) {
         for depth_writing_phase in [true, false] {
-            self.draw_phase(pass, camera, depth_writing_phase, None, None, None);
+            self.draw_phase(pass, camera, depth_writing_phase, None, None, None, false);
         }
     }
 
@@ -652,6 +697,28 @@ impl DynamicModelRenderer {
                 None,
                 None,
                 Some(excluded_entity),
+                false,
+            );
+        }
+    }
+
+    /// Replay only exact JKA shader stages marked `glow` into the authored
+    /// glow source. Geometry/material pipelines remain identical to the visible
+    /// scene; submission alone is filtered.
+    pub(in crate::renderer) fn draw_authored_glow<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        camera: &'a wgpu::BindGroup,
+    ) {
+        for depth_writing_phase in [true, false] {
+            self.draw_phase(
+                pass,
+                camera,
+                depth_writing_phase,
+                None,
+                None,
+                None,
+                true,
             );
         }
     }

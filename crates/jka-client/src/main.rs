@@ -42,6 +42,8 @@ mod gamma;
 mod display_gamma;
 mod color_lut;
 mod config;
+#[cfg(test)]
+mod cvar_compatibility;
 mod console;
 mod crash;
 mod credential_store;

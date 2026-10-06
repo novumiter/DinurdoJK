@@ -395,6 +395,15 @@ pub(in crate::renderer) fn companion_render_thread_main(
         if shutdown {
             return;
         }
+        // The companion shares the main device, so a loss there kills this
+        // window too: every queue write starts failing silently and egui's
+        // upload asserts with an unrelated message. Leave the surface in place
+        // rather than unconfiguring a swapchain whose submissions a dead device
+        // will never retire.
+        if crate::renderer::device_lost() {
+            std::mem::forget(surface);
+            return;
+        }
         if let Some(size) = resize {
             if size.width > 0 && size.height > 0 {
                 config.width = size.width;

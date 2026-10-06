@@ -303,6 +303,8 @@ pub const ENV_ROW_PUDDLE_SCATTER: usize = 30;
 
 pub const ENV_ROW_RAIN_GRADE: usize = 31;
 
+pub const ENV_ROW_RAIN_GLASS: usize = 33;
+
 pub const CLOUD_ROW_TEMPORAL_DEPTH_FIX: usize = 0;
 
 pub const CLOUD_ROW_SHEAR: usize = 1;

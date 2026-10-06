@@ -5,6 +5,7 @@
 //! network source both feed the same decoded `Snapshot` values into this layer.
 
 mod player_animation;
+pub(crate) mod player_state;
 pub(crate) mod footsteps;
 pub(crate) mod ragdoll;
 pub(crate) mod cloth;
@@ -524,13 +525,78 @@ pub struct ShaderRemap {
     pub time_offset: String,
 }
 
+impl ShaderRemap {
+    /// C `atof` semantics used by R_RemapShader for the optional animation
+    /// origin: consume the numeric prefix and fall back to zero.
+    pub fn time_offset_seconds(&self) -> f32 {
+        let text = self.time_offset.trim_start();
+        let bytes = text.as_bytes();
+        let mut index = 0usize;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+
+        let integer_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        let mut saw_digit = index != integer_start;
+        if bytes.get(index) == Some(&b'.') {
+            index += 1;
+            let fraction_start = index;
+            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            saw_digit |= index != fraction_start;
+        }
+        if !saw_digit {
+            return 0.0;
+        }
+
+        // `atof("1e+")` consumes the valid `1` prefix rather than failing the
+        // whole conversion, so only commit the exponent when it has digits.
+        let exponent_mark = index;
+        if matches!(bytes.get(index), Some(b'e' | b'E')) {
+            let mut exponent = index + 1;
+            if matches!(bytes.get(exponent), Some(b'+' | b'-')) {
+                exponent += 1;
+            }
+            let exponent_digits = exponent;
+            while bytes.get(exponent).is_some_and(u8::is_ascii_digit) {
+                exponent += 1;
+            }
+            if exponent != exponent_digits {
+                index = exponent;
+            } else {
+                index = exponent_mark;
+            }
+        }
+
+        text[..index]
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+    }
+}
+
 /// Reliable cgame side effects which belong outside pure snapshot state. The
 /// first four compatibility passes intentionally preserve these commands even
 /// where the final Siege/UI consumer is implemented later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderRemapSource {
+    /// `CS_SHADERSTATE` parsed by CG_ShaderStateChanged. TaystJK cg_remaps=1
+    /// filters models/players/* only on this path.
+    ShaderState,
+    /// Explicit reliable `remapShader old new time` server command. TaystJK
+    /// gates this only on cg_remaps != 0.
+    ServerCommand,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CgameServerAction {
     KillLoopSounds { entities: Vec<u16> },
-    ShaderRemap(ShaderRemap),
+    ShaderRemap { remap: ShaderRemap, source: ShaderRemapSource },
     RestartMapMusic,
     LightStyleChanged { index: u16 },
     NewForceRank { rank: i32, open_menu: bool, team: i32 },
@@ -554,6 +620,10 @@ struct ConfigStringState {
     siege_time_override: i32,
     siege_win_team: i32,
     shader_remaps: BTreeMap<String, ShaderRemap>,
+    /// CS_SHADERSTATE order matters because R_RemapShader writes the target
+    /// shader's global timeOffset as it walks the string. Keep that order in
+    /// addition to the keyed lookup used by diagnostics/tests.
+    shader_remap_sequence: Vec<ShaderRemap>,
 }
 
 impl Default for ConfigStringState {
@@ -570,6 +640,7 @@ impl Default for ConfigStringState {
             siege_time_override: 0,
             siege_win_team: 0,
             shader_remaps: BTreeMap::new(),
+            shader_remap_sequence: Vec::new(),
         }
     }
 }
@@ -838,6 +909,21 @@ impl ClientGameState {
         self.pending_server_actions.drain(..).collect()
     }
 
+    /// Drain only renderer shader-remap actions without consuming unrelated
+    /// Siege/UI actions that still belong to their future consumers.
+    pub fn drain_shader_remap_actions(&mut self) -> Vec<(ShaderRemapSource, ShaderRemap)> {
+        let mut remaps = Vec::new();
+        let mut keep = VecDeque::with_capacity(self.pending_server_actions.len());
+        while let Some(action) = self.pending_server_actions.pop_front() {
+            match action {
+                CgameServerAction::ShaderRemap { remap, source } => remaps.push((source, remap)),
+                other => keep.push_back(other),
+            }
+        }
+        self.pending_server_actions = keep;
+        remaps
+    }
+
     /// Audio side effects have their own queue so unconsumed Siege/UI actions
     /// never get rescanned every frame.
     pub fn drain_audio_server_actions(&mut self) -> Vec<CgameServerAction> {
@@ -858,6 +944,10 @@ impl ClientGameState {
 
     pub fn shader_remaps(&self) -> &BTreeMap<String, ShaderRemap> {
         &self.config_state.shader_remaps
+    }
+
+    pub fn shader_remaps_in_order(&self) -> &[ShaderRemap] {
+        &self.config_state.shader_remap_sequence
     }
 
     pub fn duelists(&self) -> [i32; 3] { self.config_state.duelists }
@@ -929,6 +1019,15 @@ impl ClientGameState {
         ] {
             self.apply_configstring_state(index, false);
         }
+        // Tayst/OpenJK apply CS_SHADERSTATE during CGame initialization too.
+        // Keep initialization otherwise side-effect-free, then enqueue only these
+        // renderer actions in configstring order.
+        for remap in self.config_state.shader_remap_sequence.clone() {
+            self.pending_server_actions.push_back(CgameServerAction::ShaderRemap {
+                remap,
+                source: ShaderRemapSource::ShaderState,
+            });
+        }
     }
 
     fn apply_configstring_state(&mut self, index: u16, emit_actions: bool) {
@@ -959,10 +1058,15 @@ impl ClientGameState {
             }
             CS_SHADERSTATE => {
                 self.config_state.shader_remaps.clear();
+                self.config_state.shader_remap_sequence.clear();
                 for remap in parse_shader_state(&value) {
                     if emit_actions {
-                        self.pending_server_actions.push_back(CgameServerAction::ShaderRemap(remap.clone()));
+                        self.pending_server_actions.push_back(CgameServerAction::ShaderRemap {
+                            remap: remap.clone(),
+                            source: ShaderRemapSource::ShaderState,
+                        });
                     }
+                    self.config_state.shader_remap_sequence.push(remap.clone());
                     self.config_state.shader_remaps.insert(remap.from.to_ascii_lowercase(), remap);
                 }
             }
@@ -1764,36 +1868,18 @@ impl ClientGameState {
         Ok(presented)
     }
 
-    /// Demo/follow-camera equivalent of OpenJK's predictedPlayerEntity path.
-    /// The caller decides whether the local/followed body is rendered (OpenJK
-    /// suppresses it in ordinary first person); this method only produces the
-    /// player entity state that the shared player presenter consumes.
+    /// Test fixture adapter. Production constructs this entity from the session's
+    /// cached presented_player_state, with no downstream interpolation.
     #[cfg(test)]
     pub fn present_followed_player(&self, time: i32) -> Option<PresentedEntity> {
-        self.present_followed_player_at(f64::from(time))
+        let ps = player_state::interpolate_player_state_at(
+            self.current_snapshot.as_ref()?,
+            self.next_snapshot.as_ref(),
+            f64::from(time),
+        );
+        presented_player_state_entity(&ps)
     }
 
-    pub fn present_followed_player_at(&self, time_ms: f64) -> Option<PresentedEntity> {
-        let current = self.current_snapshot.as_ref()?;
-        let next = self.next_snapshot.as_ref();
-        let discontinuity = next.is_some_and(|next| snapshot_discontinuity(current, next));
-        let alpha = if discontinuity {
-            0.0
-        } else {
-            next.filter(|next| next.server_time > current.server_time)
-                .map(|next| {
-                    ((time_ms - f64::from(current.server_time))
-                        / f64::from(next.server_time - current.server_time)) as f32
-                })
-                .unwrap_or(0.0)
-                .clamp(0.0, 1.0)
-        };
-        presented_player_state(
-            &current.player_state,
-            next.map(|snapshot| &snapshot.player_state),
-            alpha,
-        )
-    }
     pub fn summarize_entities(&self) -> EntityTypeSummary {
         let mut summary = EntityTypeSummary::default();
         let Some(snapshot) = self.current_snapshot.as_ref() else {
@@ -2051,7 +2137,10 @@ impl ClientGameState {
                     time_offset: bytes_to_lossless_ascii(parts[3]),
                 };
                 self.config_state.shader_remaps.insert(remap.from.to_ascii_lowercase(), remap.clone());
-                self.pending_server_actions.push_back(CgameServerAction::ShaderRemap(remap));
+                self.pending_server_actions.push_back(CgameServerAction::ShaderRemap {
+                    remap,
+                    source: ShaderRemapSource::ServerCommand,
+                });
             }
             return Ok(());
         }
@@ -2861,15 +2950,14 @@ fn vector_ma(base: &mut [f32; 3], scale: f32, delta: [f32; 3]) {
     }
 }
 
-fn lerp_angle(from: f32, to: f32, fraction: f32) -> f32 {
-    let mut delta = to - from;
-    if delta > 180.0 {
-        delta -= 360.0;
+fn lerp_angle(from: f32, mut to: f32, fraction: f32) -> f32 {
+    if to - from > 180.0 {
+        to -= 360.0;
     }
-    if delta < -180.0 {
-        delta += 360.0;
+    if to - from < -180.0 {
+        to += 360.0;
     }
-    from + fraction * delta
+    from + fraction * (to - from)
 }
 
 /// Presentation-relevant port of OpenJK `BG_PlayerStateToEntityState` from
@@ -3054,7 +3142,7 @@ pub fn player_state_to_entity_state(ps: &PlayerState) -> Option<EntityState> {
 
 /// cg.predictedPlayerEntity: CG_PlayerStateToEntityState of the predicted state.
 pub fn presented_player_state_entity(ps: &PlayerState) -> Option<PresentedEntity> {
-    presented_player_state(ps, None, 0.0)
+    presented_player_state(ps)
 }
 
 /// Presentation-only interpolation for auxiliary playerState sources such as
@@ -3065,14 +3153,27 @@ pub(crate) fn presented_player_state_interpolated(
     next: Option<&PlayerState>,
     alpha: f32,
 ) -> Option<PresentedEntity> {
-    presented_player_state(current, next, alpha)
+    let mut entity = presented_player_state_entity(current)?;
+    if let Some(next) =
+        next.filter(|next| next.field_i32("clientNum") == current.field_i32("clientNum"))
+    {
+        if let Some(origin) = player_state_vec3(next, "origin") {
+            for axis in 0..3 {
+                entity.origin[axis] += (origin[axis] - entity.origin[axis]) * alpha;
+            }
+        }
+        if let Some(angles) = player_state_vec3(next, "viewangles") {
+            for axis in 0..3 {
+                entity.angles[axis] = lerp_angle(entity.angles[axis], angles[axis], alpha);
+            }
+        }
+    }
+    set_entity_vec3(&mut entity.state, "pos.trBase", entity.origin);
+    set_entity_vec3(&mut entity.state, "apos.trBase", entity.angles);
+    Some(entity)
 }
 
-fn presented_player_state(
-    current: &PlayerState,
-    next: Option<&PlayerState>,
-    alpha: f32,
-) -> Option<PresentedEntity> {
+fn presented_player_state(current: &PlayerState) -> Option<PresentedEntity> {
     // OpenJK CG_AddCEntity: the locally predicted free spectator is not
     // presented at all when PERS_TEAM == TEAM_SPECTATOR. Follow mode is
     // unaffected because SpectatorClientEndFrame copies the followed player's
@@ -3081,22 +3182,8 @@ fn presented_player_state(
         return None;
     }
     let mut state = player_state_to_entity_state(current)?;
-    let mut origin = player_state_vec3(current, "origin")?;
-    let mut angles = player_state_vec3(current, "viewangles")?;
-    if let Some(next) = next {
-        if next.field_i32("clientNum") == current.field_i32("clientNum") {
-            if let Some(next_origin) = player_state_vec3(next, "origin") {
-                for axis in 0..3 {
-                    origin[axis] += (next_origin[axis] - origin[axis]) * alpha;
-                }
-            }
-            if let Some(next_angles) = player_state_vec3(next, "viewangles") {
-                for axis in 0..3 {
-                    angles[axis] = lerp_angle(angles[axis], next_angles[axis], alpha);
-                }
-            }
-        }
-    }
+    let origin = player_state_vec3(current, "origin")?;
+    let angles = player_state_vec3(current, "viewangles")?;
     set_entity_vec3(&mut state, "pos.trBase", origin);
     set_entity_vec3(&mut state, "apos.trBase", angles);
     Some(PresentedEntity {
@@ -3261,11 +3348,11 @@ mod tests {
         assert_eq!(game.shader_remaps()["textures/old"].to, "textures/new");
         assert_eq!(
             game.drain_server_actions(),
-            vec![CgameServerAction::ShaderRemap(ShaderRemap {
+            vec![CgameServerAction::ShaderRemap { remap: ShaderRemap {
                 from: "textures/old".to_owned(),
                 to: "textures/new".to_owned(),
                 time_offset: "1250".to_owned(),
-            })]
+            }, source: ShaderRemapSource::ServerCommand }]
         );
     }
 
@@ -3303,7 +3390,7 @@ mod tests {
         assert_eq!(audio, vec![CgameServerAction::RestartMapMusic]);
         let remaining = game.drain_server_actions();
         assert_eq!(
-            remaining.iter().filter(|action| matches!(action, CgameServerAction::ShaderRemap(_))).count(),
+            remaining.iter().filter(|action| matches!(action, CgameServerAction::ShaderRemap { .. })).count(),
             2
         );
     }

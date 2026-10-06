@@ -1,7 +1,8 @@
 //! Compose.
 use crate::ui::{
     build_background_progress, build_center_print, build_chat_history, build_chat_input,
-    build_console, build_crosshair_name, build_crosshair_vertices, build_demo_timeline,
+    build_console, build_console_notify, build_crosshair_name, build_crosshair_vertices,
+    build_demo_timeline,
     build_follow_indicator, build_force_select, build_fps_simple, build_game_timer, build_hud,
     build_lagometer, build_loading_screen, build_mini_scores, build_movement_keys, build_perf,
     build_prediction_debug, build_race_timer, build_reflection_debug_legend, build_scoreboard,
@@ -172,6 +173,11 @@ pub fn build_transient_vertices(
         });
         build_demo_timeline(out, ui, width, height);
     }
+    // TaystJK Con_DrawNotify remains visible while KEYCATCH_MESSAGE is active,
+    // but not under the solid console or UI/cgame/menu catchers.
+    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat) {
+        build_console_notify(out, ui, width, height);
+    }
     build_prediction_debug(out, ui, width, height);
     // FPS/perf is intentionally visible above menus too, matching the old
     // retained path and submit_ui_overlay ordering.
@@ -192,11 +198,9 @@ pub fn build_transient_vertices(
         build_mini_scores(out, ui, small_font, width, height);
     }
     if ui.mode == OverlayMode::Chat {
-        // The input box is anchored to the oldest visible chat line, so keep
-        // it in the same transient batch as chat history. This lets fades/new
-        // messages reposition it without rebuilding the retained UI.
-        draw_placed(out, ui, HudElementId::Chat, width, height, |out| {
-            build_chat_input(out, ui, small_font, width, height);
-        });
+        // TaystJK message entry is a console/notify field, not a child of the
+        // cg_chatBox HUD element. Keep it outside draw_placed(Chat) so the HUD
+        // editor's chat extent/position affects history only.
+        build_chat_input(out, ui, small_font, width, height);
     }
 }

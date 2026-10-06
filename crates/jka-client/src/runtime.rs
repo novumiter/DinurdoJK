@@ -71,7 +71,7 @@ pub struct SurfaceInspectorInfo {
     pub hit_inline_model: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct WorldUploadTimings {
     pub vertex_buffer_ms: f64,
     pub texture_upload_ms: f64,
@@ -102,6 +102,7 @@ pub struct WorldUploadTimings {
     /// displacement if it carries the dense replacement index range, so these
     /// distinguish "wrong spectrum" from "never tessellated".
     pub ocean_water_batches: u32,
+    pub promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     pub ocean_clipmap_vertices: u64,
     pub ocean_clipmap_tris: u64,
     pub ocean_clipmap_spacing: f32,

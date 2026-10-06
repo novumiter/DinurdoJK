@@ -873,8 +873,18 @@ int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn t
     p->move.tracemask = MASK_PLAYERSOLID;
     p->move.trace = host_trace;
     p->move.pointcontents = host_contents;
-    p->move.pmove_fixed = 1;
-    p->move.pmove_msec = tick;
+    /* Local authority receives authored usercmd timestamps just like a real
+     * server.  Leave Pmove non-fixed here so the command span itself drives
+     * movement and Pmove performs its stock 66 ms chopping internally.  A
+     * remote server that advertises pmove_fixed is handled by the prediction
+     * path instead, with that server's pmove_msec. */
+    p->move.pmove_fixed = 0;
+    p->move.pmove_msec = tick; /* ignored while non-fixed */
+#ifdef JKA_JAPRO
+    /* Some jaPRO compatibility branches consult the mirrored cvar directly
+     * rather than pmove_t. Local play is the ordinary non-fixed regime. */
+    pmove_fixed.integer = 0;
+#endif
     p->move.pmove_float = 0;
     p->move.stepSlideFix = 1;
     p->move.gametype = GT_FFA;

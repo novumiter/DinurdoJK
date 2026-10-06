@@ -6,6 +6,7 @@ use crate::renderer::{
     EntityAmbientLightingMode, Entry, Ghoul2GpuDrawUniform, Ghoul2RtComputeBatch,
     Ghoul2RtComputeMesh, Ghoul2RtInputVertex, Ghoul2RtSkinningResources, HashMap, PipelineJobKey,
     PipelineJobManager, RayTracedSkinnedMeshKey, RayTracedSkinnedPrepared, Vec3,
+    DYNAMIC_MODEL_VERTEX_WORDS,
 };
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
@@ -50,11 +51,19 @@ impl DynamicModelRenderer {
                 bind_group_layouts: &[Some(&mesh_layout), Some(&global_layout)],
                 immediate_size: 0,
             });
+            // The compute shader writes DynamicModelVertex through a raw
+            // array<u32>, so its stride is a literal. api.rs pins the struct to
+            // DYNAMIC_MODEL_VERTEX_WORDS; this pins the shader to the same
+            // number, because a silent desync writes every skinned vertex at the
+            // wrong offset instead of failing.
+            let source = include_str!("../../ghoul2_skin_compute.wgsl");
+            assert!(
+                source.contains(&format!("output_vertex * {DYNAMIC_MODEL_VERTEX_WORDS}u")),
+                "ghoul2_skin_compute.wgsl write_vertex stride must be {DYNAMIC_MODEL_VERTEX_WORDS} words"
+            );
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("JKA Ghoul2 RT compute skinning shader"),
-                source: wgpu::ShaderSource::Wgsl(
-                    include_str!("../../ghoul2_skin_compute.wgsl").into(),
-                ),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
             });
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("JKA Ghoul2 RT compute skinning pipeline"),
@@ -252,6 +261,7 @@ impl DynamicModelRenderer {
         surfaces: &[DynamicModelSurface],
         classic_grid: Option<&scene::ClassicEntityLightGrid>,
         rt_receivers: bool,
+        prepare_authored_glow: bool,
     ) -> bool {
         if !self.ensure_rt_skinning_resources(jobs, device) {
             return false;
@@ -470,6 +480,7 @@ impl DynamicModelRenderer {
                         texture_key,
                         alpha_mode: surface.alpha_mode,
                         wireframe_class: surface.wireframe_class,
+                        authored_glow: surface.authored_glow,
                     });
                     visible_gpu_draws = visible_gpu_draws.saturating_add(1);
                 }
@@ -529,6 +540,7 @@ impl DynamicModelRenderer {
                     texture_key,
                     alpha_mode: surface.alpha_mode,
                     wireframe_class: surface.wireframe_class,
+                    authored_glow: surface.authored_glow,
                 });
             }
             if matches!(
@@ -657,7 +669,7 @@ impl DynamicModelRenderer {
         }
         rt.casters = rt_casters;
         self.rt_prepared = true;
-        self.ensure_model_pipelines(jobs, device);
+        self.ensure_model_pipelines(jobs, device, prepare_authored_glow);
 
         self.scratch_vertices = vertices;
         self.scratch_indices = indices;

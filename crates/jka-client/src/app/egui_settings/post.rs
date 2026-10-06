@@ -1,16 +1,193 @@
 //! Post.
-use crate::app::egui_settings::{index_of, percent, quality_table_row, theme, ui, App, DofQuality};
+use crate::app::egui_settings::{
+    index_of, percent, quality_table_row, segmented_row, theme, ui, App, CrtMask, CrtQuality,
+    CrtReferenceResolution, CrtScope, CrtStyle, DofQuality, GlowMode,
+};
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_post_processing(&mut self, ui: &mut egui::Ui) {
-        self.egui_toggle_row(
+        theme::section(
             ui,
-            "Bloom",
-            "Bleeds light from very bright pixels into their surroundings, the \
-             way a real lens scatters light.",
-            ui::VIDEO_ROW_BLOOM,
-            self.video.bloom,
+            "CRT",
+            "Native Timothy Lottes CRT filters. The scope controls which UI layers are sent through the CRT pass.",
         );
+
+        const CRT_SCOPE: [(CrtScope, &str); 4] = [
+            (CrtScope::Off, "Off"),
+            (CrtScope::Scene, "Scene"),
+            (CrtScope::SceneHud, "Scene + HUD"),
+            (CrtScope::Everything, "Everything"),
+        ];
+        if let Some(scope) = segmented_row(
+            ui,
+            "CRT",
+            "Off skips the pass entirely. Scene keeps HUD/UI crisp; Scene + HUD filters gameplay HUD too; Everything filters the final composited window.",
+            theme::Reset::Video(ui::VIDEO_ROW_CRT_SCOPE),
+            self.video.crt_scope,
+            &CRT_SCOPE,
+        ) {
+            self.set_crt_scope(scope);
+        }
+
+        if self.video.crt_scope != CrtScope::Off {
+            const CRT_STYLE: [(CrtStyle, &str); 2] = [
+                (CrtStyle::LottesFast, "Lottes Fast"),
+                (CrtStyle::Lottes, "Lottes"),
+            ];
+            if let Some(style) = segmented_row(
+                ui,
+                "CRT style",
+                "Lottes Fast is the optimized 2/8-tap CRTS port. Lottes is Timothy Lottes' original full 42-fetch filter with its built-in bloom and upstream defaults.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_STYLE),
+                self.video.crt_style,
+                &CRT_STYLE,
+            ) {
+                self.set_crt_style(style);
+            }
+
+            const CRT_REFERENCE: [(CrtReferenceResolution, &str); 4] = [
+                (CrtReferenceResolution::P480, "480p"),
+                (CrtReferenceResolution::P600, "600p"),
+                (CrtReferenceResolution::P720, "720p"),
+                (CrtReferenceResolution::Native, "Native"),
+            ];
+            if let Some(target) = quality_table_row(
+                ui,
+                "Reference resolution",
+                "Virtual source resolution used by the CRT reconstruction. It does not lower the renderer's actual resolution.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_REFERENCE),
+                self.video.crt_reference,
+                &CRT_REFERENCE,
+                0,
+            ) {
+                self.set_crt_reference(CRT_REFERENCE[target].0);
+            }
+
+            if self.video.crt_style == CrtStyle::LottesFast {
+            const CRT_QUALITY: [(CrtQuality, &str); 2] = [
+                (CrtQuality::Fast, "Fast (2 tap)"),
+                (CrtQuality::Quality, "Quality (8 tap)"),
+            ];
+            if let Some(target) = quality_table_row(
+                ui,
+                "Quality",
+                "Uses crt-lottes-fast's real 2-tap path or its normal 8-fetch reconstruction path.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_QUALITY),
+                self.video.crt_quality,
+                &CRT_QUALITY,
+                0,
+            ) {
+                self.set_crt_quality(CRT_QUALITY[target].0);
+            }
+
+            const CRT_MASK: [(CrtMask, &str); 4] = [
+                (CrtMask::None, "Off"),
+                (CrtMask::GrilleLite, "Grille lite"),
+                (CrtMask::Grille, "Grille"),
+                (CrtMask::Shadow, "Shadow"),
+            ];
+            if let Some(mask) = segmented_row(
+                ui,
+                "Phosphor mask",
+                "Lottes mask layout. Grille Lite is the brighter default; Shadow uses a staggered RGB mask.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_MASK),
+                self.video.crt_mask,
+                &CRT_MASK,
+            ) {
+                self.set_crt_mask(mask);
+            }
+
+            theme::row(
+                ui,
+                "Scanline strength",
+                "Controls scanline thinness/contrast in the original Lottes filter.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_SCANLINE),
+                |ui| {
+                    let mut value = self.video.crt_scanline;
+                    let readout = percent(value);
+                    if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                        self.set_crt_scanline(value);
+                    }
+                },
+            );
+            if self.video.crt_quality == CrtQuality::Quality {
+                theme::row(
+                    ui,
+                    "Horizontal sharpness",
+                    "Gaussian horizontal reconstruction sharpness for the 8-tap Quality path. Higher is tighter/sharper.",
+                    theme::Reset::Video(ui::VIDEO_ROW_CRT_SHARPNESS),
+                    |ui| {
+                        let mut value = self.video.crt_sharpness;
+                        let readout = format!("{value:.1}");
+                        if theme::slider(ui, &mut value, 1.0..=6.0, &readout) {
+                            self.set_crt_sharpness(value);
+                        }
+                    },
+                );
+            }
+            theme::row(
+                ui,
+                "Mask strength",
+                "Strength of the RGB phosphor mask. Zero makes the selected mask effectively neutral.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_MASK_INTENSITY),
+                |ui| {
+                    let mut value = self.video.crt_mask_intensity;
+                    let readout = percent(value);
+                    if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                        self.set_crt_mask_intensity(value);
+                    }
+                },
+            );
+            theme::row(
+                ui,
+                "Curvature",
+                "Curves the virtual CRT glass. Zero keeps the image flat.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_CURVATURE),
+                |ui| {
+                    let mut value = self.video.crt_curvature;
+                    let readout = format!("{value:.3}");
+                    if theme::slider(ui, &mut value, 0.0..=0.25, &readout) {
+                        self.set_crt_curvature(value);
+                    }
+                },
+            );
+            theme::row(
+                ui,
+                "Corner rounding",
+                "Softens/rounds the visible CRT corners using Lottes' CORNER parameter.",
+                theme::Reset::Video(ui::VIDEO_ROW_CRT_CORNER),
+                |ui| {
+                    let mut value = self.video.crt_corner;
+                    let readout = format!("{value:.1}");
+                    if theme::slider(ui, &mut value, 0.0..=11.0, &readout) {
+                        self.set_crt_corner(value);
+                    }
+                },
+            );
+            }
+        }
+
+        theme::section(ui, "CAMERA EFFECTS", "Lens and camera-space finishing.");
+        const GLOW: [(GlowMode, &str); 4] = [
+            (GlowMode::Off, "Off"),
+            (GlowMode::JkaAuthored, "JKA Authored"),
+            (GlowMode::ModernBloom, "Modern Bloom"),
+            (GlowMode::JkaAndBloom, "JKA + Bloom"),
+        ];
+        if let Some(target) = quality_table_row(
+            ui,
+            "Glow",
+            "Controls what feeds the shared glow pyramid. JKA Authored uses only shader stages \
+             explicitly marked glow; Modern Bloom uses HDR brightness; JKA + Bloom combines both.",
+            theme::Reset::Video(ui::VIDEO_ROW_GLOW),
+            self.video.glow,
+            &GLOW,
+            0,
+        ) {
+            let current = index_of(&GLOW, self.video.glow, 0);
+            self.video_selected = ui::VIDEO_ROW_GLOW;
+            self.change_video_setting(target as i32 - current as i32);
+        }
 
         theme::row(
             ui,

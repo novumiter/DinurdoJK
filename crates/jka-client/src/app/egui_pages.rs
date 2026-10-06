@@ -877,7 +877,7 @@ impl App {
 
     // ------------------------------------------------------- game options --
 
-    /// jaPRO player visibility and spectating rows on Setup -> Game.
+    /// jaPRO player visibility and spectating rows on Setup -> JAPRO.
     pub(super) fn egui_japro_game_settings(&mut self, ui: &mut egui::Ui) {
         theme::section(
             ui,
@@ -988,7 +988,7 @@ impl App {
             self.spectator_camera.mode.as_i32(),
             &[(0, "First person"), (1, "Third person"), (2, "Orbit")],
         ) {
-            let _ = self.set_console_cvar("cg_specCamera", &mode.to_string());
+            let _ = self.set_console_cvar("cg_thirdPerson", &mode.to_string());
         }
         theme::row(
             ui,

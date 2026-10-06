@@ -950,6 +950,14 @@ pub(crate) fn format_local_date(unix_ms: u64) -> String {
     format!("{:04}-{:02}-{:02}", time.year, time.month, time.day)
 }
 
+pub(crate) fn format_local_datetime_minute(unix_ms: u64) -> String {
+    let time = local_datetime_parts(unix_ms);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        time.year, time.month, time.day, time.hour, time.minute
+    )
+}
+
 #[derive(Clone, Copy)]
 struct DateTimeParts {
     year: u16,

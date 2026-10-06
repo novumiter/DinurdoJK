@@ -186,166 +186,12 @@ impl Default for NetworkSettings {
 
 impl NetworkSettings {
     pub fn cvar_value(&self, name: &str) -> Option<String> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "name" => self.name.clone(),
-            "rate" => self.rate.to_string(),
-            "snaps" => self.snaps.to_string(),
-            "cl_maxpackets" => self.max_packets.to_string(),
-            "cl_packetdup" => self.packet_dup.to_string(),
-            "cl_timenudge" => self.time_nudge.to_string(),
-            "net_port" => self.net_port.to_string(),
-            "saber1" => self.saber1.clone(),
-            "saber2" => self.saber2.clone(),
-            "color1" => self.color1.to_string(),
-            "color2" => self.color2.to_string(),
-            "cp_sbrgb1" => self.sb_rgb1.to_string(),
-            "cp_sbrgb2" => self.sb_rgb2.to_string(),
-            "forcepowers" => self.forcepowers.clone(),
-            "sex" => self.sex.clone(),
-            "password" => self.password.clone(),
-            "char_color_red" => self.char_color[0].to_string(),
-            "char_color_green" => self.char_color[1].to_string(),
-            "char_color_blue" => self.char_color[2].to_string(),
-            "handicap" => self.handicap.to_string(),
-            "cg_predictitems" => u8::from(self.predict_items).to_string(),
-            "teamoverlay" => u8::from(self.team_overlay).to_string(),
-            "cp_cosmetics" => (self.cosmetics as i32).to_string(),
-            "fs_game" => self.fs_game.clone(),
-            "cp_clanpwd" => self.clan_pwd.clone(),
-            "ui_username" => self.ui_username.clone(),
-            "ui_password" => self.ui_password.clone(),
-            "rconpassword" => self.rcon_password.clone(),
-            "rconaddress" => self.rcon_address.clone(),
-            "cg_displaycameraposition" => self.display_camera_position.clone(),
-            "cg_displaynetsettings" => self.display_net_settings.clone(),
-            "cg_errordecay" => format!("{}", self.error_decay),
-            "cg_nopredict" => u8::from(self.no_predict).to_string(),
-            "cg_showmiss" => u8::from(self.show_miss).to_string(),
-            "cg_predictiondebug" => u8::from(self.prediction_debug).to_string(),
-            "cg_predictionmisshighlight" => u8::from(self.prediction_miss_highlight).to_string(),
-            "cg_hitchrecord" => u8::from(self.hitch_record).to_string(),
-            "cg_modelframedebug" => u8::from(self.model_frame_debug).to_string(),
-            "cg_groundtracedebug" => self.ground_trace_debug.to_string(),
-            "cg_physicsdiag" => self.physics_diag.to_string(),
-            "cg_snapmode" => self.snap_mode.to_string(),
-            "cg_predictbackend" => self.predict_backend.to_string(),
-            "cg_predictionmissthreshold" => format!("{}", self.prediction_miss_threshold),
-            "cl_allowmissingmap" => u8::from(self.allow_missing_map).to_string(),
-            "cl_allowhttpdownload" => u8::from(self.allow_http_downloads).to_string(),
-            "cl_allowdownload" => u8::from(self.allow_legacy_downloads).to_string(),
-            "cl_commandrate" => self.command_rate.to_string(),
-            "cl_commandpacing" => u8::from(self.command_pacing).to_string(),
-            "cp_plugindisable" => self.plugin_disable.to_string(),
-            "cl_chatbubbleself" => u8::from(self.chat_bubble_self).to_string(),
-            "cl_chatbubbleunfocused" => u8::from(self.chat_bubble_unfocused).to_string(),
-            _ => return None,
-        })
+        crate::app::network_cvars::settings_registry().get(self, name).map(|value| value.to_string())
     }
-
-    /// `None` when `name` is not a network cvar. `Some(Ok(userinfo_changed))`.
     pub fn set_cvar(&mut self, name: &str, value: &str) -> Option<Result<bool, String>> {
-        let number = |min: i64, max: i64| -> Result<i64, String> {
-            value
-                .trim()
-                .parse::<i64>()
-                .ok()
-                .map(|v| v.clamp(min, max))
-                .ok_or_else(|| format!("{name}: expected an integer"))
-        };
-        let text = || -> Result<String, String> {
-            if value.bytes().any(|b| matches!(b, b'\\' | b';' | b'"')) {
-                Err(format!("{name}: can't use keys or values with \\ ; or \""))
-            } else {
-                Ok(value.to_owned())
-            }
-        };
-        let result = match name.to_ascii_lowercase().as_str() {
-            "name" => text().map(|v| { self.name = v; true }),
-            "rate" => number(1000, 90000).map(|v| { self.rate = v as u32; true }),
-            "snaps" => number(1, 125).map(|v| { self.snaps = v as u32; true }),
-            "cl_maxpackets" => number(15, 1000).map(|v| { self.max_packets = v as u32; false }),
-            "cl_packetdup" => number(0, 5).map(|v| { self.packet_dup = v as u32; false }),
-            "cl_timenudge" => number(-900, 900).map(|v| { self.time_nudge = v as i32; false }),
-            // TaystJK/OpenJK register net_port as CVAR_LATCH: changing it does not
-            // disturb an existing socket; the new value is used on the next connect.
-            "net_port" => number(0, u16::MAX as i64).map(|v| { self.net_port = v as u16; false }),
-            "saber1" => text().map(|v| { self.saber1 = v; true }),
-            "saber2" => text().map(|v| { self.saber2 = v; true }),
-            "color1" => number(0, 255).map(|v| { self.color1 = v as u8; true }),
-            "color2" => number(0, 255).map(|v| { self.color2 = v as u8; true }),
-            "cp_sbrgb1" => number(0, 0xFF_FFFF).map(|v| { self.sb_rgb1 = v as u32; true }),
-            "cp_sbrgb2" => number(0, 0xFF_FFFF).map(|v| { self.sb_rgb2 = v as u32; true }),
-            "forcepowers" => text().map(|v| { self.forcepowers = v; true }),
-            "sex" => text().map(|v| { self.sex = v; true }),
-            "password" => text().map(|v| { self.password = v; true }),
-            "char_color_red" => number(0, 255).map(|v| { self.char_color[0] = v as u8; true }),
-            "char_color_green" => number(0, 255).map(|v| { self.char_color[1] = v as u8; true }),
-            "char_color_blue" => number(0, 255).map(|v| { self.char_color[2] = v as u8; true }),
-            "handicap" => number(1, 100).map(|v| { self.handicap = v as u32; true }),
-            "cg_predictitems" => Ok({ self.predict_items = atoi(value.as_bytes()) != 0; true }),
-            // CVAR_ROM in OpenJK/TaystJK. cg_drawTeamOverlay owns this value.
-            "teamoverlay" => Err("teamoverlay is read-only; use cg_drawTeamOverlay".to_owned()),
-            "cp_cosmetics" => number(i64::from(i32::MIN), i64::from(i32::MAX)).map(|v| { self.cosmetics = v as i32 as u32; true }),
-            "fs_game" => {
-                // A sibling directory name, as `resolve_fs_game_directory` accepts.
-                let name = value.trim();
-                let valid = name.len() <= 63
-                    && name != "."
-                    && name != ".."
-                    && !name.bytes().any(|b| b < 0x20 || b == 0x7f || matches!(b, b'/' | b'\\' | b':' | b';' | b'"'));
-                if valid {
-                    self.fs_game = name.to_owned();
-                    Ok(false)
-                } else {
-                    Err(format!("{name}: expected a game directory name like japro (empty or base for none)"))
-                }
-            }
-            "cp_clanpwd" => text().map(|v| { self.clan_pwd = v; true }),
-            // Client-only, so not userinfo (`false`). Passwords may hold `;`/`"`
-            // characters in a real Cvar, but the console splits on them anyway.
-            "ui_username" => text().map(|v| { self.ui_username = v; false }),
-            "ui_password" => text().map(|v| { self.ui_password = v; false }),
-            "rconpassword" => Ok({ self.rcon_password = value.to_owned(); false }),
-            "rconaddress" => Ok({ self.rcon_address = value.trim().to_owned(); false }),
-            // CVAR_ROM in jaPRO: derived state the app keeps current, not user-editable.
-            "cg_displaycameraposition" | "cg_displaynetsettings" => {
-                Err(format!("{name} is read-only"))
-            }
-            "cg_errordecay" => value
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .filter(|v| v.is_finite())
-                .map(|v| { self.error_decay = v.clamp(0.0, 500.0); false })
-                .ok_or_else(|| format!("{name}: expected a number")),
-            "cg_nopredict" => Ok({ self.no_predict = atoi(value.as_bytes()) != 0; false }),
-            "cg_showmiss" => Ok({ self.show_miss = atoi(value.as_bytes()) != 0; false }),
-            "cg_predictiondebug" => Ok({ self.prediction_debug = atoi(value.as_bytes()) != 0; false }),
-            "cg_predictionmisshighlight" => Ok({ self.prediction_miss_highlight = atoi(value.as_bytes()) != 0; false }),
-            "cg_hitchrecord" => Ok({ self.hitch_record = atoi(value.as_bytes()) != 0; false }),
-            "cg_modelframedebug" => Ok({ self.model_frame_debug = atoi(value.as_bytes()) != 0; false }),
-            "cg_groundtracedebug" => Ok({ self.ground_trace_debug = atoi(value.as_bytes()).clamp(0, 2) as u8; false }),
-            "cg_physicsdiag" => Ok({ self.physics_diag = atoi(value.as_bytes()).clamp(0, 2) as u8; false }),
-            "cg_snapmode" => Ok({ self.snap_mode = atoi(value.as_bytes()).clamp(-1, 4); false }),
-            "cg_predictbackend" => Ok({ self.predict_backend = atoi(value.as_bytes()).clamp(-1, 1); false }),
-            "cg_predictionmissthreshold" => value
-                .trim()
-                .parse::<f32>()
-                .ok()
-                .filter(|v| v.is_finite())
-                .map(|v| { self.prediction_miss_threshold = v.clamp(0.0, 4096.0); false })
-                .ok_or_else(|| format!("{name}: expected a number")),
-            "cl_allowmissingmap" => Ok({ self.allow_missing_map = atoi(value.as_bytes()) != 0; false }),
-            "cl_allowhttpdownload" => Ok({ self.allow_http_downloads = atoi(value.as_bytes()) != 0; false }),
-            "cl_allowdownload" => Ok({ self.allow_legacy_downloads = atoi(value.as_bytes()) != 0; false }),
-            "cl_commandrate" => number(15, 1000).map(|v| { self.command_rate = v as u32; false }),
-            "cl_commandpacing" => Ok({ self.command_pacing = atoi(value.as_bytes()) != 0; false }),
-            "cp_plugindisable" => number(0, i32::MAX as i64).map(|v| { self.plugin_disable = v as i32; true }),
-            "cl_chatbubbleself" => Ok({ self.chat_bubble_self = atoi(value.as_bytes()) != 0; false }),
-            "cl_chatbubbleunfocused" => Ok({ self.chat_bubble_unfocused = atoi(value.as_bytes()) != 0; false }),
-            _ => return None,
-        };
-        Some(result)
+        let registry = crate::app::network_cvars::settings_registry();
+        let def = registry.find(name)?;
+        Some(registry.set(self, name, value).map(|_| def.flags.contains(crate::console::cvars::CvarFlags::USERINFO)))
     }
 
     /// Cvar_InfoString(CVAR_USERINFO) for the stock userinfo cvars.
@@ -432,39 +278,15 @@ impl NetworkSettings {
     }
 
     pub fn write_cfg(&self, out: &mut String) {
-        use std::fmt::Write as _;
-        let _ = writeln!(out, "seta cp_pluginDisable \"{}\"", self.plugin_disable);
-        let _ = writeln!(out, "seta name \"{}\"", self.name);
-        let _ = writeln!(out, "seta rate \"{}\"", self.rate);
-        let _ = writeln!(out, "seta snaps \"{}\"", self.snaps);
-        let _ = writeln!(out, "seta cl_maxpackets \"{}\"", self.max_packets);
-        let _ = writeln!(out, "seta cl_packetdup \"{}\"", self.packet_dup);
-        let _ = writeln!(out, "seta cl_timeNudge \"{}\"", self.time_nudge);
-        let _ = writeln!(out, "seta saber1 \"{}\"", self.saber1);
-        let _ = writeln!(out, "seta saber2 \"{}\"", self.saber2);
-        let _ = writeln!(out, "seta color1 \"{}\"", self.color1);
-        let _ = writeln!(out, "seta color2 \"{}\"", self.color2);
-        let _ = writeln!(out, "seta cp_sbRGB1 \"{}\"", self.sb_rgb1);
-        let _ = writeln!(out, "seta cp_sbRGB2 \"{}\"", self.sb_rgb2);
-        let _ = writeln!(out, "seta forcepowers \"{}\"", self.forcepowers);
-        let _ = writeln!(out, "seta sex \"{}\"", self.sex);
-        let _ = writeln!(out, "seta char_color_red \"{}\"", self.char_color[0]);
-        let _ = writeln!(out, "seta char_color_green \"{}\"", self.char_color[1]);
-        let _ = writeln!(out, "seta char_color_blue \"{}\"", self.char_color[2]);
-        let _ = writeln!(out, "seta handicap \"{}\"", self.handicap);
-        let _ = writeln!(out, "seta cg_predictItems \"{}\"", u8::from(self.predict_items));
-        let _ = writeln!(out, "seta cp_cosmetics \"{}\"", self.cosmetics as i32);
-        let _ = writeln!(out, "seta fs_game \"{}\"", self.fs_game);
-        let _ = writeln!(out, "seta ui_username \"{}\"", self.ui_username);
-        let _ = writeln!(out, "seta cg_errorDecay \"{}\"", self.error_decay);
-        let _ = writeln!(out, "seta cg_noPredict \"{}\"", u8::from(self.no_predict));
-        let _ = writeln!(out, "seta cl_allowMissingMap \"{}\"", u8::from(self.allow_missing_map));
-        let _ = writeln!(out, "seta cl_allowHttpDownload \"{}\"", u8::from(self.allow_http_downloads));
-        let _ = writeln!(out, "seta cl_allowDownload \"{}\"", u8::from(self.allow_legacy_downloads));
-        let _ = writeln!(out, "seta cl_commandRate \"{}\"", self.command_rate);
-        let _ = writeln!(out, "seta cl_commandPacing \"{}\"", u8::from(self.command_pacing));
-        let _ = writeln!(out, "seta cl_chatBubbleSelf \"{}\"", u8::from(self.chat_bubble_self));
-        let _ = writeln!(out, "seta cl_chatBubbleUnfocused \"{}\"", u8::from(self.chat_bubble_unfocused));
+        use std::fmt::Write;
+        let mut definitions: Vec<_> = crate::app::network_cvars::DEFINITIONS.iter().filter(|def| def.config.archive.is_some()).collect();
+        definitions.sort_by_key(|def| def.config.archive.unwrap().0);
+        let mut presentation = crate::config::ClientPresentationSettings::default();
+        presentation.network = self.clone();
+        let video = crate::ui::VideoSettings::default();
+        let audio = crate::config::AudioSettings::default();
+        let state = crate::config::cvars::ArchiveState { video: &video, presentation: &presentation, audio: &audio };
+        for def in definitions { let _ = writeln!(out, "seta {} \"{}\"", def.runtime.entry.name, (def.config.archive.unwrap().1)(&state)); }
     }
 }
 
@@ -505,40 +327,10 @@ pub fn nearest_base_saber_color(packed_rgb: u32) -> u8 {
 
 /// cl_input.cpp inputCmds generic commands -> genCmds_t value.
 pub fn generic_command(name: &str) -> Option<u8> {
-    Some(match name.to_ascii_lowercase().as_str() {
-        "sv_saberswitch" => 1,
-        "engage_duel" => 2,
-        "force_heal" => 3,
-        "force_speed" => 4,
-        "force_throw" => 5,
-        "force_pull" => 6,
-        "force_distract" => 7,
-        "force_rage" => 8,
-        "force_protect" => 9,
-        "force_absorb" => 10,
-        "force_healother" => 11,
-        "force_forcepowerother" => 12,
-        "force_seeing" => 13,
-        "use_seeker" => 14,
-        "use_field" => 15,
-        "use_bacta" => 16,
-        "use_electrobinoculars" => 17,
-        "zoom" => 18,
-        "use_sentry" => 19,
-        "use_jetpack" => 20,
-        "use_bactabig" => 21,
-        "use_healthdisp" => 22,
-        "use_ammodisp" => 23,
-        "use_eweb" => 24,
-        "use_cloak" => 25,
-        "saberattackcycle" => jka_movement::GENCMD_SABERATTACKCYCLE,
-        "taunt" => 27,
-        "bow" => 28,
-        "meditate" => 29,
-        "flourish" => 30,
-        "gloat" => 31,
-        _ => return None,
-    })
+    match crate::app::command_registry().find(name)?.game_command {
+        Some(crate::app::GameCommand::Generic(value)) => Some(value),
+        _ => None,
+    }
 }
 
 /// cl_input.cpp `+button` commands -> usercmd button bit.

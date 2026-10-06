@@ -46,6 +46,12 @@ pub(in crate::renderer) struct MaterialUniform {
     pub(in crate::renderer) wave_alpha: [f32; 4],
     // x: rgb waveform id, y: alpha waveform id (see jka_assets::shader::WaveFunc::id).
     pub(in crate::renderer) wave_funcs: [u32; 4],
+    pub(in crate::renderer) ocean_color: [f32; 4],
+    // xyz authored reflectance (-1 = default), w roughness (-1 = default).
+    pub(in crate::renderer) ocean_material: [f32; 4],
+    // xy reserved/amplitude hint; z source blend factor + 1 (0 = physical), w destination.
+    pub(in crate::renderer) ocean_waves: [f32; 4],
+    pub(in crate::renderer) ocean_blend_color: [f32;4],
 }
 
 #[repr(C)]
@@ -98,6 +104,10 @@ impl Default for MaterialUniform {
             wave_rgb: [0.0; 4],
             wave_alpha: [0.0; 4],
             wave_funcs: [0; 4],
+            ocean_color: [0.0, 0.0, 0.0, -1.0],
+            ocean_material: [-1.0; 4],
+            ocean_waves: [1.0, 0.0, 0.0, 0.0],
+            ocean_blend_color: [0.0;4],
         }
     }
 }

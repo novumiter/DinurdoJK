@@ -17,6 +17,20 @@ pub enum Level {
     Error,
 }
 
+/// Semantic presentation class for one console row. This is deliberately
+/// independent of JKA `^N` text colours: player-controlled/chat strings may
+/// begin with any colour without becoming an engine error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsoleLineKind {
+    #[default]
+    Normal,
+    CommandEcho,
+    Error,
+    NotifyMention,
+    NotifyConnect,
+    NotifyVote,
+}
+
 struct Logger {
     file: File,
     console_color: bool,
@@ -38,6 +52,7 @@ pub struct LogRecord {
     pub text: String,
     pub local_time: [u16; 3],
     pub path_links: Vec<LogPathLink>,
+    pub console_kind: ConsoleLineKind,
 }
 
 const MAX_UI_LOG_LINES: usize = 10_000;
@@ -82,6 +97,13 @@ pub fn init() -> Result<PathBuf, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     let directory = executable.parent().ok_or("Cannot locate executable")?;
     let path = directory.join("latest.log");
+    // Keep the previous run's log. A crash is usually reported after the game has
+    // been started again, which used to truncate the only copy of the evidence.
+    let previous = directory.join("previous.log");
+    if path.exists() {
+        let _ = std::fs::remove_file(&previous);
+        let _ = std::fs::rename(&path, &previous);
+    }
     // Truncate once, then keep an append handle: the crash reporter writes to
     // this file through its own handle, and appending keeps the two from
     // overwriting each other's lines.
@@ -198,7 +220,20 @@ impl log::Log for FacadeLogger {
 }
 
 pub fn write_line(level: Level, args: fmt::Arguments<'_>) {
-    write_line_inner(level, args, Vec::new());
+    let kind = match level {
+        Level::Info => ConsoleLineKind::Normal,
+        Level::Error => ConsoleLineKind::Error,
+    };
+    write_line_inner(level, kind, args, Vec::new());
+}
+
+/// Write a console/log line with an explicit UI semantic class. The normal
+/// logger level remains orthogonal: only real errors are routed to stderr.
+pub fn write_console_line(kind: ConsoleLineKind, args: fmt::Arguments<'_>) {
+    // Console presentation metadata is deliberately independent of logger
+    // severity. Existing engine-authored console failures historically logged
+    // as Info; tagging them as an Error row must not reroute them to stderr.
+    write_line_inner(Level::Info, kind, args, Vec::new());
 }
 
 /// Write an engine-authored console/log line with an explicitly trusted local
@@ -207,10 +242,19 @@ pub fn write_line(level: Level, args: fmt::Arguments<'_>) {
 pub fn write_line_with_path(level: Level, args: fmt::Arguments<'_>, path: impl Into<PathBuf>) {
     let target = path.into();
     let label = target.display().to_string();
-    write_line_inner(level, args, vec![LogPathLink { label, target }]);
+    let kind = match level {
+        Level::Info => ConsoleLineKind::Normal,
+        Level::Error => ConsoleLineKind::Error,
+    };
+    write_line_inner(level, kind, args, vec![LogPathLink { label, target }]);
 }
 
-fn write_line_inner(level: Level, args: fmt::Arguments<'_>, path_links: Vec<LogPathLink>) {
+fn write_line_inner(
+    level: Level,
+    console_kind: ConsoleLineKind,
+    args: fmt::Arguments<'_>,
+    path_links: Vec<LogPathLink>,
+) {
     let message = args.to_string();
     let plain = strip_jka_colors(&message);
 
@@ -227,6 +271,7 @@ fn write_line_inner(level: Level, args: fmt::Arguments<'_>, path_links: Vec<LogP
                 text: message,
                 local_time: local_hms(),
                 path_links,
+                console_kind,
             };
             logger.ui_lines.push_back(record.clone());
             if let Some(sink) = &logger.ui_sink {
@@ -320,6 +365,28 @@ pub(crate) fn strip_jka_colors(text: &str) -> String {
         out.push(ch);
     }
     out
+}
+
+/// Display a piece of JKA-colored text as a scoped span and restore the
+/// caller's intended color immediately afterwards. Player names and other
+/// server-controlled strings may end in any `^0`..`^9` color; interpolating
+/// them directly into a larger console sentence would otherwise leak that
+/// color into the static suffix.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JkaColorScope<'a> {
+    text: &'a str,
+    restore: char,
+}
+
+impl fmt::Display for JkaColorScope<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}^{}", self.text, self.restore)
+    }
+}
+
+pub(crate) fn jka_color_scope(text: &str, restore: char) -> JkaColorScope<'_> {
+    debug_assert!(restore.is_ascii_digit(), "JKA restore color must be ^0..^9");
+    JkaColorScope { text, restore }
 }
 
 fn write_console(level: Level, text: &str, color_enabled: bool) {
@@ -439,5 +506,17 @@ mod tests {
     #[test]
     fn strips_jka_color_codes_from_log_file_text() {
         assert_eq!(strip_jka_colors("^1error ^7normal ^2ok"), "error normal ok");
+    }
+
+    #[test]
+    fn jka_color_scope_restores_requested_color() {
+        assert_eq!(
+            format!("name={} model=lando", super::jka_color_scope("^1Red^3Name", '7')),
+            "name=^1Red^3Name^7 model=lando"
+        );
+        assert_eq!(
+            format!("^5prefix {} suffix", super::jka_color_scope("^2Player", '5')),
+            "^5prefix ^2Player^5 suffix"
+        );
     }
 }

@@ -33,8 +33,17 @@ impl App {
             theme::Reset::None => {}
             theme::Reset::Color(name) => {
                 let defaults = crate::color_grading::SplitToningSettings::default();
+                let grade = crate::color_grading::ColorGradeSettings::default();
                 let value = match name {
                     "r_gammaMethod" => "shader".to_owned(),
+                    "r_colorExposure" => grade.exposure_ev.to_string(),
+                    "r_colorContrast" => grade.contrast.to_string(),
+                    "r_colorSaturation" => grade.saturation.to_string(),
+                    "r_colorVibrance" => grade.vibrance.to_string(),
+                    "r_colorTemperature" => grade.temperature.to_string(),
+                    "r_colorTint" => grade.tint.to_string(),
+                    "r_colorShadows" => grade.shadows.to_string(),
+                    "r_colorHighlights" => grade.highlights.to_string(),
                     "r_splitToning" => u8::from(defaults.enabled).to_string(),
                     "r_splitToningStrength" => defaults.strength.to_string(),
                     "r_splitToningShadowHue" => defaults.shadow_hue.to_string(),
@@ -63,6 +72,7 @@ impl App {
             }
 
             theme::Reset::Video(row) => self.reset_video_row(row),
+            theme::Reset::MovementCommandRate => self.set_player_movement_rate(125),
             theme::Reset::Environment(row) => self.reset_environment_row(row),
             theme::Reset::CloudTuning(row) => self.reset_cloud_tuning_row(row),
             theme::Reset::Physics(field) => self.reset_physics_field(field),
@@ -97,7 +107,6 @@ impl App {
             }
             ui::VIDEO_ROW_QUALITY_PRESET => self.apply_quality_preset(QualityPreset::Low),
             ui::VIDEO_ROW_FPS_CAP => self.set_fps_cap(defaults.fps_cap),
-            ui::VIDEO_ROW_PHYSICS_FPS => self.set_physics_msec(defaults.physics_msec),
             ui::VIDEO_ROW_BRIGHTNESS => self.set_gamma(defaults.gamma),
             ui::VIDEO_ROW_MODEL_BRIGHTNESS => {
                 self.set_model_brightness_locked(defaults.model_brightness_locked)
@@ -355,8 +364,8 @@ impl App {
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
-            ui::VIDEO_ROW_BLOOM => {
-                self.video.bloom = defaults.bloom;
+            ui::VIDEO_ROW_GLOW => {
+                self.video.glow = defaults.glow;
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
@@ -375,6 +384,18 @@ impl App {
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_CRT_SCOPE => self.set_crt_scope(defaults.crt_scope),
+            ui::VIDEO_ROW_CRT_STYLE => self.set_crt_style(defaults.crt_style),
+            ui::VIDEO_ROW_CRT_QUALITY => self.set_crt_quality(defaults.crt_quality),
+            ui::VIDEO_ROW_CRT_REFERENCE => self.set_crt_reference(defaults.crt_reference),
+            ui::VIDEO_ROW_CRT_MASK => self.set_crt_mask(defaults.crt_mask),
+            ui::VIDEO_ROW_CRT_SCANLINE => self.set_crt_scanline(defaults.crt_scanline),
+            ui::VIDEO_ROW_CRT_SHARPNESS => self.set_crt_sharpness(defaults.crt_sharpness),
+            ui::VIDEO_ROW_CRT_MASK_INTENSITY => {
+                self.set_crt_mask_intensity(defaults.crt_mask_intensity)
+            }
+            ui::VIDEO_ROW_CRT_CURVATURE => self.set_crt_curvature(defaults.crt_curvature),
+            ui::VIDEO_ROW_CRT_CORNER => self.set_crt_corner(defaults.crt_corner),
             ui::VIDEO_ROW_HALATION => {
                 self.video.halation = defaults.halation;
                 self.sync_post_effects();
@@ -651,11 +672,17 @@ impl App {
             }
             ui::ENV_ROW_RAIN_INTENSITY => {
                 self.video.rain_intensity = defaults.rain_intensity;
+            self.video.rain_glass = defaults.rain_glass;
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
             ui::ENV_ROW_PUDDLE_WATER => {
                 self.video.puddle_quality = defaults.puddle_quality;
+                self.sync_post_effects();
+                self.mark_config_dirty();
+            }
+            ui::ENV_ROW_RAIN_GLASS => {
+                self.video.rain_glass = defaults.rain_glass;
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }

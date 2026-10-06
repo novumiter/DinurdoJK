@@ -8,6 +8,44 @@ use crate::renderer::{
     WorldUploadTimings, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
 };
 
+/// Panic payloads are `&str` or `String` in practice; anything else is reported
+/// as an unknown panic rather than being dropped silently.
+fn panic_detail(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+/// Leave the renderer and its companion workers for the process to reclaim.
+///
+/// Used on the two paths where the GPU state can no longer be trusted: a device
+/// loss, and a panic raised mid-frame. Running the normal teardown there means
+/// destroying a surface whose last acquired image is still referenced by
+/// submissions that a dead device will never retire, which makes wgpu-hal
+/// assert. The device is gone either way, so its objects die with the process -
+/// or, after a backend restart, with the driver-side device that already failed.
+fn abandon_renderer(renderer: Renderer, companions: HashMap<CompanionId, CompanionRenderThread>) {
+    std::mem::forget(companions);
+    std::mem::forget(renderer);
+}
+
+/// Report the loss with the reason the device-lost callback recorded, then stop.
+/// Rendering cannot resume on this device; recovery would mean building a new
+/// one, which is a renderer restart.
+fn stop_for_device_loss(
+    proxy: &EventLoopProxy<UserEvent>,
+    renderer: Renderer,
+    companions: HashMap<CompanionId, CompanionRenderThread>,
+) {
+    let _ = proxy.send_event(UserEvent::RendererError(format!(
+        "GPU device lost ({}) - renderer stopped",
+        crate::renderer::device_lost_reason()
+    )));
+    abandon_renderer(renderer, companions);
+}
+
 pub struct RenderThread {
     pub(in crate::renderer) command_tx: Sender<RenderCommand>,
     /// Kept on the Winit/app side so auxiliary surfaces are created on the
@@ -44,6 +82,16 @@ impl RenderThread {
         let render_snapshot = Arc::clone(&latest_snapshot);
         let render_latest_view = Arc::clone(&latest_view);
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        // Release builds run with the backend validation layers off. A GPU fault
+        // ("[GPU DEVICE LOST] reason=Unknown: Device is lost") cannot be traced to
+        // the command that caused it without them, so honour wgpu's own env vars
+        // for a single diagnostic run: WGPU_VALIDATION=1, plus
+        // WGPU_GPU_BASED_VALIDATION=1 (shader-side bounds checks) and
+        // WGPU_VALIDATION_INDIRECT_CALL=1 (indirect draw/dispatch arguments).
+        instance_desc.flags = instance_desc.flags.with_env();
+        if instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION) {
+            eprintln!("[GPU] backend validation layers enabled: {:?}", instance_desc.flags);
+        }
         instance_desc.backends = match backend {
             RendererBackend::Vulkan => wgpu::Backends::VULKAN,
             RendererBackend::Dx12 => wgpu::Backends::DX12,
@@ -85,13 +133,9 @@ impl RenderThread {
                     )
                 }));
                 if let Err(payload) = result {
-                    let detail = payload
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                        .unwrap_or("unknown panic");
                     let _ = panic_proxy.send_event(UserEvent::RendererError(format!(
-                        "render thread panicked: {detail}"
+                        "render thread panicked: {}",
+                        panic_detail(&*payload)
                     )));
                 }
             })
@@ -262,7 +306,7 @@ pub(in crate::renderer) fn render_thread_main(
         hdr: initial_ui.video.hdr,
         auto_exposure: initial_ui.video.auto_exposure,
         tone_mapping: initial_ui.video.tone_mapping,
-        bloom: initial_ui.video.bloom,
+        glow: initial_ui.video.glow,
         halation: initial_ui.video.halation,
         ssao: initial_ui.video.ssao,
         static_bsp_ao: initial_ui.video.static_bsp_ao,
@@ -310,6 +354,7 @@ pub(in crate::renderer) fn render_thread_main(
         cloud_size: initial_ui.video.cloud_size,
         rain: initial_ui.video.rain,
         rain_intensity: initial_ui.video.rain_intensity,
+        rain_glass: initial_ui.video.rain_glass,
         puddle_quality: initial_ui.video.puddle_quality,
         puddle_scatter: initial_ui.video.puddle_scatter,
         rain_grade: initial_ui.video.rain_grade,
@@ -320,9 +365,20 @@ pub(in crate::renderer) fn render_thread_main(
         film_grain_strength: initial_ui.video.film_grain_strength,
         motion_blur_strength: initial_ui.video.motion_blur_strength,
         depth_of_field_strength: initial_ui.video.depth_of_field_strength,
+        crt_scope: initial_ui.video.crt_scope,
+        crt_style: initial_ui.video.crt_style,
+        crt_quality: initial_ui.video.crt_quality,
+        crt_reference: initial_ui.video.crt_reference,
+        crt_mask: initial_ui.video.crt_mask,
+        crt_scanline: initial_ui.video.crt_scanline,
+        crt_sharpness: initial_ui.video.crt_sharpness,
+        crt_mask_intensity: initial_ui.video.crt_mask_intensity,
+        crt_curvature: initial_ui.video.crt_curvature,
+        crt_corner: initial_ui.video.crt_corner,
         dof_quality: initial_ui.video.dof_quality,
         color_lut: initial_ui.video.color_lut,
         color_lut_strength: initial_ui.video.color_lut_strength,
+        color_grade: initial_ui.video.color_grade,
         split_toning: initial_ui.video.split_toning,
     });
     renderer.set_grass_enabled(initial_ui.video.grass);
@@ -436,6 +492,13 @@ pub(in crate::renderer) fn render_thread_main(
     let mut deferred_load_map = None;
 
     loop {
+        // Checked before the command batch as well as before the frame: map and
+        // texture uploads run from here, and on a dead device those fail the same
+        // silent way, panicking somewhere inside wgpu instead of reporting.
+        if crate::renderer::device_lost() {
+            stop_for_device_loss(&proxy, renderer, companion_renderers);
+            return;
+        }
         {
             let _activity = crate::thread_activity::activity(
                 crate::thread_activity::ThreadSlot::Render,
@@ -555,11 +618,15 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetContactShadowDebug(enabled)) => {
                         renderer.contact_shadow_debug = enabled
                     }
+                    Ok(RenderCommand::SetSsrDebug(mode)) => renderer.ssr_debug = mode,
                     Ok(RenderCommand::SetOceanEnabled(enabled)) => {
                         renderer.set_ocean_enabled(enabled)
                     }
                     Ok(RenderCommand::SetOceanSettings(settings)) => {
                         renderer.set_ocean_settings(settings)
+                    }
+                    Ok(RenderCommand::SetPromotedOceanSettings(settings)) => {
+                        renderer.promoted_ocean_overrides = settings;
                     }
                     Ok(RenderCommand::SetAuthoredOceans(oceans)) => {
                         renderer.set_authored_oceans(oceans)
@@ -665,8 +732,11 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetPlanarReflectionDebug(mode)) => {
                         renderer.set_planar_reflection_debug(mode);
                     }
-                    Ok(RenderCommand::SetPuddleDebug(enabled)) => {
-                        renderer.set_puddle_debug(enabled);
+                    Ok(RenderCommand::SetPuddleDebug(mode)) => {
+                        renderer.set_puddle_debug(mode);
+                    }
+                    Ok(RenderCommand::SetPuddleSkyBlend { window, ceiling }) => {
+                        renderer.set_puddle_sky_blend(window, ceiling);
                     }
                     Ok(RenderCommand::DumpMaterials { filter, all }) => {
                         renderer.dump_materials(filter.as_deref(), all);
@@ -699,6 +769,7 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::Screenshot {
                         directory,
                         mut metadata,
+                        format,
                     }) => {
                         // Use the renderer-owned snapshot as authority for the camera fields
                         // instead of the older main-thread copy bundled with the command.
@@ -750,12 +821,13 @@ pub(in crate::renderer) fn render_thread_main(
                                 entity_num: info.hit_entity_num,
                             }
                         });
-                        renderer.request_screenshot(directory, metadata)
+                        renderer.request_screenshot(directory, metadata, format)
                     }
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
                     Ok(RenderCommand::SetTransientUi {
                         chat_lines,
+                        console_notify_lines,
                         center_print,
                         demo_timeline,
                         prediction_debug,
@@ -774,6 +846,7 @@ pub(in crate::renderer) fn render_thread_main(
                     }) => {
                         renderer.set_transient_ui(
                             chat_lines,
+                            console_notify_lines,
                             center_print,
                             demo_timeline,
                             prediction_debug,
@@ -847,6 +920,9 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.asset_preview_viewport = viewport;
                     }
                     Ok(RenderCommand::UnloadMap) => renderer.unload_map(),
+                    Ok(RenderCommand::GrowInlineInstances { map }) => {
+                        renderer.load_map(*map);
+                    }
                     Ok(RenderCommand::LoadMap {
                         request_id,
                         started,
@@ -1016,21 +1092,42 @@ pub(in crate::renderer) fn render_thread_main(
                 crate::thread_activity::ThreadSlot::Render,
                 crate::thread_activity::Task::RenderFrame,
             );
-            renderer.render(
-                &frame_camera,
-                snapshot.player_position,
-                snapshot.area_mask.as_ref(),
-                snapshot.dynamic_models.as_slice(),
-                snapshot.transient_lights.as_slice(),
-                snapshot.companion_scene.as_ref(),
-                snapshot.dof_focus_target,
-                frame_crosshair_world,
-                &motion_reference_camera,
-                motion_camera_sample_dt,
-                motion_camera_changed_at.elapsed().as_secs_f32(),
-                snapshot.view_latch,
-                input_latelatch.then_some(latest_view.as_ref()),
-            )
+            // Caught here rather than at the thread entry point so the renderer
+            // is never dropped while this panic unwinds. The frame holds an
+            // acquired swapchain image whose submissions are not retired yet;
+            // tearing the surface down underneath it makes wgpu-hal assert
+            // ("Trying to destroy a SwapchainAcquireSemaphore that is still in
+            // use by a SurfaceTexture"), and a panic during a panic aborts the
+            // process through __fastfail - no minidump, no log tail, and the
+            // original message buried under the fallout.
+            let frame_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                renderer.render(
+                    &frame_camera,
+                    snapshot.player_position,
+                    snapshot.area_mask.as_ref(),
+                    snapshot.dynamic_models.as_slice(),
+                    snapshot.transient_lights.as_slice(),
+                    snapshot.companion_scene.as_ref(),
+                    snapshot.dof_focus_target,
+                    frame_crosshair_world,
+                    &motion_reference_camera,
+                    motion_camera_sample_dt,
+                    motion_camera_changed_at.elapsed().as_secs_f32(),
+                    snapshot.view_latch,
+                    input_latelatch.then_some(latest_view.as_ref()),
+                )
+            }));
+            match frame_outcome {
+                Ok(result) => result,
+                Err(payload) => {
+                    let detail = panic_detail(&*payload).to_owned();
+                    let _ = proxy.send_event(UserEvent::RendererError(format!(
+                        "render thread panicked: {detail}"
+                    )));
+                    abandon_renderer(renderer, companion_renderers);
+                    return;
+                }
+            }
         };
         if gamma_preparation.is_some() && render_result.is_ok() && !renderer.baked_brightness.busy {
             let generation = gamma_preparation.take().unwrap();
@@ -1155,6 +1252,10 @@ pub(in crate::renderer) fn render_thread_main(
                 // Slow levelshot VFS/decode work happens only after a visible
                 // unknown-map frame has completed present().
                 renderer.resolve_pending_ui_levelshot();
+            }
+            Err(RenderError::DeviceLost) => {
+                stop_for_device_loss(&proxy, renderer, companion_renderers);
+                return;
             }
             Err(RenderError::Lost | RenderError::Outdated) => renderer.reconfigure(),
             Err(RenderError::Timeout) => {}
@@ -1545,7 +1646,7 @@ pub(in crate::renderer) fn render_thread_main(
                 renderer.weather.fog.mode,
                 u8::from(renderer.hdr_enabled),
                 u8::from(renderer.tone_mapping_enabled),
-                u8::from(renderer.bloom_enabled),
+                u8::from(renderer.glow_mode.enabled()),
                 u8::from(renderer.ssao_enabled),
                 u8::from(renderer.static_bsp_ao_enabled),
                 u8::from(renderer.fxaa_enabled),

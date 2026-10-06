@@ -1,11 +1,11 @@
 //! Session advance.
 use crate::app::{
     event_debug, event_workers, local_player_alpha, playerstate_vec3, race_ghost,
-    rendering_third_person, sample_player_state, scene, snapshot_discontinuity,
-    snapshot_owns_playerstate_events, Arc, ClientFramePerf, DemoAdvance, DemoCameraSample,
-    EventCheckDisposition, GameSession, Ghoul2PresentationView, Instant, LivePredictionFrame,
-    PresentedEntity, ProtocolSnapshot, SessionPhase, SpectatorCameraMode, SpectatorCameraSettings,
-    ThirdPersonSettings, TransientLight,
+    rendering_third_person, scene, snapshot_discontinuity, snapshot_owns_playerstate_events, Arc,
+    ClientFramePerf, DemoAdvance, DemoCameraSample, EventCheckDisposition, GameSession,
+    Ghoul2PresentationView, Instant, LivePredictionFrame, PlayerPresentationInput, PresentedEntity,
+    ProtocolSnapshot, SessionPhase, SpectatorCameraMode, SpectatorCameraSettings, ThirdPersonSettings,
+    TransientLight,
 };
 
 impl GameSession {
@@ -42,12 +42,14 @@ impl GameSession {
             blob_shadows_enabled,
             false,
             None,
+            None,
         )
     }
 
     pub(in crate::app) fn advance_to(
         &mut self,
         target_server_time: i32,
+        view_angles: [f32; 3],
         third_person: ThirdPersonSettings,
         spectator_camera: SpectatorCameraSettings,
         first_person_lightsaber: bool,
@@ -70,6 +72,7 @@ impl GameSession {
             blob_shadows_enabled,
             false,
             None,
+            Some(PlayerPresentationInput::Local(view_angles)),
         )
     }
 
@@ -95,6 +98,7 @@ impl GameSession {
                 &[PresentedEntity],
             ) -> Result<Option<LivePredictionFrame>, String>,
         >,
+        input: Option<PlayerPresentationInput>,
     ) -> Result<(DemoAdvance, DemoCameraSample), String> {
         self.client_perf = ClientFramePerf::default();
         self.player_presenter.begin_perf_frame();
@@ -225,28 +229,24 @@ impl GameSession {
                 target_server_time,
             )?;
         }
-        let sample = match &predicted {
-            Some(prediction) => sample_player_state(
-                &prediction.display,
+        let sample = self
+            .update_presented_player_state(
+                presentation_time_ms,
                 target_server_time,
                 camera_teleported,
-                prediction.error,
-            ),
-            None => self.sample_at(presentation_time_ms, target_server_time, camera_teleported),
-        }
-        .ok_or_else(|| "DEMO CURRENT SNAPSHOT HAS NO CAMERA PLAYERSTATE".to_owned())?;
+                predicted.as_ref(),
+                input,
+            )
+            .ok_or_else(|| "DEMO CURRENT SNAPSHOT HAS NO CAMERA PLAYERSTATE".to_owned())?;
         self.client_perf.snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
 
         // CG_AddEntities adds cg.predictedPlayerEntity separately from packet
         // entities. Audio has the same ownership rule: the local/followed
         // player's loops and entity position must still exist even though
         // present_entities() intentionally skips that packet entity.
-        let followed_entity = match &predicted {
-            Some(prediction) => crate::cgame::presented_player_state_entity(&prediction.display),
-            None => self
-                .client_game
-                .present_followed_player_at(presentation_time_ms),
-        };
+        let followed_entity = self
+            .presented_player_state()
+            .and_then(crate::cgame::presented_player_state_entity);
         self.audio_followed_entity.clone_from(&followed_entity);
 
         // Presentation needs a renderer view before App::apply_demo_camera runs.
@@ -450,10 +450,10 @@ impl GameSession {
                 {
                     Some(info) => devprintln!(
                         2,
-                        "  ET_PLAYER entity={} clientNum={} name={:?} model={}/{} glm={} skin={} siegeclass={:?}",
+                        "  ET_PLAYER entity={} clientNum={} name=\"{}\" model={}/{} glm={} skin={} siegeclass={:?}",
                         entity.number,
                         client_num,
-                        info.name,
+                        crate::logging::jka_color_scope(&info.name, '7'),
                         info.model_name,
                         info.skin_name,
                         info.model_qpath(),
@@ -472,10 +472,7 @@ impl GameSession {
         self.client_perf.events_ms = events_started.elapsed().as_secs_f64() * 1000.0;
 
         self.player_position = Some(glam::Vec3::from_array(sample.player_position));
-        self.update_race_timer(
-            target_server_time,
-            predicted.as_ref().map(|prediction| &prediction.display),
-        );
+        self.update_race_timer(target_server_time);
         // CG_AddLagometerFrameInfo: cg.time - cg.latestSnapshotTime, where the latest
         // snapshot is the newest one received, not just the newest one read.
         let latest_snapshot_time = self
@@ -504,37 +501,14 @@ impl GameSession {
             target_server_time,
         );
 
-        // CG_AddEntities adds cg.predictedPlayerEntity for the local player.
-        let followed_entity = match &predicted {
-            Some(prediction) => crate::cgame::presented_player_state_entity(&prediction.display),
-            None => self
-                .client_game
-                .present_followed_player_at(presentation_time_ms),
-        };
         let followed_entity_num = followed_entity.as_ref().map(|entity| entity.number);
         // forceGripCripple is one of the few exact victim-side grip signals in
         // vanilla playerState. Remote entityState does not transmit
         // forceGripEntityNum, so PlayerPresenter reconstructs those targets
         // from each active gripper's view trace.
-        let local_force_gripped = predicted
-            .as_ref()
-            .map(|prediction| {
-                prediction
-                    .display
-                    .field_i32("fd.forceGripCripple")
-                    .unwrap_or(0)
-                    != 0
-            })
-            .or_else(|| {
-                self.current_snapshot.as_ref().map(|snapshot| {
-                    snapshot
-                        .player_state
-                        .field_i32("fd.forceGripCripple")
-                        .unwrap_or(0)
-                        != 0
-                })
-            })
-            .unwrap_or(false);
+        let local_force_gripped = self
+            .presented_player_state()
+            .is_some_and(|ps| ps.field_i32("fd.forceGripCripple").unwrap_or(0) != 0);
         self.player_presenter.prepare_force_grip_targets(
             &self.presented_entities,
             followed_entity.as_ref(),
@@ -545,18 +519,9 @@ impl GameSession {
         // playerState. Remote victims are confirmed from event-correlated
         // entity trajectory changes inside PlayerPresenter.
         const PMF_TIME_KNOCKBACK: i32 = 64;
-        let local_knockback = predicted
-            .as_ref()
-            .map(|prediction| {
-                prediction.display.field_i32("pm_flags").unwrap_or(0) & PMF_TIME_KNOCKBACK != 0
-            })
-            .or_else(|| {
-                self.current_snapshot.as_ref().map(|snapshot| {
-                    snapshot.player_state.field_i32("pm_flags").unwrap_or(0) & PMF_TIME_KNOCKBACK
-                        != 0
-                })
-            })
-            .unwrap_or(false);
+        let local_knockback = self
+            .presented_player_state()
+            .is_some_and(|ps| ps.field_i32("pm_flags").unwrap_or(0) & PMF_TIME_KNOCKBACK != 0);
         self.player_presenter.prepare_impulse_ragdolls(
             &self.presented_entities,
             followed_entity.as_ref(),
@@ -768,22 +733,14 @@ impl GameSession {
         self.race_ghost_live_sample = None;
         if self.live && !self.race_ghosts.is_empty() {
             let ghost_present_started = Instant::now();
-            let live_race_clock = predicted
-                .as_ref()
-                .map(|prediction| &prediction.display)
-                .or_else(|| {
-                    self.current_snapshot
-                        .as_ref()
-                        .map(|snapshot| &snapshot.player_state)
-                })
-                .map(|player_state| {
-                    (
-                        player_state.field_i32("duelTime").unwrap_or(0),
-                        player_state.stats[crate::japro_cg::STAT_RACEMODE] != 0,
-                        playerstate_vec3(player_state, "origin"),
-                        playerstate_vec3(player_state, "velocity"),
-                    )
-                });
+            let live_race_clock = self.presented_player_state().map(|player_state| {
+                (
+                    player_state.field_i32("duelTime").unwrap_or(0),
+                    player_state.stats[crate::japro_cg::STAT_RACEMODE] != 0,
+                    playerstate_vec3(player_state, "origin"),
+                    playerstate_vec3(player_state, "velocity"),
+                )
+            });
             if let Some((live_duel_time, live_race_mode, live_origin, live_velocity)) =
                 live_race_clock
             {
@@ -969,6 +926,9 @@ impl GameSession {
                 .current_snapshot
                 .as_ref()
                 .is_some_and(|snapshot| target_server_time >= snapshot.server_time);
+        // OpenJK assigns cg.time from the CGame frame's serverTime. Keep the
+        // successful frame time for jaPRO asynchronous commands such as `/do`.
+        self.cgame_time = target_server_time;
         Ok((
             if completed {
                 DemoAdvance::Completed

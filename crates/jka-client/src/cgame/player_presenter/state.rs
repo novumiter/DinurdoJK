@@ -87,6 +87,29 @@ impl PlayerPresenter {
         self.view_weapon_frame_time = 0;
     }
 
+    /// Apply renderer-global R_RemapShader state at an asset-registration boundary.
+    /// Model/material caches are rebuilt once here, so ordinary Ghoul2 draws do
+    /// not perform shader-name remap lookups.
+    pub(crate) fn set_shader_remaps(&mut self, remaps: crate::scene::ShaderRemapState) {
+        if self.shader_remaps == remaps {
+            return;
+        }
+        self.shader_remaps = remaps.clone();
+        self.models.clear();
+        self.saber_models.clear();
+        // Replacing registries drops the old generation token; queued jobs from
+        // the previous material mapping cannot populate the new caches.
+        self.async_models = AssetRegistry::new("player model");
+        self.async_static_models = AssetRegistry::new("ghoul2 model");
+        self.load_shared = Arc::new(ModelLoadShared::new(
+            Arc::clone(&self.shaders),
+            remaps,
+        ));
+        self.failed_models.clear();
+        self.failed_saber_models.clear();
+        self.prime_default_player_models();
+    }
+
     pub fn vehicle_definition_for_model_request(
         &self,
         requested: &str,
@@ -126,7 +149,11 @@ impl PlayerPresenter {
         }
         let asset_source = AssetSource::from_search_path(&assets);
         let shaders = Arc::new(shaders);
-        let load_shared = Arc::new(ModelLoadShared::new(Arc::clone(&shaders)));
+        let shader_remaps = crate::scene::ShaderRemapState::default();
+        let load_shared = Arc::new(ModelLoadShared::new(
+            Arc::clone(&shaders),
+            shader_remaps.clone(),
+        ));
         let worker_count = std::thread::available_parallelism()
             .map_or(4, |count| count.get())
             .saturating_sub(2)
@@ -141,6 +168,7 @@ impl PlayerPresenter {
             assets,
             pbr,
             shaders,
+            shader_remaps,
             textures: Textures::new(),
             texture_arcs: HashMap::new(),
             animations,

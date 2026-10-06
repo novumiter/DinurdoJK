@@ -168,27 +168,24 @@ impl App {
         }
     }
 
-    pub(in crate::app) fn set_physics_msec(&mut self, physics_msec: u32) {
-        self.video.physics_msec = physics_msec;
-        if !self.physics_fps_editing {
-            self.physics_fps_input = config::physics_fps_from_msec(physics_msec).to_string();
+    /// One client-side movement/input cadence for both live and solo play.
+    /// Remote fixed-Pmove servers still advertise pmove_fixed/pmove_msec and
+    /// the predictor obeys those values independently.
+    pub(in crate::app) fn set_player_movement_rate(&mut self, command_rate: u32) {
+        let command_rate = command_rate.clamp(15, 1000);
+        if self.network.command_rate == command_rate {
+            return;
         }
-        if let Some(player) = &mut self.local_server {
-            if let Err(error) = player.set_physics_tick_msec(physics_msec) {
-                self.console_status = format!("PHYSICS FPS ERROR: {error}");
+        self.network.command_rate = command_rate;
+        // Rebase live pacing instead of trying to catch up using slots from the
+        // old cadence. This does not touch raw/subframe view-angle sampling.
+        self.next_command_time = None;
+        if let Some(server) = self.local_server.as_mut() {
+            if let Err(error) = server.set_command_rate(command_rate) {
+                self.console_status = format!("COMMAND RATE ERROR: {error}");
             }
         }
         self.mark_config_dirty();
-        self.publish_ui();
-    }
-
-    pub(in crate::app) fn begin_physics_fps_edit(&mut self) {
-        if !self.physics_fps_editing {
-            self.physics_fps_editing = true;
-            self.physics_fps_input =
-                config::physics_fps_from_msec(self.video.physics_msec).to_string();
-            self.physics_fps_replace_on_type = true;
-        }
         self.publish_ui();
     }
 

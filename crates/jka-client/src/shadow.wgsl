@@ -49,7 +49,7 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
     }
 
-    let time = shadow.camera_pos_time.w;
+    let time = (shadow.camera_pos_time.w - material.params.w);
     for (var i = 0u; i < 4u; i = i + 1u) {
         if (i >= material.header.y) {
             break;

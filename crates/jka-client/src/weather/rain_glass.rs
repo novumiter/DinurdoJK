@@ -1,0 +1,429 @@
+//! Fullscreen lens-rain pass, ported from Toadstorm/RainyGlassShader.
+//!
+//! The shader math and material values are kept in `rain_glass.wgsl`. The two
+//! embedded masks are direct channel-preserving conversions of the upstream
+//! `droplets_mask.tif` and `rivulets_mask.tif`: RGBA (including TIFF meta0 as
+//! Unity's alpha), linear data, Mitchell-scaled from 2048 to the Unity Standalone
+//! importer cap of 1024. The upstream importer uses repeat wrapping and a -100
+//! mip bias, so this native port stores only mip 0 and samples it directly.
+
+use crate::pipeline_jobs::{hash_config as pipeline_hash, PipelineJobKey, PipelineJobManager};
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+
+const MASK_SIZE: u32 = 1024;
+const DROPLET_MASK_RGBA: &[u8] = include_bytes!("assets/rainy_glass_droplets.rgba");
+const RIVULET_MASK_RGBA: &[u8] = include_bytes!("assets/rainy_glass_rivulets.rgba");
+const SHADER: &str = include_str!("rain_glass.wgsl");
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RainGlassUniform {
+    time_amount_up: [f32; 4],
+}
+
+pub(super) struct RainGlassResources {
+    _droplet_texture: wgpu::Texture,
+    _rivulet_texture: wgpu::Texture,
+    droplet_view: wgpu::TextureView,
+    rivulet_view: wgpu::TextureView,
+    source_texture: wgpu::Texture,
+    source_view: wgpu::TextureView,
+    source_sampler: wgpu::Sampler,
+    mask_sampler: wgpu::Sampler,
+    uniform_buffer: wgpu::Buffer,
+    bind_group_layout: wgpu::BindGroupLayout,
+    pipeline_layout: wgpu::PipelineLayout,
+    shader: wgpu::ShaderModule,
+    bind_group: wgpu::BindGroup,
+    pipeline: Option<wgpu::RenderPipeline>,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    amount: f32,
+}
+
+impl RainGlassResources {
+    pub(super) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        debug_assert_eq!(DROPLET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
+        debug_assert_eq!(RIVULET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
+
+        let (droplet_texture, droplet_view) =
+            create_mask_texture(device, queue, "JKA RainyGlass droplet mask", DROPLET_MASK_RGBA);
+        let (rivulet_texture, rivulet_view) =
+            create_mask_texture(device, queue, "JKA RainyGlass rivulet mask", RIVULET_MASK_RGBA);
+
+        let source_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA RainyGlass scene sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let mask_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("JKA RainyGlass mask sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            // Upstream has trilinear filtering but mipBias=-100. With the LOD
+            // clamped to mip 0, retaining only that mip is the same effective path.
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            anisotropy_clamp: 1,
+            ..Default::default()
+        });
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JKA RainyGlass settings"),
+            contents: bytemuck::bytes_of(&RainGlassUniform::zeroed()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("JKA RainyGlass bind group layout"),
+            entries: &[
+                texture_entry(0),
+                sampler_entry(1),
+                texture_entry(2),
+                texture_entry(3),
+                sampler_entry(4),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA RainyGlass pipeline layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA RainyGlass WGSL"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let (source_texture, source_view) = create_source_texture(device, width, height, format);
+        let bind_group = create_bind_group(
+            device,
+            &bind_group_layout,
+            &source_view,
+            &source_sampler,
+            &droplet_view,
+            &rivulet_view,
+            &mask_sampler,
+            &uniform_buffer,
+        );
+
+        Self {
+            _droplet_texture: droplet_texture,
+            _rivulet_texture: rivulet_texture,
+            droplet_view,
+            rivulet_view,
+            source_texture,
+            source_view,
+            source_sampler,
+            mask_sampler,
+            uniform_buffer,
+            bind_group_layout,
+            pipeline_layout,
+            shader,
+            bind_group,
+            pipeline: None,
+            width,
+            height,
+            format,
+            amount: 0.0,
+        }
+    }
+
+    pub(super) fn prepare(
+        &mut self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        frame_time: f32,
+        amount: f32,
+        lens_up_alignment: f32,
+    ) {
+        if self.width != width || self.height != height || self.format != format {
+            let format_changed = self.format != format;
+            let (source_texture, source_view) = create_source_texture(device, width, height, format);
+            self.source_texture = source_texture;
+            self.source_view = source_view;
+            self.bind_group = create_bind_group(
+                device,
+                &self.bind_group_layout,
+                &self.source_view,
+                &self.source_sampler,
+                &self.droplet_view,
+                &self.rivulet_view,
+                &self.mask_sampler,
+                &self.uniform_buffer,
+            );
+            self.width = width;
+            self.height = height;
+            self.format = format;
+            if format_changed {
+                self.pipeline = None;
+            }
+        }
+
+        self.amount = amount.clamp(0.0, 1.0);
+        let uniform = RainGlassUniform {
+            time_amount_up: [
+                frame_time,
+                self.amount,
+                lens_up_alignment.abs().clamp(0.0, 1.0),
+                0.0,
+            ],
+        };
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+
+        let config = pipeline_hash(&self.format);
+        if self.pipeline.is_none() {
+            let key = PipelineJobKey::new("rain-glass", 0, config);
+            if let Some(pipeline) = jobs.take_ready(key) {
+                self.pipeline = Some(pipeline);
+            } else {
+                let device = device.clone();
+                let layout = self.pipeline_layout.clone();
+                let shader = self.shader.clone();
+                let format = self.format;
+                jobs.request(key, "RainyGlass lens", move || {
+                    create_pipeline(&device, &layout, &shader, format)
+                });
+            }
+        }
+    }
+
+    pub(super) fn active(&self) -> bool {
+        self.amount > 0.001 && self.pipeline.is_some()
+    }
+
+    pub(super) fn source_view(&self) -> &wgpu::TextureView {
+        &self.source_view
+    }
+
+    pub(super) fn render(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+    ) {
+        let Some(pipeline) = self.pipeline.as_ref().filter(|_| self.amount > 0.001) else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("JKA RainyGlass lens refraction"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+        count: None,
+    }
+}
+
+fn create_mask_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &'static str,
+    rgba: &[u8],
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: MASK_SIZE,
+                height: MASK_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            // Upstream TextureImporter.sRGBTexture == 0: these are data masks.
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        rgba,
+    );
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_source_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JKA RainyGlass GrabPass source"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn create_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    source_view: &wgpu::TextureView,
+    source_sampler: &wgpu::Sampler,
+    droplet_view: &wgpu::TextureView,
+    rivulet_view: &wgpu::TextureView,
+    mask_sampler: &wgpu::Sampler,
+    uniform_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA RainyGlass bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(source_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(droplet_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(rivulet_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(mask_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn create_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA RainyGlass lens pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rainy_glass_assets_match_unity_standalone_import_size() {
+        assert_eq!(DROPLET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
+        assert_eq!(RIVULET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
+    }
+
+    #[test]
+    fn rainy_glass_wgsl_parses_and_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(SHADER)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(SHADER)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("RainyGlass WGSL must validate");
+    }
+}

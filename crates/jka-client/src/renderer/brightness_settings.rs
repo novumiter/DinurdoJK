@@ -92,7 +92,7 @@ impl Renderer {
                     self.output_gamma(),
                     self.color_lut_effective_strength,
                     if self.vignette_enabled { 1.0 } else { 0.0 },
-                    0.0,
+                    self.color_grade.exposure_ev,
                 ],
             }),
         );

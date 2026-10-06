@@ -22,6 +22,10 @@ struct Material {
     wave_rgb: vec4<f32>,
     wave_alpha: vec4<f32>,
     wave_funcs: vec4<u32>,
+    ocean_color: vec4<f32>, // linear authored texture tint, opacity; negative alpha = default
+    ocean_material: vec4<f32>, // xyz reflectance, w roughness; negative = default
+    ocean_waves: vec4<f32>, // xy reserved/amplitude hint, z/w authored blend factors
+    ocean_blend_color: vec4<f32>, // analyzed mean color/brightness; never a texture lookup
 };
 struct PlanarReflectionSettings {
     planes: array<vec4<f32>, 4>,
@@ -241,7 +245,7 @@ fn wave_value(func: u32, p: vec4<f32>, time: f32) -> f32 {
 
 fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
-    let time = camera.camera_pos_time.w;
+    let time = (camera.camera_pos_time.w - material.params.w);
     if ((material.header.z & 134217728u) != 0u) {
         let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
         out = vec4<f32>(vec3<f32>(g), out.a);
@@ -261,7 +265,7 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
 // using UV there aliases badly on any surface that tiles many times.
 fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = base_uv;
-    let time = camera.camera_pos_time.w;
+    let time = (camera.camera_pos_time.w - material.params.w);
     for (var i = 0u; i < 4u; i = i + 1u) {
         if (i >= material.header.y) {
             break;
@@ -1280,7 +1284,7 @@ fn default_pbr_surface(input: VertexOut, albedo: vec3<f32>, weather: WeatherSurf
     result.n = geometric;
     result.specular_n = weather_reflection_normal(geometric, weather);
     result.v = normalize(camera.camera_pos_time.xyz - input.world_position);
-    result.roughness = weather_wet_roughness(0.65, weather.wetness, weather.puddle);
+    result.roughness = weather_wet_roughness(0.65, weather);
     result.metallic = 0.0;
     result.ao = 1.0;
     result.f0 = vec3<f32>(0.04);
@@ -1298,7 +1302,7 @@ fn evaluate_pbr_surface(
     result.n = cotangent_normal(input, uv, shared_frame);
     result.specular_n = weather_reflection_normal(result.n, weather);
     let pbr = sample_pbr_material(uv);
-    result.roughness = weather_wet_roughness(pbr.roughness, weather.wetness, weather.puddle);
+    result.roughness = weather_wet_roughness(pbr.roughness, weather);
     result.metallic = pbr.metallic;
     result.ao = pbr.ao;
     result.f0 = mix(pbr.dielectric_f0, albedo, pbr.metallic) * pbr.specular_scale;
@@ -2130,12 +2134,10 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     }
     let wetness = weather.wetness;
     let puddle = weather.puddle;
-    if (ENABLE_WEATHER_SURFACE && weather_surface.puddle.w > 0.5) {
-        let film_only = clamp(wetness - puddle * 0.65, 0.0, 1.0);
-        let dry = vec3<f32>(0.05, 0.05, 0.05);
-        let wet_film = vec3<f32>(0.12, 0.48, 0.14);
-        let puddle_debug = vec3<f32>(0.05, 0.72, 1.0);
-        return vec4<f32>(mix(mix(dry, wet_film, film_only), puddle_debug, puddle), 1.0);
+    // `puddle_debug <mode>`; see weather_surface_debug for what each mode paints.
+    let weather_debug_mode = u32(max(weather_surface.puddle.w, 0.0) + 0.5);
+    if (ENABLE_WEATHER_SURFACE && weather_debug_mode != 0u) {
+        return vec4<f32>(weather_surface_debug(input, weather, weather_debug_mode), 1.0);
     }
     if (ENABLE_WEATHER_SURFACE && wetness > 0.001) {
         base = vec4<f32>(weather_wet_albedo(base.rgb, weather) * weather_ripple_relief(weather) * weather_water_depth_tint(weather), base.a);

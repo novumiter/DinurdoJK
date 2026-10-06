@@ -32,6 +32,8 @@ struct OceanRenderSettings {
     wind_motion: vec4<f32>,
     authored_bounds: vec4<f32>,
     authored_plane: vec4<f32>,
+    mask_ranges: array<vec4<f32>,8>,
+    mask_triangles: array<vec4<f32>,512>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -74,11 +76,42 @@ fn hidden_vertex() -> VertexOut {
     return out;
 }
 
+fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
+    if (slot < 0 || slot >= 8) {
+        return true;
+    }
+    let range = ocean.mask_ranges[slot];
+    let count = u32(range.y);
+    if (count == 0u) {
+        return true;
+    }
+    let first = u32(range.x);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let t0 = ocean.mask_triangles[(first + i) * 2u];
+        let t1 = ocean.mask_triangles[(first + i) * 2u + 1u];
+        let a = t0.xy;
+        let b = t0.zw;
+        let c = t1.xy;
+        let ab = b - a;
+        let bc = c - b;
+        let ca = a - c;
+        let e0 = (ab.x * (p.y - a.y) - ab.y * (p.x - a.x)) / max(length(ab), 1.0e-4);
+        let e1 = (bc.x * (p.y - b.y) - bc.y * (p.x - b.x)) / max(length(bc), 1.0e-4);
+        let e2 = (ca.x * (p.y - c.y) - ca.y * (p.x - c.x)) / max(length(ca), 1.0e-4);
+        let tolerance = 0.75;
+        if ((e0 >= -tolerance && e1 >= -tolerance && e2 >= -tolerance)
+            || (e0 <= tolerance && e1 <= tolerance && e2 <= tolerance)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 @vertex fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
     @builtin(instance_index) instance_index: u32,
 ) -> VertexOut {
-    let surface_count = min(u32(ocean.spray_info.x + 0.5), 4u);
+    let surface_count = min(u32(ocean.spray_info.x + 0.5), 8u);
     let total_particles = max(u32(ocean.spray_info.y + 0.5), 1u);
     if (ocean.surface.z < 0.5 || surface_count == 0u || instance_index >= total_particles) {
         return hidden_vertex();
@@ -102,6 +135,12 @@ fn hidden_vertex() -> VertexOut {
         return hidden_vertex();
     }
 
+    let promoted = ocean.authored_plane.w > 0.5;
+    let activity = select(1.0, ocean.spray_planes[surface_index].y, promoted);
+    let foam_gain = select(1.0, ocean.spray_planes[surface_index].w, promoted);
+    if (promoted && !ocean_mask_contains(i32(ocean.spray_planes[surface_index].z), start_xz)) {
+        return hidden_vertex();
+    }
     let time = max(camera.camera_pos_time.w, 0.0);
     let lifetime = max(ocean.spray_info.z, 0.001);
     let lifetime_randomness = clamp(ocean.spray_info.w, 0.0, 1.0);
@@ -131,8 +170,11 @@ fn hidden_vertex() -> VertexOut {
             i32(i),
             0.0
         );
-        gradient += vec3<f32>(sample.x, sample.y, sample.w);
+        gradient += vec3<f32>(sample.x * ocean.map_scales[i].w,
+            sample.y * ocean.map_scales[i].w, sample.w * activity * foam_gain);
     }
+    let phase = dot(start_m, ocean.swell.xy) * ocean.swell.z - ocean.swell_motion.x * ocean.swell_motion.w;
+    gradient = vec3<f32>(gradient.xy + ocean.swell.xy * ocean.swell.w * ocean.swell.z * cos(phase), gradient.z);
     let water_normal = normalize(vec3<f32>(-gradient.x, 1.0, -gradient.y));
     let foam = gradient.z;
     // Exact activation/shaping thresholds from upstream sea_spray_particle.gdshader.
@@ -142,7 +184,7 @@ fn hidden_vertex() -> VertexOut {
         return hidden_vertex();
     }
     let wind_strength = clamp(length(ocean.wind_motion.xy) / 20.0, 0.0, 2.0);
-    let scale_factor = normal_factor * foam_factor * ocean.wind_motion.z * (0.15 + wind_strength);
+    let scale_factor = normal_factor * foam_factor * ocean.wind_motion.z * (0.15 + wind_strength) * activity;
 
     var displacement_m = vec3<f32>(0.0);
     for (var i = 0u; i < 3u; i += 1u) {
@@ -156,11 +198,10 @@ fn hidden_vertex() -> VertexOut {
         ).xyz * vec3<f32>(1.0,1.0,-1.0) * scales.z;
     }
     displacement_m *= vec3<f32>(ocean.swell_motion.z, 1.0, ocean.swell_motion.z);
-    let phase = dot(start_m, ocean.swell.xy) * ocean.swell.z - ocean.swell_motion.x * ocean.swell_motion.w;
     let horizontal = ocean.swell.w * ocean.swell_motion.y * cos(phase);
     displacement_m += vec3<f32>(ocean.swell.x * horizontal, ocean.swell.w * sin(phase), ocean.swell.y * horizontal);
     displacement_m += vec3<f32>(ocean.wind_motion.x,0.0,ocean.wind_motion.y) * t * 0.15;
-    displacement_m += vec3<f32>(0.0, -5.0 * pow(2.5 * t - 0.45, 2.0) * scale_factor + 0.5, 0.0);
+    displacement_m += vec3<f32>(0.0, (-5.0 * pow(2.5 * t - 0.45, 2.0) * scale_factor + 0.5) * activity, 0.0);
 
     let centre = vec3<f32>(start_xz.x, ocean.spray_planes[surface_index].x, start_xz.y)
         + displacement_m * units_per_meter;
@@ -175,7 +216,7 @@ fn hidden_vertex() -> VertexOut {
     let particle_scale_m = vec3<f32>(20.0, 8.5, 20.0)
         * vec3<f32>(foam_factor, foam_factor * normal_factor, foam_factor)
         * scale_modifier;
-    let particle_scale = particle_scale_m * units_per_meter * ocean.wind_motion.z * (0.15 + wind_strength);
+    let particle_scale = particle_scale_m * units_per_meter * ocean.wind_motion.z * (0.15 + wind_strength) * activity;
 
     var forward = normalize(camera.camera_forward.xyz);
     var right = cross(forward, vec3<f32>(0.0, 1.0, 0.0));

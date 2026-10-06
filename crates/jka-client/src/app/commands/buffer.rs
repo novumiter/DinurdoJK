@@ -119,7 +119,7 @@ impl App {
         let qpath = match normalize_cfg_qpath(name) {
             Ok(path) => path,
             Err(error) => {
-                self.push_console_line(format!("^1{error}"));
+                self.push_console_error(format!("^1{error}"));
                 return;
             }
         };
@@ -179,7 +179,7 @@ impl App {
             .map(|command| command.len().saturating_add(1))
             .sum::<usize>();
         if self.console_buffer_bytes().saturating_add(added) >= MAX_CONSOLE_COMMAND_BUFFER_BYTES {
-            self.push_console_line("^1Cbuf_InsertText overflowed".to_owned());
+            self.push_console_error("^1Cbuf_InsertText overflowed".to_owned());
             return false;
         }
         for command in commands.into_iter().rev() {
@@ -194,7 +194,7 @@ impl App {
             .map(|command| command.len().saturating_add(1))
             .sum::<usize>();
         if self.console_buffer_bytes().saturating_add(added) >= MAX_CONSOLE_COMMAND_BUFFER_BYTES {
-            self.push_console_line("^1Cbuf_AddText: overflow".to_owned());
+            self.push_console_error("^1Cbuf_AddText: overflow".to_owned());
             return false;
         }
         self.console_command_buffer.extend(commands);
@@ -216,9 +216,11 @@ impl App {
             if self.perf_sample.is_some() || self.quit_requested {
                 break;
             }
-            if self.console_wait_frames > 0 {
-                self.console_wait_frames -= 1;
-                break;
+            if let Some(until) = self.console_wait_until {
+                if crate::app::Instant::now() < until {
+                    break;
+                }
+                self.console_wait_until = None;
             }
             let Some(command) = self.console_command_buffer.pop_front() else {
                 break;
@@ -247,7 +249,7 @@ impl App {
         let qpath = match normalize_cfg_qpath(name) {
             Ok(path) => path,
             Err(error) => {
-                self.push_console_line(format!("^1{error}"));
+                self.push_console_error(format!("^1{error}"));
                 return;
             }
         };
@@ -257,18 +259,18 @@ impl App {
             match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
                 Ok(assets) => assets,
                 Err(error) => {
-                    self.push_console_line(format!("^1couldn't exec {qpath_string}: {error}"));
+                    self.push_console_error(format!("^1couldn't exec {qpath_string}: {error}"));
                     return;
                 }
             };
         let asset = match assets.read(&qpath_string, MAX_CFG_BYTES) {
             Ok(Some(asset)) => asset,
             Ok(None) => {
-                self.push_console_line(format!("^1couldn't exec {qpath_string}"));
+                self.push_console_error(format!("^1couldn't exec {qpath_string}"));
                 return;
             }
             Err(error) => {
-                self.push_console_line(format!("^1couldn't exec {qpath_string}: {error}"));
+                self.push_console_error(format!("^1couldn't exec {qpath_string}: {error}"));
                 return;
             }
         };
@@ -296,7 +298,7 @@ impl App {
             return;
         }
 
-        self.push_console_line(format!("^7] {command}"));
+        self.push_console_command_echo(format!("^7] {command}"));
         if self
             .console_history
             .last()
@@ -335,7 +337,7 @@ impl App {
                     return;
                 };
                 let Some(option) = crate::japro_cg::plugin_disable_option(bit) else {
-                    self.push_console_line(format!(
+                    self.push_console_error(format!(
                         "^1plugin:^7 bit {bit} is not a TaystJK jaPRO plugin-disable option; use /plugin to list them"
                     ));
                     return;
@@ -352,7 +354,7 @@ impl App {
                             "^1OFF"
                         }
                     )),
-                    Err(error) => self.push_console_line(format!("^1{error}")),
+                    Err(error) => self.push_console_error(format!("^1{error}")),
                 }
             }
             _ => self.push_console_line("^3usage:^7 plugin [bit number]".to_owned()),

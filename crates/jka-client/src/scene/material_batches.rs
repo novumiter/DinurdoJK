@@ -278,6 +278,8 @@ pub(in crate::scene) fn stage_batch(
             stage.opacity,
         ],
         alpha_cutoff: stage.alpha_cutoff,
+        shader_time_offset: 0.0,
+        authored_glow: stage.glow,
         fog,
         fog_is_global,
         fog_color_override: stage_fog_color_override(stage, first),
@@ -298,6 +300,8 @@ pub(in crate::scene) fn stage_batch(
                 }),
         planar_reflection: material.planar_reflection && first,
         water: material.water,
+        water_amplitude: material.water_amplitude,
+        water_deformed: material.water_deformed,
         alpha_shadow: material.alpha_shadow,
         light_filter: material.light_filter,
         water_primary: material.water && first,
@@ -730,6 +734,7 @@ pub(crate) fn append_sky_batches(
         tc_mods: Vec::new(),
         depth_write: true,
         depth_equal: false,
+            glow: false,
     };
     out.push(stage_batch(
         material,

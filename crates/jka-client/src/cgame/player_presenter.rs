@@ -211,6 +211,10 @@ pub struct PlayerPresenter {
     assets: AssetSearchPath,
     pbr: bool,
     shaders: Arc<BTreeMap<String, Shader>>,
+    /// Runtime renderer-style shader redirects. Updated only when a remap changes;
+    /// registered model/material caches are invalidated at that point, so normal
+    /// presentation does not pay a per-draw remap lookup.
+    shader_remaps: crate::scene::ShaderRemapState,
     textures: Textures,
     texture_arcs: HashMap<usize, Arc<TextureData>>,
     animations: AnimationSet,

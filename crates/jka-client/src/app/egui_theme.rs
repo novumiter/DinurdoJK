@@ -611,6 +611,8 @@ pub(super) enum Reset {
     None,
     /// A `ui::VIDEO_ROW_*` row.
     Video(usize),
+    /// The client user-command cadence shown on Setup -> Movement.
+    MovementCommandRate,
     /// A split-toning control, identified by its archived cvar.
     Color(&'static str),
     /// One split-toning color picker backed by hue + saturation cvars.

@@ -71,6 +71,7 @@ impl Default for LerpFrameState {
 /// Per-centity humanoid animation state. OpenJK stores the lerp frames on
 /// `cent->pe`, Ghoul2 state on `cent->ghoul2`, and remembered animation values
 /// on clientInfo; this Rust type owns exactly those animation responsibilities.
+#[derive(Clone)]
 pub struct PlayerAnimationState {
     pub animator: Ghoul2Animator,
     pub legs: LerpFrameState,

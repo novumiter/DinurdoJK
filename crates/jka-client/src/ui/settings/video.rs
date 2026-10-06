@@ -3,8 +3,9 @@ use crate::ui::{
     CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DetailTextureMode, DofQuality,
     DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FogMode,
     FootprintMode, FullscreenMode, FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode,
-    PlanarReflectionDebugMode, PuddleQuality, PvsMode, RainIntensity, ReflectionQuality,
-    RendererBackend, SaberMarkMode, SunVisibilityMode, TextureFilter, VsyncMode,
+    CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, PlanarReflectionDebugMode,
+    GlowMode, PuddleQuality, PvsMode, RainIntensity, ReflectionQuality, RendererBackend, SaberMarkMode,
+    SunVisibilityMode, TextureFilter, VsyncMode,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -92,7 +93,6 @@ pub struct VideoSettings {
     /// filter factor. Matches jaPRO's own default of 0.3; only active strictly
     /// between 0 and 1 (0 or >=1 disables it).
     pub ghoul2_anim_smooth: f32,
-    pub physics_msec: u32,
     /// Request a 1 ms Windows multimedia timer period for timeout/sleep waits.
     /// Raw mouse events already wake the event loop independently.
     pub timer_resolution_1ms: bool,
@@ -163,7 +163,7 @@ pub struct VideoSettings {
     pub float_lightmap: bool,
     pub tone_mapping: bool,
     pub auto_exposure: bool,
-    pub bloom: bool,
+    pub glow: GlowMode,
     pub halation: bool,
     pub ssao: bool,
     pub static_bsp_ao: bool,
@@ -212,6 +212,9 @@ pub struct VideoSettings {
     pub weather_wind: crate::ocean::OceanWind,
     pub rain: bool,
     pub rain_intensity: RainIntensity,
+    /// Rain on the camera's own lens: the RainyGlass droplet/rivulet refraction
+    /// pass over the finished scene (`weather/rain_glass.rs`).
+    pub rain_glass: bool,
     pub puddle_quality: PuddleQuality,
     /// How readily rain collects in scattered puddles on large flat ground, 0..1.
     pub puddle_scatter: f32,
@@ -227,6 +230,8 @@ pub struct VideoSettings {
     /// Runtime A/B diagnostic: order opaque grass near-to-far for early-Z.
     pub grass_front_to_back: bool,
     pub contact_shadow_debug: u8,
+    /// `r_ssrDebug`: isolates the screen-space reflection pass. Runtime only.
+    pub ssr_debug: u8,
     pub ocean: bool,
     pub ocean_settings: crate::ocean::OceanSettings,
     pub cloud_render_resolution: CloudRenderResolution,
@@ -253,11 +258,23 @@ pub struct VideoSettings {
     pub film_grain_strength: f32,
     pub motion_blur_strength: f32,
     pub depth_of_field_strength: f32,
+    /// Native WGPU port of Timothy Lottes' crt-lottes-fast filter.
+    pub crt_scope: CrtScope,
+    pub crt_style: CrtStyle,
+    pub crt_quality: CrtQuality,
+    pub crt_reference: CrtReferenceResolution,
+    pub crt_mask: CrtMask,
+    pub crt_scanline: f32,
+    pub crt_sharpness: f32,
+    pub crt_mask_intensity: f32,
+    pub crt_curvature: f32,
+    pub crt_corner: f32,
     /// Crosshair-surface autofocus for DOF. When off, the last focus distance is held.
     pub dof_autofocus: bool,
     pub dof_quality: DofQuality,
     pub color_lut: ColorLutPreset,
     pub color_lut_strength: f32,
+    pub color_grade: crate::color_grading::ColorGradeSettings,
     pub split_toning: crate::color_grading::SplitToningSettings,
     pub gpu_driven: bool,
     pub hiz_occlusion: bool,
@@ -350,7 +367,7 @@ impl VideoSettings {
 
 impl Default for VideoSettings {
     fn default() -> Self {
-        Self {
+        let mut settings = Self {
             fullscreen: FullscreenMode::Windowed,
             renderer_backend: RendererBackend::Vulkan,
             vsync: VsyncMode::Off,
@@ -381,8 +398,8 @@ impl Default for VideoSettings {
             draw_triggers: false,
             draw_clip_brushes: false,
             draw_entities: false,
-            draw_fps: 1,
-            draw_timer: false,
+            draw_fps: Default::default(),
+            draw_timer: Default::default(),
             developer_level: 0,
             developer_tools: false,
             renderer_verbose: 0,
@@ -395,7 +412,6 @@ impl Default for VideoSettings {
             ghoul2_lod_bias: 0,
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             ghoul2_anim_smooth: 0.3,
-            physics_msec: 8,
             timer_resolution_1ms: false,
             input_latelatch: false,
             client_physics: false,
@@ -455,7 +471,7 @@ impl Default for VideoSettings {
             float_lightmap: false,
             tone_mapping: false,
             auto_exposure: false,
-            bloom: false,
+            glow: GlowMode::Off,
             halation: false,
             ssao: false,
             static_bsp_ao: false,
@@ -495,6 +511,7 @@ impl Default for VideoSettings {
             },
             rain: false,
             rain_intensity: RainIntensity::Rain,
+            rain_glass: true,
             puddle_quality: PuddleQuality::High,
             puddle_scatter: 0.8,
             rain_grade: 0.5,
@@ -504,6 +521,7 @@ impl Default for VideoSettings {
             grass_mid_lod: true,
             grass_front_to_back: true,
             contact_shadow_debug: 0,
+            ssr_debug: 0,
             ocean: false,
             ocean_settings: crate::ocean::OceanSettings::default(),
             cloud_render_resolution: CloudRenderResolution::Full,
@@ -528,10 +546,21 @@ impl Default for VideoSettings {
             film_grain_strength: 0.0,
             motion_blur_strength: 0.0,
             depth_of_field_strength: 0.0,
+            crt_scope: CrtScope::Off,
+            crt_style: CrtStyle::LottesFast,
+            crt_quality: CrtQuality::Fast,
+            crt_reference: CrtReferenceResolution::P480,
+            crt_mask: CrtMask::GrilleLite,
+            crt_scanline: 0.5,
+            crt_sharpness: 2.5,
+            crt_mask_intensity: 0.5,
+            crt_curvature: 0.02,
+            crt_corner: 3.0,
             dof_autofocus: true,
             dof_quality: DofQuality::Adaptive,
             color_lut: ColorLutPreset::Off,
             color_lut_strength: 1.0,
+            color_grade: Default::default(),
             split_toning: Default::default(),
             gpu_driven: false,
             hiz_occlusion: false,
@@ -561,6 +590,9 @@ impl Default for VideoSettings {
             cascaded_shadows: false,
             cull_debug: CullDebugMode::Off,
             planar_reflection_debug: PlanarReflectionDebugMode::Off,
-        }
+        };
+        crate::app::video_cvar_registry().apply_defaults(&mut settings)
+            .expect("registered video defaults must apply");
+        settings
     }
 }

@@ -585,10 +585,10 @@ impl SoundPresenter {
     /// `S_StartLocalSound(sfx, CHAN_LOCAL_SOUND)`: a head-locked interface sound
     /// (chat beeps). Plays the first candidate that resolves, mirroring jaPRO's
     /// `privateChatSound` fallback to a base-assets sound.
-    pub fn play_local_sound(&mut self, candidates: &[&str]) {
+    pub fn play_local_sound(&mut self, candidates: &[&str]) -> bool {
         const CHAN_LOCAL_SOUND: i32 = 8;
         if self.backend.is_none() {
-            return;
+            return false;
         }
         for qpath in candidates {
             match self.assets.register(qpath) {
@@ -598,12 +598,14 @@ impl SoundPresenter {
                             SoundRequest { qpath: (*qpath).to_owned(), entity: 1023, channel: CHAN_LOCAL_SOUND, origin: SoundOrigin::Local },
                             sound,
                         );
+                        return true;
                     }
-                    return;
+                    return false;
                 }
                 Err(error) => self.warn_once(qpath, &error),
             }
         }
+        false
     }
 
     /// `S_StartLocalSound(sfx, CHAN_ANNOUNCER)`: head-locked reward/announcer

@@ -2,9 +2,9 @@
 //!
 //! Passwords are never written to DinurdoJK.cfg. On Windows they live in the
 //! current user's Windows Credential Manager as generic credentials, keyed by
-//! the exact resolved server `SocketAddr` (`IP:port`). That exact endpoint key
-//! is also the autologin trust boundary: a credential saved for one server is
-//! never offered to another resolved address.
+//! the exact resolved server `SocketAddr` (`IP:port`). That exact endpoint is
+//! the trust boundary: a credential saved for one server is never offered to
+//! another resolved address. A friendly server name is optional metadata only.
 
 use std::net::SocketAddr;
 
@@ -14,6 +14,7 @@ const TARGET_PREFIX: &str = "DinurdoJK/jaPRO/";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedLogin {
     pub server: SocketAddr,
+    pub server_name: Option<String>,
     pub username: String,
 }
 
@@ -125,8 +126,17 @@ mod platform {
         format!("{context} failed (Windows error {code})")
     }
 
-    pub fn save(server: SocketAddr, username: &str, password: &str) -> Result<(), String> {
+    pub fn save(
+        server: SocketAddr,
+        server_name: Option<&str>,
+        username: &str,
+        password: &str,
+    ) -> Result<(), String> {
         let mut target = wide(&target(server));
+        let mut comment = server_name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(wide);
         let mut username = wide(username);
         let mut password = password.as_bytes().to_vec();
         let blob_size = u32::try_from(password.len()).map_err(|_| "jaPRO password is too long".to_owned())?;
@@ -134,7 +144,9 @@ mod platform {
             Flags: 0,
             Type: CRED_TYPE_GENERIC,
             TargetName: target.as_mut_ptr(),
-            Comment: ptr::null_mut(),
+            Comment: comment
+                .as_mut()
+                .map_or(ptr::null_mut(), |value| value.as_mut_ptr()),
             LastWritten: FileTime { dwLowDateTime: 0, dwHighDateTime: 0 },
             CredentialBlobSize: blob_size,
             CredentialBlob: password.as_mut_ptr(),
@@ -185,7 +197,10 @@ mod platform {
         };
         unsafe { CredFree(raw.cast()) };
         let (username, password) = value;
-        Ok(Some(Credential { username, password: password? }))
+        Ok(Some(Credential {
+            username,
+            password: password?,
+        }))
     }
 
     pub fn delete(server: SocketAddr) -> Result<(), String> {
@@ -226,8 +241,13 @@ mod platform {
                 let credential = &*entry;
                 let target = wide_ptr_string(credential.TargetName);
                 let Some(server) = parse_target(&target) else { continue };
+                let server_name = wide_ptr_string(credential.Comment);
                 let username = wide_ptr_string(credential.UserName);
-                result.push(SavedLogin { server, username });
+                result.push(SavedLogin {
+                    server,
+                    server_name: (!server_name.is_empty()).then_some(server_name),
+                    username,
+                });
             }
             CredFree(raw.cast());
         }
@@ -245,7 +265,12 @@ mod platform {
 
     const UNSUPPORTED: &str = "secure saved jaPRO logins currently require Windows Credential Manager";
 
-    pub fn save(_server: SocketAddr, _username: &str, _password: &str) -> Result<(), String> {
+    pub fn save(
+        _server: SocketAddr,
+        _server_name: Option<&str>,
+        _username: &str,
+        _password: &str,
+    ) -> Result<(), String> {
         Err(UNSUPPORTED.to_owned())
     }
     pub fn read(_server: SocketAddr) -> Result<Option<Credential>, String> {

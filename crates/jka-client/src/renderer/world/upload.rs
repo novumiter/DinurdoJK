@@ -170,21 +170,36 @@ pub(in crate::renderer) fn build_world(
     // material uniform and cannot end up placing the ocean somewhere the draw
     // call did not intend. The footprint is only the bounding box; the real
     // outline travels as triangle masks the fragment shader cuts back to.
-    let mut ocean_clipmaps = BTreeMap::<[u32; 5], ([std::ops::Range<u32>; 2], u8)>::new();
+    let mut ocean_clipmaps = BTreeMap::<[u32; 6], ([std::ops::Range<u32>; 2], u8)>::new();
     let mut ocean_surfaces = Vec::<crate::ocean::OceanSurface>::new();
+    let mut ocean_appearances = BTreeMap::new();
     let mut ocean_masks = crate::ocean::OceanMasks::default();
     let mut ocean_coarsest_spacing = 0.0f32;
+    let mut diffuse_stages = HashMap::new();
+    if build_ocean_meshes {
+        for source in coarse_sources.iter().chain(full_sources.iter()) {
+            if source.water && !source.texture_is_lightmap
+                && !matches!(source.tc_gen,jka_assets::shader::TcGen::Environment) {
+                let stage = diffuse_stages.entry((source.vertices.start,source.vertices.end))
+                    .or_insert_with(|| source.clone());
+                if stage.texture.is_none() && source.texture.is_some() { *stage = source.clone(); }
+            }
+        }
+    }
+
     if build_ocean_meshes {
         let mut water_faces = Vec::<crate::ocean::WaterFace>::new();
-        let mut water_face_keys = Vec::<[u32; 5]>::new();
+        let mut water_face_keys = Vec::<[u32; 6]>::new();
+        let mut water_face_appearances = Vec::new();
+        let mut water_face_sources = Vec::new();
         let mut water_face_triangles = Vec::<Vec<crate::ocean::MaskTriangle>>::new();
-        let mut seen_faces = BTreeSet::<[u32; 5]>::new();
+        let mut seen_faces = BTreeSet::<[u32; 6]>::new();
         for source in coarse_sources.iter().chain(full_sources.iter()) {
             if !source.water_primary || !is_upward_water_face(source, &vertices) {
                 continue;
             }
             let (plane, minimum, maximum) = water_surface_extent(source, &vertices);
-            let key = ocean_surface_key(plane, minimum, maximum);
+            let key = ocean_surface_key(plane, minimum, maximum, source.bsp_shader_index);
             if !seen_faces.insert(key) {
                 continue;
             }
@@ -196,11 +211,17 @@ pub(in crate::renderer) fn build_world(
                     .collect(),
             );
             water_face_keys.push(key);
+            water_face_sources.push(source);
+            water_face_appearances.push(if source.authored_ocean.is_none() {
+                diffuse_stages.get(&(source.vertices.start, source.vertices.end))
+                    .map(|stage| crate::ocean::appearance::from_stage(stage, &vertices, &texture_data))
+            } else { None });
             water_faces.push(crate::ocean::WaterFace {
                 plane,
                 minimum,
                 maximum,
                 authored_ocean: source.authored_ocean,
+                material: source.bsp_shader_index,
             });
         }
         let clusters = crate::ocean::cluster_water_faces(&water_faces);
@@ -215,6 +236,28 @@ pub(in crate::renderer) fn build_world(
         }
         for (slot, cluster) in clusters.iter().take(MAX_OCEAN_SURFACES).enumerate() {
             let authored = water_faces[cluster.members[0]].authored_ocean.is_some();
+            // Use one stable representative for every face sharing this clipmap.
+            // Choosing its largest member avoids PVS pieces changing tint,
+            // tcMod-derived swell direction, or calm-water LOD by submission order.
+            let representative = cluster.members.iter().copied().max_by(|&a, &b| {
+                let area = |i: usize| {
+                    let f = water_faces[i];
+                    (f.maximum[0]-f.minimum[0]) * (f.maximum[1]-f.minimum[1])
+                };
+                area(a).total_cmp(&area(b))
+            }).unwrap_or(cluster.members[0]);
+            let mut appearance = water_face_appearances[representative];
+            let mut promoted_source = None;
+            if !authored {
+                let primary = water_face_sources[representative];
+                let source = diffuse_stages
+                    .get(&(primary.vertices.start, primary.vertices.end))
+                    .unwrap_or(primary);
+                appearance = Some(appearance.unwrap_or_else(||
+                    crate::ocean::appearance::from_stage(source, &vertices, &texture_data)));
+                promoted_source = Some(source);
+            }
+
             // A map-authored ocean carries its own bounds, so it takes no mask.
             let mask_slot = if authored {
                 None
@@ -227,21 +270,33 @@ pub(in crate::renderer) fn build_world(
                 ocean_masks.push_surface(slot, &triangles).then_some(slot)
             };
             // Both mesh qualities are uploaded so the quality setting stays a
-            // live switch instead of needing a map reload.
-            let low = crate::ocean::build_clipmap(
-                crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
-                cluster.plane,
-                cluster.minimum,
-                cluster.maximum,
-                mask_slot,
-            );
-            let high = crate::ocean::build_clipmap(
-                crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
-                cluster.plane,
-                cluster.minimum,
-                cluster.maximum,
-                mask_slot,
-            );
+            // live switch instead of needing a map reload. Ordinary promoted
+            // water additionally scales the physical radius of its LOD rings
+            // from the inferred displacement amplitude: a ~5-unit calm pool
+            // keeps full 10-unit tessellation only near the viewer, whereas a
+            // large swell converges back to the original 128-cell profile.
+            let build = |spacing| {
+                if let Some(appearance) = appearance {
+                    crate::ocean::build_promoted_clipmap(
+                        spacing,
+                        cluster.plane,
+                        cluster.minimum,
+                        cluster.maximum,
+                        mask_slot,
+                        appearance.heuristic.amplitude,
+                    )
+                } else {
+                    crate::ocean::build_clipmap(
+                        spacing,
+                        cluster.plane,
+                        cluster.minimum,
+                        cluster.maximum,
+                        mask_slot,
+                    )
+                }
+            };
+            let low = build(crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS);
+            let high = build(crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS);
             ocean_coarsest_spacing = low.coarsest_spacing;
             upload_timings.ocean_clipmap_vertices +=
                 (low.vertices.len() + high.vertices.len()) as u64;
@@ -252,7 +307,23 @@ pub(in crate::renderer) fn build_world(
                 indexed_builder.append_clipmap(&low.vertices, &low.indices),
                 indexed_builder.append_clipmap(&high.vertices, &high.indices),
             ];
+            if let Some(source) = promoted_source {
+                let appearance = appearance.expect("promoted water appearance");
+                let name = source.texture.and_then(|i| texture_data.get(i))
+                    .map(|t| t.label.clone()).unwrap_or_else(|| format!("water shader {}", source.bsp_shader_index));
+                upload_timings.promoted_oceans.push(crate::ocean::appearance::PromotedOcean {
+                    index: slot, name,
+                    surface: crate::ocean::OceanSurface { plane_height:cluster.plane, minimum:cluster.minimum, maximum:cluster.maximum },
+                    heuristic:appearance.heuristic,
+                    roughness:(appearance.material[3] >= 0.0).then_some(appearance.material[3]),
+                    color:crate::ocean::appearance::linear_to_srgb([appearance.color[0],appearance.color[1],appearance.color[2]]),
+                    swell_direction:crate::ocean::appearance::swell_direction_from_stage(source, &vertices),
+                });
+            }
             for &member in &cluster.members {
+                if let Some(appearance) = appearance {
+                    ocean_appearances.insert(water_face_keys[member], appearance);
+                }
                 ocean_clipmaps.insert(water_face_keys[member], (ranges.clone(), slot as u8));
             }
             ocean_surfaces.push(crate::ocean::OceanSurface {
@@ -536,15 +607,22 @@ pub(in crate::renderer) fn build_world(
                     water_plane = Some(water_surface_extent(&source, source_vertices));
                 } else {
                     // A water brush contributes its underside and its sides
-                    // too. Those are not the water surface, so they neither
-                    // become ocean nor draw on their own.
+                    // too. Those are not the surface to promote. Preserve
+                    // their authored draw unless a replacement owns them.
                     source.water_primary = false;
                 }
             }
+            // Ownership is independent of stage order or face orientation.
+            // Coplanar undersides and all sibling stages share the replacement.
+            let surface_key = source.water.then(|| {
+                let (plane, min, max) = water_surface_extent(&source, source_vertices);
+                ocean_surface_key(plane, min, max, source.bsp_shader_index)
+            });
+            let ocean_replaced = surface_key.is_some_and(|key| ocean_clipmaps.contains_key(&key));
             let (ocean_clipmap, ocean_clipmap_id) =
                 match water_plane.and_then(|(plane, minimum, maximum)| {
                     ocean_clipmaps
-                        .get(&ocean_surface_key(plane, minimum, maximum))
+                        .get(&ocean_surface_key(plane, minimum, maximum, source.bsp_shader_index))
                         .cloned()
                 }) {
                     Some((ranges, id)) => (Some(ranges), id),
@@ -557,8 +635,15 @@ pub(in crate::renderer) fn build_world(
                 .texture
                 .and_then(|texture| detail_texture_by_base.get(texture).copied())
                 .unwrap_or(0);
-            let material_uniform =
+            let mut material_uniform =
                 material_uniform(&source, (detail_auto_word & AUTO_DETAIL_ENABLED_BIT) != 0);
+            if let Some(appearance) = surface_key.and_then(|key| ocean_appearances.get(&key)) {
+                material_uniform.ocean_color = appearance.color;
+                material_uniform.ocean_material = appearance.material;
+                material_uniform.ocean_waves = appearance.waves;
+                let own = crate::ocean::appearance::from_stage(&source,source_vertices,&texture_data);
+                material_uniform.ocean_blend_color = own.blend_color;
+            }
             let material_buffer =
                 material_arena.push(device, queue, bytemuck::bytes_of(&material_uniform));
             let fog_uniform = weather::fog::surface_fog_uniform(
@@ -569,6 +654,22 @@ pub(in crate::renderer) fn build_world(
                 source.global_fog_post_eligible,
             );
             let fog_buffer = fog_arena.push(device, queue, bytemuck::bytes_of(&fog_uniform));
+            // OpenJK Dynamic Glow renders only `glow` stages and temporarily
+            // overrides fog colour to black. Preserve the stage's ordinary
+            // visibility/fog amount while preventing the fog colour itself
+            // from becoming an emissive source. This tiny alternate uniform is
+            // created only for authored glow batches; no per-frame cost exists
+            // for ordinary materials or Glow Off.
+            let authored_glow_fog_buffer = source.authored_glow.then(|| {
+                let glow_fog_uniform = weather::fog::surface_fog_uniform(
+                    source.fog,
+                    source.fog_is_global,
+                    weather::fog::FogColorOverride::Black,
+                    source.legacy2_fog_in_stage_safe,
+                    source.global_fog_post_eligible,
+                );
+                fog_arena.push(device, queue, bytemuck::bytes_of(&glow_fog_uniform))
+            });
             let selected_detail_texture = detail_texture_for_source(
                 &source,
                 detail_texture,
@@ -603,6 +704,96 @@ pub(in crate::renderer) fn build_world(
                 deformation_field_views,
                 deformation_field_sampler,
             );
+            // Keep the stock material/binding intact for Ocean Off. The ocean
+            // pass may need a later diffuse stage instead of the primary stage's
+            // environment reflection texture and generators.
+            let ocean_material = if ocean_clipmap.is_some() && source.authored_ocean.is_none() {
+                surface_key
+                    .and_then(|key| ocean_appearances.get(&key))
+                    .map(|appearance| {
+                        let stage = diffuse_stages
+                            .get(&(source.vertices.start, source.vertices.end))
+                            .unwrap_or(&source);
+                        let own =
+                            crate::ocean::appearance::from_stage(stage, source_vertices, &texture_data);
+                        let mut uniform = crate::renderer::material_uniform(stage, false);
+                        uniform.ocean_color = appearance.color;
+                        uniform.ocean_material = appearance.material;
+                        uniform.ocean_waves = [
+                            1.0,
+                            appearance.heuristic.amplitude,
+                            own.waves[2],
+                            own.waves[3],
+                        ];
+                        // Every member shares a stable mean-color/lighting
+                        // estimate. Source texture detail is used only to choose
+                        // wave defaults and never sampled by the ocean shader.
+                        uniform.ocean_blend_color = appearance.blend_color;
+                        let buffer = material_arena.push(device, queue, bytemuck::bytes_of(&uniform));
+                        (stage, buffer)
+                    })
+            } else {
+                None
+            };
+            let ocean_surface_bind_group = ocean_material.as_ref().map(|(stage, buffer)| {
+                create_world_bind_group(
+                    device,
+                    surface_layout,
+                    white,
+                    missing,
+                    flat_normal,
+                    repeat_sampler,
+                    clamp_sampler,
+                    pbr_repeat_sampler,
+                    pbr_clamp_sampler,
+                    lightmap_sampler,
+                    sky_sampler,
+                    selected_detail_texture,
+                    &textures,
+                    &lightmaps,
+                    &deluxemaps,
+                    &texture_clamp,
+                    primary_skybox,
+                    &footprint_marks,
+                    &reflection_probes,
+                    stage,
+                    buffer,
+                    &fog_buffer,
+                    surface_deformation_buffer,
+                    deformation_field_views,
+                    deformation_field_sampler,
+                )
+            });
+            let ocean_material_buffer = ocean_material.map(|(_, buffer)| buffer);
+            let authored_glow_bind_group = authored_glow_fog_buffer.as_ref().map(|glow_fog_buffer| {
+                create_world_bind_group(
+                    device,
+                    surface_layout,
+                    white,
+                    missing,
+                    flat_normal,
+                    repeat_sampler,
+                    clamp_sampler,
+                    pbr_repeat_sampler,
+                    pbr_clamp_sampler,
+                    lightmap_sampler,
+                    sky_sampler,
+                    selected_detail_texture,
+                    &textures,
+                    &lightmaps,
+                    &deluxemaps,
+                    &texture_clamp,
+                    primary_skybox,
+                    &footprint_marks,
+                    &reflection_probes,
+                    &source,
+                    &material_buffer,
+                    glow_fog_buffer,
+                    surface_deformation_buffer,
+                    deformation_field_views,
+                    deformation_field_sampler,
+                )
+            });
             let fast_bind_group = create_fast_world_bind_group(
                 device,
                 fast_surface_layout,
@@ -651,11 +842,16 @@ pub(in crate::renderer) fn build_world(
                 inline_group: u32::MAX,
                 ocean_clipmap,
                 ocean_clipmap_id,
+                ocean_replaced,
                 source,
                 bind_group,
+                authored_glow_bind_group,
+                ocean_surface_bind_group,
+                _ocean_material_buffer: ocean_material_buffer,
                 fast_bind_group,
                 _material_buffer: material_buffer,
                 _fog_buffer: fog_buffer,
+                _authored_glow_fog_buffer: authored_glow_fog_buffer,
                 cull_index,
                 compact_group: None,
                 bounds_min,
@@ -1525,6 +1721,7 @@ pub(in crate::renderer) fn build_world(
             sky_portal,
             primary_skybox,
             ocean_surfaces,
+            promoted_oceans: upload_timings.promoted_oceans.clone(),
             ocean_masks: Arc::new(ocean_masks),
             inline_models,
             vertex_buffer,

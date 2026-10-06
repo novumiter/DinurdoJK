@@ -123,6 +123,12 @@ unsafe extern "C" {
     ) -> i32;
     pub fn jka_world_new(data: *const u8, length: i32) -> *mut c_void;
     pub fn jka_world_free(world: *mut c_void);
+    pub fn jka_world_load_sub_bsp(
+        world: *mut c_void,
+        name: *const c_char,
+        data: *const u8,
+        length: i32,
+    ) -> i32;
     pub fn jka_collision_error() -> *const c_char;
     pub fn jka_world_trace(
         world: *mut c_void,

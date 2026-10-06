@@ -613,7 +613,7 @@ impl PlayerPresenter {
             return None;
         }
         if !self.blob_shadow_texture_resolved {
-            let (texture, alpha_mode) = self.custom_shader_material("markShadow");
+            let (texture, alpha_mode, _) = self.custom_shader_material("markShadow");
             self.blob_shadow_texture = texture;
             self.blob_shadow_alpha_mode = alpha_mode;
             self.blob_shadow_texture_resolved = true;
@@ -644,6 +644,8 @@ impl PlayerPresenter {
             // OpenJK registers `markShadow` as a shader and lets the renderer
             // honor the shader's authored blendFunc; preserve that here.
             alpha_mode: self.blob_shadow_alpha_mode,
+
+            authored_glow: false,
         })
     }
 

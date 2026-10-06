@@ -93,6 +93,7 @@ impl App {
         // consumed, so synthetic +moveup/-moveup affects this frame's usercmd.
         self.tick_japro_flipkick();
         self.tick_network(dt);
+        self.tick_japro_userinfo_updates();
         self.tick_demo_scrub_preview(now);
 
         // `/map`/`/devmap` now runs a tiny authoritative one-client server.
@@ -190,6 +191,9 @@ impl App {
                 }
             }
             self.drain_cgame_notices();
+            // jaPRO calls CG_DoAsync at the end of each CGame frame, after
+            // CG_DrawActive. Queue any due vstr now; it executes next App tick.
+            self.tick_japro_do();
             let duel_mini_scores = self.draw_scores == 3
                 && self
                     .game_session
@@ -218,6 +222,12 @@ impl App {
             self.tick_frontend_cinematic(now);
             self.update_solo_player_view_and_presentation();
         }
+
+        // Spectators have no local mouse-motion event to run the event-rate
+        // crosshair trace. Trace from this frame's freshly presented follow
+        // sample *before* publishing RenderSnapshot; doing it afterward leaves
+        // dynamic_crosshair_world one main tick behind only while spectating.
+        self.update_crosshair_target(now);
         if self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus {
             if let Some(hit) = self.crosshair_hit_world {
                 self.dof_focus_target = self
@@ -247,6 +257,7 @@ impl App {
             self.render_command(RenderCommand::AddSurfaceDeformation(stamp));
         }
         self.update_player_name_visibility(now);
+        self.ensure_inline_instance_capacity();
         self.publish_snapshot();
 
         let follow_name = self.current_follow_name();
@@ -280,7 +291,6 @@ impl App {
             self.publish_transient_ui();
         }
         self.tick_follow_fastest(now);
-        self.update_crosshair_target(now);
 
         let refresh_chat = !self.chat_lines.is_empty()
             && now.duration_since(self.last_chat_refresh) >= Duration::from_millis(250);
@@ -307,6 +317,26 @@ impl App {
             }
             self.last_center_refresh = now;
         }
+        // TaystJK does not fade notify rows: it stops drawing a row once its age
+        // exceeds con_notifytime. Refresh lightly until that boundary passes so
+        // expiration does not require rebuilding retained UI every frame.
+        let notify_lifetime_ms = f64::from(self.console_notify_time) * 1000.0;
+        let demo_now = self.current_demo_elapsed_ms(now);
+        let notify_clock_active = self.console_notify.back().is_some_and(|line| {
+            if notify_lifetime_ms < 0.0 {
+                return false;
+            }
+            let age_ms = match (demo_now, line.demo_elapsed_ms) {
+                (Some(now_ms), Some(created_ms)) => (now_ms - created_ms).max(0.0),
+                _ => now.saturating_duration_since(line.created).as_secs_f64() * 1000.0,
+            };
+            age_ms <= notify_lifetime_ms + 100.0
+        });
+        let refresh_console_notify = notify_clock_active
+            && now.duration_since(self.last_console_notify_refresh) >= Duration::from_millis(50);
+        if refresh_console_notify {
+            self.last_console_notify_refresh = now;
+        }
         let refresh_demo_timeline = self.demo_playback_active()
             && (self.demo_scrub_dragging
                 || now.saturating_duration_since(self.last_demo_timeline_refresh)
@@ -314,7 +344,7 @@ impl App {
         if refresh_demo_timeline {
             self.last_demo_timeline_refresh = now;
         }
-        if refresh_chat || refresh_center || refresh_demo_timeline {
+        if refresh_chat || refresh_center || refresh_console_notify || refresh_demo_timeline {
             // Fade/timeline updates are intentionally isolated from retained UI.
             // This avoids cloning console/menu state and rebuilding unrelated HUD
             // geometry at render frequency.

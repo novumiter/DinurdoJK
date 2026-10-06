@@ -1,5 +1,8 @@
 //! Console state.
-use crate::app::{ui, App, ConsoleSearchMatch, Duration, Instant, OverlayMode, Path, PathBuf};
+use crate::app::{
+    ui, App, ConsoleNotifyRecord, ConsoleSearchMatch, Duration, Instant, OverlayMode, Path,
+    PathBuf,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) struct ConsolePoint {
@@ -14,9 +17,33 @@ pub(in crate::app) struct ConsolePathLink {
     pub(in crate::app) target: PathBuf,
 }
 
+pub(in crate::app) fn parse_console_notify_terms(value: &str) -> Vec<String> {
+    value
+        .split_whitespace()
+        .take(8)
+        .filter_map(|word| {
+            // TaystJK stores each parsed term in `char notifyWords[8][32]` via
+            // Q_strncpyz, leaving 31 bytes for text plus the terminator.
+            let mut end = word.len().min(31);
+            while end > 0 && !word.is_char_boundary(end) {
+                end -= 1;
+            }
+            let word = &word[..end];
+            (!word.is_empty()).then(|| word.to_ascii_lowercase())
+        })
+        .collect()
+}
+
 impl App {
     pub(in crate::app) fn clear_console_output(&mut self) {
         self.console_lines.clear();
+        self.console_line_kinds.clear();
+        // TaystJK's Con_Clear_f blanks the console text backing the recent
+        // notify rows as well, so nothing remains visible in Con_DrawNotify.
+        // Our notify rows are stored separately from the scrollback buffer;
+        // clearing the ring is the equivalent observable behavior.
+        self.console_notify.clear();
+        self.last_console_notify_refresh = Instant::now();
         self.console_path_links.clear();
         self.console_scroll = 0;
         self.console_selection_anchor = None;
@@ -33,11 +60,13 @@ impl App {
         &mut self,
         line: String,
         path_links: Vec<ConsolePathLink>,
+        kind: crate::logging::ConsoleLineKind,
     ) {
         const MAX_CONSOLE_LINES: usize = 10_000;
         let preserve_scroll = self.console_scroll > 0;
         if self.console_lines.len() >= MAX_CONSOLE_LINES {
             self.console_lines.pop_front();
+            self.console_line_kinds.pop_front();
             self.console_path_links.pop_front();
 
             let shift_point = |point: Option<ConsolePoint>| {
@@ -59,6 +88,7 @@ impl App {
             });
         }
         self.console_lines.push_back(line);
+        self.console_line_kinds.push_back(kind);
         self.console_path_links.push_back(path_links);
         self.mark_companion_console_dirty();
 
@@ -118,7 +148,7 @@ impl App {
                         })
                     })
                     .collect();
-                self.append_console_line(line, path_links);
+                self.append_console_line(line, path_links, record.console_kind);
             }
             changed = true;
         }
@@ -128,35 +158,137 @@ impl App {
         changed
     }
 
-    pub(in crate::app) fn push_console_line(&mut self, line: impl Into<String>) {
-        crate::logging::write_line(crate::logging::Level::Info, format_args!("{}", line.into()));
-        // `push_console_line` drains the log channel immediately. That means the
-        // next tick's `sync_console_log()` cannot notice this line and publish a
-        // fresh retained console snapshot for us. While the console is open,
-        // publish here so server prints/centerprints (jaPRO checkpoints included)
-        // become visible immediately. `append_console_line` still owns scroll
-        // anchoring: live-bottom stays pinned, while an intentional PageUp/scroll
-        // remains anchored on the older text.
-        if self.sync_console_log() && self.overlay == OverlayMode::Console {
+    fn strip_console_notify_prefix(mut line: String) -> (String, bool) {
+        let mut skip_notify = false;
+        if let Some(rest) = line.strip_prefix("[skipnotify]") {
+            line = rest.to_owned();
+            skip_notify = true;
+        }
+        if let Some(rest) = line.strip_prefix('*') {
+            line = rest.to_owned();
+            skip_notify = true;
+        }
+        (line, skip_notify)
+    }
+
+    fn record_console_notify_print(&mut self, text: &str, notify: bool) {
+        // TaystJK keeps NUM_CON_TIMES (64) timestamps for console *rows*. A
+        // completed CL_ConsolePrint line leaves con.current on the next blank
+        // row, and CL_ConsolePrint timestamps that current row too. Preserve that
+        // shape here rather than treating this as an unrelated message deque.
+        let now = Instant::now();
+        let demo_elapsed_ms = self.current_demo_elapsed_ms(now);
+        if self.console_notify.is_empty() {
+            self.console_notify.push_back(ConsoleNotifyRecord {
+                text: String::new(),
+                created: now,
+                demo_elapsed_ms,
+                notify: false,
+            });
+        }
+
+        // Rust's push_console_line is a complete-print primitive. Embedded
+        // newlines therefore behave like repeated Con_Linefeed calls, including
+        // deliberate blank rows.
+        for segment in text.split('\n') {
+            let segment = segment.strip_suffix('\r').unwrap_or(segment);
+            if let Some(current) = self.console_notify.back_mut() {
+                current.text.clear();
+                current.text.push_str(segment);
+                current.created = now;
+                current.demo_elapsed_ms = demo_elapsed_ms;
+                current.notify = notify;
+            }
+            while self.console_notify.len() >= 64 {
+                self.console_notify.pop_front();
+            }
+            self.console_notify.push_back(ConsoleNotifyRecord {
+                text: String::new(),
+                created: now,
+                demo_elapsed_ms,
+                notify: false,
+            });
+        }
+
+        // CL_ConsolePrint marks the current row at the end of a non-skipped
+        // print. `[skipnotify]`/leading `*` instead leave it untimestamped.
+        if let Some(current) = self.console_notify.back_mut() {
+            current.created = now;
+            current.demo_elapsed_ms = demo_elapsed_ms;
+            current.notify = notify;
+        }
+        self.last_console_notify_refresh = now;
+    }
+
+    fn push_console_line_kind(
+        &mut self,
+        line: impl Into<String>,
+        kind: crate::logging::ConsoleLineKind,
+    ) {
+        let (line, skip_notify) = Self::strip_console_notify_prefix(line.into());
+        crate::logging::write_console_line(kind, format_args!("{line}"));
+        self.record_console_notify_print(&line, !skip_notify);
+
+        let console_changed = self.sync_console_log();
+        if console_changed && self.overlay == OverlayMode::Console {
             self.publish_ui();
+        } else {
+            self.publish_transient_ui();
         }
     }
 
+    /// Rust-side equivalent of TaystJK `CL_ConsolePrint`: engine/game console
+    /// text is eligible for `Con_DrawNotify` unless prefixed by `[skipnotify]`
+    /// or a leading `*`. Suppression markers are stripped from console text too.
+    pub(in crate::app) fn push_console_line(&mut self, line: impl Into<String>) {
+        self.push_console_line_kind(line, crate::logging::ConsoleLineKind::Normal);
+    }
+
+    /// Console command echo. The amber gutter is explicit metadata rather than
+    /// inferred from rendered `] ...` text.
+    pub(in crate::app) fn push_console_command_echo(&mut self, line: impl Into<String>) {
+        self.push_console_line_kind(line, crate::logging::ConsoleLineKind::CommandEcho);
+    }
+
+    /// Genuine engine/client error. Red JKA text by itself is not an error tag.
+    pub(in crate::app) fn push_console_error(&mut self, line: impl Into<String>) {
+        self.push_console_line_kind(line, crate::logging::ConsoleLineKind::Error);
+    }
+
+    /// TaystJK-style semantic notification line (mention/connect/vote).
+    pub(in crate::app) fn push_console_notification(
+        &mut self,
+        line: impl Into<String>,
+        kind: crate::logging::ConsoleLineKind,
+    ) {
+        debug_assert!(matches!(
+            kind,
+            crate::logging::ConsoleLineKind::NotifyMention
+                | crate::logging::ConsoleLineKind::NotifyConnect
+                | crate::logging::ConsoleLineKind::NotifyVote
+        ));
+        self.push_console_line_kind(line, kind);
+    }
+
     /// Emit an engine-authored console line with one explicitly trusted local
-    /// path target. No path-looking text is inferred or auto-linked.
+    /// path target. This still follows the same `CL_ConsolePrint` notify path.
     pub(in crate::app) fn push_console_path_line(
         &mut self,
         line: impl Into<String>,
         path: impl Into<PathBuf>,
     ) {
-        let line = line.into();
+        let (line, skip_notify) = Self::strip_console_notify_prefix(line.into());
         crate::logging::write_line_with_path(
             crate::logging::Level::Info,
             format_args!("{line}"),
             path.into(),
         );
-        if self.sync_console_log() && self.overlay == OverlayMode::Console {
+        self.record_console_notify_print(&line, !skip_notify);
+        let console_changed = self.sync_console_log();
+        if console_changed && self.overlay == OverlayMode::Console {
             self.publish_ui();
+        } else {
+            self.publish_transient_ui();
         }
     }
 

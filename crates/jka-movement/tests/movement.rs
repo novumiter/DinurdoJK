@@ -541,3 +541,195 @@ mod local_saber_stance {
         assert_eq!(levels(&p), (SS_STRONG, SS_STRONG));
     }
 }
+
+#[test]
+fn snapshot_inline_model_handles_are_checked_against_the_loaded_bsp() {
+    use jka_movement::{CollisionWorld, EntityClip, ENTITY_NONE};
+
+    // Reproduce the join crash: nine BSP models, but a snapshot references *9.
+    let bytes = rewrite_lumps(&Map::floor().bytes(), |lumps| {
+        let model = lumps[7].clone();
+        for _ in 1..9 {
+            lumps[7].extend_from_slice(&model);
+        }
+    });
+    let mut world = CollisionWorld::from_bsp(&bytes).unwrap();
+    let query = TraceQuery {
+        start: [0.0, 0.0, 100.0],
+        end: [0.0, 0.0, -10.0],
+        mins: [0.0; 3],
+        maxs: [0.0; 3],
+        pass_entity: ENTITY_NONE,
+        mask: 1,
+    };
+    for index in [9, 10, -1, 0, 510, 511, 512, i32::MAX] {
+        let trace = world.trace_entity(
+            query,
+            EntityClip::InlineModel {
+                index,
+                origin: [0.0; 3],
+                angles: [0.0; 3],
+            },
+        );
+        assert_eq!(
+            trace.fraction, 1.0,
+            "invalid model {index} must not collide"
+        );
+        assert_eq!(trace.end, query.end);
+        assert_eq!(trace.entity, ENTITY_NONE);
+        assert_eq!(
+            (trace.start_solid, trace.all_solid, trace.contents),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            world.inline_model_contents(query.end, index, [0.0; 3], [0.0; 3]),
+            0
+        );
+    }
+    // The last valid model still clips and reports contents, including a transform.
+    let origin = [0.0, 0.0, 20.0];
+    let trace = world.trace_entity(
+        query,
+        EntityClip::InlineModel {
+            index: 8,
+            origin,
+            angles: [0.0; 3],
+        },
+    );
+    assert!(trace.fraction < 1.0);
+    assert!((trace.end[2] - 20.125).abs() < 0.001);
+    assert_eq!(
+        world.inline_model_contents(query.end, 8, origin, [0.0; 3]),
+        1
+    );
+    assert!(
+        world.trace(query).fraction < 1.0,
+        "world collision remains available"
+    );
+}
+
+#[test]
+fn misc_bsp_handles_include_imported_world_and_inline_models() {
+    use jka_movement::{CollisionWorld, EntityClip, ENTITY_NONE};
+
+    let main = rewrite_lumps(&Map::floor().bytes(), |lumps| {
+        let model = lumps[7].clone();
+        for _ in 1..9 {
+            lumps[7].extend_from_slice(&model);
+        }
+    });
+    let child = rewrite_lumps(
+        &Map::default()
+            .box_brush([-8.0, -16.0, -24.0], [8.0, 16.0, 24.0], 4)
+            .bytes(),
+        |lumps| {
+            let model = lumps[7].clone();
+            lumps[7].extend_from_slice(&model);
+        },
+    );
+    let second = Map::default().box_brush([-12.0; 3], [12.0; 3], 1).bytes();
+    let mut world = CollisionWorld::from_bsp_with_sub_bsps(
+        &main,
+        &[
+            ("maps/test_child.bsp", &child),
+            ("maps/test_second.bsp", &second),
+        ],
+    )
+    .unwrap();
+    let mut clone = world.clone();
+    let query = TraceQuery {
+        start: [250.0, 0.0, 100.0],
+        end: [200.0, 0.0, 100.0],
+        mins: [0.0; 3],
+        maxs: [0.0; 3],
+        pass_entity: ENTITY_NONE,
+        mask: 4,
+    };
+    let origin = [200.0, 0.0, 100.0];
+    let angles = [0.0, 90.0, 0.0];
+    assert_eq!(
+        world.trace(query).fraction,
+        1.0,
+        "imported BSP is not static world geometry"
+    );
+    for index in [9, 10] {
+        let hit = world.trace_entity(
+            query,
+            EntityClip::InlineModel {
+                index,
+                origin,
+                angles,
+            },
+        );
+        assert!((hit.end[0] - 216.125).abs() < 0.001, "{hit:?}");
+        assert_eq!(hit.contents, 4);
+        assert_eq!(
+            world.inline_model_contents(origin, index, origin, angles),
+            4
+        );
+    }
+    let hit = world.trace_entity(
+        TraceQuery { mask: 1, ..query },
+        EntityClip::InlineModel {
+            index: 11,
+            origin,
+            angles: [0.0; 3],
+        },
+    );
+    assert!((hit.end[0] - 212.125).abs() < 0.001, "{hit:?}");
+    assert_eq!(world.inline_model_contents(origin, 12, origin, angles), 0);
+
+    // Loading and freeing a different world must not lose this world's submaps
+    // or leave the global temporary box hull pointing at the freed arena.
+    let other = Map::floor().world();
+    drop(other);
+    let box_query = TraceQuery {
+        mask: 0x100,
+        ..query
+    };
+    let bbox = EntityClip::Box {
+        mins: [-8.0; 3],
+        maxs: [8.0; 3],
+        origin,
+    };
+    let box_hit = clone.trace_entity(box_query, bbox);
+    assert!((box_hit.end[0] - 208.125).abs() < 0.001, "{box_hit:?}");
+    assert_eq!(clone.inline_model_contents(origin, 9, origin, angles), 4);
+    assert!(
+        world
+            .trace_entity(
+                query,
+                EntityClip::InlineModel {
+                    index: 10,
+                    origin,
+                    angles
+                }
+            )
+            .fraction
+            < 1.0
+    );
+}
+
+#[test]
+fn misc_bsp_input_is_validated_before_native_loading() {
+    use jka_movement::CollisionWorld;
+    let main = Map::floor().bytes();
+    assert!(
+        CollisionWorld::from_bsp_with_sub_bsps(&main, &[("maps/bad.bsp", b"invalid")]).is_err()
+    );
+    assert!(CollisionWorld::from_bsp_with_sub_bsps(
+        &main,
+        &[("maps/child.bsp", &main), ("MAPS/CHILD.BSP", &main)]
+    )
+    .is_err());
+    let too_many_models = rewrite_lumps(&main, |lumps| {
+        let model = lumps[7].clone();
+        for _ in 1..510 {
+            lumps[7].extend_from_slice(&model);
+        }
+    });
+    assert!(
+        CollisionWorld::from_bsp_with_sub_bsps(&main, &[("maps/large.bsp", &too_many_models)])
+            .is_err()
+    );
+}

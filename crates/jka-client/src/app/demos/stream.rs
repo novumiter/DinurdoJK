@@ -204,10 +204,12 @@ impl GameSession {
             .set_next_snapshot(self.next_snapshot.as_ref())?;
         self.timeline = Some(DemoTimeline::new(self.first_server_time.unwrap(), now));
         self.phase = SessionPhase::Playing;
-        self.sample_at(
+        self.update_presented_player_state(
             f64::from(self.first_server_time.unwrap()),
             self.first_server_time.unwrap(),
             false,
+            None,
+            None,
         )
         .ok_or_else(|| "DEMO FIRST SNAPSHOT HAS NO CAMERA PLAYERSTATE".to_owned())
     }
@@ -235,6 +237,8 @@ impl GameSession {
         self.client_game
             .set_next_snapshot(self.next_snapshot.as_ref())?;
         self.phase = SessionPhase::Playing;
+        let time = self.first_server_time.unwrap();
+        self.update_presented_player_state(f64::from(time), time, false, None, None);
         Ok(true)
     }
 }

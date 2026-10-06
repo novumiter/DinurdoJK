@@ -5,6 +5,14 @@ use crate::renderer::{
     CloudRenderResolution, Duration, Instant, DEPTH_FORMAT,
 };
 
+
+pub(in crate::renderer) struct AuthoredGlowTarget {
+    pub(in crate::renderer) _texture: wgpu::Texture,
+    pub(in crate::renderer) view: wgpu::TextureView,
+    pub(in crate::renderer) _msaa_texture: Option<wgpu::Texture>,
+    pub(in crate::renderer) msaa_view: Option<wgpu::TextureView>,
+}
+
 pub(in crate::renderer) struct BloomPyramid {
     pub(in crate::renderer) _textures: [wgpu::Texture; 3],
     pub(in crate::renderer) views: [wgpu::TextureView; 3],
@@ -53,6 +61,7 @@ pub(in crate::renderer) struct RenderTargets {
     pub(in crate::renderer) msaa_view: Option<wgpu::TextureView>,
     pub(in crate::renderer) _scene_texture: wgpu::Texture,
     pub(in crate::renderer) scene_view: wgpu::TextureView,
+    pub(in crate::renderer) authored_glow: Option<AuthoredGlowTarget>,
     pub(in crate::renderer) bloom: Option<BloomPyramid>,
     pub(in crate::renderer) dof: Option<DofTarget>,
     pub(in crate::renderer) ssao_history: Option<TemporalSsaoHistory>,
@@ -210,6 +219,7 @@ pub(in crate::renderer) fn create_targets(
     color_format: wgpu::TextureFormat,
     samples: u32,
     enable_bloom: bool,
+    enable_authored_glow: bool,
     enable_dof: bool,
     enable_ssao: bool,
     enable_ssr: bool,
@@ -264,6 +274,48 @@ pub(in crate::renderer) fn create_targets(
         view_formats: &[],
     });
     let scene_view = scene_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let authored_glow = enable_authored_glow.then(|| {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("JKA authored glow source"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa_texture = (samples > 1).then(|| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("JKA authored glow source MSAA"),
+                size: wgpu::Extent3d {
+                    width: width.max(1),
+                    height: height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format: color_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        });
+        let msaa_view = msaa_texture
+            .as_ref()
+            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        AuthoredGlowTarget {
+            _texture: texture,
+            view,
+            _msaa_texture: msaa_texture,
+            msaa_view,
+        }
+    });
     let bloom = enable_bloom.then(|| create_bloom_pyramid(device, width, height));
     let dof = enable_dof.then(|| create_dof_target(device, width, height));
     let ssao_history = enable_ssao.then(|| create_temporal_ssao_history(device, width, height));
@@ -474,6 +526,7 @@ pub(in crate::renderer) fn create_targets(
         msaa_view,
         _scene_texture: scene_texture,
         scene_view,
+        authored_glow,
         bloom,
         dof,
         ssao_history,

@@ -209,13 +209,15 @@ pub fn build_rgba8(preset: ColorLutPreset, base: &Path, game: Option<&Path>) -> 
 pub fn build_graded_rgba8(
     preset: ColorLutPreset,
     strength: f32,
+    color_grade: crate::color_grading::ColorGradeSettings,
     split_toning: crate::color_grading::SplitToningSettings,
     gamma: f32,
     base: &Path,
     game: Option<&Path>,
 ) -> (u32, Vec<u8>) {
+    let color_grade = color_grade.sanitize();
     let split_toning = split_toning.sanitize();
-    if !split_toning.active() {
+    if !color_grade.lut_active() && !split_toning.active() {
         return build_rgba8(preset, base, game);
     }
     let (size, data) = build_rgba8(preset, base, game);
@@ -224,13 +226,14 @@ pub fn build_graded_rgba8(
     let source = (size == LUT_SIZE).then_some(data.as_slice());
     (
         LUT_SIZE,
-        bake_split_toning_rgba8(source, strength, split_toning, gamma),
+        bake_color_grading_rgba8(source, strength, color_grade, split_toning, gamma),
     )
 }
 
-fn bake_split_toning_rgba8(
+fn bake_color_grading_rgba8(
     source: Option<&[u8]>,
     strength: f32,
+    color_grade: crate::color_grading::ColorGradeSettings,
     split_toning: crate::color_grading::SplitToningSettings,
     gamma: f32,
 ) -> Vec<u8> {
@@ -267,6 +270,12 @@ fn bake_split_toning_rgba8(
             };
             mixed.powf(gamma)
         });
+        // Primary controls are display-referred and intentionally run after the
+        // selected creative LUT. Split toning keeps its existing linear-light
+        // behavior and uses the ungraded scene as its range reference.
+        let display = graded.map(|v| v.powf(1.0 / gamma));
+        let display = color_grade.apply_display(display);
+        let graded = display.map(|v| v.powf(gamma));
         let output = split_toning.apply_with_reference(graded, reference);
         for v in output {
             data.push((v.powf(1.0 / gamma).clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
@@ -405,6 +414,7 @@ mod grading_tests {
             let graded = build_graded_rgba8(
                 preset,
                 0.4,
+                Default::default(),
                 SplitToningSettings::default(),
                 2.5,
                 Path::new("."),
@@ -415,10 +425,35 @@ mod grading_tests {
     }
 
     #[test]
+    fn primary_grade_works_without_a_film_lut() {
+        let grade = crate::color_grading::ColorGradeSettings {
+            saturation: 0.0,
+            contrast: 1.15,
+            ..Default::default()
+        };
+        let (size, data) = build_graded_rgba8(
+            ColorLutPreset::Off,
+            1.0,
+            grade,
+            SplitToningSettings::default(),
+            1.0,
+            Path::new("."),
+            None,
+        );
+        assert_eq!(size, LUT_SIZE);
+        assert_eq!(data.len(), (LUT_SIZE as usize).pow(3) * 4);
+        assert_ne!(data, identity_rgba8(LUT_SIZE));
+        let output = sample_lut(&data, [0.2, 0.5, 0.8]);
+        assert!((output[0] - output[1]).abs() < 0.01, "{output:?}");
+        assert!((output[1] - output[2]).abs() < 0.01, "{output:?}");
+    }
+
+    #[test]
     fn split_toning_works_without_a_film_lut() {
         let (size, data) = build_graded_rgba8(
             ColorLutPreset::Off,
             1.0,
+            Default::default(),
             SplitToningSettings {
                 enabled: true,
                 ..Default::default()
@@ -442,6 +477,7 @@ mod grading_tests {
         let (_, film) = build_graded_rgba8(
             ColorLutPreset::KodakPortra400,
             0.0,
+            Default::default(),
             settings,
             1.0,
             Path::new("."),
@@ -450,6 +486,7 @@ mod grading_tests {
         let (_, plain) = build_graded_rgba8(
             ColorLutPreset::Off,
             0.0,
+            Default::default(),
             settings,
             1.0,
             Path::new("."),
@@ -498,6 +535,7 @@ mod grading_tests {
             let (_, data) = build_graded_rgba8(
                 ColorLutPreset::Off,
                 1.0,
+                Default::default(),
                 settings,
                 gamma,
                 Path::new("."),
@@ -557,7 +595,7 @@ mod grading_tests {
         };
         // A flat synthetic external LUT isolates the composition order.
         let source = [51, 102, 153, 255].repeat((LUT_SIZE as usize).pow(3));
-        let data = bake_split_toning_rgba8(Some(&source), 1.0, settings, 1.0);
+        let data = bake_color_grading_rgba8(Some(&source), 1.0, Default::default(), settings, 1.0);
         for node in [2usize, 16, 28] {
             let index =
                 (node * LUT_SIZE as usize * LUT_SIZE as usize + node * LUT_SIZE as usize + node)

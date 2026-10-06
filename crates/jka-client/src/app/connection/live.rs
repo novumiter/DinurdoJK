@@ -11,7 +11,6 @@ impl App {
         }
         self.disconnect_notice = None;
         self.server_password_prompt = None;
-        self.japro_autologin_attempted = None;
         // Start before DNS/socket setup so the join metric really measures from
         // the user's connect action to the first rendered world frame.
         self.live_join_timing = Some(LiveJoinTiming::new());
@@ -117,11 +116,18 @@ impl App {
             net.pump()
         };
         self.poll_live_cgame_prep();
+        let mut sub_bsps_changed = false;
         for event in events {
+            if let jka_protocol::session::SessionEvent::ServerCommand(command) = &event {
+                sub_bsps_changed |= scene::sub_bsp_configstring_command(&command.text);
+            }
             self.handle_session_event(event);
             if self.net.is_none() {
                 return;
             }
+        }
+        if sub_bsps_changed {
+            self.refresh_live_sub_bsps();
         }
         self.poll_live_cgame_prep();
         if self.pending_live_gamestate && self.live_cgame_prep_rx.is_none() {
@@ -274,7 +280,10 @@ impl App {
                 self.console_status = text.to_ascii_uppercase();
                 println!("NET: {state:?} - {text}");
                 self.push_console_line(format!("^5{text}"));
-                if state == ConnectionState::Connected {
+                // History means a server we actually made it into, not merely a
+                // socket that accepted connectResponse. Stamp it once the first
+                // active snapshot is reached so "Last visited" is meaningful.
+                if state == ConnectionState::Active {
                     if let Some(address) = self.net.as_ref().map(|net| net.session().server()) {
                         if let Err(error) = self.server_browser.remember_history(address) {
                             eprintln!("SERVER BROWSER: could not save history: {error}");
@@ -457,6 +466,9 @@ impl App {
 
     /// CL_ParseGamestate -> CL_InitCGame: a new CGame for the new gamestate.
     pub(in crate::app) fn start_live_gamestate(&mut self) {
+        // Fresh cg_t state in TaystJK starts with a zero debounce deadline.
+        // Preserve any already-pending input change across the gamestate.
+        self.japro_userinfo_update_debounce = 0;
         self.send_userinfo();
         // CL_SystemInfoChanged: the gamestate systeminfo is authoritative for
         // fs_game. Inspect it before accepting any overlapped presenter/map prep
@@ -502,6 +514,11 @@ impl App {
                 self.disconnect_to_main_menu();
                 return;
             }
+        }
+        if let Err(error) = scene::server_bsp_names(&configstrings) {
+            self.push_console_line(format!("^1Rejected server BSP instances: {error}"));
+            self.disconnect_to_main_menu();
+            return;
         }
         self.update_chat_log_live_metadata(&map_name);
 
@@ -653,7 +670,16 @@ impl App {
         while let Some(command) = self.pending_live_server_commands.pop_front() {
             session.client_game.queue_server_command(command);
         }
+        // Renderer shader redirects belong to one cgame registration. A new
+        // gamestate must start from the authored shaders even when it reuses an
+        // already-loaded BSP; otherwise an old server/reconnect can leak its
+        // R_RemapShader state into this cgame. Keep a dirty bit if an in-flight
+        // old remap upload still needs to be replaced after its first frame.
+        let shader_remap_reset_needed = !self.shader_remaps.is_empty();
+        self.shader_remaps.clear();
+        self.shader_remap_dirty |= shader_remap_reset_needed;
         self.game_session = Some(session);
+        self.sync_shader_remap_presenters();
         self.predictor.reset();
         self.local_server = None;
         println!(
@@ -661,9 +687,17 @@ impl App {
             configstrings.len()
         );
         self.push_console_line(format!("^2Gamestate: {map_name} (client {client_num})"));
-        self.try_japro_autologin();
-
         if self.loaded_map_matches(&map_name) {
+            // A prefetched/same-map world can already be resident before the new
+            // cgame exists. Apply its initial CS_SHADERSTATE now, or restore the
+            // pristine cached materials when the previous cgame had remaps and
+            // this one intentionally has none.
+            let shader_remaps_changed = self.consume_server_shader_remaps();
+            if shader_remap_reset_needed || shader_remaps_changed {
+                if let Err(error) = self.rebuild_shader_remapped_world() {
+                    self.push_console_line(format!("^1shader remap: {error}"));
+                }
+            }
             if self.front_end {
                 self.pending_frontend_map_launch = false;
                 self.front_end = false;

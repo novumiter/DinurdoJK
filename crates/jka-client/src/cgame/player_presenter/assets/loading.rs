@@ -80,6 +80,7 @@ impl ModelSource for SyncModelSource<'_> {
 /// one decode instead of repeating it (all humanoid players share one GLA).
 pub(in crate::cgame::player_presenter) struct ModelLoadShared {
     pub(in crate::cgame::player_presenter) shaders: Arc<BTreeMap<String, Shader>>,
+    pub(in crate::cgame::player_presenter) shader_remaps: crate::scene::ShaderRemapState,
     pub(in crate::cgame::player_presenter) glas:
         Mutex<HashMap<String, Arc<OnceLock<Result<Arc<GlaAnimation>, String>>>>>,
     pub(in crate::cgame::player_presenter) textures:
@@ -87,9 +88,13 @@ pub(in crate::cgame::player_presenter) struct ModelLoadShared {
 }
 
 impl ModelLoadShared {
-    pub(in crate::cgame::player_presenter) fn new(shaders: Arc<BTreeMap<String, Shader>>) -> Self {
+    pub(in crate::cgame::player_presenter) fn new(
+        shaders: Arc<BTreeMap<String, Shader>>,
+        shader_remaps: crate::scene::ShaderRemapState,
+    ) -> Self {
         Self {
             shaders,
+            shader_remaps,
             glas: Mutex::new(HashMap::new()),
             textures: Mutex::new(HashMap::new()),
         }
@@ -153,13 +158,16 @@ impl ModelSource for WorkerModelSource<'_> {
 
     fn resolve_material(&mut self, shader_name: &str) -> ResolvedMaterial {
         let shared = self.shared;
-        let layers = material_layers(&shared.shaders, shader_name);
+        let effective = shared.shader_remaps.effective_name(shader_name);
+        let layers = material_layers(&shared.shaders, effective.as_ref());
+        let shader_time_offset = shared.shader_remaps.time_offset_for(effective.as_ref());
         let (mut texture, mut alpha_mode) = self.load_stage(&layers.base);
         let overlay = layers.overlay.as_ref().map(|stage| {
             let (texture, alpha_mode) = self.load_stage(stage);
             SurfaceOverlay {
                 texture,
                 alpha_mode,
+                authored_glow: stage.authored_glow,
             }
         });
         let stages = layers
@@ -170,6 +178,7 @@ impl ModelSource for WorkerModelSource<'_> {
                     image: stage.image.as_str(),
                     clamp: stage.clamp,
                     alpha_mode: mode,
+                    authored_glow: stage.glow,
                 });
                 resolved_stage(stage, mode, texture)
             })
@@ -185,6 +194,8 @@ impl ModelSource for WorkerModelSource<'_> {
             overlay,
             stages,
             two_sided: layers.two_sided,
+            authored_glow: layers.base.authored_glow,
+            shader_time_offset,
         }
     }
 }
@@ -262,6 +273,7 @@ pub(in crate::cgame::player_presenter) struct StageMaterial<'a> {
     pub(in crate::cgame::player_presenter) image: &'a str,
     pub(in crate::cgame::player_presenter) clamp: bool,
     pub(in crate::cgame::player_presenter) alpha_mode: DynamicModelAlphaMode,
+    pub(in crate::cgame::player_presenter) authored_glow: bool,
 }
 
 pub(in crate::cgame::player_presenter) struct MaterialLayers<'a> {
@@ -380,6 +392,7 @@ pub(in crate::cgame::player_presenter) fn resolved_stage(
         unlit: const_rgb,
         specular_alpha: stage.alpha_gen == AlphaGen::LightingSpecular,
         tc_mods: stage.tc_mods.clone(),
+        authored_glow: stage.glow,
     }
 }
 
@@ -462,6 +475,7 @@ pub(in crate::cgame::player_presenter) fn stage_material(
         image: stage.image.as_str(),
         clamp: stage.clamp,
         alpha_mode,
+        authored_glow: stage.glow,
     }
 }
 
@@ -478,6 +492,7 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
             image: shader_name,
             clamp: false,
             alpha_mode: DynamicModelAlphaMode::Opaque,
+            authored_glow: false,
         },
         entity_tint: false,
         overlay: None,
@@ -511,6 +526,7 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
                     clamp: stage.clamp,
                     // rgbGen lightingDiffuse: a lit, alpha-blended layer.
                     alpha_mode: DynamicModelAlphaMode::Blend,
+                    authored_glow: stage.glow,
                 })
         })
         .flatten();
@@ -675,6 +691,8 @@ pub(in crate::cgame::player_presenter) fn build_player_model(
             surface_name: hierarchy.name.clone(),
             texture: material.texture,
             alpha_mode: material.alpha_mode,
+            authored_glow: material.authored_glow,
+            shader_time_offset: material.shader_time_offset,
             entity_tint: material.entity_tint,
             overlay: material.overlay,
             stages: material.stages,
@@ -800,6 +818,8 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
             surface_name: hierarchy.name.clone(),
             texture: material.texture,
             alpha_mode: material.alpha_mode,
+            authored_glow: material.authored_glow,
+            shader_time_offset: material.shader_time_offset,
             entity_tint: material.entity_tint,
             overlay: material.overlay,
             stages: material.stages,
@@ -1058,7 +1078,10 @@ impl PlayerPresenter {
         self.asset_source = AssetSource::from_search_path(&self.assets);
         // Worker-side GLA/texture caches remember failures too. A new load-shared
         // object makes future jobs resolve against the refreshed shader table.
-        self.load_shared = Arc::new(ModelLoadShared::new(Arc::clone(&self.shaders)));
+        self.load_shared = Arc::new(ModelLoadShared::new(
+            Arc::clone(&self.shaders),
+            self.shader_remaps.clone(),
+        ));
         self.blob_shadow_texture_resolved = false;
         self.blob_shadow_asset_warned = false;
         if retried > 0 {
@@ -1305,13 +1328,19 @@ impl PlayerPresenter {
         shader_name: &str,
     ) -> ResolvedMaterial {
         let shaders = Arc::clone(&self.shaders);
-        let layers = material_layers(&shaders, shader_name);
+        // Own the resolved shader name before taking mutable borrows of the
+        // presenter to load textures. A borrowed Cow here would keep an
+        // immutable borrow of self.shader_remaps alive through MaterialLayers.
+        let effective = self.shader_remaps.effective_name(shader_name).into_owned();
+        let shader_time_offset = self.shader_remaps.time_offset_for(&effective);
+        let layers = material_layers(&shaders, &effective);
         let (mut texture, mut alpha_mode) = self.load_stage_texture(&layers.base);
         let overlay = layers.overlay.as_ref().map(|stage| {
             let (texture, alpha_mode) = self.load_stage_texture(stage);
             SurfaceOverlay {
                 texture,
                 alpha_mode,
+                authored_glow: stage.authored_glow,
             }
         });
         let stages = layers
@@ -1322,6 +1351,7 @@ impl PlayerPresenter {
                     image: stage.image.as_str(),
                     clamp: stage.clamp,
                     alpha_mode: mode,
+                    authored_glow: stage.glow,
                 });
                 resolved_stage(stage, mode, texture)
             })
@@ -1337,6 +1367,8 @@ impl PlayerPresenter {
             overlay,
             stages,
             two_sided: layers.two_sided,
+            authored_glow: layers.base.authored_glow,
+            shader_time_offset,
         }
     }
 

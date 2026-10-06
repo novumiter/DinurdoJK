@@ -77,23 +77,23 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "ZOOM", command: "+zoom", group: "Other" },
     ControlAction { label: "TAUNT", command: "taunt", group: "Other" },
     ControlAction { label: "CHALLENGE DUEL", command: "engage_duel", group: "Other" },
-    ControlAction { label: "TOGGLE THIRD PERSON", command: "toggle cg_thirdPerson", group: "Other" },
+    ControlAction { label: "TOGGLE THIRD PERSON", command: "toggle cg_thirdPerson 0 1", group: "Other" },
     // DinurdoJK-local actions stay available, but do not create extra top-level groups.
     ControlAction { label: "SURFACE TRACE", command: "trace", group: "Other" },
     ControlAction { label: "PUDDLE DEBUG", command: "puddle_debug", group: "Other" },
 ];
 
 /// Bind overrides that only apply while spectating a live game. Normal `bind`
-/// entries remain the fallback, so existing configs keep working unchanged.
+/// entries apply when no spectator override is assigned.
 pub const SPECTATOR_CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "NEXT PLAYER", command: "follownext", group: "Spectate" },
     ControlAction { label: "PREVIOUS PLAYER", command: "followprev", group: "Spectate" },
-    ControlAction { label: "CHANGE CAMERA TYPE", command: "toggle cg_specCamera", group: "Spectate" },
+    ControlAction { label: "CHANGE CAMERA TYPE", command: "toggle cg_thirdPerson 0 1 2", group: "Spectate" },
 ];
 
 /// Commands whose current DinurdoJK implementation is specifically tied to
 /// TaystJK/jaPRO integration. They are intentionally not shown on the Base JKA
-/// Controls page; the MOD page exposes them only while a jaPRO server is active.
+/// Controls page; the dynamic JAPRO section exposes them only while a jaPRO server is active.
 pub const JAPRO_CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "JETPACK", command: "+button12", group: "jaPRO" },
     ControlAction { label: "DASH", command: "+button13", group: "jaPRO" },
@@ -213,7 +213,7 @@ impl Default for Bindings {
             (BindKey::Keyboard(KeyCode::KeyT), "messagemode2"),
             (BindKey::Keyboard(KeyCode::KeyV), "voicechat"),
             (BindKey::Keyboard(KeyCode::Tab), "+scores"),
-            (BindKey::Keyboard(KeyCode::KeyP), "toggle cg_thirdPerson"),
+            (BindKey::Keyboard(KeyCode::KeyP), "toggle cg_thirdPerson 0 1"),
             (BindKey::Keyboard(KeyCode::KeyK), "engage_duel"),
             (BindKey::Keyboard(KeyCode::KeyN), "noclip"),
         ] {
@@ -221,13 +221,13 @@ impl Default for Bindings {
         }
         // Sparse override: normal Mouse3 remains saberAttackCycle in gameplay,
         // while spectators use it to cycle their presentation camera.
-        bindings.set_spectator(BindKey::Mouse(3), "toggle cg_specCamera");
+        bindings.set_spectator(BindKey::Mouse(3), "toggle cg_thirdPerson 0 1 2");
         bindings
     }
 }
 
 impl Bindings {
-    pub fn load(primary: &Path, fallback: Option<&Path>) -> Self {
+    pub fn load(primary: &Path) -> Self {
         if let Ok(text) = fs::read_to_string(primary) {
             let mut bindings = Self::default();
             if apply_cfg(&mut bindings, &text) {
@@ -235,14 +235,7 @@ impl Bindings {
             }
         }
 
-        if let Some(path) = fallback {
-            if let Ok(text) = fs::read_to_string(path) {
-                let mut bindings = Self::default();
-                if apply_cfg(&mut bindings, &text) {
-                    return bindings;
-                }
-            }
-        }
+
 
         Self::default()
     }
@@ -446,6 +439,62 @@ pub fn split_binding_commands(binding: &str) -> impl Iterator<Item = &str> {
     binding.split(';').map(str::trim).filter(|part| !part.is_empty())
 }
 
+/// Button commands currently consumed by DinurdoJK's CL_CreateCmd/CG input
+/// path. These have real `+foo` / `-foo` state, rather than being fire-and-forget
+/// console commands.
+pub fn is_supported_button_stem(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "moveup"
+            | "movedown"
+            | "forward"
+            | "back"
+            | "moveleft"
+            | "moveright"
+            | "speed"
+            | "attack"
+            | "use"
+            | "force_grip"
+            | "altattack"
+            | "useforce"
+            | "force_lightning"
+            | "force_drain"
+            | "button0"
+            | "button1"
+            | "button2"
+            | "button3"
+            | "button4"
+            | "button5"
+            | "button6"
+            | "button7"
+            | "button8"
+            | "button9"
+            | "button10"
+            | "button11"
+            | "button12"
+            | "button13"
+            | "button14"
+            | "button15"
+            | "scores"
+            | "zoom"
+    )
+}
+
+/// `movement_keys` is a semantic set represented with the stock default key
+/// codes so the local Pmove/demo/HUD paths can share it regardless of rebinding.
+pub fn canonical_movement_key(command: &str) -> Option<KeyCode> {
+    Some(match command.to_ascii_lowercase().as_str() {
+        "+forward" => KeyCode::KeyW,
+        "+back" => KeyCode::KeyS,
+        "+moveleft" => KeyCode::KeyA,
+        "+moveright" => KeyCode::KeyD,
+        "+moveup" => KeyCode::Space,
+        "+movedown" => KeyCode::ControlLeft,
+        "+speed" => KeyCode::ShiftLeft,
+        _ => return None,
+    })
+}
+
 pub fn bind_key_for_code(code: KeyCode) -> BindKey {
     BindKey::Keyboard(match code {
         KeyCode::ControlRight => KeyCode::ControlLeft,
@@ -633,9 +682,9 @@ mod tests {
     fn spectator_bindings_override_and_fall_back() {
         let bindings = Bindings::default();
         assert_eq!(bindings.get(BindKey::Mouse(3)), Some("saberAttackCycle"));
-        assert_eq!(bindings.get_spectator(BindKey::Mouse(3)), Some("toggle cg_specCamera"));
+        assert_eq!(bindings.get_spectator(BindKey::Mouse(3)), Some("toggle cg_thirdPerson 0 1 2"));
         assert_eq!(bindings.get_resolved(BindKey::Mouse(3), false), Some("saberAttackCycle"));
-        assert_eq!(bindings.get_resolved(BindKey::Mouse(3), true), Some("toggle cg_specCamera"));
+        assert_eq!(bindings.get_resolved(BindKey::Mouse(3), true), Some("toggle cg_thirdPerson 0 1 2"));
         assert_eq!(bindings.get_resolved(BindKey::Keyboard(KeyCode::KeyY), true), Some("messagemode"));
     }
 
@@ -645,7 +694,7 @@ mod tests {
         let mut text = String::new();
         bindings.write_cfg(&mut text);
         assert!(text.contains("unbindspecall"));
-        assert!(text.contains("bindspec MOUSE3 \"toggle cg_specCamera\""));
+        assert!(text.contains("bindspec MOUSE3 \"toggle cg_thirdPerson 0 1 2\""));
     }
 
     #[test]

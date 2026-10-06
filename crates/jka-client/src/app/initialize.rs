@@ -24,13 +24,12 @@ impl App {
         // External LUTs must be listed before the saved r_colorLut is parsed.
         crate::color_lut::scan_external(&base, game.as_deref());
         let config_path = settings_dir.join("DinurdoJK.cfg");
-        let legacy_config = settings_dir.join("jampconfig.cfg");
-        let mut video = config::load_video_settings(&config_path, Some(&legacy_config));
+        let mut video = config::load_video_settings(&config_path);
         crate::logging::set_developer_level(video.developer_level);
         crate::logging::set_renderer_verbose_level(video.renderer_verbose);
-        let audio = config::load_audio_settings(&config_path, Some(&legacy_config));
+        let audio = config::load_audio_settings(&config_path);
         let mut presentation =
-            config::load_client_presentation_settings(&config_path, Some(&legacy_config));
+            config::load_client_presentation_settings(&config_path);
         // OpenJK/TaystJK mirror cg_drawTeamOverlay into the read-only CVAR_USERINFO
         // key `teamoverlay`; the server uses it to decide whether to send tinfo.
         presentation.network.team_overlay = presentation.team_overlay.mode > 0;
@@ -48,10 +47,10 @@ impl App {
             // BAKED is the hybrid HQ path; keep the user's bake tuning.
             video.static_bsp_ao_lightmap = true;
         }
-        // AA is a single user-facing choice. Normalize legacy configs that may
-        // have stacked MSAA with FXAA/TAA so disabled modes do not keep hidden cost.
+        // AA is a single user-facing choice. Resolve conflicting MSAA/FXAA/TAA
+        // settings so disabled modes do not keep hidden cost.
         let aa_normalized = normalize_anti_aliasing(&mut video);
-        let mut bindings = Bindings::load(&config_path, Some(&legacy_config));
+        let mut bindings = Bindings::load(&config_path);
         // OpenJK's scoreboard is normally on Tab. Preserve an existing Tab bind,
         // but make +scores the default when this config has no Tab assignment.
         let tab = BindKey::Keyboard(KeyCode::Tab);
@@ -59,7 +58,6 @@ impl App {
             bindings.set(tab, "+scores");
         }
         let fps_cap_input = video.fps_cap.to_string();
-        let physics_fps_input = config::physics_fps_from_msec(video.physics_msec).to_string();
         let default_video = VideoSettings::default();
         let sun_custom_initialized = video.sun_override
             || (video.sun_yaw - default_video.sun_yaw).abs() > 0.0001
@@ -67,8 +65,8 @@ impl App {
             || (video.sun_intensity - default_video.sun_intensity).abs() > 0.0001
             || video.sun_color != default_video.sun_color;
         // If no native client config exists yet, persist the effective defaults
-        // (or imported jampconfig values) shortly after startup. Also rewrite
-        // legacy configs that stacked multiple AA methods.
+        // shortly after startup. Also rewrite
+        // configs that stacked multiple AA methods.
         let mut config_dirty = !config_path.is_file() || aa_normalized;
         let fresh_install = !config_path.is_file();
         let initial_label = initial_source.label();
@@ -205,6 +203,11 @@ impl App {
             profile_userinfo_pending: false,
             console_buffer_running: false,
             console_userinfo_dirty: false,
+            japro_userinfo_update_debounce: 0,
+            // TaystJK's modification-count baselines start at -1, so the first
+            // active jaPRO CGame frame publishes both mirror cvars once.
+            japro_camera_userinfo_dirty: true,
+            japro_net_userinfo_dirty: true,
             profile_force_pending: false,
             profile_dynamic_models: Arc::new(Vec::new()),
             profile_preview_active: false,
@@ -278,18 +281,18 @@ impl App {
             network: presentation.network.clone(),
             japro_saved_logins,
             japro_credential_error,
-            japro_autologin_attempted: None,
+            japro_login_editor: None,
             japro_cg: presentation.japro,
             camera_edit: None,
             vote_menu: egui_pages::VoteMenuState::default(),
             live_input: crate::net::LiveInput::default(),
             live_buttons: HashSet::new(),
+            live_button_sources: HashMap::new(),
             predictor: crate::net::Predictor::default(),
             hitch: hitch::HitchRecorder::default(),
             reconnect_target: None,
             demo_recording: None,
             map_movement: None,
-            last_center_print: Vec::new(),
             center_print: None,
             last_center_refresh: Instant::now(),
             scoreboard: None,
@@ -334,8 +337,12 @@ impl App {
             draw_scores: presentation.draw_scores,
             mini_scores_shown: None,
             team_overlay_shown: None,
-            cg_debug_events: 0,
-            cg_event_workers: false,
+            cg_debug_events: match super::cvar_registry().find("cg_debugEvents").unwrap().default_value() {
+                crate::console::cvars::CvarValue::Int(value) => value as u8, _ => unreachable!(),
+            },
+            cg_event_workers: match super::cvar_registry().find("cg_eventWorkers").unwrap().default_value() {
+                crate::console::cvars::CvarValue::Bool(value) => value, _ => unreachable!(),
+            },
             crosshair: presentation.crosshair,
             crosshair_target: ui::UiCrosshairTarget::default(),
             crosshair_hit_world: None,
@@ -397,8 +404,18 @@ impl App {
                 "STARTING".into()
             },
             console_lines: VecDeque::with_capacity(1024),
+            console_line_kinds: VecDeque::with_capacity(1024),
             console_path_links: VecDeque::with_capacity(1024),
             console_timestamps: presentation.console_timestamps,
+            console_notify_time: crate::app::cvar_registry().find("con_notifytime").expect("notify-time definition").entry.default.parse().expect("notify-time default"),
+            console_notify_lines: presentation.console_notify_lines,
+            console_notify_words: presentation.console_notify_words.clone(),
+            console_notify_terms: crate::app::console_state::parse_console_notify_terms(
+                &presentation.console_notify_words,
+            ),
+            console_notify_connect: presentation.console_notify_connect,
+            console_notify_vote: presentation.console_notify_vote,
+            console_notify_beep: presentation.console_notify_beep,
             console_suggest: presentation.console_suggest,
             chatbox_completion: presentation.chatbox_completion,
             chat_log_enabled: presentation.chat_log,
@@ -425,7 +442,7 @@ impl App {
             console_history: Vec::with_capacity(128),
             console_history_index: None,
             console_command_buffer: VecDeque::new(),
-            console_wait_frames: 0,
+            console_wait_until: None,
             console_map_barrier: false,
             perf_sample: None,
             latched_console_cvars: BTreeMap::new(),
@@ -445,6 +462,8 @@ impl App {
             chat_player_completion: None,
             chat_lines: VecDeque::with_capacity(16),
             last_chat_refresh: Instant::now(),
+            console_notify: VecDeque::with_capacity(64),
+            last_console_notify_refresh: Instant::now(),
             video_selected: 0,
             video_section: VideoSection::Display,
             environment_selected: 0,
@@ -456,6 +475,9 @@ impl App {
             authored_ocean_selected: 0,
             authored_ocean_preview: false,
             ocean_selected: 0,
+            ocean_settings_target: -1,
+            promoted_oceans: Vec::new(),
+            promoted_ocean_overrides: Vec::new(),
             cloud_tuning_open: false,
             cloud_tuning_selected: 0,
             video,
@@ -510,6 +532,9 @@ impl App {
                 steam_audio: audio.steam_audio,
             },
             prepared_map_cache: None,
+            shader_remaps: scene::ShaderRemapState::default(),
+            shader_remap_upload: false,
+            shader_remap_dirty: false,
             physics_mesh_label: None,
             display_transition_until: None,
             loading: initial_loading,
@@ -654,7 +679,11 @@ impl App {
             surface_inspector: None,
             trace_menu_entries: Vec::new(),
             trace_menu_selected: None,
-            puddle_debug_visualization: false,
+            puddle_debug_mode: 0,
+            puddle_sky_blend: (
+                crate::weather::RAIN_SKY_BLEND_WINDOW,
+                crate::weather::RAIN_SKY_BLEND_CEILING,
+            ),
             dof_focus_target: 4096.0,
             config_path,
             config_dirty,
@@ -663,9 +692,6 @@ impl App {
             fps_cap_input,
             fps_cap_editing: false,
             fps_cap_replace_on_type: false,
-            physics_fps_input,
-            physics_fps_editing: false,
-            physics_fps_replace_on_type: false,
             egui_ctx: egui::Context::default(),
             egui_state: None,
             egui_last_frame: Instant::now(),

@@ -27,7 +27,7 @@ struct PostSettings {
     cloud_detail_billow: vec4<f32>, // xyz unit-scale erosion wander; scaled by tile in the shader
     rain: vec4<f32>, // enabled, intensity, distant haze strength, puddle accumulation
     rain_occlusion: vec4<f32>, // min render X/Z, inverse heightfield extent X/Z
-    weather_look: vec4<f32>, // scattered puddle amount, wet grade amount, high-quality water, reserved
+    weather_look: vec4<f32>, // scattered puddle amount, wet grade amount, high-quality water, rain reaching camera (shared with RainyGlass lens exposure)
     underwater: vec4<f32>, // water surface Y above a submerged camera (-1e30 when not submerged), absorption distance, reserved x2
     cloud_foreground: vec4<f32>, // lit saber blade count, reserved x3
     cloud_blades: array<vec4<f32>, 16>, // per blade: ax, ay, bx, by (pixels); glow radius px, nearest distance

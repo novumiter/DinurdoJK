@@ -309,6 +309,7 @@ fn sky_cloud_stages_become_ordered_sky_batches_with_view_direction_coordinates()
             tc_mods: mods,
             depth_write: false,
             depth_equal: false,
+                    glow: false,
         }
     };
     let material = SurfaceMaterial {
@@ -423,6 +424,7 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
         tc_mods: Vec::new(),
         depth_write: false,
         depth_equal: false,
+            glow: false,
     };
     let material = SurfaceMaterial {
         sky: true,
@@ -803,6 +805,8 @@ fn all_renderer_shaders_validate() {
     let ssr_temporal = weather::with_bound_weather_surface(include_str!("../../ssr_temporal.wgsl"));
     let rain = weather::with_weather_surface(include_str!("../../rain.wgsl"));
     let rain_haze_mask = weather::with_post_settings(include_str!("../../rain_haze_mask.wgsl"));
+    let md3 = weather::with_model_weather(include_str!("../../md3.wgsl"));
+    let ghoul2_skin = weather::with_model_weather(include_str!("../../ghoul2_skin.wgsl"));
     for (name, source) in [
         ("bsp", bsp.as_str()),
         ("bsp_lean", bsp_lean.as_str()),
@@ -810,8 +814,14 @@ fn all_renderer_shaders_validate() {
         ("post", post.as_str()),
         ("rain", rain.as_str()),
         ("rain_sim", include_str!("../../rain_sim.wgsl")),
+        (
+            "rain_glass",
+            include_str!("../../weather/rain_glass.wgsl"),
+        ),
         ("rain_haze_mask", rain_haze_mask.as_str()),
         ("post_gamma", include_str!("../../post_gamma.wgsl")),
+        ("crt_lottes_fast", include_str!("../../crt_lottes_fast.wgsl")),
+        ("crt_lottes", include_str!("../../crt_lottes.wgsl")),
         ("depth_prepass", include_str!("../../depth_prepass.wgsl")),
         ("ssr_temporal", ssr_temporal.as_str()),
         ("ssr_visibility", include_str!("../../ssr_visibility.wgsl")),
@@ -826,8 +836,9 @@ fn all_renderer_shaders_validate() {
         ("cluster_lights", include_str!("../../cluster_lights.wgsl")),
         ("froxel_fog", include_str!("../../froxel_fog.wgsl")),
         ("ocean_windrow", include_str!("../../ocean_windrow.wgsl")),
-        ("md3", include_str!("../../md3.wgsl")),
-        ("ghoul2_skin", include_str!("../../ghoul2_skin.wgsl")),
+        ("ocean_spray", include_str!("../../ocean_spray.wgsl")),
+        ("md3", md3.as_str()),
+        ("ghoul2_skin", ghoul2_skin.as_str()),
         (
             "ghoul2_skin_compute",
             include_str!("../../ghoul2_skin_compute.wgsl"),
@@ -960,6 +971,8 @@ fn entity_shadow_pass_writes_caster_depth() {
             fx_gpu_sprites: None,
             texture: None,
             alpha_mode: DynamicModelAlphaMode::Opaque,
+
+            authored_glow: false,
         };
         models.prepare(
             &mut crate::renderer::brightness::BakedBrightness::default(),
@@ -968,6 +981,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             &queue,
             &[surface],
             None,
+            false,
             false,
             false,
             false,
@@ -1169,4 +1183,279 @@ fn blob_shadow_request_projects_onto_a_render_space_floor() {
         (area - 1.0).abs() < 1.0e-3,
         "the square is fully covered, uv area {area}"
     );
+}
+
+
+#[test]
+fn ocean_material_uniform_matches_world_shader_layouts() {
+    use crate::weather::rain_layout::{offset_of_member, wgsl_struct_layout};
+    use std::mem::{offset_of, size_of};
+    let shaders = [
+        compose_world_shader(include_str!("../../bsp.wgsl")),
+        compose_world_shader(include_str!("../../bsp_lean.wgsl")),
+        format!("{}\n{}", include_str!("../../bsp_fast.wgsl"), include_str!("../../surface_deformation.wgsl")),
+    ];
+    for shader in shaders {
+        let (size, members) = wgsl_struct_layout(&shader, "Material");
+        assert_eq!(size as usize, size_of::<MaterialUniform>());
+        assert_eq!(offset_of_member(&members, "ocean_color") as usize, offset_of!(MaterialUniform, ocean_color));
+        assert_eq!(offset_of_member(&members, "ocean_material") as usize, offset_of!(MaterialUniform, ocean_material));
+        assert_eq!(offset_of_member(&members, "ocean_waves") as usize, offset_of!(MaterialUniform, ocean_waves));
+        assert_eq!(offset_of_member(&members, "ocean_blend_color") as usize, offset_of!(MaterialUniform, ocean_blend_color));
+    }
+}
+
+#[test]
+#[ignore = "requires JKA_TEST_BASE with stock assets and hothchallenges.pk3"]
+fn hothchallenges_water_faces_remain_promotable() {
+    let base = std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE"));
+    let map = scene::prepare(&base, None, "hothchallenges").expect("prepare hothchallenges");
+    for batches in [&map.batches, &map.pvs_batches] {
+        let mut heights = std::collections::BTreeSet::new();
+        for batch in batches.iter().filter(|b| b.water_primary && is_upward_water_face(b, &map.vertices)) {
+            let (height, _, _) = water_surface_extent(batch, &map.vertices);
+            heights.insert(height as i32);
+            let appearance = crate::ocean::appearance::from_stage(batch, &map.vertices, &map.textures);
+            assert!((appearance.color[3] - 0.2).abs() < 0.001, "water2 alphaGen const 0.2");
+            assert!(!batch.water_deformed, "water2 only animates UVs");
+            assert!(appearance.heuristic.amplitude >= 4.0 && appearance.heuristic.amplitude <= 16.0);
+            let factors = crate::ocean::appearance::blend_factors(batch.pipeline.blend);
+            assert_eq!(appearance.waves, [1.0, appearance.heuristic.amplitude, factors[0], factors[1]]);
+        }
+        let tops: std::collections::BTreeSet<_> = batches.iter()
+            .filter(|b| b.water_primary && is_upward_water_face(b, &map.vertices))
+            .map(|b| { let (h, min, max) = water_surface_extent(b, &map.vertices);
+                ocean_surface_key(h, min, max, b.bsp_shader_index) }).collect();
+        let undersides = batches.iter().filter(|b| b.water_primary &&
+            map.vertices[b.vertices.start as usize..b.vertices.end as usize].iter().all(|v| v.normal[1] < -0.5))
+            .collect::<Vec<_>>();
+        assert_eq!(undersides.len(), 5);
+        for underside in undersides {
+            let (h, min, max) = water_surface_extent(underside, &map.vertices);
+            assert!(tops.contains(&ocean_surface_key(h, min, max, underside.bsp_shader_index)),
+                "each underside must belong to a promoted top and be suppressed");
+        }
+        assert_eq!(heights, [1216, 2536, 12776, 12784, 14064].into_iter().collect(),
+            "all five water planes, including the main pool and its coplanar underside");
+    }
+}
+
+#[test]
+fn ocean_render_uniform_matches_water_and_spray_layouts() {
+    use crate::ocean::OceanRenderUniform;
+    use crate::weather::rain_layout::{offset_of_member,wgsl_struct_layout};
+    use std::mem::{offset_of,size_of};
+    for shader in [compose_world_shader(include_str!("../../bsp.wgsl")),
+        include_str!("../../ocean_spray.wgsl").to_string()] {
+        let (size,members) = wgsl_struct_layout(&shader,"OceanRenderSettings");
+        assert_eq!(size as usize,size_of::<OceanRenderUniform>());
+        for (name,offset) in [
+            ("map_scales",offset_of!(OceanRenderUniform,map_scales)),
+            ("spray_planes",offset_of!(OceanRenderUniform,spray_planes)),
+            ("swell",offset_of!(OceanRenderUniform,swell)),
+            ("authored_plane",offset_of!(OceanRenderUniform,authored_plane)),
+            ("mask_ranges",offset_of!(OceanRenderUniform,mask_ranges)),
+            ("mask_triangles",offset_of!(OceanRenderUniform,mask_triangles))] {
+            assert_eq!(offset_of_member(&members,name) as usize,offset,"{name}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn promoted_water_gpu_views_and_spray_validate() {
+    use crate::ocean::{appearance::{PromotedOcean,wave_heuristic},OceanGpu,OceanSettings,OceanSurface};
+    block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends:wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let (device,queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits:adapter.limits(),..Default::default()
+        }).await.unwrap();
+        println!("promoted water GPU test: {:?}",adapter.get_info());
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label:None,entries:&[wgpu::BindGroupLayoutEntry { binding:0,
+                visibility:wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT,
+                ty:wgpu::BindingType::Buffer { ty:wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset:false,min_binding_size:None },count:None }]
+        });
+        let albedo = upload_texture(&device,&queue,&TextureData { label:"spray test".into(),
+            source:None,width:1,height:1,rgba:vec![255;4],rgba16f:None,mip_level_count:1,
+            clamp:true,srgb:true });
+        let layout = OceanGpu::create_render_layout(&device);
+        let _spray = crate::ocean::create_spray_pipeline(&device,&camera_layout,&layout,
+            wgpu::TextureFormat::Bgra8UnormSrgb,1);
+        let settings = OceanSettings { map_size:128,..Default::default() };
+        let mut ocean = OceanGpu::new(&device,&queue,&layout,&albedo.view,settings);
+        let pools: Vec<_> = (0..2).map(|i| PromotedOcean { index:i,name:format!("pool{i}"),
+            surface:OceanSurface { plane_height:100.0+i as f32*200.0,
+                minimum:[0.0;2],maximum:[4096.0;2] },heuristic:wave_heuristic(i as f32,None),
+            color:[0.1,0.2,0.3],roughness:None,swell_direction:None }).collect();
+        let surfaces: Vec<_> = pools.iter().map(|p| p.surface).collect();
+        ocean.set_enabled(&queue,true);
+        ocean.set_surfaces(&queue,&surfaces);
+        ocean.set_promoted_surfaces(&device,&queue,&pools,&[]);
+        let mut local = pools[0].settings(settings);
+        local.authored.amplitude = 64.0;
+        ocean.set_promoted_surfaces(&device,&queue,&pools,&[(0,local)]);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        ocean.encode_frame(&queue,&mut encoder,1.0/60.0);
+        let submission = queue.submit([encoder.finish()]);
+        device.poll(wgpu::PollType::Wait { submission_index:Some(submission),
+            timeout:Some(std::time::Duration::from_secs(30)) }).unwrap();
+        // Removing a pool or changing quality must release/rebuild just its
+        // render view while retaining valid references to the shared FFT field.
+        ocean.set_promoted_surfaces(&device,&queue,&pools[1..],&[]);
+        assert!(block_on(scope.pop()).is_none(),"ocean views and spray pipeline must validate");
+    });
+}
+
+#[test]
+#[ignore = "requires JKA_TEST_BASE with racepack8 assets"]
+fn racepack8_water_uses_analyzed_color_and_screen_blend() {
+    let base = std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE"));
+    let map = scene::prepare(&base,None,"racepack8").expect("prepare racepack8");
+    for batches in [&map.batches,&map.pvs_batches] {
+        let mut count = 0;
+        for batch in batches.iter().filter(|b| b.water_primary && is_upward_water_face(b,&map.vertices)) {
+            let Some(texture) = batch.texture.and_then(|i| map.textures.get(i)) else {continue};
+            if !texture.label.contains("rp8_water") {continue;}
+            let appearance = crate::ocean::appearance::from_stage(batch,&map.vertices,&map.textures);
+            assert_eq!(appearance.waves[2..],[8.0,1.0],"GL_ONE_MINUS_DST_COLOR GL_ONE");
+            assert_eq!(batch.rgb_gen,RgbGen::Vertex);
+            assert!(appearance.blend_color.iter().all(|v| v.is_finite()));
+            let mut different_uvs = map.vertices[batch.vertices.start as usize..batch.vertices.end as usize].to_vec();
+            for vertex in &mut different_uvs {vertex.uv = [0.0;2];}
+            let mut local_batch = batch.clone();
+            local_batch.vertices = 0..different_uvs.len() as u32;
+            let no_uv = crate::ocean::appearance::from_stage(&local_batch,&different_uvs,&map.textures);
+            assert_eq!(appearance.blend_color,no_uv.blend_color,"color analysis is independent of source mapping");
+            assert_eq!(appearance.heuristic,no_uv.heuristic);
+            count += 1;
+        }
+        assert!(count > 0,"actual rp8_water tops must remain promotable");
+    }
+}
+
+/// Compare the actual ocean blend helpers against hardware blending on varied
+/// backgrounds and painted detail, including JPEG-style alpha=1. This catches
+/// opaque replacement regressions without depending on a screenshot comparison.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn promoted_water_blends_match_authored_hardware_blending() {
+    block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends:wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        let (device,queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits:adapter.limits(),..Default::default()
+        }).await.unwrap();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let bsp = include_str!("../../bsp.wgsl");
+        let begin = bsp.find("fn ocean_authored_blend_factor").unwrap();
+        let end = bsp.find("fn ocean_surface_sample").unwrap();
+        let helpers = &bsp[begin..end];
+        use crate::materials::BlendFactor::*;
+        for (src,dst) in [(OneMinusDstColor,One),(SrcAlpha,OneMinusSrcAlpha),
+            (One,One),(DstColor,Zero),(DstColor,SrcColor),(One,OneMinusSrcAlpha)] {
+            let packed = crate::ocean::appearance::blend_factors(BlendMode::Custom(src,dst));
+            let body = r#"
+@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> {
+    var points = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));
+    return vec4<f32>(points[i],0.0,1.0);
+}
+fn background(p:vec4<f32>)->vec4<f32> {
+    return vec4<f32>(0.11+0.5*f32(u32(p.x)%2u),0.24,0.3,1.0);
+}
+fn painted_water(p:vec4<f32>)->vec4<f32> {
+    let detail = 0.3+0.3*f32(u32(p.x)%3u);
+    let alpha = f32(u32(p.x)%3u)*0.5;
+    return vec4<f32>(vec3<f32>(detail,detail*0.8,0.7)*vec3<f32>(0.2,0.3,0.4),alpha);
+}
+@fragment fn bg(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {return background(p);}
+@fragment fn original(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {return painted_water(p);}
+@fragment fn promoted(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {
+    return vec4<f32>(ocean_authored_blend(painted_water(p),background(p),BLEND_FACTORS),1.0);
+}
+"#;
+            let source = format!("{helpers}\n{body}").replace("BLEND_FACTORS",
+                &format!("vec2<u32>({}u,{}u)",packed[0] as u32-1,packed[1] as u32));
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label:Some("authored water blend comparison"),source:wgpu::ShaderSource::Wgsl(source.into()) });
+            let pipeline = |entry:&str,blend| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label:None,layout:None,vertex:wgpu::VertexState {module:&shader,entry_point:Some("vs"),
+                    compilation_options:Default::default(),buffers:&[]},primitive:Default::default(),
+                depth_stencil:None,multisample:Default::default(),fragment:Some(wgpu::FragmentState {
+                    module:&shader,entry_point:Some(entry),compilation_options:Default::default(),
+                    targets:&[Some(wgpu::ColorTargetState {format:wgpu::TextureFormat::Rgba8Unorm,
+                        blend,write_mask:wgpu::ColorWrites::ALL})] }),multiview_mask:None,cache:None });
+            let bg = pipeline("bg",None);
+            let component = wgpu::BlendComponent {src_factor:gpu_blend_factor(src),dst_factor:gpu_blend_factor(dst),
+                operation:wgpu::BlendOperation::Add};
+            let original = pipeline("original",Some(wgpu::BlendState {color:component,alpha:component}));
+            let promoted = pipeline("promoted",None);
+            let texture = || device.create_texture(&wgpu::TextureDescriptor {label:None,
+                size:wgpu::Extent3d {width:8,height:1,depth_or_array_layers:1},mip_level_count:1,sample_count:1,
+                dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba8Unorm,
+                usage:wgpu::TextureUsages::RENDER_ATTACHMENT|wgpu::TextureUsages::COPY_SRC,view_formats:&[] });
+            let reference = texture(); let actual = texture();
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {label:None,size:512,
+                usage:wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::MAP_READ,mapped_at_creation:false});
+            let mut encoder = device.create_command_encoder(&Default::default());
+            for (texture,passes,offset) in [(&reference,vec![&bg,&original],0),(&actual,vec![&promoted],256)] {
+                let view = texture.create_view(&Default::default());
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {label:None,
+                        color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:&view,depth_slice:None,
+                            resolve_target:None,ops:wgpu::Operations {load:wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store:wgpu::StoreOp::Store}})],..Default::default()});
+                    for pipeline in passes {pass.set_pipeline(pipeline);pass.draw(0..3,0..1);}
+                }
+                encoder.copy_texture_to_buffer(wgpu::TexelCopyTextureInfo {texture,mip_level:0,
+                    origin:wgpu::Origin3d::ZERO,aspect:wgpu::TextureAspect::All},wgpu::TexelCopyBufferInfo {
+                    buffer:&readback,layout:wgpu::TexelCopyBufferLayout {offset,bytes_per_row:Some(256),rows_per_image:Some(1)}},
+                    wgpu::Extent3d {width:8,height:1,depth_or_array_layers:1});
+            }
+            let submission = queue.submit([encoder.finish()]);
+            let (tx,rx) = std::sync::mpsc::channel();
+            readback.slice(..).map_async(wgpu::MapMode::Read,move |r| tx.send(r).unwrap());
+            device.poll(wgpu::PollType::Wait {submission_index:Some(submission),
+                timeout:Some(std::time::Duration::from_secs(30))}).unwrap();
+            rx.recv().unwrap().unwrap();
+            let pixels = readback.slice(..).get_mapped_range();
+            for x in 0..8 {for channel in 0..3 {
+                let expected = pixels[x*4+channel]; let actual = pixels[256+x*4+channel];
+                assert!(expected.abs_diff(actual)<=2,"{src:?}/{dst:?}: pixel {x}, channel {channel}: {actual} vs hardware {expected}");
+            }}
+            assert_ne!(pixels[256],pixels[260],"background/detail must survive promotion");
+        }
+        assert!(block_on(scope.pop()).is_none(),"water blend shader must validate");
+    });
+}
+
+#[test]
+fn ocean_shading_does_not_sample_the_authored_base_texture() {
+    let source = compose_world_shader(include_str!("../../bsp.wgsl"));
+    let module = wgpu::naga::front::wgsl::parse_str(&source).unwrap();
+    let base = module.global_variables.iter().find(|(_,g)| g.name.as_deref()==Some("base_texture")).unwrap().0;
+    let root = module.functions.iter().find(|(_,f)| f.name.as_deref()==Some("ocean_surface_sample")).unwrap().0;
+    let mut pending = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(handle) = pending.pop() {
+        if !visited.insert(handle) {continue;}
+        let function = &module.functions[handle];
+        for (_,expression) in function.expressions.iter() {
+            match expression {
+                wgpu::naga::Expression::GlobalVariable(global) => assert_ne!(*global,base,
+                    "promoted water must use analyzed color and FFT detail, not source image sampling ({:?})",function.name),
+                wgpu::naga::Expression::CallResult(callee) => pending.push(*callee),
+                _ => {}
+            }
+        }
+    }
 }

@@ -14,7 +14,7 @@ impl App {
     /// Origin, `pm_time` and `fd.forceJumpZStart` of the local player: the
     /// fields the speedometer reads that the movement HUD state does not carry.
     pub(in crate::app) fn speedometer_player_extras(&self) -> ([f32; 3], i32, f32) {
-        if let Some(ps) = self.live_player_state() {
+        if let Some(ps) = self.current_player_state() {
             return (
                 playerstate_vec3(ps, "origin").unwrap_or_default(),
                 ps.field_i32("pm_time").unwrap_or(0),
@@ -72,7 +72,7 @@ impl App {
             self.speedometer_last_frame = None;
             return;
         }
-        let in_game = self.live_player_state().is_some()
+        let in_game = self.current_player_state().is_some()
             || self
                 .local_server
                 .as_ref()
@@ -217,7 +217,7 @@ impl App {
         }
 
         let mut state = ui::MovementHudState::default();
-        let ps = self.live_player_state();
+        let ps = self.current_player_state();
         let local_session = self
             .game_session
             .as_ref()
@@ -239,6 +239,14 @@ impl App {
         let spectator_ps = snapshot_ps.or(ps);
         let following =
             spectator_ps.is_some_and(|ps| ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0);
+        // Recorded demo POVs also own their command reconstruction; the
+        // spectator's keyboard never describes the viewed player's command.
+        let following = following
+            || self
+                .game_session
+                .as_ref()
+                .is_some_and(|session| !session.live)
+                && ps.is_some();
         state.spectator_free_roam = spectator_ps
             .is_some_and(|ps| ps.field_i32("pm_type").unwrap_or(0) == PM_SPECTATOR && !following);
         if spectator_ps.is_none() {
@@ -319,7 +327,9 @@ impl App {
         let (angles, origin, command_time);
         if let Some(ps) = ps {
             let ps_i32 = |name: &str| ps.field_i32(name).unwrap_or(0);
-            angles = if subframe {
+            angles = if following {
+                playerstate_vec3(ps, "viewangles")
+            } else if subframe {
                 self.local_server
                     .as_ref()
                     .map(|server| server.subframe_view_angles())

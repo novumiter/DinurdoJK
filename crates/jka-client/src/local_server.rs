@@ -364,8 +364,12 @@ impl LocalServer {
         self.player.set_mouse_input_settings(settings);
     }
 
-    pub fn set_physics_tick_msec(&mut self, tick_msec: u32) -> Result<(), String> {
-        self.player.set_physics_tick_msec(tick_msec)
+    pub fn set_command_rate(&mut self, command_rate: u32) -> Result<(), String> {
+        self.player.set_command_rate(command_rate)
+    }
+
+    pub fn latest_command_msec(&self) -> i32 {
+        self.player.latest_command_msec()
     }
 
     pub fn pause(&mut self) {

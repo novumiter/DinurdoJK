@@ -1,5 +1,8 @@
 //! Capture.
-use crate::app::{playerstate_vec3, scene, App, Arc, FrontendPage, PathBuf, RenderCommand};
+use crate::{
+    app::{playerstate_vec3, scene, App, Arc, FrontendPage, PathBuf, RenderCommand},
+    renderer::ScreenshotFormat,
+};
 
 impl App {
     pub(in crate::app) fn build_screenshot_metadata(
@@ -99,9 +102,18 @@ impl App {
     }
 
     pub(in crate::app) fn request_screenshot(&mut self) {
+        self.request_screenshot_format(ScreenshotFormat::Jpeg);
+    }
+
+    pub(in crate::app) fn request_screenshot_png(&mut self) {
+        self.request_screenshot_format(ScreenshotFormat::Png);
+    }
+
+    fn request_screenshot_format(&mut self, format: ScreenshotFormat) {
         self.render_command(RenderCommand::Screenshot {
             directory: self.game_write_path("screenshots"),
             metadata: self.build_screenshot_metadata(),
+            format,
         });
     }
 

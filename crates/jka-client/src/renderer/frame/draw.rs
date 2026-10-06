@@ -10,7 +10,7 @@ use crate::renderer::{
     temporal_jitter, ui, update_active_cull_indices, update_visibility, weather, Arc,
     AutoExposureUniform, BlendMode, Camera, CameraUniform, CompanionSceneView, CullDebugMode,
     DofUniform, DrawClass, DrawIndexedIndirectArgs, DynamicLightsMode, DynamicModelSurface,
-    DynamicShadowsMode, FootprintMode, FrameInfo, GpuPass, Instant, LatestViewState, Mat4,
+    DynamicShadowsMode, FootprintMode, FrameInfo, GlowMode, GpuPass, Instant, LatestViewState, Mat4,
     PlanarReflectionDebugMode, PlanarReflectionMode, PlanarReflectionUniform, PvsMode, RenderError,
     Renderer, SunVisibilityMode, TcGen, TransientLight, Vec3, ViewLatchMode, WorldBatch,
     WorldBatchSet, WorldRenderPath, WorldShaderFamily, CLOUD_INTERLEAVE_GRID, CLUSTER_COUNT,
@@ -35,6 +35,14 @@ impl Renderer {
         view_latch: ViewLatchMode,
         latest_view: Option<&LatestViewState>,
     ) -> Result<FrameInfo, RenderError> {
+        // Every frame path (fast baseline, asset preview, full) is entered from
+        // here, so one check covers them all. On a dead device the first queue
+        // write of the frame fails silently and the panic surfaces wherever that
+        // happens to be - historically inside egui's buffer upload, with a
+        // message about buffer sizes that were never the problem.
+        if crate::renderer::device_lost() {
+            return Err(RenderError::DeviceLost);
+        }
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(FrameInfo::default());
         }
@@ -68,6 +76,7 @@ impl Renderer {
             }
             self.update_wake(camera, player_position, dynamic_models);
         }
+        self.update_entity_weather();
 
         self.sync_runtime_variant_flags();
 
@@ -96,6 +105,16 @@ impl Renderer {
         // The first menu frame is allowed to render directly while the backdrop
         // PSO/resources compile in the background; never block gameplay/UI.
         let menu_backdrop_active = menu_backdrop_requested && self.menu_backdrop.is_some();
+
+        let crt_active = self.crt_scope != ui::CrtScope::Off;
+        if crt_active {
+            self.ensure_crt_resources();
+        }
+        // Clone the lightweight WGPU view handle so the rest of the frame can
+        // mutably borrow Renderer without holding a borrow into crt_resources.
+        let crt_view = self.crt_resources.as_ref().map(|resources| resources.view.clone());
+        let crt_everything = self.crt_scope == ui::CrtScope::Everything;
+        let crt_before_ui = crt_active && !crt_everything;
 
         // CGame/FX submits RE_AddLightToScene-style lights at simulation rate.
         // Keep them in a transient tail of the clustered-light buffer.
@@ -133,6 +152,9 @@ impl Renderer {
             // in the background. Keep rendering through the already-hot advanced
             // path until that set is ready instead of stalling this frame.
         }
+
+        // Keep glow pipeline polling entirely outside the maximum-FPS path.
+        self.ensure_bloom_pipelines();
 
         let frame_started = Instant::now();
         let frame_time = self.started.elapsed().as_secs_f32();
@@ -732,6 +754,7 @@ impl Renderer {
             split_dynamic_wireframe,
             ray_traced_shadows,
             ray_traced_shadows && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware,
+            self.glow_mode.authored(),
         );
         self.ensure_prepared_wireframe_pipelines(
             prepared_grass.as_ref(),
@@ -879,10 +902,11 @@ impl Renderer {
                 world.primary_skybox.is_some(),
                 world.ocean_surfaces.clone(),
                 Arc::clone(&world.ocean_masks),
+                world.promoted_oceans.clone(),
             )
         });
         if let Some(ocean) = &mut self.ocean {
-            if let Some((sky_average, has_skybox, surfaces, masks)) = ocean_scene_context.as_ref() {
+            if let Some((sky_average, has_skybox, surfaces, masks, promoted)) = ocean_scene_context.as_ref() {
                 ocean.set_masks(&self.queue, masks);
                 ocean.set_environment(
                     &self.queue,
@@ -908,6 +932,8 @@ impl Renderer {
                     })
                     .collect();
                 ocean.set_surfaces(&self.queue, &fallback);
+                let promoted: Vec<_> = promoted.iter().filter(|p| fallback.contains(&p.surface)).cloned().collect();
+                ocean.set_promoted_surfaces(&self.device, &self.queue, &promoted, &self.promoted_ocean_overrides);
             }
             // Re-centre the clipmap before the wave step so the geometry the
             // frame draws and the field it samples come from the same tick.
@@ -922,7 +948,7 @@ impl Renderer {
             ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
         }
         for (authored, ocean) in &mut self.authored_oceans {
-            if let Some((sky_average, has_skybox, _, _)) = ocean_scene_context.as_ref() {
+            if let Some((sky_average, has_skybox, _, _, _)) = ocean_scene_context.as_ref() {
                 ocean.set_environment(
                     &self.queue,
                     ocean_sun.direction,
@@ -1904,7 +1930,7 @@ impl Renderer {
         if self.smaa_enabled {
             self.ensure_smaa_target();
         }
-        let presentation_output = if menu_backdrop_active {
+        let direct_presentation_output = if menu_backdrop_active {
             &self
                 .menu_backdrop
                 .as_ref()
@@ -1912,6 +1938,15 @@ impl Renderer {
                 .view
         } else {
             &frame_view
+        };
+        // Scene and Scene + HUD run CRT before the native menu/egui layers.
+        // Everything with no menu can render straight into the CRT source; with
+        // a menu, the backdrop first has to finish composing the scene.
+        let crt_scene_target = crt_active && !(crt_everything && menu_backdrop_active);
+        let presentation_output = if crt_scene_target {
+            crt_view.as_ref().expect("CRT resources must exist while enabled")
+        } else {
+            direct_presentation_output
         };
         let mut smaa_frame = if self.smaa_enabled {
             self.smaa_target
@@ -1924,6 +1959,11 @@ impl Renderer {
             Some(smaa_frame) => smaa_frame,
             None => presentation_output,
         };
+        // RainyGlass is the WGPU equivalent of the upstream GrabPass: normal
+        // post first resolves into its private full-resolution source, then the
+        // lens pass refracts that finished scene into the real presentation
+        // target. HUD/debug/UI remain after it and therefore stay undistorted.
+        let rain_glass_active = plan.use_post && self.weather.rain.lens_glass_active();
 
         let scene_output = if plan.use_post {
             &self.targets.scene_view
@@ -2938,6 +2978,7 @@ impl Renderer {
                         }),
                     Some(&mut self.gpu_profiler),
                     None,
+                    false,
                 );
             } else {
                 for depth_writing_phase in [true, false] {
@@ -2948,6 +2989,7 @@ impl Renderer {
                         None,
                         Some(&mut self.gpu_profiler),
                         None,
+                        false,
                     );
                 }
             }
@@ -3042,7 +3084,7 @@ impl Renderer {
                     if !claim_ocean_clipmap(&mut ocean_drawn, batch) {
                         continue;
                     }
-                    pass.set_bind_group(1, &batch.bind_group, &[]);
+                    pass.set_bind_group(1,batch.ocean_surface_bind_group.as_ref().unwrap_or(&batch.bind_group),&[]);
                     pass.set_bind_group(
                         6,
                         Self::ocean_bind_group_for(
@@ -3207,6 +3249,7 @@ impl Renderer {
                         }),
                     Some(&mut self.gpu_profiler),
                     None,
+                    false,
                 );
                 self.gpu_profiler.write_render_pass_timestamp(
                     &mut pass,
@@ -3434,6 +3477,232 @@ impl Renderer {
                 }
             }
             self.weather.rain.render(&mut pass, &self.camera_bind_group);
+
+            // OpenJK Dynamic Glow is authored at shader-stage granularity: only
+            // stages carrying the exact `glow` marker are replayed into a black
+            // glow buffer while testing against the already-rendered scene depth.
+            // Reuse the normal material pipelines so rgbGen/alphaGen, tcMods,
+            // animation, blending and fog stay identical to the visible stage.
+            if self.glow_mode.authored() {
+                drop(pass);
+                if let Some(glow_target) = self.targets.authored_glow.as_ref() {
+                    let (glow_color_view, glow_resolve_target) =
+                        if let Some(msaa_view) = glow_target.msaa_view.as_ref() {
+                            (msaa_view, Some(&glow_target.view))
+                        } else {
+                            (&glow_target.view, None)
+                        };
+                    let mut glow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("JKA authored glow source"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: glow_color_view,
+                            depth_slice: None,
+                            resolve_target: glow_resolve_target,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.targets.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    glow_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    glow_pass.set_bind_group(
+                        2,
+                        if enhanced_world_shader {
+                            &world.lighting_bind_group
+                        } else {
+                            &world.lighting_bind_group_lean
+                        },
+                        &[],
+                    );
+                    glow_pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
+                    glow_pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                    if enhanced_world_shader {
+                        let ocean_bind_group = self
+                            .ocean
+                            .as_ref()
+                            .map(|ocean| &ocean.render_bind_group)
+                            .unwrap_or(&self.ocean_inert_bind_group);
+                        glow_pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                        glow_pass.set_bind_group(6, ocean_bind_group, &[]);
+                    }
+                    glow_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    glow_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                    glow_pass.set_index_buffer(
+                        world.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    let mut current_glow_pipeline = None;
+                    for &batch_index in active.indices {
+                        let batch = &active.batches[batch_index];
+                        if !batch.source.authored_glow
+                            || batch.is_inline_entity
+                            || !batch_area_visible(batch, effective_area_mask)
+                            || ocean_suppresses_batch(render_ocean, batch)
+                        {
+                            continue;
+                        }
+                        if batch.source.pipeline.class != DrawClass::Sky
+                            && !aabb_intersects_clip_frustum(
+                                batch.bounds_min,
+                                batch.bounds_max,
+                                view_proj,
+                            )
+                        {
+                            continue;
+                        }
+                        if current_glow_pipeline != Some(batch.source.pipeline) {
+                            let Some(pipeline) = active_pipeline_variant
+                                .pipelines
+                                .get(&batch.source.pipeline)
+                            else {
+                                continue;
+                            };
+                            glow_pass.set_pipeline(pipeline);
+                            current_glow_pipeline = Some(batch.source.pipeline);
+                        }
+                        glow_pass.set_bind_group(
+                            1,
+                            batch
+                                .authored_glow_bind_group
+                                .as_ref()
+                                .unwrap_or(&batch.bind_group),
+                            &[],
+                        );
+                        if enhanced_world_shader {
+                            glow_pass.set_bind_group(
+                                6,
+                                Self::ocean_bind_group_for(
+                                    batch,
+                                    &self.authored_oceans,
+                                    &self.ocean,
+                                    &self.ocean_inert_bind_group,
+                                ),
+                                &[],
+                            );
+                        }
+                        draw_world_batch(&mut glow_pass, batch, 0..1, None);
+                    }
+
+                    // Inline BSP movers are submitted as ordinary authored stages too.
+                    // Re-pack just the visible `glow` stages so their normal mover
+                    // transforms/order are preserved without a separate material path.
+                    let glow_inline_visible = self
+                        .inline_visible_scratch
+                        .iter()
+                        .copied()
+                        .filter(|&index| active.batches[index].source.authored_glow)
+                        .collect::<Vec<_>>();
+                    if !glow_inline_visible.is_empty() {
+                        let packed = pack_inline_draws(
+                            &self.queue,
+                            active.batches,
+                            &glow_inline_visible,
+                            &mut self.inline_draw_scratch,
+                            world.inline_group_count,
+                            &world.inline_indirect_buffer,
+                            0,
+                            world.inline_indirect_capacity,
+                        );
+                        let scratch = &self.inline_draw_scratch;
+                        if packed {
+                            for &(first, count) in &scratch.runs {
+                                let batch = &active.batches[glow_inline_visible
+                                    [scratch.order[first as usize] as usize]];
+                                if current_glow_pipeline != Some(batch.source.pipeline) {
+                                    if let Some(pipeline) = active_pipeline_variant
+                                        .pipelines
+                                        .get(&batch.source.pipeline)
+                                    {
+                                        glow_pass.set_pipeline(pipeline);
+                                        current_glow_pipeline = Some(batch.source.pipeline);
+                                    } else {
+                                        continue;
+                                    }
+                                }
+                                glow_pass.set_bind_group(
+                            1,
+                            batch
+                                .authored_glow_bind_group
+                                .as_ref()
+                                .unwrap_or(&batch.bind_group),
+                            &[],
+                        );
+                                if enhanced_world_shader {
+                                    glow_pass.set_bind_group(
+                                        6,
+                                        Self::ocean_bind_group_for(
+                                            batch,
+                                            &self.authored_oceans,
+                                            &self.ocean,
+                                            &self.ocean_inert_bind_group,
+                                        ),
+                                        &[],
+                                    );
+                                }
+                                if count == 1 {
+                                    glow_pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                                } else {
+                                    glow_pass.multi_draw_indexed_indirect(
+                                        &world.inline_indirect_buffer,
+                                        u64::from(first)
+                                            * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                        count,
+                                    );
+                                }
+                            }
+                        } else {
+                            for &batch_index in &glow_inline_visible {
+                                let batch = &active.batches[batch_index];
+                                if current_glow_pipeline != Some(batch.source.pipeline) {
+                                    let Some(pipeline) = active_pipeline_variant
+                                        .pipelines
+                                        .get(&batch.source.pipeline)
+                                    else {
+                                        continue;
+                                    };
+                                    glow_pass.set_pipeline(pipeline);
+                                    current_glow_pipeline = Some(batch.source.pipeline);
+                                }
+                                glow_pass.set_bind_group(
+                            1,
+                            batch
+                                .authored_glow_bind_group
+                                .as_ref()
+                                .unwrap_or(&batch.bind_group),
+                            &[],
+                        );
+                                if enhanced_world_shader {
+                                    glow_pass.set_bind_group(
+                                        6,
+                                        Self::ocean_bind_group_for(
+                                            batch,
+                                            &self.authored_oceans,
+                                            &self.ocean,
+                                            &self.ocean_inert_bind_group,
+                                        ),
+                                        &[],
+                                    );
+                                }
+                                glow_pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                            }
+                        }
+                    }
+
+                    self.dynamic_model_renderer
+                        .draw_authored_glow(&mut glow_pass, &self.camera_bind_group);
+                }
+            }
         } else {
             // Worldless live/demo sessions intentionally have no BSP, but their
             // CGame still produces players, sabers, missiles and FX. Render those
@@ -3477,6 +3746,7 @@ impl Renderer {
                     None,
                     Some(&mut self.gpu_profiler),
                     None,
+                    false,
                 );
             }
             self.gpu_profiler
@@ -3491,6 +3761,42 @@ impl Renderer {
                 );
             }
             self.debug_volumes.draw(&mut pass, &self.camera_bind_group);
+            if self.glow_mode.authored() {
+                drop(pass);
+                if let Some(glow_target) = self.targets.authored_glow.as_ref() {
+                    let (glow_color_view, glow_resolve_target) =
+                        if let Some(msaa_view) = glow_target.msaa_view.as_ref() {
+                            (msaa_view, Some(&glow_target.view))
+                        } else {
+                            (&glow_target.view, None)
+                        };
+                    let mut glow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("JKA worldless authored glow source"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: glow_color_view,
+                            depth_slice: None,
+                            resolve_target: glow_resolve_target,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.targets.depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    self.dynamic_model_renderer
+                        .draw_authored_glow(&mut glow_pass, &self.camera_bind_group);
+                }
+            }
         }
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::World, true);
@@ -3661,7 +3967,7 @@ impl Renderer {
             }
         }
 
-        if self.bloom_enabled || self.halation_enabled {
+        if self.glow_mode.enabled() || self.halation_enabled {
             if let (Some(bloom), Some(bind_groups)) = (&self.targets.bloom, &self.bloom_bind_groups)
             {
                 let labels = [
@@ -3669,6 +3975,18 @@ impl Renderer {
                     "JKA bloom quarter-resolution downsample",
                     "JKA bloom eighth-resolution downsample",
                 ];
+                let extraction = match self.glow_mode {
+                    GlowMode::JkaAuthored if self.halation_enabled => {
+                        self.bloom_extract_authored_halation_pipeline.as_ref()
+                    }
+                    GlowMode::JkaAuthored => self.bloom_extract_authored_pipeline.as_ref(),
+                    GlowMode::JkaAndBloom => self.bloom_extract_combined_pipeline.as_ref(),
+                    // Off still needs modern highlights when halation is enabled.
+                    GlowMode::ModernBloom | GlowMode::Off => {
+                        self.bloom_extract_modern_pipeline.as_ref()
+                    }
+                };
+                let pipelines = extraction.zip(self.bloom_downsample_pipeline.as_ref());
                 for level in 0..3 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some(labels[level]),
@@ -3677,7 +3995,7 @@ impl Renderer {
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                                 store: wgpu::StoreOp::Store,
                             },
                         })],
@@ -3686,11 +4004,13 @@ impl Renderer {
                         occlusion_query_set: None,
                         multiview_mask: None,
                     });
-                    pass.set_pipeline(if level == 0 {
-                        &self.bloom_extract_pipeline
-                    } else {
-                        &self.bloom_downsample_pipeline
-                    });
+                    // Clear every level until both worker results are installed;
+                    // a mode change must not display stale or partial glow.
+                    let Some((extraction, downsample)) = pipelines else {
+                        continue;
+                    };
+                    let pipeline = if level == 0 { extraction } else { downsample };
+                    pass.set_pipeline(pipeline);
                     pass.set_bind_group(0, &bind_groups[level], &[]);
                     pass.draw(0..3, 0..1);
                 }
@@ -3799,6 +4119,14 @@ impl Renderer {
             }
         }
 
+        let post_output = if rain_glass_active {
+            self.weather
+                .rain
+                .lens_glass_source_view()
+                .expect("active RainyGlass source view")
+        } else {
+            final_output
+        };
         let mut taa_resolved_this_frame = false;
         if plan.use_post {
             if let (true, Some(taa_post_pipeline)) =
@@ -3810,7 +4138,7 @@ impl Renderer {
                 let history_write_index = 1 - self.history_read_index;
                 let color_attachments = [
                     Some(wgpu::RenderPassColorAttachment {
-                        view: final_output,
+                        view: post_output,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
@@ -3849,7 +4177,7 @@ impl Renderer {
                 taa_resolved_this_frame = true;
             } else {
                 let color_attachments = [Some(wgpu::RenderPassColorAttachment {
-                    view: final_output,
+                    view: post_output,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -3883,6 +4211,9 @@ impl Renderer {
                 }
                 pass.draw(0..3, 0..1);
             }
+        }
+        if rain_glass_active {
+            self.weather.rain.render_lens_glass(&mut encoder, final_output);
         }
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Post, true);
@@ -3961,10 +4292,18 @@ impl Renderer {
         self.previous_frame_time = camera_pos_time[3];
         self.camera_history_valid = true;
 
-        // Deferred to `submit_ui_overlay` whenever a menu is drawn over the
-        // frame, so the readout ends up above it rather than beneath.
-        if !menu_backdrop_active
-            && !self.egui_active
+        // Decide whether the native JKA overlay belongs before or after CRT.
+        // Scene keeps it crisp. Scene + HUD always sends it through CRT.
+        // Everything preserves the old egui layering by deferring the native
+        // overlay when egui is active, but both still land in the CRT source.
+        let native_ui_in_main = !menu_backdrop_active
+            && match self.crt_scope {
+                ui::CrtScope::Off => !self.egui_active,
+                ui::CrtScope::Scene => false,
+                ui::CrtScope::SceneHud => true,
+                ui::CrtScope::Everything => !self.egui_active,
+            };
+        if native_ui_in_main
             && (self.screen_fx_vertex_count != 0
                 || self.ui_vertex_count != 0
                 || self.ui_dynamic_vertex_count != 0
@@ -4013,6 +4352,24 @@ impl Renderer {
                 .write_encoder_timestamp(&mut encoder, GpuPass::Ui, true);
         }
 
+        // Avoid an extra queue submission when no external SMAA resolve sits
+        // between the scene and CRT. This is the common low-latency path.
+        let crt_encoded_in_main = crt_before_ui && !self.smaa_enabled;
+        if crt_encoded_in_main {
+            if let Some(resources) = self.crt_resources.as_ref() {
+                // `smaa_frame` keeps a mutable borrow of `self.smaa_target` alive
+                // until resolve. Borrow only the disjoint CRT fields here instead
+                // of calling a method that would immutably borrow all of `self`.
+                Self::encode_crt_resources(
+                    resources,
+                    self.crt_style,
+                    self.crt_quality,
+                    &mut encoder,
+                    direct_presentation_output,
+                );
+            }
+        }
+
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, true);
         self.gpu_profiler.resolve(&mut encoder);
@@ -4020,7 +4377,7 @@ impl Renderer {
         // copy into the frame command buffer instead of paying another submit.
         // SMAA and the menu backdrop both submit work after this encoder, so
         // those paths intentionally do a tiny late copy submit instead.
-        if !self.smaa_enabled && !menu_backdrop_active && !self.egui_active {
+        if !self.smaa_enabled && !menu_backdrop_active && !self.egui_active && !crt_active {
             if let Some(readback) = screenshot_readback.as_mut() {
                 let staging_buffer = &self
                     .screenshot_readback_buffer
@@ -4063,17 +4420,30 @@ impl Renderer {
         }
         // Release the SMAA target borrow before re-borrowing `self` below.
         drop(smaa_frame);
-        if menu_backdrop_active {
-            // SMAA resolves into the lazy backdrop source when enabled, so this
-            // must run after its three-pass resolve and before the UI overlay.
-            self.submit_menu_backdrop(&frame_view);
+        if crt_before_ui && !crt_encoded_in_main {
+            // SMAA resolves in its own submit, so only that path needs a tiny
+            // follow-up CRT submit here.
+            self.submit_crt(direct_presentation_output);
         }
-        // The menu is a native-resolution overlay. Keeping it after
-        // SMAA/post-processing makes text crisp and lets screenshots capture
-        // exactly what the player sees.
-        self.submit_egui(&frame_view);
-        if menu_backdrop_active || self.egui_active {
-            self.submit_ui_overlay(&frame_view);
+
+        let ui_composite_target = if crt_everything {
+            crt_view.as_ref().expect("CRT resources must exist while enabled")
+        } else {
+            &frame_view
+        };
+        if menu_backdrop_active {
+            // In Everything mode the backdrop itself is part of the CRT source;
+            // otherwise it goes straight to the swapchain as before.
+            self.submit_menu_backdrop(ui_composite_target);
+        }
+        self.submit_egui(ui_composite_target);
+        let late_native_ui = !native_ui_in_main
+            && (menu_backdrop_active || self.egui_active || self.crt_scope == ui::CrtScope::Scene);
+        if late_native_ui {
+            self.submit_ui_overlay(ui_composite_target);
+        }
+        if crt_everything {
+            self.submit_crt(&frame_view);
         }
         if let Some(readback) = screenshot_readback
             .as_mut()

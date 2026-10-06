@@ -116,6 +116,16 @@ impl App {
                 self.change_environment_setting(next as i32 - current as i32);
             }
 
+            self.egui_environment_toggle(
+                ui,
+                "Rain on lens",
+                "Droplets and rivulets of water on the camera itself, refracting the \
+             finished scene. Fades out under shelter with the rest of the weather. \
+             HUD and menus are drawn afterwards and stay undistorted.",
+                ui::ENV_ROW_RAIN_GLASS,
+                self.video.rain_glass,
+            );
+
             const PUDDLE_WATER: [(PuddleQuality, &str); 2] = [
                 (PuddleQuality::Standard, "Standard"),
                 (PuddleQuality::High, "High"),

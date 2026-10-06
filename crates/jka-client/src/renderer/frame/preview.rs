@@ -54,6 +54,7 @@ impl Renderer {
             false,
             false,
             false,
+            false,
         );
         info.dynamic_model_prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =

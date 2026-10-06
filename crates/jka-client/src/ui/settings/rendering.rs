@@ -1,5 +1,67 @@
 //! Settings rendering.
 
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GlowMode {
+    #[default]
+    Off,
+    /// Only shader stages explicitly marked `glow` by the JKA material.
+    JkaAuthored,
+    /// HDR/luminance-driven modern bloom from the final scene.
+    ModernBloom,
+    /// Stock-authored glow stages plus modern HDR/luminance bloom.
+    JkaAndBloom,
+}
+
+impl GlowMode {
+    pub const ALL: [Self; 4] = [
+        Self::Off,
+        Self::JkaAuthored,
+        Self::ModernBloom,
+        Self::JkaAndBloom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::JkaAuthored => "JKA AUTHORED",
+            Self::ModernBloom => "MODERN BLOOM",
+            Self::JkaAndBloom => "JKA + BLOOM",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::JkaAuthored => "authored",
+            Self::ModernBloom => "bloom",
+            Self::JkaAndBloom => "combined",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "authored" => Some(Self::JkaAuthored),
+            "bloom" => Some(Self::ModernBloom),
+            "combined" => Some(Self::JkaAndBloom),
+            _ => None,
+        }
+    }
+
+    pub const fn enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub const fn authored(self) -> bool {
+        matches!(self, Self::JkaAuthored | Self::JkaAndBloom)
+    }
+
+    pub const fn modern(self) -> bool {
+        matches!(self, Self::ModernBloom | Self::JkaAndBloom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TextureFilter {
     Nearest,
@@ -580,6 +642,196 @@ impl EntityShadowLight {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrtScope {
+    #[default]
+    Off,
+    Scene,
+    SceneHud,
+    Everything,
+}
+
+impl CrtScope {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Scene, Self::SceneHud, Self::Everything];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Scene => "SCENE",
+            Self::SceneHud => "SCENE + HUD",
+            Self::Everything => "EVERYTHING",
+        }
+    }
+
+    pub fn config_value(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Scene => 1,
+            Self::SceneHud => 2,
+            Self::Everything => 3,
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" => Some(Self::Off),
+            "1" | "scene" | "game" => Some(Self::Scene),
+            "2" | "scene+hud" | "scene_hud" | "hud" => Some(Self::SceneHud),
+            "3" | "everything" | "all" | "true" | "on" => Some(Self::Everything),
+            _ => None,
+        }
+    }
+
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrtStyle {
+    #[default]
+    LottesFast,
+    Lottes,
+}
+
+impl CrtStyle {
+    pub const ALL: [Self; 2] = [Self::LottesFast, Self::Lottes];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LottesFast => "LOTTES FAST",
+            Self::Lottes => "LOTTES",
+        }
+    }
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::LottesFast => "fast",
+            Self::Lottes => "lottes",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "fast" | "lottes_fast" | "lottes-fast" => Some(Self::LottesFast),
+            "1" | "lottes" | "full" | "original" => Some(Self::Lottes),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrtQuality {
+    #[default]
+    Fast,
+    Quality,
+}
+
+impl CrtQuality {
+    pub const ALL: [Self; 2] = [Self::Fast, Self::Quality];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "FAST (2 TAP)",
+            Self::Quality => "QUALITY (8 TAP)",
+        }
+    }
+
+    pub fn config_value(self) -> u8 {
+        match self { Self::Fast => 0, Self::Quality => 1 }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "fast" | "2" | "2tap" => Some(Self::Fast),
+            "1" | "quality" | "8" | "8tap" => Some(Self::Quality),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrtMask {
+    None,
+    #[default]
+    GrilleLite,
+    Grille,
+    Shadow,
+}
+
+impl CrtMask {
+    pub const ALL: [Self; 4] = [Self::None, Self::GrilleLite, Self::Grille, Self::Shadow];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "OFF",
+            Self::GrilleLite => "GRILLE LITE",
+            Self::Grille => "GRILLE",
+            Self::Shadow => "SHADOW",
+        }
+    }
+
+    /// Matches crt-lottes-fast's runtime MASK values exactly.
+    pub fn shader_value(self) -> u32 {
+        match self { Self::None => 0, Self::GrilleLite => 1, Self::Grille => 2, Self::Shadow => 3 }
+    }
+
+    pub fn config_value(self) -> u8 { self.shader_value() as u8 }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "none" => Some(Self::None),
+            "1" | "lite" | "grille_lite" | "grillelite" => Some(Self::GrilleLite),
+            "2" | "grille" | "aperture" => Some(Self::Grille),
+            "3" | "shadow" | "shadowmask" => Some(Self::Shadow),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CrtReferenceResolution {
+    #[default]
+    P480,
+    P600,
+    P720,
+    Native,
+}
+
+impl CrtReferenceResolution {
+    pub const ALL: [Self; 4] = [Self::P480, Self::P600, Self::P720, Self::Native];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::P480 => "480P",
+            Self::P600 => "600P",
+            Self::P720 => "720P",
+            Self::Native => "NATIVE",
+        }
+    }
+
+    pub fn config_value(self) -> u32 {
+        match self { Self::P480 => 480, Self::P600 => 600, Self::P720 => 720, Self::Native => 0 }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "480" | "480p" => Some(Self::P480),
+            "600" | "600p" => Some(Self::P600),
+            "720" | "720p" => Some(Self::P720),
+            "0" | "native" => Some(Self::Native),
+            _ => None,
+        }
+    }
+
+    pub fn height(self, native_height: u32) -> f32 {
+        let native = native_height.max(1);
+        match self {
+            Self::P480 => native.min(480) as f32,
+            Self::P600 => native.min(600) as f32,
+            Self::P720 => native.min(720) as f32,
+            Self::Native => native as f32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DofQuality {
     Performance,
     #[default]
@@ -626,7 +878,7 @@ pub const VIDEO_ROW_VSYNC: usize = 2;
 
 pub const VIDEO_ROW_FPS_CAP: usize = 3;
 
-pub const VIDEO_ROW_PHYSICS_FPS: usize = 4;
+pub const VIDEO_ROW_COMMAND_RATE: usize = 4;
 
 pub const VIDEO_ROW_BRIGHTNESS: usize = 5;
 
@@ -668,7 +920,7 @@ pub const VIDEO_ROW_HDR: usize = 23;
 
 pub const VIDEO_ROW_TONE_MAPPING: usize = 24;
 
-pub const VIDEO_ROW_BLOOM: usize = 25;
+pub const VIDEO_ROW_GLOW: usize = 25;
 
 pub const VIDEO_ROW_MOTION_BLUR: usize = 26;
 
@@ -787,6 +1039,17 @@ pub const VIDEO_ROW_PICMIP: usize = 83;
 pub const VIDEO_ROW_FX_FPS_SCOPE: usize = 84;
 
 pub const VIDEO_ROW_DOF_AUTOFOCUS: usize = 85;
+
+pub const VIDEO_ROW_CRT_SCOPE: usize = 86;
+pub const VIDEO_ROW_CRT_STYLE: usize = 95;
+pub const VIDEO_ROW_CRT_QUALITY: usize = 87;
+pub const VIDEO_ROW_CRT_REFERENCE: usize = 88;
+pub const VIDEO_ROW_CRT_MASK: usize = 89;
+pub const VIDEO_ROW_CRT_SCANLINE: usize = 90;
+pub const VIDEO_ROW_CRT_SHARPNESS: usize = 91;
+pub const VIDEO_ROW_CRT_MASK_INTENSITY: usize = 92;
+pub const VIDEO_ROW_CRT_CURVATURE: usize = 93;
+pub const VIDEO_ROW_CRT_CORNER: usize = 94;
 
 pub const ENV_ROW_WEATHER_WIND_SPEED: usize = 8;
 

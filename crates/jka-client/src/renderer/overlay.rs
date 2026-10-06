@@ -400,6 +400,7 @@ impl Renderer {
     pub(in crate::renderer) fn set_transient_ui(
         &mut self,
         chat_lines: Vec<ui::UiChatLine>,
+        console_notify_lines: Vec<ui::UiConsoleNotifyLine>,
         center_print: Option<ui::UiCenterPrint>,
         demo_timeline: Option<ui::DemoTimelineUi>,
         prediction_debug: Option<ui::PredictionDebugUi>,
@@ -417,6 +418,7 @@ impl Renderer {
         team_overlay: Option<ui::TeamOverlayUi>,
     ) {
         self.ui_state.chat_lines = chat_lines;
+        self.ui_state.console_notify_lines = console_notify_lines;
         self.ui_state.center_print = center_print;
         self.ui_state.demo_timeline = demo_timeline;
         self.ui_state.prediction_debug = prediction_debug;

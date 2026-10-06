@@ -19,77 +19,169 @@ impl App {
             .flatten()
     }
 
-    pub(in crate::app) fn save_japro_login_for_current_server(&mut self) -> Result<(), String> {
-        let server = self
-            .current_japro_server_endpoint()
-            .ok_or_else(|| "Join a jaPRO server before saving an automatic login".to_owned())?;
-        if self.network.ui_username.is_empty() || self.network.ui_password.is_empty() {
-            return Err("Enter both jaPRO username and password first".to_owned());
+    pub(in crate::app) fn begin_new_japro_login(&mut self, server: SocketAddr) {
+        let server_name: String = self
+            .current_server_hostname()
+            .map(|name| crate::logging::strip_jka_colors(&name).trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(96)
+            .collect();
+        self.japro_login_editor = Some(crate::app::JaproLoginEditor {
+            server,
+            server_name,
+            username: self.network.ui_username.clone(),
+            password: self.network.ui_password.clone(),
+            new_entry: true,
+        });
+        self.japro_credential_error = None;
+    }
+
+    pub(in crate::app) fn begin_edit_japro_login(&mut self, server: SocketAddr) {
+        let Some(saved) = self
+            .japro_saved_logins
+            .iter()
+            .find(|entry| entry.server == server)
+            .cloned()
+        else {
+            self.japro_credential_error = Some(format!("No saved jaPRO login for {server}"));
+            return;
+        };
+        self.japro_login_editor = Some(crate::app::JaproLoginEditor {
+            server,
+            server_name: saved.server_name.unwrap_or_default(),
+            username: saved.username,
+            // Do not pull the existing password out of Credential Manager just
+            // to render an editor. Blank means preserve it when saving.
+            password: String::new(),
+            new_entry: false,
+        });
+        self.japro_credential_error = None;
+    }
+
+    pub(in crate::app) fn save_japro_login_edit(
+        &mut self,
+        server: SocketAddr,
+        server_name: &str,
+        username: &str,
+        password: &str,
+        new_entry: bool,
+    ) -> Result<(), String> {
+        const LOGIN_LIMIT: usize = 15;
+        const SERVER_NAME_LIMIT: usize = 96;
+
+        let username = username.trim();
+        let server_name = server_name.trim();
+        if username.is_empty() {
+            return Err("Enter a jaPRO username".to_owned());
         }
+        if username.chars().count() > LOGIN_LIMIT {
+            return Err(format!("jaPRO usernames are limited to {LOGIN_LIMIT} characters"));
+        }
+        if server_name.chars().count() > SERVER_NAME_LIMIT {
+            return Err(format!("Server names are limited to {SERVER_NAME_LIMIT} characters"));
+        }
+        if server_name.chars().any(char::is_control) {
+            return Err("Server names cannot contain control characters".to_owned());
+        }
+        let invalid_arg = |value: &str| {
+            value.chars().any(char::is_whitespace)
+                || value.chars().any(|c| matches!(c, ';' | '"' | '\\'))
+        };
+        if invalid_arg(username) {
+            return Err(
+                "jaPRO usernames cannot contain spaces, semicolons, quotes, or backslashes"
+                    .to_owned(),
+            );
+        }
+
+        let stored_password = if password.is_empty() && !new_entry {
+            Some(
+                crate::credential_store::read(server)?
+                    .ok_or_else(|| format!("No saved jaPRO login for {server}"))?
+                    .password,
+            )
+        } else {
+            None
+        };
+        let password = stored_password.as_deref().unwrap_or(password);
+        if password.is_empty() {
+            return Err("Enter a jaPRO password".to_owned());
+        }
+        if password.chars().count() > LOGIN_LIMIT {
+            return Err(format!("jaPRO passwords are limited to {LOGIN_LIMIT} characters"));
+        }
+        if invalid_arg(password) {
+            return Err(
+                "jaPRO passwords cannot contain spaces, semicolons, quotes, or backslashes"
+                    .to_owned(),
+            );
+        }
+
         crate::credential_store::save(
             server,
-            &self.network.ui_username,
-            &self.network.ui_password,
+            (!server_name.is_empty()).then_some(server_name),
+            username,
+            password,
         )?;
         self.refresh_japro_saved_logins();
         Ok(())
     }
 
-    pub(in crate::app) fn forget_japro_login(&mut self, server: SocketAddr) -> Result<(), String> {
-        crate::credential_store::delete(server)?;
-        self.refresh_japro_saved_logins();
+    pub(in crate::app) fn login_with_saved_japro_credential(
+        &mut self,
+        server: SocketAddr,
+    ) -> Result<(), String> {
+        let current = self
+            .current_japro_server_endpoint()
+            .ok_or_else(|| "Join a jaPRO server before using a saved login".to_owned())?;
+        if current != server {
+            return Err(format!(
+                "Saved login belongs to {server}, but the current server is {current}"
+            ));
+        }
+        let credential = crate::credential_store::read(server)?
+            .ok_or_else(|| format!("No saved jaPRO login for {server}"))?;
+        let valid = !credential.username.is_empty()
+            && !credential.password.is_empty()
+            && !credential.username.chars().any(char::is_whitespace)
+            && !credential.password.chars().any(char::is_whitespace)
+            && !credential
+                .username
+                .chars()
+                .any(|c| matches!(c, ';' | '"' | '\\'))
+            && !credential
+                .password
+                .chars()
+                .any(|c| matches!(c, ';' | '"' | '\\'));
+        if !valid {
+            return Err(format!("Saved credential for {server} is invalid"));
+        }
+
+        self.forward_command_to_server(&format!(
+            "login {} {}",
+            credential.username, credential.password
+        ));
+        self.console_status = format!("JAPRO LOGIN SENT FOR {}", credential.username);
+        self.push_console_line(format!(
+            "^2jaPRO saved login:^7 {} @ {server}",
+            credential.username
+        ));
         Ok(())
     }
 
-    /// Auto-login only after the gamestate identifies jaPRO, and only with a
-    /// credential whose key exactly equals the resolved UDP endpoint. Server
-    /// names / hostnames are deliberately not accepted as credential identity.
-    pub(in crate::app) fn try_japro_autologin(&mut self) {
-        let Some(server) = self.current_japro_server_endpoint() else {
-            return;
-        };
-        if self.japro_autologin_attempted == Some(server) {
-            return;
+    pub(in crate::app) fn forget_japro_login(&mut self, server: SocketAddr) -> Result<(), String> {
+        crate::credential_store::delete(server)?;
+        if self
+            .japro_login_editor
+            .as_ref()
+            .is_some_and(|editor| editor.server == server)
+        {
+            self.japro_login_editor = None;
         }
-        self.japro_autologin_attempted = Some(server);
-        match crate::credential_store::read(server) {
-            Ok(Some(credential)) => {
-                let valid = !credential.username.is_empty()
-                    && !credential.password.is_empty()
-                    && !credential.username.chars().any(char::is_whitespace)
-                    && !credential.password.chars().any(char::is_whitespace)
-                    && !credential
-                        .username
-                        .chars()
-                        .any(|c| matches!(c, ';' | '"' | '\\'))
-                    && !credential
-                        .password
-                        .chars()
-                        .any(|c| matches!(c, ';' | '"' | '\\'));
-                if !valid {
-                    self.push_console_line(format!(
-                        "^3Auto-login skipped:^7 saved credential for {server} is invalid"
-                    ));
-                    return;
-                }
-                self.network.ui_username = credential.username.clone();
-                // Never copy the saved password into ui_password or config. Build
-                // the one reliable command directly, then let the local secret drop.
-                self.forward_command_to_server(&format!(
-                    "login {} {}",
-                    credential.username, credential.password
-                ));
-                self.push_console_line(format!(
-                    "^2jaPRO auto-login:^7 {} @ {server}",
-                    credential.username
-                ));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.japro_credential_error = Some(error.clone());
-                self.push_console_line(format!("^3jaPRO auto-login unavailable:^7 {error}"));
-            }
-        }
+        self.refresh_japro_saved_logins();
+        Ok(())
     }
 
     /// The connected server's mod, from its serverinfo configstring.
@@ -125,29 +217,76 @@ impl App {
         (local && japro_dir).then_some(ServerMod::Japro)
     }
 
-    /// jaPRO's cgame republishes `cg_displayCameraPosition` and
-    /// `cg_displayNetSettings` (CVAR_ROM|CVAR_USERINFO) whenever their inputs
-    /// change. Recompute them and report whether a jaPRO server needs new userinfo.
-    pub(in crate::app) fn refresh_japro_userinfo_state(&mut self) -> bool {
-        let camera = format!(
-            "{} {} {}",
-            i32::from(self.third_person.enabled),
-            self.third_person.range as i32,
-            self.third_person.vert_offset as i32,
-        );
-        let net = format!(
-            "{} {} {}",
-            self.network.max_packets,
-            self.network.time_nudge,
-            self.effective_fps_cap(),
-        );
-        let changed = camera != self.network.display_camera_position
-            || net != self.network.display_net_settings;
-        self.network.display_camera_position = camera;
-        self.network.display_net_settings = net;
-        changed
-            && self.live_connected()
-            && self.connected_server_mod() == crate::net::mod_support::ServerMod::Japro
+    /// Mark the inputs mirrored by jaPRO's ROM/userinfo camera cvar dirty.
+    /// TaystJK does not publish this immediately; CG_UpdateNetUserinfo checks
+    /// the modification counts only after its shared 8 second debounce expires.
+    pub(in crate::app) fn mark_japro_camera_userinfo_dirty(&mut self) {
+        self.japro_camera_userinfo_dirty = true;
+    }
+
+    /// Mark the inputs mirrored by jaPRO's cg_displayNetSettings dirty.
+    pub(in crate::app) fn mark_japro_net_userinfo_dirty(&mut self) {
+        self.japro_net_userinfo_dirty = true;
+    }
+
+    /// Port of TaystJK/jaPRO CG_UpdateNetUserinfo's shared 8000 ms debounce.
+    /// Changes made inside the window collapse to the latest camera/net tuple.
+    /// Crucially, queue_userinfo() does not recompute these mirrors: an unrelated
+    /// userinfo send during the window must keep the last published tuple.
+    pub(in crate::app) fn tick_japro_userinfo_updates(&mut self) {
+        const USERINFO_DEBOUNCE_MS: i32 = 8000;
+
+        if !self.live_connected()
+            || self.connected_server_mod() != crate::net::mod_support::ServerMod::Japro
+            || (!self.japro_camera_userinfo_dirty && !self.japro_net_userinfo_dirty)
+            || self.profile_userinfo_pending
+        {
+            return;
+        }
+        if !self.game_session.as_ref().is_some_and(|session| session.live) {
+            return;
+        }
+        // TaystJK's cg.time is the CGame frame's serverTime, not the timestamp
+        // of the current snapshot. cl.serverTime is the matching live clock here.
+        let Some(cg_time) = self.net.as_ref().map(|net| net.session().server_time()) else {
+            return;
+        };
+        if cg_time <= self.japro_userinfo_update_debounce {
+            return;
+        }
+
+        let mut changed = false;
+        if self.japro_camera_userinfo_dirty {
+            // Dinurdo mode 2 is spectator-only orbit. jaPRO's advertised camera
+            // bit remains the stock/Tayst 0/1 third-person setting.
+            let camera = format!(
+                "{} {} {}",
+                i32::from(self.third_person.enabled),
+                self.third_person.range as i32,
+                self.third_person.vert_offset as i32,
+            );
+            changed |= camera != self.network.display_camera_position;
+            self.network.display_camera_position = camera;
+            self.japro_camera_userinfo_dirty = false;
+        }
+        if self.japro_net_userinfo_dirty {
+            let net = format!(
+                "{} {} {}",
+                self.network.max_packets,
+                self.network.time_nudge,
+                self.effective_fps_cap(),
+            );
+            changed |= net != self.network.display_net_settings;
+            self.network.display_net_settings = net;
+            self.japro_net_userinfo_dirty = false;
+        }
+
+        self.japro_userinfo_update_debounce = cg_time.saturating_add(USERINFO_DEBOUNCE_MS);
+        if changed {
+            if let Err(error) = self.queue_userinfo() {
+                self.push_console_line(format!("^1{error}"));
+            }
+        }
     }
 
     /// CL_CheckUserinfo after a CVAR_USERINFO change, or a staged change while
@@ -162,22 +301,38 @@ impl App {
         }
     }
 
-    /// Shared live playerState. Remote play prefers client prediction; the
-    /// in-process server is already authoritative and reads its current snapshot.
-    pub(in crate::app) fn live_player_state(&self) -> Option<&jka_protocol::server::PlayerState> {
-        let session = self.game_session.as_ref().filter(|session| session.live)?;
-        if session.local {
-            return session
-                .current_snapshot
-                .as_ref()
-                .map(|snapshot| &snapshot.player_state);
-        }
-        self.predictor.predicted().or_else(|| {
+    /// Canonical state for this frame's local or recorded/followed player.
+    /// Alternate demo POVs have only EntityState, so keep their reconstruction
+    /// separate. Snapshot fallback is for initialization before the first frame.
+    pub(in crate::app) fn current_player_state(
+        &self,
+    ) -> Option<&jka_protocol::server::PlayerState> {
+        let session = self.game_session.as_ref()?;
+        let ps = session.presented_player_state().or_else(|| {
             session
                 .current_snapshot
                 .as_ref()
                 .map(|snapshot| &snapshot.player_state)
-        })
+        })?;
+        if !session.live {
+            match self.demo_view_mode {
+                crate::app::DemoViewMode::Free => return None,
+                crate::app::DemoViewMode::Follow(client)
+                    if ps.field_i32("clientNum") != Some(client) =>
+                {
+                    return None
+                }
+                _ => {}
+            }
+        }
+        Some(ps)
+    }
+
+    /// Live-only gateway retained for gameplay callers; presentation reads the
+    /// session's cached frame, while Predictor still owns committed Pmove state.
+    pub(in crate::app) fn live_player_state(&self) -> Option<&jka_protocol::server::PlayerState> {
+        self.game_session.as_ref().filter(|session| session.live)?;
+        self.current_player_state()
     }
 
     /// True only for a joined remote game whose current predicted/display Pmove
@@ -204,6 +359,15 @@ impl App {
             return self.live_view_angles_unpredicted();
         }
         let net = self.net.as_ref()?;
+        let snapshot_ps = &self
+            .game_session
+            .as_ref()?
+            .current_snapshot
+            .as_ref()?
+            .player_state;
+        if snapshot_ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0 {
+            return None;
+        }
         let ps = self.predictor.predicted()?;
         let pm_type = ps.field_i32("pm_type").unwrap_or(0);
         if ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0 || pm_type >= PM_DEAD {
@@ -268,6 +432,71 @@ impl App {
                 ))
             })
             .unwrap_or(crate::net::mod_support::ServerMod::Unknown)
+    }
+
+    fn cgame_server_info(&self) -> &[u8] {
+        if let Some(net) = self.net.as_ref() {
+            return crate::net::mod_support::server_info(&net.session().decoder().configstrings);
+        }
+        self.game_session
+            .as_ref()
+            .map(|session| crate::net::mod_support::server_info(&session.decoder.configstrings))
+            .unwrap_or_default()
+    }
+
+    fn cgame_server_mod(&self) -> crate::net::mod_support::ServerMod {
+        crate::net::mod_support::ServerMod::detect(self.cgame_server_info())
+    }
+
+    pub(in crate::app) fn japro_do_restricted(&self) -> bool {
+        const RESTRICT_DO: i32 = 1 << 9;
+        jka_protocol::commands::info_value(self.cgame_server_info(), b"restricts")
+            .map_or(0, jka_protocol::commands::atoi)
+            & RESTRICT_DO
+            != 0
+    }
+
+    fn japro_do_race_restricted(&self) -> bool {
+        self.cgame_server_mod() == crate::net::mod_support::ServerMod::Japro
+            && self
+                .current_player_state()
+                .is_some_and(|ps| ps.stats[crate::japro_cg::STAT_RACEMODE] != 0)
+    }
+
+    /// Port of jaPRO CG_Do_f: one pending `vstr`, replaced by a newer `/do`,
+    /// with its deadline expressed in the CGame's millisecond clock.
+    pub(in crate::app) fn start_japro_do(&mut self, vstr: String, delay_ms: i32) {
+        if self.japro_do_restricted() || self.japro_do_race_restricted() {
+            return;
+        }
+        let Some(session) = self.game_session.as_mut() else {
+            return;
+        };
+        let deadline = session.cgame_time.saturating_add(delay_ms.max(0));
+        session.japro_do = Some((vstr, deadline));
+    }
+
+    /// Port of jaPRO CG_DoAsync's doVstr block. It intentionally uses `>`
+    /// rather than `>=`, so a zero-delay `/do` runs on a later CGame frame.
+    pub(in crate::app) fn tick_japro_do(&mut self) {
+        let due_vstr = {
+            let Some(session) = self.game_session.as_mut() else {
+                return;
+            };
+            let Some((_, deadline)) = session.japro_do.as_ref() else {
+                return;
+            };
+            if session.cgame_time <= *deadline {
+                return;
+            }
+            session.japro_do.take().map(|(vstr, _)| vstr)
+        };
+        if let Some(vstr) = due_vstr {
+            // trap->SendConsoleCommand queues this back to the engine. The
+            // command buffer already ran this App tick, so append now and let
+            // the next tick execute it rather than calling vstr recursively.
+            let _ = self.append_console_commands(vec![format!("vstr {vstr}")]);
+        }
     }
 
     pub(in crate::app) fn japro_flipkick_restricted(&self) -> bool {

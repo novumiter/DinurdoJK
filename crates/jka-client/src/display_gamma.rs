@@ -238,9 +238,12 @@ fn controller_worker(rx: mpsc::Receiver<Request>, notify: Arc<dyn Fn(Status) + S
     // Dropping input delivers EOF. The child serializes restoration itself.
 }
 pub fn backup_directory() -> Result<PathBuf, String> {
-    let root =
-        std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable for gamma recovery")?;
-    Ok(PathBuf::from(root).join("DinurdoJK").join("gamma-recovery"))
+    let executable = std::env::current_exe()
+        .map_err(|e| format!("locate gamma recovery executable: {e}"))?;
+    executable
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "gamma recovery executable has no parent directory".into())
 }
 pub fn recover_before_launch() -> Vec<String> {
     #[cfg(windows)]

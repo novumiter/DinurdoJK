@@ -23,7 +23,9 @@ mod loading;
 mod scoreboard;
 mod settings;
 mod text;
-use chat::{build_chat_history, build_chat_input, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE};
+use chat::{
+    build_chat_history, build_chat_input, build_console_notify, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE,
+};
 pub use chat::{KEY_ART_SIZE, KEY_ATLAS_COLUMNS, MOVEMENT_KEY_ART};
 use compose::gameplay_hud_visible;
 pub use compose::{
@@ -73,11 +75,13 @@ pub use settings::environment::{
     ENV_ROW_CLOUD_RENDER_RESOLUTION, ENV_ROW_CLOUD_SHADOWS, ENV_ROW_CLOUD_TEMPORAL,
     ENV_ROW_CLOUD_THICKNESS, ENV_ROW_CLOUD_TUNING, ENV_ROW_CLOUD_TYPE, ENV_ROW_FOG_MODE,
     ENV_ROW_FOG_STRENGTH, ENV_ROW_FOOTPRINTS, ENV_ROW_PUDDLE_SCATTER, ENV_ROW_PUDDLE_WATER,
-    ENV_ROW_RAIN, ENV_ROW_RAIN_GRADE, ENV_ROW_RAIN_INTENSITY, MAX_FOG_STRENGTH,
+    ENV_ROW_RAIN, ENV_ROW_RAIN_GLASS, ENV_ROW_RAIN_GRADE, ENV_ROW_RAIN_INTENSITY,
+    MAX_FOG_STRENGTH,
     VIDEO_ROW_FILM_GRAIN,
 };
 pub use settings::rendering::{
-    ColorLutPreset, CullDebugMode, DetailTextureMode, DofQuality, DynamicLightsMode,
+    ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
+    DetailTextureMode, DofQuality, DynamicLightsMode, GlowMode,
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FullscreenMode,
     FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode,
     PlanarReflectionMode, PvsMode, ReflectionQuality, RendererBackend, SunVisibilityMode,
@@ -89,7 +93,7 @@ pub use settings::rendering::{
     SUN_INTENSITY_MAX, VIDEO_ROW_AMBIENT_OCCLUSION, VIDEO_ROW_ANTI_ALIASING,
     VIDEO_ROW_ASSET_OVERRIDES, VIDEO_ROW_AUTO_EXPOSURE, VIDEO_ROW_BAKED_AO_CURRENT_CELL,
     VIDEO_ROW_BAKED_AO_RANGE, VIDEO_ROW_BAKED_AO_RESOLUTION, VIDEO_ROW_BAKED_AO_SAMPLES,
-    VIDEO_ROW_BAKED_AO_STRENGTH, VIDEO_ROW_BLOOM, VIDEO_ROW_BRIGHTNESS,
+    VIDEO_ROW_BAKED_AO_STRENGTH, VIDEO_ROW_GLOW, VIDEO_ROW_BRIGHTNESS,
     VIDEO_ROW_CHROMATIC_ABERRATION, VIDEO_ROW_COLOR_LUT, VIDEO_ROW_CONTACT_SHADOWS,
     VIDEO_ROW_CULL_DEBUG, VIDEO_ROW_DELUXE_MAPPING, VIDEO_ROW_DELUXE_SPECULAR,
     VIDEO_ROW_DEPTH_OF_FIELD, VIDEO_ROW_DETAIL_TEXTURES, VIDEO_ROW_DEVELOPER_TOOLS,
@@ -106,11 +110,14 @@ pub use settings::rendering::{
     VIDEO_ROW_LIGHTMAP_ONLY, VIDEO_ROW_LOCAL_LIGHT_SHADOWS, VIDEO_ROW_LUT_STRENGTH,
     VIDEO_ROW_MAP_LIGHT_SIMULATION, VIDEO_ROW_MAX_FRAME_LATENCY, VIDEO_ROW_MODEL_BRIGHTNESS,
     VIDEO_ROW_MODERN_SABERS, VIDEO_ROW_MOTION_BLUR, VIDEO_ROW_PBR, VIDEO_ROW_PERF_TRACE,
-    VIDEO_ROW_PHYSICS_FPS, VIDEO_ROW_PICMIP, VIDEO_ROW_PLANAR_REFLECTIONS,
+    VIDEO_ROW_PICMIP, VIDEO_ROW_PLANAR_REFLECTIONS,
     VIDEO_ROW_PLANAR_REFLECTION_DEBUG, VIDEO_ROW_PVS, VIDEO_ROW_QUALITY_PRESET,
     VIDEO_ROW_RENDERER_VERBOSE, VIDEO_ROW_RENDER_BACKEND, VIDEO_ROW_RESOLUTION,
     VIDEO_ROW_SABER_IMPACT_FX, VIDEO_ROW_SABER_MARKS, VIDEO_ROW_SSR, VIDEO_ROW_TEXTURE_FILTER,
     VIDEO_ROW_TONE_MAPPING, VIDEO_ROW_VERTEX_LIGHTING, VIDEO_ROW_VID_RESTART, VIDEO_ROW_VIGNETTE,
+    VIDEO_ROW_CRT_SCOPE, VIDEO_ROW_CRT_STYLE, VIDEO_ROW_CRT_QUALITY, VIDEO_ROW_CRT_REFERENCE, VIDEO_ROW_CRT_MASK,
+    VIDEO_ROW_CRT_SCANLINE, VIDEO_ROW_CRT_SHARPNESS, VIDEO_ROW_CRT_MASK_INTENSITY,
+    VIDEO_ROW_CRT_CURVATURE, VIDEO_ROW_CRT_CORNER,
     VIDEO_ROW_VOXEL_PROBE_GI, VIDEO_ROW_VSYNC, VIDEO_ROW_WIREFRAME, VIDEO_ROW_WORLD_LIGHTING,
 };
 pub use settings::video::VideoSettings;
@@ -171,6 +178,13 @@ pub enum ChatMode {
 pub struct UiChatLine {
     pub text: String,
     pub alpha: f32,
+}
+
+/// Classic idTech/OpenJK console notify line: a recent console print promoted
+/// temporarily over the top-left of gameplay (TaystJK `Con_DrawNotify`).
+#[derive(Debug, Clone)]
+pub struct UiConsoleNotifyLine {
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -809,6 +823,7 @@ pub struct UiSnapshot {
     pub console_cursor: usize,
     pub console_status: String,
     pub console_lines: Vec<String>,
+    pub console_line_kinds: Vec<crate::logging::ConsoleLineKind>,
     pub console_scroll: usize,
     pub console_size: ConsoleSize,
     pub console_selection: Option<ConsoleSelection>,
@@ -834,6 +849,7 @@ pub struct UiSnapshot {
     pub chat_mode: ChatMode,
     pub chat_input: String,
     pub chat_lines: Vec<UiChatLine>,
+    pub console_notify_lines: Vec<UiConsoleNotifyLine>,
     pub center_print: Option<UiCenterPrint>,
     pub follow_name: Option<String>,
     /// TaystJK/OpenJK `cg_drawTimer` elapsed level time, preformatted as M:SS.
@@ -885,6 +901,7 @@ impl Default for UiSnapshot {
             console_cursor: 0,
             console_status: String::new(),
             console_lines: Vec::new(),
+            console_line_kinds: Vec::new(),
             console_scroll: 0,
             console_size: ConsoleSize::Normal,
             console_selection: None,
@@ -906,6 +923,7 @@ impl Default for UiSnapshot {
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
             chat_lines: Vec::new(),
+            console_notify_lines: Vec::new(),
             center_print: None,
             follow_name: None,
             game_timer: None,

@@ -9,6 +9,7 @@ use crate::renderer::{
     TextureData, TextureFilter, UiSnapshot, Vec3, ViewLatchMode, VsyncMode, Window, Zeroable,
 };
 use crate::renderer::{GrassDrawStats, ViewSampleMeasurement};
+use crate::ui::GlowMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DynamicModelAlphaMode {
@@ -95,6 +96,16 @@ pub struct DynamicModelVertex {
     /// `md3.wgsl` performs the reverse-Z equivalent clip-space remap.
     pub depth_hack: f32,
 }
+
+/// `ghoul2_skin_compute.wgsl` materializes this vertex through a raw `array<u32>`
+/// and so hard-codes the stride. Keep the two in step: a desync silently writes
+/// every skinned vertex at the wrong offset and leaves the tail of each range
+/// zeroed, i.e. collapsed onto the world origin.
+pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_WORDS: usize = 13;
+const _: () = assert!(
+    std::mem::size_of::<DynamicModelVertex>() == DYNAMIC_MODEL_VERTEX_WORDS * 4,
+    "DynamicModelVertex changed size; update write_vertex in ghoul2_skin_compute.wgsl"
+);
 
 /// Bind-pose GLM vertex used by the optional GPU Ghoul2 skinning path. Bone
 /// indices are GLA/global indices, resolved from the GLM surface-local table at
@@ -334,6 +345,8 @@ pub struct DynamicModelSurface {
     /// Instanced RT_SPRITE path used by r_fxGeometry gpu. Non-sprite EFX and
     /// the CPU reference modes leave this unset.
     pub fx_gpu_sprites: Option<FxGpuSprites>,
+    /// Exact JKA shader-stage `glow` marker. Synthetic/modern FX leave this false.
+    pub authored_glow: bool,
     pub texture: Option<Arc<TextureData>>,
     pub alpha_mode: DynamicModelAlphaMode,
 }
@@ -356,6 +369,7 @@ impl DynamicModelSurface {
             .as_ref()
             .map_or(self.indices.len(), |skin| skin.indices.len())
     }
+
 }
 
 /// CGame's CG_Mover submission of an inline BSP model: R_AddRefEntityToScene
@@ -571,7 +585,7 @@ pub struct PostEffects {
     pub hdr: bool,
     pub auto_exposure: bool,
     pub tone_mapping: bool,
-    pub bloom: bool,
+    pub glow: GlowMode,
     pub halation: bool,
     pub ssao: bool,
     pub static_bsp_ao: bool,
@@ -619,6 +633,7 @@ pub struct PostEffects {
     pub cloud_size: f32,
     pub rain: bool,
     pub rain_intensity: RainIntensity,
+    pub rain_glass: bool,
     pub puddle_quality: PuddleQuality,
     pub puddle_scatter: f32,
     pub rain_grade: f32,
@@ -629,9 +644,20 @@ pub struct PostEffects {
     pub film_grain_strength: f32,
     pub motion_blur_strength: f32,
     pub depth_of_field_strength: f32,
+    pub crt_scope: ui::CrtScope,
+    pub crt_style: ui::CrtStyle,
+    pub crt_quality: ui::CrtQuality,
+    pub crt_reference: ui::CrtReferenceResolution,
+    pub crt_mask: ui::CrtMask,
+    pub crt_scanline: f32,
+    pub crt_sharpness: f32,
+    pub crt_mask_intensity: f32,
+    pub crt_curvature: f32,
+    pub crt_corner: f32,
     pub dof_quality: DofQuality,
     pub color_lut: ColorLutPreset,
     pub color_lut_strength: f32,
+    pub color_grade: crate::color_grading::ColorGradeSettings,
     pub split_toning: crate::color_grading::SplitToningSettings,
 }
 
@@ -732,6 +758,12 @@ impl RenderBatchTiming {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenshotFormat {
+    Jpeg,
+    Png,
+}
+
 pub enum RenderCommand {
     Resize(PhysicalSize<u32>),
     SetVsync(VsyncMode),
@@ -777,8 +809,10 @@ pub enum RenderCommand {
     SetGrassMidLod(bool),
     SetGrassFrontToBack(bool),
     SetContactShadowDebug(u8),
+    SetSsrDebug(u8),
     SetOceanEnabled(bool),
     SetOceanSettings(crate::ocean::OceanSettings),
+    SetPromotedOceanSettings(Vec<(usize, crate::ocean::OceanSettings)>),
     SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),
     SetOceanTime(f32),
     SetPerfTrace(bool),
@@ -814,7 +848,11 @@ pub enum RenderCommand {
     SetCascadedShadows(DynamicShadowsMode),
     SetCullDebug(CullDebugMode),
     SetPlanarReflectionDebug(PlanarReflectionDebugMode),
-    SetPuddleDebug(bool),
+    SetPuddleDebug(u32),
+    SetPuddleSkyBlend {
+        window: f32,
+        ceiling: f32,
+    },
     DumpMaterials {
         filter: Option<String>,
         all: bool,
@@ -831,11 +869,13 @@ pub enum RenderCommand {
     Screenshot {
         directory: PathBuf,
         metadata: crate::screenshot::ScreenshotMetadata,
+        format: ScreenshotFormat,
     },
     CopyFrameToClipboard,
     SetUi(UiSnapshot),
     SetTransientUi {
         chat_lines: Vec<ui::UiChatLine>,
+        console_notify_lines: Vec<ui::UiConsoleNotifyLine>,
         center_print: Option<ui::UiCenterPrint>,
         demo_timeline: Option<ui::DemoTimelineUi>,
         prediction_debug: Option<ui::PredictionDebugUi>,
@@ -884,6 +924,9 @@ pub enum RenderCommand {
     /// being drawn underneath translucent browser panes.
     SetAssetPreviewViewport(Option<[u32; 4]>),
     UnloadMap,
+    /// Grow private inline render slots from the prepared CPU cache while the
+    /// current CGame/collision session continues unchanged.
+    GrowInlineInstances { map: Box<PreparedMap> },
     LoadMap {
         request_id: u64,
         started: Instant,
@@ -950,4 +993,8 @@ pub(in crate::renderer) enum RenderError {
     Timeout,
     Occluded,
     Validation,
+    /// The WGPU device itself is gone (driver reset/TDR, removed adapter).
+    /// Unlike `Lost`, which is a surface that only needs reconfiguring, nothing
+    /// can be rendered on this device again.
+    DeviceLost,
 }

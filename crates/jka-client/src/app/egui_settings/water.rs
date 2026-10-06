@@ -59,29 +59,45 @@ impl App {
             );
         }
 
-        if !self.authored_oceans.is_empty() {
-            let old = self.authored_ocean_selected;
-            let mut selected = old;
-            theme::row(
-                ui,
-                "Authored ocean",
-                "Select which server/map-authored ocean volume is shown in the local tuning controls.",
-                theme::Reset::None,
-                |ui| {
-                    egui::ComboBox::from_id_salt("authored_ocean_selector")
-                        .selected_text(format!("Ocean {}", self.authored_oceans[selected].index))
-                        .show_ui(ui, |ui| {
-                            for (index, ocean) in self.authored_oceans.iter().enumerate() {
-                                ui.selectable_value(&mut selected, index, format!("Ocean {} · weather {}", ocean.index, ocean.weather));
-                            }
-                        });
-                },
-            );
-            self.authored_ocean_selected = selected;
-            if old != self.authored_ocean_selected {
-                self.authored_ocean_preview = false;
-                self.publish_authored_oceans();
-            }
+        let mut target = self.ocean_settings_target;
+        let target_label = if target >= 0 {
+            self.promoted_oceans.iter().find(|p| p.index == target as usize).map(|p| p.label())
+                .unwrap_or_else(|| "Shared simulation / optics".into())
+        } else if target <= -2 {
+            self.authored_oceans.get((-target-2) as usize)
+                .map(|o| format!("Authored ocean {}",o.index))
+                .unwrap_or_else(|| "Shared simulation / optics".into())
+        } else { "Shared simulation / optics".into() };
+        theme::row(ui, "Ocean settings target",
+            "Choose a pool by texture and JKA coordinates. Pool tuning is local to this map; FFT quality and underwater optics are shared.",
+            theme::Reset::None, |ui| {
+                egui::ComboBox::from_id_salt("ocean_settings_target").selected_text(target_label).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut target, -1, "Shared simulation / optics");
+                    for pool in &self.promoted_oceans {
+                        ui.selectable_value(&mut target, pool.index as i32, pool.label());
+                    }
+                    for (i,ocean) in self.authored_oceans.iter().enumerate() {
+                        ui.selectable_value(&mut target, -2-i as i32, format!("Authored ocean {}", ocean.index));
+                    }
+                });
+            });
+        if target != self.ocean_settings_target {
+            self.ocean_settings_target = target;
+            self.authored_ocean_preview = false;
+            if target <= -2 { self.authored_ocean_selected = (-target-2) as usize; }
+            self.publish_authored_oceans();
+        }
+        let promoted_index = self.promoted_oceans.iter().position(|p| self.ocean_settings_target == p.index as i32);
+        let reset = |value| if promoted_index.is_some() { theme::Reset::None } else { value };
+        if let Some(index) = promoted_index {
+            let pool = &self.promoted_oceans[index];
+            theme::banner(ui, &format!("Local pool tuning / image variation {:.0}% / amplitude default {:.1}u. Manual changes override these estimates.",
+                pool.heuristic.variation*100.0, pool.heuristic.amplitude), theme::TEXT_DIM);
+        } else {
+            theme::banner(ui, "FFT spectrum, quality and underwater optics are shared. Select a pool to edit its wave height, chop, foam and surface appearance.", theme::TEXT_DIM);
+        }
+        if self.ocean_settings_target <= -2 && !self.authored_oceans.is_empty() {
+            self.authored_ocean_selected = self.authored_ocean_selected.min(self.authored_oceans.len()-1);
             if !self.authored_ocean_preview {
                 let ocean = &self.authored_oceans[self.authored_ocean_selected];
                 self.video.ocean_settings.authored = ocean.waves;
@@ -120,7 +136,11 @@ impl App {
                 },
             );
         }
-        let mut settings = self.video.ocean_settings;
+        let mut settings = if let Some(index) = promoted_index {
+            let pool = &self.promoted_oceans[index];
+            let local = self.promoted_ocean_overrides.iter().find(|(slot,_)| *slot == pool.index).map(|(_,s)| *s);
+            crate::ocean::appearance::surface_settings(self.video.ocean_settings, pool, local)
+        } else { self.video.ocean_settings };
         let mut changed = false;
 
         theme::section(
@@ -129,16 +149,16 @@ impl App {
             "Map-facing swell controls. Distances and speeds use JKA map units (40 units = 1 metre).",
         );
         ui.add_enabled_ui(
-            self.authored_oceans.is_empty() || self.authored_ocean_preview,
+            promoted_index.is_some() || (self.ocean_settings_target <= -2 && self.authored_ocean_preview),
             |ui| {
                 let a = &mut settings.authored;
                 ocean_slider(
                     ui,
                     "Swell amplitude",
-                    "Height scale of the authored long swell, in map units.",
+                    "Wave height in map units for the selected ocean. Promoted pools retain a small nonzero ripple.",
                     theme::Reset::None,
                     &mut a.amplitude,
-                    0.0..=5000.0,
+                    if promoted_index.is_some() { crate::ocean::appearance::MIN_PROMOTED_AMPLITUDE..=5000.0 } else { 0.0..=5000.0 },
                     &mut changed,
                 );
                 ocean_slider(
@@ -198,7 +218,7 @@ impl App {
                 ocean_slider(
                     ui,
                     "Foam amount",
-                    "Global multiplier for crest foam generation.",
+                    "Foam strength for the selected ocean.",
                     theme::Reset::None,
                     &mut a.foam,
                     0.0..=4.0,
@@ -206,35 +226,43 @@ impl App {
                 );
                 ocean_slider(
                     ui,
-                    "Foam lifetime",
-                    "How long accumulated crest foam persists before decaying.",
-                    theme::Reset::None,
-                    &mut a.foam_lifetime,
-                    0.1..=30.0,
-                    &mut changed,
-                );
-                ocean_slider(
-                    ui,
                     "Spray amount",
-                    "Global multiplier for crest-triggered sea spray particles.",
+                    "Spray strength for the selected ocean.",
                     theme::Reset::None,
                     &mut a.spray,
                     0.0..=4.0,
                     &mut changed,
                 );
-                theme::row(
-                    ui,
-                    "Wave seed",
-                    "Random seed used to generate the repeatable FFT spectrum phases.",
-                    theme::Reset::None,
-                    |ui| {
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut a.seed).speed(1.0))
-                            .changed();
-                    },
-                );
+
             },
         );
+
+        ui.add_enabled_ui(promoted_index.is_none(), |ui| {
+            ocean_slider(
+                ui,
+                "Foam lifetime",
+                "How long accumulated crest foam persists before decaying.",
+                theme::Reset::None,
+                &mut settings.authored.foam_lifetime,
+                0.1..=30.0,
+                &mut changed,
+            );
+        });
+
+        ui.add_enabled_ui(promoted_index.is_none(), |ui| {
+            theme::row(
+                ui,
+                "Wave seed",
+                "Random seed used to generate the repeatable FFT spectrum phases.",
+                theme::Reset::None,
+                |ui| {
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut settings.authored.seed).speed(1.0))
+                        .changed();
+                },
+            );
+        });
+
 
         theme::row(
             ui,
@@ -248,6 +276,8 @@ impl App {
                 }
             },
         );
+        theme::banner(ui, "FFT resolution, mesh quality and update rate apply to all oceans.", theme::TEXT_FAINT);
+        ui.add_enabled_ui(promoted_index.is_none(), |ui| {
         const MAP_SIZES: [(u32, &str); 4] =
             [(128, "128"), (256, "256"), (512, "512"), (1024, "1024")];
         if let Some(target) = quality_table_row(
@@ -257,7 +287,7 @@ impl App {
              textures and FFT input. This is NOT the water mesh grid; Mesh \
              quality below controls geometry. Higher resolves finer ripples; \
              memory cost grows with N^2 and FFT work roughly with N^2 log N.",
-            theme::Reset::Ocean(OCEAN_MAP_SIZE),
+            reset(theme::Reset::Ocean(OCEAN_MAP_SIZE)),
             settings.map_size,
             &MAP_SIZES,
             1,
@@ -271,7 +301,7 @@ impl App {
             "Mesh quality",
             "Tessellation density of the water surface the displacement is \
              applied to.",
-            theme::Reset::Ocean(OCEAN_MESH_QUALITY),
+            reset(theme::Reset::Ocean(OCEAN_MESH_QUALITY)),
             settings.mesh_quality,
             &MESHES,
             0,
@@ -284,7 +314,7 @@ impl App {
             "Simulation updates",
             "How often the wave spectrum is stepped, independent of frame rate. \
              Lower rates save GPU time and make the motion choppier.",
-            theme::Reset::Ocean(OCEAN_UPDATES),
+            reset(theme::Reset::Ocean(OCEAN_UPDATES)),
             |ui| {
                 let mut value = settings.updates_per_second;
                 let readout = format!("{value:.0} Hz");
@@ -295,11 +325,12 @@ impl App {
             },
         );
 
+        });
         theme::row(
             ui,
             "Sea spray",
             "GodotOceanWaves-style crest spray. Samples the same FFT foam/normal field and emits only from breaking whitecaps.",
-            theme::Reset::Ocean(OCEAN_SEA_SPRAY),
+            reset(theme::Reset::Ocean(OCEAN_SEA_SPRAY)),
             |ui| {
                 if let Some(value) = theme::switch(ui, settings.sea_spray) {
                     settings.sea_spray = value;
@@ -312,7 +343,7 @@ impl App {
             ui,
             "Wind foam streaks",
             "Severe-wind surface foam transport. Reuses real FFT whitecaps, advects them with weather wind, and concentrates them into long wind-aligned foam streaks for gale conditions.",
-            theme::Reset::Ocean(OCEAN_WIND_FOAM),
+            reset(theme::Reset::Ocean(OCEAN_WIND_FOAM)),
             |ui| {
                 if let Some(value) = theme::switch(ui, settings.wind_foam_streaks) {
                     settings.wind_foam_streaks = value;
@@ -327,7 +358,7 @@ impl App {
             "Roughness",
             "Microfacet roughness of the water. Low is glassy and mirror-like, \
              high is a dull matte sheet.",
-            theme::Reset::Ocean(OCEAN_ROUGHNESS),
+            reset(theme::Reset::Ocean(OCEAN_ROUGHNESS)),
             |ui| {
                 let mut value = settings.roughness;
                 let readout = percent(value);
@@ -341,7 +372,7 @@ impl App {
             ui,
             "Normal strength",
             "How strongly the simulated ripple normals perturb the lighting.",
-            theme::Reset::Ocean(OCEAN_NORMAL_STRENGTH),
+            reset(theme::Reset::Ocean(OCEAN_NORMAL_STRENGTH)),
             |ui| {
                 let mut value = settings.normal_strength;
                 let readout = percent(value);
@@ -355,7 +386,7 @@ impl App {
             ui,
             "Water color",
             "Colour of the water body itself, before reflection and foam.",
-            theme::Reset::Ocean(OCEAN_WATER_COLOR),
+            reset(theme::Reset::Ocean(OCEAN_WATER_COLOR)),
             &mut settings.water_color,
             &mut changed,
         );
@@ -363,17 +394,18 @@ impl App {
             ui,
             "Foam color",
             "Colour of whitecaps and the foam trail behind breaking waves.",
-            theme::Reset::Ocean(OCEAN_FOAM_COLOR),
+            reset(theme::Reset::Ocean(OCEAN_FOAM_COLOR)),
             &mut settings.foam_color,
             &mut changed,
         );
 
+        ui.add_enabled_ui(promoted_index.is_none(), |ui| {
         theme::section(ui, "WATER OPTICS", "");
         color_row(
             ui,
             "Fog color",
             "Scattered underwater light; converted to linear color.",
-            theme::Reset::Ocean(9),
+            reset(theme::Reset::Ocean(9)),
             &mut settings.optics.fog_color,
             &mut changed,
         );
@@ -381,7 +413,7 @@ impl App {
             ui,
             "Fog distance",
             "Base absorption distance in game units.",
-            theme::Reset::Ocean(10),
+            reset(theme::Reset::Ocean(10)),
             &mut settings.optics.fog_distance,
             1.0..=4000.0,
             &mut changed,
@@ -390,7 +422,7 @@ impl App {
             ui,
             "Transparency",
             "Multiplies the absorption distance above and below water.",
-            theme::Reset::Ocean(11),
+            reset(theme::Reset::Ocean(11)),
             &mut settings.optics.transparency,
             0.1..=16.0,
             &mut changed,
@@ -399,7 +431,7 @@ impl App {
             ui,
             "Depth darkening",
             "Sunlight penetration multiplier; larger values stay bright deeper.",
-            theme::Reset::Ocean(12),
+            reset(theme::Reset::Ocean(12)),
             &mut settings.optics.depth_darkening,
             0.01..=8.0,
             &mut changed,
@@ -408,7 +440,7 @@ impl App {
             ui,
             "Refraction",
             "Wave distortion of objects viewed through water. Zero disables distortion.",
-            theme::Reset::Ocean(13),
+            reset(theme::Reset::Ocean(13)),
             &mut settings.optics.refraction,
             0.0..=0.15,
             &mut changed,
@@ -417,17 +449,19 @@ impl App {
             ui,
             "Caustics",
             "Experimental wave-curvature sunlight focusing. Not shadow-aware yet; zero disables.",
-            theme::Reset::Ocean(14),
+            reset(theme::Reset::Ocean(14)),
             &mut settings.optics.caustics,
             0.0..=4.0,
             &mut changed,
         );
-        ocean_slider(ui, "Underwater cull", "Absorption-distance multiple for fully submerged distant world geometry. Zero disables.", theme::Reset::Ocean(15), &mut settings.optics.underwater_cull, 0.0..=8.0, &mut changed);
+        ocean_slider(ui, "Underwater cull", "Absorption-distance multiple for fully submerged distant world geometry. Zero disables.", reset(theme::Reset::Ocean(15)), &mut settings.optics.underwater_cull, 0.0..=8.0, &mut changed);
 
+        });
+        ui.add_enabled_ui(promoted_index.is_none(), |ui| {
         theme::section(
             ui,
             "ADVANCED SPECTRUM",
-            "Three layered FFT spectra reduce tiling. These controls use the native GodotOceanWaves units: metres, m/s and km.",
+            "Shared by all pools. Three layered FFT spectra reduce tiling. These controls use the native GodotOceanWaves units: metres, m/s and km.",
         );
         for cascade_index in 0..crate::ocean::OCEAN_CASCADES {
             let (role, detail) = match cascade_index {
@@ -442,13 +476,13 @@ impl App {
                 .show(ui, |ui| {
                     theme::banner(ui, detail, theme::TEXT_DIM);
                     let cascade = &mut settings.cascades[cascade_index];
-                    ocean_slider(ui, "Tile length X", "Repeat size of this FFT cascade along X, in metres. Larger values carry broader waves and repeat less often.", theme::Reset::OceanCascade(cascade_index as u8, 0), &mut cascade.tile_length[0], 1.0..=2000.0, &mut changed);
-                    ocean_slider(ui, "Tile length Y", "Repeat size of this FFT cascade along Y, in metres. Keeping X/Y different can make repetition less obvious.", theme::Reset::OceanCascade(cascade_index as u8, 1), &mut cascade.tile_length[1], 1.0..=2000.0, &mut changed);
-                    ocean_slider(ui, "Displacement scale", "Multiplier for this cascade's geometric displacement. Reduce it on higher-frequency cascades to avoid over-busy silhouettes.", theme::Reset::OceanCascade(cascade_index as u8, 2), &mut cascade.displacement_scale, 0.0..=2.0, &mut changed);
-                    ocean_slider(ui, "Normal scale", "Multiplier for this cascade's shading normals. It can add small-scale sparkle/chop without adding the same amount of geometry displacement.", theme::Reset::OceanCascade(cascade_index as u8, 3), &mut cascade.normal_scale, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Tile length X", "Repeat size of this FFT cascade along X, in metres. Larger values carry broader waves and repeat less often.", reset(theme::Reset::OceanCascade(cascade_index as u8, 0)), &mut cascade.tile_length[0], 1.0..=2000.0, &mut changed);
+                    ocean_slider(ui, "Tile length Y", "Repeat size of this FFT cascade along Y, in metres. Keeping X/Y different can make repetition less obvious.", reset(theme::Reset::OceanCascade(cascade_index as u8, 1)), &mut cascade.tile_length[1], 1.0..=2000.0, &mut changed);
+                    ocean_slider(ui, "Displacement scale", "Multiplier for this cascade's geometric displacement. Reduce it on higher-frequency cascades to avoid over-busy silhouettes.", reset(theme::Reset::OceanCascade(cascade_index as u8, 2)), &mut cascade.displacement_scale, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Normal scale", "Multiplier for this cascade's shading normals. It can add small-scale sparkle/chop without adding the same amount of geometry displacement.", reset(theme::Reset::OceanCascade(cascade_index as u8, 3)), &mut cascade.normal_scale, 0.0..=2.0, &mut changed);
                     if cascade_index < 2 {
-                        ocean_slider(ui, "Spectrum wind speed", "Reference wind speed for this TMA/JONSWAP spectrum, in m/s. It changes spectrum energy and peak frequency; it is separate from live weather wind.", theme::Reset::OceanCascade(cascade_index as u8, 4), &mut cascade.wind_speed, 0.0001..=60.0, &mut changed);
-                        ocean_slider(ui, "Spectrum angle offset", "Directional offset from the authored swell heading, in degrees. This lets the cascades cross rather than stack in exactly one direction.", theme::Reset::OceanCascade(cascade_index as u8, 5), &mut cascade.wind_direction, -360.0..=360.0, &mut changed);
+                        ocean_slider(ui, "Spectrum wind speed", "Reference wind speed for this TMA/JONSWAP spectrum, in m/s. It changes spectrum energy and peak frequency; it is separate from live weather wind.", reset(theme::Reset::OceanCascade(cascade_index as u8, 4)), &mut cascade.wind_speed, 0.0001..=60.0, &mut changed);
+                        ocean_slider(ui, "Spectrum angle offset", "Directional offset from the authored swell heading, in degrees. This lets the cascades cross rather than stack in exactly one direction.", reset(theme::Reset::OceanCascade(cascade_index as u8, 5)), &mut cascade.wind_direction, -360.0..=360.0, &mut changed);
                     } else {
                         theme::banner(
                             ui,
@@ -456,12 +490,12 @@ impl App {
                             theme::TEXT_FAINT,
                         );
                     }
-                    ocean_slider(ui, "Fetch length", "Distance from shoreline / wind fetch, in kilometres. Longer fetch shifts the TMA/JONSWAP sea state toward more developed waves.", theme::Reset::OceanCascade(cascade_index as u8, 6), &mut cascade.fetch_length, 0.1..=1000.0, &mut changed);
-                    ocean_slider(ui, "Directional concentration", "GodotOceanWaves calls this swell. Higher values elongate/concentrate wave energy around the preferred heading; it is not your authored swell height.", theme::Reset::OceanCascade(cascade_index as u8, 7), &mut cascade.swell, 0.0..=2.0, &mut changed);
-                    ocean_slider(ui, "Spread", "Mix between strongly directional and flatter/isotropic wave energy. Higher values allow more energy away from the preferred heading.", theme::Reset::OceanCascade(cascade_index as u8, 8), &mut cascade.spread, 0.0..=1.0, &mut changed);
-                    ocean_slider(ui, "Detail", "Small-wave suppression control. Lower values attenuate high-frequency waves; 1 keeps the full high-frequency tail.", theme::Reset::OceanCascade(cascade_index as u8, 9), &mut cascade.detail, 0.0..=1.0, &mut changed);
-                    ocean_slider(ui, "Whitecap threshold", "Controls how steep/compressed a crest must be before foam accumulates. Higher values make whitecaps trigger more readily in this implementation.", theme::Reset::OceanCascade(cascade_index as u8, 10), &mut cascade.whitecap, 0.0..=2.0, &mut changed);
-                    ocean_slider(ui, "Foam amount", "Per-cascade foam growth multiplier. Lifetime/decay is controlled by the main Foam lifetime setting above.", theme::Reset::OceanCascade(cascade_index as u8, 11), &mut cascade.foam_amount, 0.0..=10.0, &mut changed);
+                    ocean_slider(ui, "Fetch length", "Distance from shoreline / wind fetch, in kilometres. Longer fetch shifts the TMA/JONSWAP sea state toward more developed waves.", reset(theme::Reset::OceanCascade(cascade_index as u8, 6)), &mut cascade.fetch_length, 0.1..=1000.0, &mut changed);
+                    ocean_slider(ui, "Directional concentration", "GodotOceanWaves calls this swell. Higher values elongate/concentrate wave energy around the preferred heading; it is not your authored swell height.", reset(theme::Reset::OceanCascade(cascade_index as u8, 7)), &mut cascade.swell, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Spread", "Mix between strongly directional and flatter/isotropic wave energy. Higher values allow more energy away from the preferred heading.", reset(theme::Reset::OceanCascade(cascade_index as u8, 8)), &mut cascade.spread, 0.0..=1.0, &mut changed);
+                    ocean_slider(ui, "Detail", "Small-wave suppression control. Lower values attenuate high-frequency waves; 1 keeps the full high-frequency tail.", reset(theme::Reset::OceanCascade(cascade_index as u8, 9)), &mut cascade.detail, 0.0..=1.0, &mut changed);
+                    ocean_slider(ui, "Whitecap threshold", "Controls how steep/compressed a crest must be before foam accumulates. Higher values make whitecaps trigger more readily in this implementation.", reset(theme::Reset::OceanCascade(cascade_index as u8, 10)), &mut cascade.whitecap, 0.0..=2.0, &mut changed);
+                    ocean_slider(ui, "Foam amount", "Per-cascade foam growth multiplier. Lifetime/decay is controlled by the main Foam lifetime setting above.", reset(theme::Reset::OceanCascade(cascade_index as u8, 11)), &mut cascade.foam_amount, 0.0..=10.0, &mut changed);
                     if cascade.displacement_scale <= 0.001 {
                         theme::banner(
                             ui,
@@ -479,15 +513,31 @@ impl App {
                 });
         }
 
+        });
         ui.add_space(10.0);
         if theme::ghost_button(ui, "RESET OCEAN DEFAULTS").clicked() {
+            if let Some(index) = promoted_index {
+                let slot = self.promoted_oceans[index].index;
+                self.promoted_ocean_overrides.retain(|(i, _)| *i != slot);
+                self.render_command(crate::renderer::RenderCommand::SetPromotedOceanSettings(self.promoted_ocean_overrides.clone()));
+                self.publish_ui();
+                return;
+            }
             settings = crate::ocean::OceanSettings::default();
             changed = true;
         }
 
         if changed {
-            self.video.ocean_settings = settings;
-            self.commit_ocean_settings();
+            if let Some(index) = promoted_index {
+                let slot = self.promoted_oceans[index].index;
+                self.promoted_ocean_overrides.retain(|(i,_)| *i != slot);
+                self.promoted_ocean_overrides.push((slot, settings));
+                self.render_command(crate::renderer::RenderCommand::SetPromotedOceanSettings(self.promoted_ocean_overrides.clone()));
+                self.publish_ui();
+            } else {
+                self.video.ocean_settings = settings;
+                self.commit_ocean_settings();
+            }
         }
     }
 }

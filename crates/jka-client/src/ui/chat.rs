@@ -209,84 +209,99 @@ pub(in crate::ui) fn build_chat_history(
     }
 }
 
-pub(in crate::ui) fn build_chat_input(
+/// TaystJK/OpenJK `Con_DrawNotify`: recent console output over the top-left of
+/// gameplay. These are console/game notices, not chatbox history.
+pub(in crate::ui) fn build_console_notify(
     out: &mut Vec<UiVertex>,
     ui: &UiSnapshot,
-    small_font: Option<&ProportionalFont>,
     w: u32,
     h: u32,
 ) {
-    // OpenJK draws the message-entry field with SCR_DrawBigString /
-    // Field_BigDraw: 16x16 geometry sampling the same charsgrid_med atlas.
-    const BIG_CHAR: f32 = 16.0;
-    const CHAT_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
-    const INPUT_HEIGHT: f32 = 40.0;
-    const INPUT_GAP: f32 = 6.0;
-    let chat_width_virtual = (CHATBOX_CUTOFF * ui.hud_layout.chat.extent[0]).clamp(120.0, 2200.0);
-    let max_history_lines = ((52.0 * ui.hud_layout.chat.extent[1])
-        / (CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE))
-        .floor()
-        .max(1.0) as usize;
-    let width = (chat_width_virtual * w as f32 / 640.0).clamp(220.0, (w as f32 - 36.0).max(220.0));
-    let x = 18.0;
+    if ui.console_notify_lines.is_empty() {
+        return;
+    }
+    // TaystJK Con_CheckResize keeps the console charset at physical 8x16
+    // pixels when con_scale is 1.0. Con_DrawNotify then feeds those physical
+    // dimensions straight to SCR_DrawSmallChar; it does *not* scale them from
+    // a 640x480 virtual canvas. Scaling by w/640 and h/480 made notify text
+    // enormous at modern resolutions.
+    const CHAR_W: f32 = 8.0;
+    const CHAR_H: f32 = 16.0;
+    let mut y = 0.0;
+    for line in &ui.console_notify_lines {
+        fixed_charset_text(
+            out,
+            &line.text,
+            CHAR_W,
+            y,
+            CHAR_W,
+            CHAR_H,
+            CHAR_W,
+            [1.0, 1.0, 1.0, 1.0],
+            false,
+            w,
+            h,
+        );
+        y += CHAR_H;
+    }
+}
 
-    // Anchor the entry box above the oldest visible chat line instead of to a
-    // fixed number of pixels from the bottom.  cg_chatBoxHeight is in 640x480
-    // virtual coordinates, while this field is drawn in framebuffer pixels.
-    let y_scale = h as f32 / 480.0;
-    let history_top = if let Some(font) = small_font {
-        let total_lines: usize = ui
-            .chat_lines
-            .iter()
-            .filter(|line| line.alpha > 0.01)
-            .map(|line| {
-                let wrapped = wrap_proportional_text(
-                    &line.text,
-                    font,
-                    CHATBOX_FONT_SCALE,
-                    chat_width_virtual,
-                );
-                wrapped.bytes().filter(|&byte| byte == b'\n').count() + 1
-            })
-            .sum::<usize>()
-            .min(max_history_lines);
-        let line_step = CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE;
-        (CHATBOX_Y - line_step * (total_lines.max(1) as f32 + 1.0)) * y_scale
-    } else {
-        let count = ui.chat_lines.len().min(max_history_lines).max(1);
-        let line_step = 6.5 * y_scale;
-        CHATBOX_Y * y_scale - count as f32 * line_step
-    };
-    let y = (history_top - INPUT_GAP - INPUT_HEIGHT).max(0.0);
-    rect(out, x, y, width, 40.0, [0.01, 0.018, 0.028, 0.92], w, h);
-    rect(out, x, y + 38.0, width, 2.0, [0.25, 0.78, 0.30, 0.95], w, h);
+pub(in crate::ui) fn build_chat_input(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    _small_font: Option<&ProportionalFont>,
+    w: u32,
+    h: u32,
+) {
+    // TaystJK Con_DrawNotify owns message entry independently from the HUD
+    // chatbox: SAY/SAY_TEAM and Field_BigDraw sit at the top/notify area and
+    // consume screen width, not cg_chatBoxWidth/Height. Keep that ownership
+    // boundary so resizing the HUD chat history cannot clip or displace input.
+    // Unlike the legacy single-line Field_BigDraw, wrap the *whole* composer
+    // (prompt included) so long messages remain visible while being typed.
+    const BIG_CHAR_VIRTUAL: f32 = 16.0;
+    const CHAT_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    let scale = (h as f32 / 480.0).max(0.5);
+    let big_char = BIG_CHAR_VIRTUAL * scale;
+    let margin = 8.0 * scale;
+    let padding_x = 8.0 * scale;
+    let padding_y = 6.0 * scale;
+    let underline = (2.0 * scale).max(1.0);
+    let width = (w as f32 - margin * 2.0).max(big_char);
+    let max_columns = ((width - padding_x * 2.0) / big_char).floor().max(1.0) as usize;
+
     let prompt = match ui.chat_mode {
         ChatMode::Global => "SAY:",
         ChatMode::Team => "TEAM:",
     };
-    fixed_charset_text(
+    let field = format!("{prompt} {}_", ui.chat_input);
+    let wrapped = wrap_fixed_chat_text(&field, max_columns);
+    let line_count = wrapped.bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let height = padding_y * 2.0 + big_char * line_count as f32 + underline;
+    let x = margin;
+    let y = margin;
+
+    // Small modern backing plate, but the placement/ownership remains the
+    // classic TaystJK message field rather than the editable HUD chat panel.
+    rect(out, x, y, width, height, [0.01, 0.018, 0.028, 0.92], w, h);
+    rect(
         out,
-        prompt,
-        x + 8.0,
-        y + 11.0,
-        BIG_CHAR,
-        BIG_CHAR,
-        BIG_CHAR,
-        CHAT_WHITE,
-        true,
+        x,
+        y + height - underline,
+        width,
+        underline,
+        [0.25, 0.78, 0.30, 0.95],
         w,
         h,
     );
-
-    let input_x = x + 8.0 + (prompt.chars().count() as f32 + 1.0) * BIG_CHAR;
     fixed_charset_text(
         out,
-        &format!("{}_", ui.chat_input),
-        input_x,
-        y + 11.0,
-        BIG_CHAR,
-        BIG_CHAR,
-        BIG_CHAR,
+        &wrapped,
+        x + padding_x,
+        y + padding_y,
+        big_char,
+        big_char,
+        big_char,
         CHAT_WHITE,
         true,
         w,

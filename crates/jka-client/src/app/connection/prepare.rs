@@ -116,17 +116,69 @@ impl App {
         normalized.to_ascii_lowercase()
     }
 
+    pub(in crate::app) fn server_sub_bsp_names_for(
+        &self,
+        source: &scene::MapSource,
+    ) -> Result<Vec<String>, String> {
+        let scene::MapSource::Bsp(map_name) = source else {
+            return Ok(Vec::new());
+        };
+        let decoder = if let Some(net) = self.net.as_ref() {
+            net.session().decoder()
+        } else if let Some(session) = self
+            .game_session
+            .as_ref()
+            .filter(|session| !session.live && !session.local)
+        {
+            &session.decoder
+        } else {
+            return Ok(Vec::new());
+        };
+        if decoder.map_name().is_some_and(|name| {
+            Self::normalized_bsp_name(&name) == Self::normalized_bsp_name(map_name)
+        }) {
+            scene::server_bsp_names(&decoder.configstrings)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+    pub(in crate::app) fn refresh_live_sub_bsps(&mut self) {
+        let Some(map_name) = self
+            .game_session
+            .as_ref()
+            .filter(|session| session.live)
+            .and_then(|session| session.map_name.clone())
+        else {
+            return;
+        };
+        if self.live_without_world
+            || self.loaded_map_matches(&map_name)
+            || self.loading_map_matches(&map_name)
+        {
+            return;
+        }
+        self.request_map(scene::MapSource::Bsp(map_name));
+        self.preserve_game_state_on_next_map_upload = true;
+    }
+
     pub(in crate::app) fn loading_map_matches(&self, map_name: &str) -> bool {
         let wanted = Self::normalized_bsp_name(map_name);
-        self.loading
-            .as_ref()
-            .is_some_and(|loading| Self::normalized_bsp_name(&loading.name) == wanted)
+        self.loading.as_ref().is_some_and(|loading| {
+            Self::normalized_bsp_name(&loading.name) == wanted
+                && self
+                    .server_sub_bsp_names_for(&scene::MapSource::Bsp(map_name.to_owned()))
+                    .is_ok_and(|names| names == loading.sub_bsp_names)
+        })
     }
 
     pub(in crate::app) fn loaded_map_matches(&self, map_name: &str) -> bool {
         !self.live_without_world
             && self.loading.is_none()
             && Self::normalized_bsp_name(&self.map_name) == Self::normalized_bsp_name(map_name)
+            && self.prepared_map_cache.as_ref().is_some_and(|cache| {
+                self.server_sub_bsp_names_for(&scene::MapSource::Bsp(map_name.to_owned()))
+                    .is_ok_and(|names| names == cache.map.sub_bsp_names)
+            })
     }
 
     pub(in crate::app) fn handle_live_server_info(&mut self, info: jka_protocol::ServerInfo) {

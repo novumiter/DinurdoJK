@@ -71,6 +71,39 @@ impl App {
         (chat_lines, center_print)
     }
 
+    pub(in crate::app) fn console_notify_ui_snapshot(&self) -> Vec<ui::UiConsoleNotifyLine> {
+        let line_count = self.console_notify_lines.max(0) as usize;
+        if line_count == 0 {
+            return Vec::new();
+        }
+
+        let now = Instant::now();
+        let demo_now = self.current_demo_elapsed_ms(now);
+        let lifetime_ms = f64::from(self.console_notify_time) * 1000.0;
+
+        // TaystJK literally scans con.current-con_notifylines through
+        // con.current inclusive. The final slot is normally the current/trailing
+        // row, hence con_notifylines + 1 timestamp slots. There is no alpha fade.
+        let rows_to_scan = line_count.saturating_add(1);
+        let start = self.console_notify.len().saturating_sub(rows_to_scan);
+        self.console_notify
+            .iter()
+            .skip(start)
+            .filter_map(|line| {
+                if !line.notify {
+                    return None;
+                }
+                let age_ms = match (demo_now, line.demo_elapsed_ms) {
+                    (Some(now_ms), Some(created_ms)) => (now_ms - created_ms).max(0.0),
+                    _ => now.saturating_duration_since(line.created).as_secs_f64() * 1000.0,
+                };
+                (age_ms <= lifetime_ms).then(|| ui::UiConsoleNotifyLine {
+                    text: line.text.clone(),
+                })
+            })
+            .collect()
+    }
+
     pub(in crate::app) fn restore_demo_transients(&mut self, elapsed_ms: i32, now: Instant) {
         let notices = self
             .game_session
@@ -79,8 +112,8 @@ impl App {
             .map(|index| index.transient_notices.clone())
             .unwrap_or_default();
         self.chat_lines.clear();
+        self.console_notify.clear();
         self.center_print = None;
-        self.last_center_print.clear();
 
         let chat_start = elapsed_ms.saturating_sub(10_000);
         for entry in notices

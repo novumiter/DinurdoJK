@@ -592,6 +592,8 @@ impl MapEditor {
             fx_gpu_sprites: None,
             texture: None,
             alpha_mode: DynamicModelAlphaMode::BlendUnlit,
+
+            authored_glow: false,
         })
     }
 

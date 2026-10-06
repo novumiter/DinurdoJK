@@ -1,10 +1,10 @@
 //! Post state.
 use crate::renderer::{
-    cloud_wind, create_auto_exposure_bind_group, create_bloom_bind_groups,
+    cloud_wind, create_auto_exposure_bind_group, create_bloom_bind_groups, create_bloom_pipeline,
     create_cloud_resolve_bind_group, create_dof_bind_group, create_fast_post_bind_group,
     create_gamma_post_bind_group, create_post_bind_group, create_post_pipeline,
     create_ssao_temporal_bind_groups, create_ssr_temporal_bind_groups, pipeline_hash,
-    CloudLayerSettings, CloudRenderSettings, CloudSunSettings, Mat4, PipelineJobKey,
+    CloudLayerSettings, CloudRenderSettings, CloudSunSettings, GlowMode, Mat4, PipelineJobKey,
     PostAaSettings, PostCameraFxSettings, PostCloudShadowSettings, PostCloudShapingSettings,
     PostCloudSkyAmbientSettings, PostCloudTemporalSettings, PostCloudTemporalTuningSettings,
     PostCloudVariationSettings, PostCloudWindSettings, PostColorSettings, PostFilmSettings,
@@ -14,6 +14,59 @@ use crate::renderer::{
 use bytemuck::Zeroable;
 
 impl Renderer {
+    /// Queue only the active extraction variant and the shared downsample PSO.
+    /// Off (without halation) does no polling or worker requests. Retain compiled
+    /// PSOs for later toggles; never wait for shader compilation on a frame.
+    pub(in crate::renderer) fn ensure_bloom_pipelines(&mut self) {
+        let (slot, entry, extraction) = match self.glow_mode {
+            GlowMode::Off if !self.halation_enabled => return,
+            GlowMode::Off | GlowMode::ModernBloom => (
+                0,
+                "fs_extract_modern",
+                &mut self.bloom_extract_modern_pipeline,
+            ),
+            GlowMode::JkaAuthored if self.halation_enabled => (
+                2,
+                "fs_extract_authored_halation",
+                &mut self.bloom_extract_authored_halation_pipeline,
+            ),
+            GlowMode::JkaAuthored => (
+                1,
+                "fs_extract_authored",
+                &mut self.bloom_extract_authored_pipeline,
+            ),
+            GlowMode::JkaAndBloom => (
+                3,
+                "fs_extract_combined",
+                &mut self.bloom_extract_combined_pipeline,
+            ),
+        };
+        for (slot, entry, pipeline) in [
+            (slot, entry, extraction),
+            (4, "fs_downsample", &mut self.bloom_downsample_pipeline),
+        ] {
+            if pipeline.is_some() {
+                continue;
+            }
+            // Bloom PSOs always render to single-sample Rgba16Float; scene format
+            // and viewport changes do not invalidate these cached variants.
+            let key = PipelineJobKey::new("bloom", slot, 0);
+            if let Some(ready) = self.pipeline_jobs.take_ready(key) {
+                *pipeline = Some(ready);
+                continue;
+            }
+            let device = self.device.clone();
+            let layout = self.bloom_pipeline_layout.clone();
+            self.pipeline_jobs.request(key, entry, move || {
+                let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("JKA lazy glow/bloom shader"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("../../bloom.wgsl").into()),
+                });
+                create_bloom_pipeline(&device, &layout, &shader, entry)
+            });
+        }
+    }
+
     /// Polls/queues the full post pipeline without ever waiting for compilation.
     /// Until it is ready, the frame recorder falls back to the already-hot gamma
     /// copy so a first-use shader compile cannot hitch gameplay.
@@ -110,7 +163,7 @@ impl Renderer {
                 // independent. This lane controls ACES only; HDR rendering is
                 // selected separately by scene_format().
                 tone_mapping: if self.tone_mapping_enabled { 1.0 } else { 0.0 },
-                bloom: if self.bloom_enabled { 1.0 } else { 0.0 },
+                bloom: if self.glow_mode.enabled() { 1.0 } else { 0.0 },
                 ssao: if self.ssao_enabled { 1.0 } else { 0.0 },
             },
             aa: PostAaSettings {
@@ -149,7 +202,14 @@ impl Renderer {
                 } else {
                     0.0
                 },
-                ssr: if self.ssr_enabled { 1.0 } else { 0.0 },
+                // r_ssrDebug rides along as a magnitude, exactly as
+                // r_contactShadowDebug does above: every existing consumer only
+                // tests `> 0.5` for "SSR is on".
+                ssr: if self.ssr_enabled {
+                    1.0 + f32::from(self.ssr_debug)
+                } else {
+                    0.0
+                },
                 history_valid: if history_valid { 1.0 } else { 0.0 },
             },
             film: PostFilmSettings {
@@ -162,7 +222,7 @@ impl Renderer {
                 strength: self.film_grain_strength,
                 grain_size: 1.35,
                 time: self.started.elapsed().as_secs_f32(),
-                exposure: 0.0,
+                exposure: self.color_grade.exposure_ev,
             },
             camera_fx: PostCameraFxSettings {
                 motion_blur_scale,
@@ -324,7 +384,7 @@ impl Renderer {
                 } else {
                     0.0
                 },
-                0.0,
+                self.weather.rain.lens_drop_amount(),
             ],
             // The optics only exist with the GPU ocean; a plain BSP water
             // shader gets no underwater treatment, so clouds are left alone.
@@ -415,7 +475,21 @@ impl Renderer {
             viewport_history: [
                 self.config.width.max(1) as f32,
                 self.config.height.max(1) as f32,
-                if self.ssr_history_valid { 1.0 } else { 0.0 },
+                // r_ssrDebug 6 holds the temporal accumulation permanently
+                // invalid, so every frame is a fresh trace. The blend weight is
+                // 0.90 while the camera is still and falls away with motion, so
+                // this is the only way to see a standing-still frame without it.
+                // 7 does the same: blending flat outcome labels across frames
+                // would average them into colours that name no outcome.
+                if self.ssr_history_valid
+                    && self.ssr_debug != 6
+                    && self.ssr_debug != 7
+                    && self.ssr_debug != 9
+                {
+                    1.0
+                } else {
+                    0.0
+                },
                 (self.ssr_frame_index & 0xffff) as f32,
             ],
             camera_pos_time,
@@ -423,7 +497,10 @@ impl Renderer {
                 previous_camera.x,
                 previous_camera.y,
                 previous_camera.z,
-                self.reflection_quality.shader_value() as f32,
+                // Quality is 0..4, so the debug selector rides above it in the
+                // same slot rather than growing the uniform: quality | debug << 3.
+                (self.reflection_quality.shader_value() as f32)
+                    + 8.0 * f32::from(self.ssr_debug),
             ],
             view_proj: view_proj.to_cols_array_2d(),
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
@@ -476,6 +553,7 @@ impl Renderer {
             &self.bloom_layout,
             &self.post_sampler,
             &self.targets.scene_view,
+            self.targets.authored_glow.as_ref().map(|target| &target.view),
             self.targets.bloom.as_ref(),
         );
         self.dof_bind_group = create_dof_bind_group(

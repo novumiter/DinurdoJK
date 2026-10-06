@@ -1,5 +1,6 @@
 //! Notices.
 use crate::app::{App, Instant, UiScoreEntry, UiScoreboard};
+use winit::window::UserAttentionType;
 
 /// jaPRO `cg.crosshairClientNum` / `cg.crosshairClientTime`: the last entity the
 /// crosshair was on. Names read it, so it keeps fading after aiming away.
@@ -17,6 +18,18 @@ pub(in crate::app) struct ChatRecord {
     pub(in crate::app) created: Instant,
     /// Demo timeline position when this line was authored. Live sessions use wall time.
     pub(in crate::app) demo_elapsed_ms: Option<f64>,
+}
+
+/// One row in the classic transparent top-left console-notify timestamp ring.
+/// The back entry is the current row (often blank after a completed print), just
+/// like TaystJK's `con.current`; `notify == false` represents a zero timestamp.
+pub(in crate::app) struct ConsoleNotifyRecord {
+    pub(in crate::app) text: String,
+    pub(in crate::app) created: Instant,
+    pub(in crate::app) demo_elapsed_ms: Option<f64>,
+    /// False is TaystJK's `con.times[row] = 0`: the console row still consumes
+    /// a slot, but `[skipnotify]` / leading `*` prevents it from being drawn.
+    pub(in crate::app) notify: bool,
 }
 
 /// Retained state for repeated chatbox Tab completion. The first Tab captures
@@ -220,6 +233,94 @@ impl App {
         }
     }
 
+    /// Result of TaystJK-style chat notification matching. A normal word/name
+    /// match is both highlighted and alerted; `con_notifywords -1` alerts every
+    /// chat without pretending each line was a word match.
+    fn console_chat_notification(&self, kind: crate::cgame::ChatKind, text: &str) -> (bool, bool) {
+        if kind == crate::cgame::ChatKind::Voice {
+            return (false, false);
+        }
+
+        let configured = self.console_notify_words.trim();
+        let every_chat = self
+            .console_notify_terms
+            .first()
+            .is_some_and(|word| word == "-1");
+        let plain = crate::logging::strip_jka_colors(text).replace('\x19', "");
+        let Some((_, body)) = plain.rsplit_once(':') else {
+            return (false, every_chat);
+        };
+        let body = body.to_ascii_lowercase();
+
+        // DinurdoJK extension requested by the client: the current player name
+        // is always a notification term. Strip colour escapes before matching,
+        // exactly as we do for the incoming chat body.
+        let own_name = crate::logging::strip_jka_colors(&self.network.name)
+            .replace('\x19', "")
+            .trim()
+            .to_ascii_lowercase();
+        let own_match = !own_name.is_empty() && body.contains(&own_name);
+
+        let word_match = configured != "0"
+            && !every_chat
+            && self
+                .console_notify_terms
+                .iter()
+                .any(|word| body.contains(word.as_str()));
+
+        let highlighted = own_match || word_match;
+        let alert = highlighted || every_chat;
+        (highlighted, alert)
+    }
+
+    /// Cross-platform equivalent of TaystJK's Windows `con_alert`: request OS
+    /// attention only while unfocused. The optional beep is independent of
+    /// focus so a highlighted mention still has audible feedback while playing.
+    fn fire_console_notification_alert(&mut self) -> bool {
+        if !self.window_focused {
+            if let Some(window) = self.window.as_ref() {
+                window.request_user_attention(Some(UserAttentionType::Informational));
+            }
+        }
+        if self.console_notify_beep {
+            if let Some(sound) = self
+                .game_session
+                .as_mut()
+                .and_then(|session| session.sound_presenter.as_mut())
+            {
+                return sound.play_local_sound(&["sound/player/talk.wav"]);
+            }
+        }
+        false
+    }
+
+    fn classify_tayst_print_notification(
+        &self,
+        raw: &str,
+    ) -> (crate::logging::ConsoleLineKind, bool) {
+        use crate::logging::ConsoleLineKind;
+        let lower = raw.to_ascii_lowercase();
+        let mut kind = ConsoleLineKind::Normal;
+        let mut alert = false;
+
+        // TaystJK performs both checks in order. A pathological line matching
+        // both keeps the alert raised by either condition while the later vote
+        // classification wins the stamp colour.
+        if lower.contains("@@@plconnect")
+            || lower.contains("@@@disconnect")
+            || lower.contains("@@@was_kicked")
+            || lower.contains("timed out")
+        {
+            kind = ConsoleLineKind::NotifyConnect;
+            alert |= self.console_notify_connect;
+        }
+        if lower.contains("@@@plcalledvote") {
+            kind = ConsoleLineKind::NotifyVote;
+            alert |= self.console_notify_vote;
+        }
+        (kind, alert)
+    }
+
     pub(in crate::app) fn queue_tayst_reward(
         &mut self,
         kind: crate::cgame::RewardKind,
@@ -296,9 +397,21 @@ impl App {
         for notice in notices {
             match notice {
                 crate::cgame::CgameNotice::Print(text) => {
+                    // TaystJK classifies these before StringEd translation so its
+                    // @@@ markers are still available. The stamp colour is
+                    // semantic even when the desktop-alert cvar is disabled.
+                    let raw = crate::cgame::bytes_to_lossless_ascii(&text);
+                    let (line_kind, alert) = self.classify_tayst_print_notification(&raw);
+                    if alert {
+                        let _ = self.fire_console_notification_alert();
+                    }
                     let text = self.translate_server_text(&text);
                     for line in text.lines().filter(|line| !line.is_empty()) {
-                        self.push_console_line(line.to_owned());
+                        if line_kind == crate::logging::ConsoleLineKind::Normal {
+                            self.push_console_line(line.to_owned());
+                        } else {
+                            self.push_console_notification(line.to_owned(), line_kind);
+                        }
                     }
                 }
                 crate::cgame::CgameNotice::Chat { team, kind, text } => {
@@ -307,8 +420,26 @@ impl App {
                         self.chat_log
                             .message(kind, team, text.clone(), chat_server_time);
                     }
-                    self.play_chat_sound(kind, &text);
-                    self.push_console_line(text.clone());
+                    let (highlighted, alert) = self.console_chat_notification(kind, &text);
+                    let notify_beep_played = if alert {
+                        self.fire_console_notification_alert()
+                    } else {
+                        false
+                    };
+                    // Do not stack the ordinary cg_chatSounds beep on top of the
+                    // notification beep. If the notify sound could not play,
+                    // preserve the normal chat sound path.
+                    if !notify_beep_played {
+                        self.play_chat_sound(kind, &text);
+                    }
+                    if highlighted {
+                        self.push_console_notification(
+                            text.clone(),
+                            crate::logging::ConsoleLineKind::NotifyMention,
+                        );
+                    } else {
+                        self.push_console_line(text.clone());
+                    }
                     if self.chat_lines.len() >= 16 {
                         self.chat_lines.pop_front();
                     }
@@ -323,24 +454,20 @@ impl App {
                     self.publish_transient_ui();
                 }
                 crate::cgame::CgameNotice::CenterPrint(text) => {
-                    // Every cp resets CG_CenterPrint time, including repeats.
-                    // Keep console de-duplication separate from presentation.
+                    // JKA/Tayst `cp` is presentation-only: CG_ServerCommand calls
+                    // CG_CenterPrint and returns. It must not also become CG_Printf
+                    // / console output. Every cp still resets the center-print time,
+                    // including repeated text.
                     let rendered = self.translate_server_text(&text);
                     let now = Instant::now();
                     let demo_elapsed_ms = self.current_demo_elapsed_ms(now);
                     self.center_print = Some(CenterPrintRecord {
-                        text: rendered.clone(),
+                        text: rendered,
                         created: now,
                         demo_elapsed_ms,
                         y_fraction: 0.30,
                     });
-                    self.last_center_refresh = Instant::now();
-                    if text != self.last_center_print {
-                        for line in rendered.lines().filter(|line| !line.trim().is_empty()) {
-                            self.push_console_line(line.to_owned());
-                        }
-                        self.last_center_print = text;
-                    }
+                    self.last_center_refresh = now;
                     self.publish_transient_ui();
                 }
                 crate::cgame::CgameNotice::Obituary {
@@ -365,10 +492,12 @@ impl App {
                                 "died".to_owned()
                             }
                         });
-                    let line = if let Some(attacker) = attacker {
-                        format!("{target}^7 {localized} {attacker}^7")
+                    let target = crate::logging::jka_color_scope(&target, '7');
+                    let line = if let Some(attacker) = attacker.as_deref() {
+                        let attacker = crate::logging::jka_color_scope(attacker, '7');
+                        format!("{target} {localized} {attacker}")
                     } else {
-                        format!("{target}^7 {localized}")
+                        format!("{target} {localized}")
                     };
                     self.push_console_line(line);
                 }
@@ -404,7 +533,7 @@ impl App {
                         })
                         .filter(|text| !text.is_empty())
                         .unwrap_or_else(|| "place with".to_owned());
-                    let target = format!("{target}^7");
+                    let target = crate::logging::jka_color_scope(&target, '7');
                     // EternalJK/TaystJK's score/position suffix is an FFA
                     // convenience. Mode 2 explicitly suppresses it.
                     let text = if mode != 2 && gametype == 0 {
@@ -477,8 +606,9 @@ impl App {
                         (Some(team), true) => template.replace("%s", team),
                         _ => template,
                     };
-                    if let Some(player) = player {
-                        text = format!("{player}^7 {text}");
+                    if let Some(player) = player.as_deref() {
+                        let player = crate::logging::jka_color_scope(player, '7');
+                        text = format!("{player} {text}");
                     }
                     if center {
                         let now = Instant::now();

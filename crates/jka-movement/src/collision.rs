@@ -11,13 +11,23 @@ const SOURCE_CONTENTS_BODY: i32 = 0x0000_0100;
 
 type SourceCell = (i32, i32, i32);
 
-struct NativeWorld(NonNull<c_void>);
+struct NativeWorld {
+    handle: NonNull<c_void>,
+    model_count: usize,
+}
+impl NativeWorld {
+    fn has_inline_model(&self, index: i32) -> bool {
+        // Zero is the static world, not an entity. Native temporary box handles
+        // also must not be accepted as BSP model indices from a snapshot.
+        index > 0 && (index as usize) < self.model_count
+    }
+}
 // CM globals and per-world checkcounts are serialized by the native recursive mutex.
 unsafe impl Send for NativeWorld {}
 unsafe impl Sync for NativeWorld {}
 impl Drop for NativeWorld {
     fn drop(&mut self) {
-        unsafe { ffi::jka_world_free(self.0.as_ptr()) };
+        unsafe { ffi::jka_world_free(self.handle.as_ptr()) };
     }
 }
 
@@ -99,37 +109,59 @@ fn aabb_overlaps(a_min: [f32; 3], a_max: [f32; 3], b_min: [f32; 3], b_max: [f32;
 impl CollisionWorld {
     /// Validates every native collision reference before passing the original RBSP to OpenJK.
     pub fn from_bsp(data: &[u8]) -> Result<Self, String> {
-        let bsp = Bsp::parse(data).map_err(|e| e.to_string())?;
-        if bsp.collision.is_none() || bsp.planes.is_empty() || bsp.shaders.is_empty() {
-            return Err("BSP has no compiled collision tree".into());
+        Self::from_bsp_with_sub_bsps(data, &[])
+    }
+
+    /// Load server-advertised misc_bsp assets in CS_BSP_MODELS order. Each
+    /// imported BSP's world model also gets a handle, after the main BSP models.
+    pub fn from_bsp_with_sub_bsps(data: &[u8], sub_bsps: &[(&str, &[u8])]) -> Result<Self, String> {
+        let bsp = validated_bsp(data)?;
+        if sub_bsps.len() > 31 {
+            return Err("Server exceeds OpenJK sub-BSP configstring limit".into());
         }
-        if bsp.models.len() > 1024 {
-            return Err("BSP exceeds OpenJK inline model limit".into());
-        }
-        for brush in &bsp.brushes {
-            if brush.sides.len() < 6 {
-                return Err("Collision brush lacks six axial bounds".into());
+        let mut names = std::collections::HashSet::new();
+        let mut total_models = bsp.models.len();
+        let mut imports = Vec::with_capacity(sub_bsps.len());
+        for &(name, bytes) in sub_bsps {
+            if !names.insert(name.to_ascii_lowercase()) {
+                return Err(format!("Duplicate sub-BSP {name}"));
             }
-            for side in 0..6 {
-                let plane = bsp.planes[bsp.brush_sides[brush.sides.start + side].plane];
-                let mut expected = [0.0; 3];
-                expected[side / 2] = if side % 2 == 0 { -1.0 } else { 1.0 };
-                if plane.normal != expected {
-                    return Err("Collision brush axial planes are out of order".into());
-                }
+            let name = std::ffi::CString::new(name).map_err(|_| "Sub-BSP name contains NUL")?;
+            let sub = validated_bsp(bytes)?;
+            total_models = total_models
+                .checked_add(sub.models.len())
+                .ok_or("Sub-BSP model count overflow")?;
+            // CM_ClipHandleToModel checks the reserved box handle before SubBSP.
+            if total_models > 510 {
+                return Err("Sub-BSP models overlap OpenJK temporary collision handles".into());
             }
-        }
-        for surface in &bsp.surfaces {
-            if surface.kind == SurfaceKind::Patch
-                && (surface.vertices.len() > 1024 || surface.patch_size.iter().any(|&n| n > 129))
-            {
-                return Err("Patch exceeds OpenJK collision grid limit".into());
-            }
+            imports.push((name, bytes, sub.models.len()));
         }
         let raw = unsafe { ffi::jka_world_new(data.as_ptr(), data.len() as i32) };
         let native = NonNull::new(raw).ok_or_else(error)?;
+        let mut native = NativeWorld {
+            handle: native,
+            model_count: bsp.models.len(),
+        };
+        for (name, bytes, count) in imports {
+            let offset = unsafe {
+                ffi::jka_world_load_sub_bsp(
+                    native.handle.as_ptr(),
+                    name.as_ptr(),
+                    bytes.as_ptr(),
+                    bytes.len() as i32,
+                )
+            };
+            if offset < 0 {
+                return Err(error());
+            }
+            if offset as usize != native.model_count {
+                return Err("Native sub-BSP model numbering differs from server order".into());
+            }
+            native.model_count += count;
+        }
         Ok(Self {
-            backend: Arc::new(CollisionBackend::Native(NativeWorld(native))),
+            backend: Arc::new(CollisionBackend::Native(native)),
             source_visit: Vec::new(),
             source_generation: 1,
             source_candidates_scratch: Vec::new(),
@@ -259,6 +291,37 @@ impl CollisionWorld {
     }
 }
 
+fn validated_bsp(data: &[u8]) -> Result<Bsp, String> {
+    let bsp = Bsp::parse(data).map_err(|e| e.to_string())?;
+    if bsp.collision.is_none() || bsp.planes.is_empty() || bsp.shaders.is_empty() {
+        return Err("BSP has no compiled collision tree".into());
+    }
+    if bsp.models.len() > 1024 {
+        return Err("BSP exceeds OpenJK inline model limit".into());
+    }
+    for brush in &bsp.brushes {
+        if brush.sides.len() < 6 {
+            return Err("Collision brush lacks six axial bounds".into());
+        }
+        for side in 0..6 {
+            let plane = bsp.planes[bsp.brush_sides[brush.sides.start + side].plane];
+            let mut expected = [0.0; 3];
+            expected[side / 2] = if side % 2 == 0 { -1.0 } else { 1.0 };
+            if plane.normal != expected {
+                return Err("Collision brush axial planes are out of order".into());
+            }
+        }
+    }
+    for surface in &bsp.surfaces {
+        if surface.kind == SurfaceKind::Patch
+            && (surface.vertices.len() > 1024 || surface.patch_size.iter().any(|&n| n > 129))
+        {
+            return Err("Patch exceeds OpenJK collision grid limit".into());
+        }
+    }
+    Ok(bsp)
+}
+
 fn error() -> String {
     unsafe {
         CStr::from_ptr(ffi::jka_collision_error())
@@ -314,11 +377,18 @@ impl CollisionWorld {
         }
 
         let CollisionBackend::Native(native) = &*self.backend else { unreachable!() };
+        if let EntityClip::InlineModel { index, .. } = clip {
+            // Snapshot models can be absent from the loaded BSP (for example
+            // during a map transition). Do not pass invalid handles to OpenJK.
+            if !native.has_inline_model(index) {
+                return TraceResult::clear(q.end);
+            }
+        }
         let mut result = TraceResult::clear(q.end);
         let ok = unsafe {
             match clip {
                 EntityClip::InlineModel { index, origin, angles } => ffi::jka_world_trace(
-                    native.0.as_ptr(),
+                    native.handle.as_ptr(),
                     &mut result,
                     q.start.as_ptr(),
                     q.mins.as_ptr(),
@@ -330,7 +400,7 @@ impl CollisionWorld {
                     angles.as_ptr(),
                 ),
                 EntityClip::Box { mins, maxs, origin } => ffi::jka_world_trace_box_entity(
-                    native.0.as_ptr(),
+                    native.handle.as_ptr(),
                     &mut result,
                     q.start.as_ptr(),
                     q.mins.as_ptr(),
@@ -353,8 +423,11 @@ impl CollisionWorld {
         let CollisionBackend::Native(native) = &*self.backend else {
             return 0;
         };
+        if !native.has_inline_model(index) {
+            return 0;
+        }
         let contents = unsafe {
-            ffi::jka_world_contents(native.0.as_ptr(), point.as_ptr(), index, origin.as_ptr(), angles.as_ptr())
+            ffi::jka_world_contents(native.handle.as_ptr(), point.as_ptr(), index, origin.as_ptr(), angles.as_ptr())
         };
         assert_ne!(contents, -1, "{}", error());
         contents
@@ -493,7 +566,7 @@ impl TraceWorld for CollisionWorld {
         let zero = [0.0; 3];
         let ok = unsafe {
             ffi::jka_world_trace(
-                native.0.as_ptr(),
+                native.handle.as_ptr(),
                 &mut result,
                 q.start.as_ptr(),
                 q.mins.as_ptr(),
@@ -535,7 +608,7 @@ impl TraceWorld for CollisionWorld {
         let zero = [0.0; 3];
         let contents = unsafe {
             ffi::jka_world_contents(
-                native.0.as_ptr(),
+                native.handle.as_ptr(),
                 point.as_ptr(),
                 0,
                 zero.as_ptr(),

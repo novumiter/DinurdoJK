@@ -291,6 +291,8 @@ impl GameSession {
         self.timeline = None;
         self.eof = false;
         self.player_position = None;
+        self.presented_player_state = None;
+        self.audio_followed_entity = None;
         self.demo_spectator_camera_mode = None;
         self.client_deaths = [0; 32];
         self.client_game = ClientGameState::new();
@@ -393,8 +395,10 @@ impl GameSession {
         self.weapon_fx.begin_frame(target);
         self.presented_entities = self.client_game.present_entities_at(f64::from(target))?;
         let sample = self
-            .sample_at(f64::from(target), target, true)
+            .update_presented_player_state(f64::from(target), target, true, None, None)
             .ok_or_else(|| "DEMO SEEK TARGET HAS NO CAMERA PLAYERSTATE".to_owned())?;
+        self.audio_followed_entity = self.presented_player_state()
+            .and_then(crate::cgame::presented_player_state_entity);
         self.player_position = Some(glam::Vec3::from_array(sample.player_position));
         if let Some(timeline) = &mut self.timeline {
             timeline.seek(now, f64::from(target));
@@ -1424,19 +1428,24 @@ impl App {
                 });
             playback.race_ghost_alpha = self.race_ghost_alpha;
             let (advance, sample) = if playback.local {
-                let Some((server_time, _)) = local_frame else {
+                let Some((server_time, angles)) = local_frame else {
                     return Err("LOCAL SESSION HAS NO SERVER AUTHORITY".into());
                 };
                 if let Some(server) = self.local_server.as_mut() {
                     server.set_foot_bolts(playback.player_presenter.viewer_foot_bolts());
                 }
                 // Solo step events are stamped with the tick the eye interpolates over.
+                let local_command_msec = self
+                    .local_server
+                    .as_ref()
+                    .map_or(8, crate::local_server::LocalServer::latest_command_msec);
                 playback
                     .event_presenter
                     .view_kick_mut()
-                    .set_step_lead_ms(self.video.physics_msec as i32);
+                    .set_step_lead_ms(local_command_msec);
                 playback.advance_to(
                     server_time,
+                    angles,
                     self.third_person,
                     self.spectator_camera,
                     self.first_person_lightsaber,
@@ -1505,6 +1514,8 @@ impl App {
                         display,
                         previous_display,
                         error,
+                        command_angles: predictor.predicted_command_angles(),
+                        view_forced: predictor.view_forced(),
                     }))
                 };
                 playback.advance_to_with_prediction(
@@ -1520,6 +1531,10 @@ impl App {
                     blob_shadows_enabled,
                     settings.no_predict,
                     Some(&mut predict),
+                    Some(crate::app::PlayerPresentationInput::Remote {
+                        angles: self.live_input.view_angles,
+                        no_predict: settings.no_predict,
+                    }),
                 )?
             } else {
                 playback.advance(
@@ -1539,23 +1554,10 @@ impl App {
         for line in debug_lines {
             self.push_console_line(line);
         }
-        let mut sample = sample;
-        if self
-            .game_session
-            .as_ref()
-            .is_some_and(|session| session.local)
-        {
-            // Subframe input remains presentation-only. The authoritative
-            // local snapshots still contain fixed-Pmove angles, while the camera
-            // can consume mouse motion immediately between those steps.
-            if let Some((_, angles)) = local_frame {
-                sample.view_angles = angles;
-            }
-        } else if !self.live_remote_view_forced() {
-            if let Some(angles) = self.live_view_angles() {
-                sample.view_angles = angles;
-            }
-        }
+        // Reliable server commands/configstring updates were executed by the
+        // CGame advance above. Apply renderer shader redirects once at this
+        // frame boundary before building the rest of presentation.
+        self.process_server_shader_remaps();
         let listener_entity = if self
             .game_session
             .as_ref()
@@ -1590,7 +1592,8 @@ impl App {
         // Use the final camera (including third-person orbit/free/fake follow) for spatial audio.
         if let Some(playback) = &mut self.game_session {
             // FX sprites/lines face the final render view.
-            let view = crate::fx::draw::FxView::from_camera(&self.camera);
+            let mut view = crate::fx::draw::FxView::from_camera(&self.camera);
+            view.seconds = sample.presentation_time_ms as f32 * 0.001;
             playback.weapon_fx.set_view(view.origin, view.axis[1]);
             if let Some(window) = self.window.as_ref() {
                 let size = window.inner_size();

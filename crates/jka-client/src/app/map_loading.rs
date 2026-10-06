@@ -10,6 +10,7 @@ pub(in crate::app) struct MapLoadRequest {
     pub(in crate::app) started: Instant,
     pub(in crate::app) game: Option<PathBuf>,
     pub(in crate::app) source: scene::MapSource,
+    pub(in crate::app) sub_bsp_names: Vec<String>,
     pub(in crate::app) prepare_options: scene::MapPrepareOptions,
     /// The already-prepared copy of this same map (the restart cache), lent so
     /// the loader can copy unchanged stages instead of recomputing them.
@@ -47,6 +48,7 @@ pub(in crate::app) struct PerfSample {
 pub(in crate::app) struct MapLoadingState {
     pub(in crate::app) request_id: u64,
     pub(in crate::app) name: String,
+    pub(in crate::app) sub_bsp_names: Vec<String>,
     pub(in crate::app) active_game_dir: Option<String>,
     pub(in crate::app) preparation_finished: bool,
     pub(in crate::app) bars: [MapLoadingBarState; 11],
@@ -58,6 +60,7 @@ impl MapLoadingState {
         Self {
             request_id,
             name,
+            sub_bsp_names: Vec::new(),
             active_game_dir: active_game.map(|path| path.display().to_string()),
             preparation_finished: false,
             bars: [
@@ -441,6 +444,7 @@ impl App {
                 source,
                 prepare_options,
                 seed: None,
+                sub_bsp_names: Vec::new(),
             })
             .is_err()
         {
@@ -545,6 +549,40 @@ impl App {
         options
     }
 
+    /// Runtime-spawned brush entities can share a model handle. Grow once from
+    /// the prepared cache when a new peak is observed; never truncate the list.
+    pub(in crate::app) fn ensure_inline_instance_capacity(&mut self) {
+        if self.loading.is_some() {
+            return;
+        }
+        let Some(session) = self
+            .game_session
+            .as_ref()
+            .filter(|session| session.phase == crate::app::SessionPhase::Playing)
+        else {
+            return;
+        };
+        let Some(cache) = self.prepared_map_cache.as_ref() else {
+            return;
+        };
+        let mut counts = std::collections::BTreeMap::new();
+        for instance in session.inline_models.iter() {
+            *counts.entry(instance.model).or_insert(0) += 1;
+        }
+        let capacity = cache.map.inline_instance_capacity();
+        if !counts
+            .iter()
+            .any(|(id, count)| capacity.get(id).is_some_and(|have| count > have))
+        {
+            return;
+        }
+        let mut map = cache.map.as_ref().clone();
+        map.reserve_inline_instances(&counts);
+        if let Some(cache) = self.prepared_map_cache.as_mut() {
+            cache.map = Arc::new(map.clone());
+        }
+        self.render_command(RenderCommand::GrowInlineInstances { map: Box::new(map) });
+    }
     pub(in crate::app) fn active_map_prepare_options(&self) -> scene::MapPrepareOptions {
         if self.front_end && self.frontend_cinematic.is_some() {
             self.frontend_background_prepare_options()
@@ -558,6 +596,23 @@ impl App {
         source: scene::MapSource,
         purpose: MapLoadPurpose,
     ) {
+        // A real world/cgame registration must not inherit runtime redirects
+        // from the previous map. Remap-only presentation uploads bypass this
+        // entry point; a new gamestate replays its CS_SHADERSTATE normally.
+        self.shader_remaps.clear();
+        self.shader_remap_upload = false;
+        self.shader_remap_dirty = false;
+        let sub_bsp_names = if purpose == MapLoadPurpose::FrontendBackground {
+            Vec::new()
+        } else {
+            match self.server_sub_bsp_names_for(&source) {
+                Ok(names) => names,
+                Err(error) => {
+                    self.push_console_line(format!("^1BSP instances: {error}"));
+                    return;
+                }
+            }
+        };
         self.map_edit_preview_request_id = None;
         self.map_edit_preview_pending_collision = None;
         self.map_edit_preview_dirty = false;
@@ -591,6 +646,7 @@ impl App {
         };
         self.latest_prepare_options = prepare_options;
         let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
+        loading.sub_bsp_names = sub_bsp_names.clone();
         loading.apply_prepare_options(&prepare_options);
         // Frontend scenery is speculative/non-blocking: keep the menu usable
         // while duel3 prepares, then the world simply appears behind it.
@@ -615,6 +671,7 @@ impl App {
                 source,
                 prepare_options,
                 seed,
+                sub_bsp_names,
             })
             .is_err()
         {
@@ -653,7 +710,8 @@ impl App {
                 prepared.planar_environment = prepare_options.planar_environment;
                 prepared.omit_environment_stages = prepare_options.omit_environment_stages;
             }
-            (cache.label == label && prepared == prepare_options)
+            (cache.label == label && prepared == prepare_options
+                && self.server_sub_bsp_names_for(&self.initial_source).is_ok_and(|names| names == cache.map.sub_bsp_names))
                 .then(|| Box::new(cache.map.as_ref().clone()))
         }) else {
             return false;
@@ -671,6 +729,7 @@ impl App {
         self.static_ao_progress = None;
         self.preserve_game_state_on_next_map_upload = false;
         let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
+        loading.sub_bsp_names = map.sub_bsp_names.clone();
         loading.apply_prepare_options(&prepare_options);
         let has_ocean = prepare_options.ocean && prepared_map_has_ocean_surface(map.as_ref());
         loading.set_optional_task_presence(
@@ -726,6 +785,167 @@ impl App {
         self.publish_snapshot();
         true
     }
+
+    pub(in crate::app) fn sync_shader_remap_presenters(&mut self) {
+        let remaps = self.shader_remaps.clone();
+        if let Some(session) = self.game_session.as_mut() {
+            session.player_presenter.set_shader_remaps(remaps.clone());
+            session.entity_presenter.set_shader_remaps(remaps.clone());
+        }
+        if let Some(presenter) = self.asset_preview_player_presenter.as_mut() {
+            presenter.set_shader_remaps(remaps.clone());
+        }
+        if let Some(presenter) = self.asset_preview_entity_presenter.as_mut() {
+            presenter.set_shader_remaps(remaps.clone());
+        }
+        if let Some(presenter) = self.local_player_presenter.as_mut() {
+            presenter.set_shader_remaps(remaps);
+        }
+    }
+
+    fn apply_visual_shader_remap(
+        &mut self,
+        old: &str,
+        new: &str,
+        time_offset: Option<f32>,
+    ) -> Result<bool, String> {
+        if !self.shader_remaps.apply(old, new, time_offset) {
+            return Ok(false);
+        }
+        self.sync_shader_remap_presenters();
+        self.rebuild_shader_remapped_world()?;
+        Ok(true)
+    }
+
+    /// TaystJK cgame-local `/remapShader <old> <new>`: direct renderer remap,
+    /// intentionally independent of cg_remaps and with no timeOffset argument.
+    pub(in crate::app) fn local_remap_shader(&mut self, old: &str, new: &str) {
+        if let Err(error) = self.apply_visual_shader_remap(old, new, None) {
+            self.push_console_line(format!("^1remapShader: {error}"));
+        }
+    }
+
+    /// Consume only shader-remap renderer actions, preserving unrelated cgame
+    /// side effects for their own consumers. Policy exactly follows TaystJK:
+    /// CS_SHADERSTATE uses the models/players/* exception at cg_remaps=1,
+    /// while explicit server remapShader is gated only by non-zero.
+    ///
+    /// This only mutates logical renderer state. MapPrepared calls it before the
+    /// first upload so initial CS_SHADERSTATE remaps are folded into that upload;
+    /// frame-time callers request a cold-path world rebuild only when it changed.
+    pub(in crate::app) fn consume_server_shader_remaps(&mut self) -> bool {
+        let remaps = match self.game_session.as_mut() {
+            Some(session) => session.client_game.drain_shader_remap_actions(),
+            None => return false,
+        };
+        if remaps.is_empty() {
+            return false;
+        }
+        let policy = self.japro_cg.remaps;
+        let mut changed = false;
+        for (source, remap) in remaps {
+            if policy == 0 {
+                continue;
+            }
+            if policy == 1
+                && source == crate::cgame::ShaderRemapSource::ShaderState
+                && scene::canonical_shader_name(&remap.from).starts_with("models/players/")
+            {
+                continue;
+            }
+            changed |= self.shader_remaps.apply(
+                &remap.from,
+                &remap.to,
+                Some(remap.time_offset_seconds()),
+            );
+        }
+        if changed {
+            self.sync_shader_remap_presenters();
+        }
+        changed
+    }
+
+    pub(in crate::app) fn process_server_shader_remaps(&mut self) {
+        if !self.consume_server_shader_remaps() {
+            return;
+        }
+        if let Err(error) = self.rebuild_shader_remapped_world() {
+            self.push_console_line(format!("^1shader remap: {error}"));
+        }
+    }
+
+    /// Rebuild only the material-facing part of the prepared world for the
+    /// current R_RemapShader state, then use the normal GPU upload path. This
+    /// is deliberately a cold-path operation: once uploaded, the render hot
+    /// path is identical to an ordinarily prepared map (no remap hash lookup,
+    /// string comparison, or extra branch per draw).
+    pub(in crate::app) fn rebuild_shader_remapped_world(&mut self) -> Result<bool, String> {
+        if self.loading.is_some() {
+            self.shader_remap_dirty = true;
+            return Ok(false);
+        }
+        let Some(cache) = self.prepared_map_cache.as_ref() else {
+            // The gamestate can arrive before map preparation/upload. Keep the
+            // desired state and apply it when the pristine map cache exists.
+            self.shader_remap_dirty = true;
+            return Ok(false);
+        };
+        let label = cache.label.clone();
+        let prepare_options = cache.prepare_options;
+        let mut map = scene::apply_shader_remaps(
+            cache.map.as_ref(),
+            &self.base,
+            self.game.as_deref(),
+            prepare_options,
+            &self.shader_remaps,
+        )?;
+        map.load_timings = scene::MapLoadTimings::default();
+
+        self.latest_request_id = self.latest_request_id.wrapping_add(1);
+        let request_id = self.latest_request_id;
+        let started = Instant::now();
+        let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
+        loading.sub_bsp_names = map.sub_bsp_names.clone();
+        loading.apply_prepare_options(&prepare_options);
+        // The remap rebuild reused every expensive preparation stage; only
+        // material resolution for the replacement shaders and GPU upload are new.
+        {
+            use crate::thread_activity::Task;
+            for task in [
+                Task::MapBspParse,
+                Task::MapCollision,
+                Task::MapShaderParse,
+                Task::MapTextureDecode,
+                Task::MapMaterials,
+                Task::MapGeometry,
+            ] {
+                loading.mark_cached(task);
+            }
+            if prepare_options.grass {
+                loading.mark_cached(Task::MapGrass);
+            }
+            if prepare_options.voxel_probe_gi {
+                loading.mark_cached(Task::MapGi);
+            }
+            if prepare_options.steam_audio {
+                loading.mark_cached(Task::MapAcoustics);
+            }
+            if !map.portal_draw_plan.plan_by_cluster.is_empty() {
+                loading.mark_cached(Task::MapPortalPlans);
+            }
+        }
+        loading.begin_upload();
+        self.loading = Some(loading);
+        self.shader_remap_upload = true;
+        self.shader_remap_dirty = false;
+        self.render_command(RenderCommand::LoadMap {
+            request_id,
+            started,
+            name: label,
+            map: Box::new(map),
+        });
+        Ok(true)
+    }
 }
 
 pub(in crate::app) fn spawn_map_loader(
@@ -762,13 +982,14 @@ pub(in crate::app) fn spawn_map_loader(
                     crate::thread_activity::ThreadSlot::MapLoader,
                     crate::thread_activity::Task::MapPrepare,
                 );
-                match scene::prepare_source_with_jobs(
+                match scene::prepare_source_with_sub_bsps(
                     &base,
                     request.game.as_deref(),
                     &request.source,
                     &jobs,
                     request.prepare_options,
                     request.seed.as_ref(),
+                    &request.sub_bsp_names,
                 ) {
                     Ok(mut map) => {
                         // A cache hit is already attached to `map`. A cache miss

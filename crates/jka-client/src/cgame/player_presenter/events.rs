@@ -27,9 +27,29 @@ impl PlayerPresenter {
                 };
                 let source_model2_saber = source.secondary_saber_attached;
 
+                // OpenJK/TaystJK CG_BodyQueueCopy calls
+                // G2API_DuplicateGhoul2Instance(source->ghoul2, &body->ghoul2)
+                // before it mutates either instance.  Our EntityPlayerState is
+                // the persistent Ghoul2-equivalent owner of the animator/model
+                // state, so duplicate it into the ET_BODY slot here as well.
+                //
+                // Without this, the first ET_BODY presentation constructs a
+                // brand-new PlayerAnimationState at the respawn time.  Its
+                // death animation therefore starts again from frame zero even
+                // though the player already died once.  The Rapier articulation
+                // transfer below hides that only when a live corpse instance is
+                // available; this copy also preserves the correct pose if that
+                // instance was culled/retired/not spawned.
+                let mut body_runtime = source.clone();
+                // Bone smoothing is renderer cache state, not part of the
+                // duplicated Ghoul2 instance.  Do not blend a body-queue slot
+                // against the source entity's previous raster history.
+                body_runtime.bone_smooth_history = None;
+
                 // CG_BodyQueueCopy duplicates the actual source Ghoul2 first,
                 // then applies knownWeapon only to model index 1.
                 // A reused body-queue slot starts a fresh life.
+                self.entities.insert(body_entity, body_runtime);
                 self.body_fade.remove(&body_entity);
                 if let Some(parts) = self.dismembered.get(&source_client).cloned() {
                     self.dismembered.insert(body_entity, parts);

@@ -7,13 +7,16 @@ pub(in crate::renderer) fn create_color_lut_texture(
     queue: &wgpu::Queue,
     preset: ColorLutPreset,
     strength: f32,
+    color_grade: crate::color_grading::ColorGradeSettings,
     split_toning: crate::color_grading::SplitToningSettings,
     gamma: f32,
     base: &Path,
     game: Option<&Path>,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let (size, data) =
-        color_lut::build_graded_rgba8(preset, strength, split_toning, gamma, base, game);
+        color_lut::build_graded_rgba8(
+            preset, strength, color_grade, split_toning, gamma, base, game,
+        );
     upload_color_lut_texture(device, queue, size, &data)
 }
 
@@ -58,6 +61,7 @@ impl Renderer {
         let (size, data) = color_lut::build_graded_rgba8(
             self.color_lut_preset,
             self.color_lut_strength,
+            self.color_grade,
             self.split_toning,
             self.output_gamma(),
             &self.base,

@@ -785,13 +785,19 @@ struct BloomLevels {
     half: vec3<f32>,
     quarter: vec3<f32>,
     eighth: vec3<f32>,
+    halation_half: f32,
+    halation_quarter: f32,
 };
 
 fn bloom_levels(uv: vec2<f32>) -> BloomLevels {
     var levels: BloomLevels;
-    levels.half = textureSample(bloom_half_texture, scene_sampler, uv).rgb;
-    levels.quarter = textureSample(bloom_quarter_texture, scene_sampler, uv).rgb;
+    let half = textureSample(bloom_half_texture, scene_sampler, uv);
+    let quarter = textureSample(bloom_quarter_texture, scene_sampler, uv);
+    levels.half = half.rgb;
+    levels.quarter = quarter.rgb;
     levels.eighth = textureSample(bloom_eighth_texture, scene_sampler, uv).rgb;
+    levels.halation_half = half.a;
+    levels.halation_quarter = quarter.a;
     return levels;
 }
 
@@ -803,13 +809,14 @@ fn bloom_color(levels: BloomLevels) -> vec3<f32> {
 }
 
 fn halation_red_levels(levels: BloomLevels) -> f32 {
-    // Keep halation tighter than the deliberately broadened neutral bloom.
-    return levels.half.r * 0.72 + levels.quarter.r * 0.28;
+    // Halation is always sourced from the independent modern-highlight channel,
+    // even when RGB contains authored-only JKA Glow.
+    return levels.halation_half * 0.72 + levels.halation_quarter * 0.28;
 }
 
 fn halation_red(uv: vec2<f32>) -> f32 {
-    let half = textureSample(bloom_half_texture, scene_sampler, uv).r;
-    let quarter = textureSample(bloom_quarter_texture, scene_sampler, uv).r;
+    let half = textureSample(bloom_half_texture, scene_sampler, uv).a;
+    let quarter = textureSample(bloom_quarter_texture, scene_sampler, uv).a;
     return half * 0.72 + quarter * 0.28;
 }
 
@@ -1176,17 +1183,104 @@ fn ssr_bilateral_tap(
     return result;
 }
 
-fn temporal_ssr_color(pixel: vec2<i32>, centre_depth: f32, color: vec3<f32>, puddle: f32) -> vec3<f32> {
-    if (settings.scene.z <= 0.5 || !valid_depth(centre_depth)) {
-        return color;
+// r_ssrDebug, carried as a magnitude on settings.scene.z the way
+// r_contactShadowDebug rides on scene.x. 0 off, 1 resolved SSR radiance alone,
+// 2 the blend weight as greyscale, 3 the raw half-resolution history ahead of
+// every gate and filter, 4 the two full-resolution gates themselves.
+//
+// 3 and 4 are the pair that matters. Mode 3 is read before `ssr_receiver_at_pixel`
+// and `bsp_frontmost_at_pixel` run, so it is purely what the SSR pass wrote; mode 4
+// is purely those gates. A pattern in 3 was traced that way, a pattern only in 4 is
+// the full-res rejection dithering, and a pattern in both is both.
+// How much of the reflection budget the screen-space result is allowed to add on
+// top of the probe/sky coat that bsp.wgsl has already applied. At 1.0 a wet
+// surface would show both reflections at full strength and blow out; roughly half
+// keeps the total near what the lerp used to produce.
+const SSR_ADDITIVE_SHARE: f32 = 0.55;
+
+fn ssr_debug_mode() -> u32 {
+    let mode = u32(max(settings.scene.z - 1.0, 0.0) + 0.5);
+    // 6 and 8 are not views: they render normally and only change how the SSR
+    // pass is driven. 6 holds the temporal history invalid; 8 pins the per-pixel
+    // step jitter to its midpoint.
+    if (mode == 6u || mode == 8u || mode > 9u) {
+        return 0u;
     }
+    return mode;
+}
+
+fn ssr_history_coord(pixel: vec2<i32>) -> vec2<f32> {
+    let full_viewport = max(settings.aa.yz, vec2<f32>(1.0));
+    let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / full_viewport;
+    let history_dims_u = textureDimensions(ssr_history_texture);
+    return uv * vec2<f32>(f32(history_dims_u.x), f32(history_dims_u.y)) - vec2<f32>(0.5);
+}
+
+// Point sample of the half-resolution history: no bilateral weights, no depth
+// rejection, no gating, no blend. Whatever structure shows here is structure the
+// SSR pass itself produced.
+fn ssr_raw_history(pixel: vec2<i32>) -> vec4<f32> {
+    let dims = textureDimensions(ssr_history_texture);
+    let maximum = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    let coord = vec2<i32>(round(ssr_history_coord(pixel)));
+    return textureLoad(ssr_history_texture, clamp(coord, vec2<i32>(0), maximum), 0);
+}
+
+fn temporal_ssr_color(pixel: vec2<i32>, centre_depth: f32, color: vec3<f32>, puddle: f32) -> vec3<f32> {
+    let debug_mode = ssr_debug_mode();
+    // In every debug view a pixel SSR does not reach reads black, so coverage is
+    // as legible as content.
+    let miss = select(color, vec3<f32>(0.0), debug_mode != 0u);
+    if (settings.scene.z <= 0.5 || !valid_depth(centre_depth)) {
+        return miss;
+    }
+
+    // Ahead of the gates on purpose. 7 is the march-outcome labelling from
+    // ssr_temporal.wgsl, which has to be read unfiltered for the same reason: a
+    // bilateral blend of two labels is a third colour that means nothing.
+    if (debug_mode == 3u || debug_mode == 7u || debug_mode == 9u) {
+        return max(ssr_raw_history(pixel).rgb, vec3<f32>(0.0));
+    }
+    if (debug_mode == 5u) {
+        // Which of the SSR pass's two ways of producing nothing happened here.
+        // `fs_main` in ssr_temporal.wgsl writes depth 0 only when it bails before
+        // tracing - its own half-resolution `ssr_frontmost_at_uv` test, or an
+        // invalid prepass depth - whereas a ray that traced and simply missed
+        // still stores `centre_depth`. So red is "erased before tracing" and grey
+        // is "traced, hit or miss". If the lattice is red, the half-res frontmost
+        // test is cutting it; if the lattice is grey, the march is.
+        let dims = textureDimensions(ssr_depth_texture);
+        let maximum = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+        let coord = clamp(vec2<i32>(round(ssr_history_coord(pixel))), vec2<i32>(0), maximum);
+        let stored = textureLoad(ssr_depth_texture, coord, 0).x;
+        if (stored <= 0.0) {
+            return vec3<f32>(1.0, 0.0, 0.0);
+        }
+        // Flat, deliberately: a depth ramp drawn as `fract(depth / 256)` paints its
+        // own stripes across any receding floor, which is indistinguishable from the
+        // artifact this view exists to find.
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+    if (debug_mode == 4u) {
+        // red: the cached policy says this surface is not an SSR receiver.
+        // blue: the frontmost test rejected it (a later/dynamic owner of the pixel).
+        // green: both passed, so SSR is allowed here.
+        if (!ssr_receiver_at_pixel(pixel)) {
+            return vec3<f32>(1.0, 0.0, 0.0);
+        }
+        if (!bsp_frontmost_at_pixel(pixel)) {
+            return vec3<f32>(0.0, 0.0, 1.0);
+        }
+        return vec3<f32>(0.0, 1.0, 0.0);
+    }
+
     // Gate again at full display resolution. The SSR history is half-res and
     // bilinear upsampling can otherwise pull a neighboring BSP reflection over
     // a player/ocean silhouette even when the half-res source texel was cleared.
     // Entities write SSR-ineligible policy in the prepass; the frontmost test
     // still covers non-prepass geometry such as grass and promoted ocean.
     if (!ssr_receiver_at_pixel(pixel) || !bsp_frontmost_at_pixel(pixel)) {
-        return color;
+        return miss;
     }
 
     let full_viewport = max(settings.aa.yz, vec2<f32>(1.0));
@@ -1211,13 +1305,43 @@ fn temporal_ssr_color(pixel: vec2<i32>, centre_depth: f32, color: vec3<f32>, pud
         total_weight += taps[i].weight;
     }
     if (total_weight <= 1e-5) {
-        return color;
+        return miss;
     }
 
     let resolved = accumulated / total_weight;
     let water = smoothstep(0.04, 0.78, puddle);
     let reflection_weight = clamp(resolved.a, 0.0, mix(0.60, 0.94, water));
-    return mix(color, max(resolved.rgb, vec3<f32>(0.0)), reflection_weight);
+    if (debug_mode == 1u) {
+        return max(resolved.rgb, vec3<f32>(0.0));
+    }
+    if (debug_mode == 2u) {
+        return vec3<f32>(reflection_weight);
+    }
+    // Bevy's SSR composite (crates/bevy_pbr/src/ssr.wesl) adds specular to a
+    // fragment that carries no reflection of its own:
+    //     indirect  = ssr_rgb * brdf * fade
+    //     indirect += env_specular * (1 - (1 - ssr_miss) * fade)
+    //     result    = fragment.rgb + indirect
+    // SSR and the environment probe share one budget, so a gate never switches a
+    // reflection off - it only moves weight between the two sources, and no gate
+    // can produce a seam.
+    //
+    // `mix(color, ssr, w)` did something different and wrong: it faded out the
+    // whole lit pixel, diffuse included, and replaced it with raw reflected scene.
+    // A surface SSR skipped kept its probe/sky coat while its neighbour had 94% of
+    // everything overwritten, which is the hard edge along the eligibility mask.
+    //
+    // Adding instead of lerping makes the composite continuous at w = 0, so every
+    // gate (receiver policy, frontmost test, a missed ray) is now invisible by
+    // construction. `reflection_weight` is already a Fresnel-shaped specular term
+    // from `strength` in ssr_temporal.wgsl, so it is the right thing to scale by.
+    //
+    // The coat is still added in bsp.wgsl, so SSR and the probe both contribute
+    // where a ray hits. SSR_ADDITIVE_SHARE splits that budget by hand instead of
+    // by the shared-budget arithmetic above, which needs the coat on its own
+    // render target before post can occlude it.
+    return color + max(resolved.rgb, vec3<f32>(0.0))
+        * (reflection_weight * SSR_ADDITIVE_SHARE);
 }
 
 fn reflection_debug_color(pixel: vec2<i32>, centre_depth: f32, _base: vec3<f32>) -> vec3<f32> {

@@ -108,6 +108,10 @@ pub(super) fn fetch_courses(
         encode_segment(map)
     );
     let value = fetch_json(&url)?;
+    parse_courses(&value, &url, map, style_id, style_name)
+}
+
+fn parse_courses(value: &Value, url: &str, map: &str, style_id: i32, style_name: &str) -> Result<Vec<RemoteCourse>, String> {
     let indexes = value
         .get("indexes")
         .and_then(Value::as_array)
@@ -173,6 +177,10 @@ pub(super) fn fetch_demos(
         stem
     );
     let value = fetch_json(&url)?;
+    parse_demos(&value, &url, &base_origin, map, course)
+}
+
+fn parse_demos(value: &Value, url: &str, base_origin: &ParsedUrl, map: &str, course: &str) -> Result<Vec<RemoteDemo>, String> {
     let courses = value
         .get("courses")
         .and_then(Value::as_array)
@@ -960,36 +968,34 @@ mod tests {
     }
 
     #[test]
-    fn course_parser_filters_known_styles_but_keeps_styleless_catalog_rows() {
-        let value: Value = serde_json::from_str(r#"{
-            "courses": [
-                {"map":"racearena_pro","course":"dash1","coursename":"racearena_pro (dash1)","styles":["jka","cpm"]},
-                {"map":"racearena_pro","course":"dash2","coursename":"racearena_pro (dash2)","styles":["cpm"]},
-                {"map":"racearena_pro","course":"","coursename":"racearena_pro"}
-            ]
-        }"#).unwrap();
-        let mut out = BTreeMap::new();
-        collect_courses(&value, "racearena_pro", "jka", &mut out);
-        assert!(out.contains_key("dash1"));
-        assert!(out.contains_key(""));
-        assert!(!out.contains_key("dash2"));
+    fn course_parser_matches_numeric_styles_and_deduplicates_courses() {
+        let value = serde_json::json!({"indexes": [
+            {"map":"racearena_pro", "course":"dash1", "style":1},
+            {"map":"racearena_pro", "course":"dash1", "style":1},
+            {"map":"racearena_pro", "course":"dash2", "style":2},
+            {"map":"other", "course":"other", "style":1},
+            {"map":"racearena_pro", "course":"", "style":1},
+            {"map":"racearena_pro", "course":"styleless"}
+        ]});
+        let courses = parse_courses(&value, "test", "racearena_pro", 1, "jka").unwrap();
+        assert_eq!(courses.iter().map(|row| row.course.as_str()).collect::<Vec<_>>(), ["", "dash1"]);
+        assert!(parse_courses(&value, "test", "racearena_pro", 9, "unknown").is_err());
     }
 
     #[test]
-    fn demo_parser_only_accepts_absolute_demo_urls() {
-        let value: Value = serde_json::from_str(r#"{
-            "entries":[
-                {"name":"Alpha","demo_url":"http://example.test/a.dm_26"},
-                {"name":"Beta","demo_url":null},
-                {"name":"Gamma","demo_url":"relative/g.dm_26"}
-            ]
-        }"#).unwrap();
-        let mut seen = BTreeSet::new();
-        let mut demos = Vec::new();
+    fn demo_parser_filters_course_origin_and_file_type_and_deduplicates() {
+        let value = serde_json::json!({"courses": [{"map":"racearena_pro", "course":"dash1", "results":[
+            {"username":"Alpha", "demo_url":"http://example.test/races/a.dm_26"},
+            {"username":"Duplicate", "demo_url":"http://example.test/races/a.dm_26"},
+            {"username":"Beta", "demo_url":null},
+            {"username":"Other origin", "demo_url":"http://other.test/a.dm_26"},
+            {"username":"Invalid", "demo_url":"http://example.test/races/a.exe"}
+        ]}]});
         let origin = parse_url("http://example.test/races").unwrap();
-        collect_demos(&value, &origin, &mut seen, &mut demos);
+        let demos = parse_demos(&value, "test", &origin, "racearena_pro", "dash1").unwrap();
         assert_eq!(demos.len(), 1);
         assert_eq!(demos[0].label, "Alpha");
+        assert!(parse_demos(&value, "test", &origin, "racearena_pro", "other").is_err());
     }
 
     #[test]

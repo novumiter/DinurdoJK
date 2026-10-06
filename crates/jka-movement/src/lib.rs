@@ -821,11 +821,11 @@ impl PlayerState {
         power: Option<MovementPower>,
         tick_msec: i32,
     ) -> Result<(), String> {
-        if !(MIN_TICK_MSEC..=MAX_TICK_MSEC).contains(&tick_msec)
+        if !(1..=1000).contains(&tick_msec)
             || server_time < 0
             || self.view().command_time.checked_add(tick_msec) != Some(server_time)
         {
-            return Err("Invalid offline tick time".into());
+            return Err("Invalid offline command time".into());
         }
         let _guard = ffi::NativeGuard::new();
         unsafe {
@@ -930,7 +930,7 @@ impl PmoveContext {
         }
         Ok(())
     }
-    /// Exactly one fixed command tick using the stock 8 ms default.
+    /// Advance one 8 ms authored command using the stock default cadence.
     pub fn step<W: TraceWorld>(
         &self,
         state: &mut PlayerState,
@@ -939,7 +939,7 @@ impl PmoveContext {
     ) -> Result<PlayerView, String> {
         self.step_with_msec(state, cmd, TICK_MSEC, world)
     }
-    /// Exactly one fixed command tick. Rendering never supplies a physics dt.
+    /// Advance one authored command span. Rendering never supplies a physics dt.
     pub fn step_with_msec<W: TraceWorld>(
         &self,
         state: &mut PlayerState,
@@ -952,7 +952,7 @@ impl PmoveContext {
         }
         if !(MIN_TICK_MSEC..=MAX_TICK_MSEC).contains(&tick_msec) {
             return Err(format!(
-                "Pmove tick must be {MIN_TICK_MSEC}..={MAX_TICK_MSEC} milliseconds"
+                "Pmove command span must be {MIN_TICK_MSEC}..={MAX_TICK_MSEC} milliseconds"
             ));
         }
         let _guard = ffi::NativeGuard::new();
@@ -975,6 +975,55 @@ impl PmoveContext {
                 state.raw.as_ptr(),
                 &cmd,
                 tick_msec,
+                ffi::trace_callback::<W>,
+                ffi::contents_callback::<W>,
+                (&mut callbacks as *mut ffi::Callbacks<'_, W>).cast(),
+            )
+        };
+        callbacks.finish()?;
+        if ok == 0 {
+            return Err(native_error());
+        }
+        Ok(state.view())
+    }
+
+    /// Advance one authored usercmd whose timestamp may be wider than a single
+    /// Pmove step. The native `Pmove` call runs with `pmove_fixed == 0`, so it
+    /// performs the stock/TaystJK non-fixed chopping internally (66 ms maximum
+    /// substep) exactly like a normal server receiving that command.
+    pub fn step_command_with_msec<W: TraceWorld>(
+        &self,
+        state: &mut PlayerState,
+        cmd: UserCmd,
+        command_msec: i32,
+        world: &mut W,
+    ) -> Result<PlayerView, String> {
+        if ffi::in_callback() {
+            return Err("Cannot reenter Pmove inside a collision callback".into());
+        }
+        if !(1..=1000).contains(&command_msec) {
+            return Err("Pmove command span must be 1..=1000 milliseconds".into());
+        }
+        let before = state.view();
+        if before.command_time.checked_add(command_msec) != Some(cmd.server_time) {
+            return Err(format!(
+                "Pmove command must advance by exactly {command_msec} milliseconds"
+            ));
+        }
+        if cmd.weapon >= 19 || cmd.force_selection >= 18 {
+            return Err("Invalid user command selection".into());
+        }
+        if self.spectator_only && before.pm_type != PM_SPECTATOR {
+            return Err("Player movement requires stock humanoid animations".into());
+        }
+        let _guard = ffi::NativeGuard::new();
+        self.activate()?;
+        let mut callbacks = ffi::Callbacks::new(world);
+        let ok = unsafe {
+            ffi::jka_player_step(
+                state.raw.as_ptr(),
+                &cmd,
+                command_msec,
                 ffi::trace_callback::<W>,
                 ffi::contents_callback::<W>,
                 (&mut callbacks as *mut ffi::Callbacks<'_, W>).cast(),

@@ -49,6 +49,7 @@ struct Md3SurfaceAsset {
     surface_index: usize,
     texture: Option<Arc<TextureData>>,
     alpha_mode: DynamicModelAlphaMode,
+    authored_glow: bool,
 }
 
 struct Md3Asset {
@@ -73,6 +74,7 @@ pub struct EntityPresenter {
     assets: AssetSearchPath,
     pbr: bool,
     shaders: BTreeMap<String, Shader>,
+    shader_remaps: scene::ShaderRemapState,
     textures: Textures,
     texture_arcs: HashMap<usize, Arc<TextureData>>,
     missing_texture: Arc<TextureData>,
@@ -128,6 +130,7 @@ impl EntityPresenter {
             assets,
             pbr,
             shaders,
+            shader_remaps: scene::ShaderRemapState::default(),
             textures: Textures::new(),
             texture_arcs: HashMap::new(),
             missing_texture: Arc::new(materials::missing_texture_data()),
@@ -146,6 +149,16 @@ impl EntityPresenter {
 
     pub fn set_draw_map_models(&mut self, enabled: bool) {
         self.draw_map_models = enabled;
+    }
+
+    pub(crate) fn set_shader_remaps(&mut self, remaps: scene::ShaderRemapState) {
+        if self.shader_remaps == remaps {
+            return;
+        }
+        self.shader_remaps = remaps;
+        self.md3_models.clear();
+        self.fx_materials.clear();
+        self.static_props = None;
     }
 
     /// Installs the current map's `misc_model_static` placements.
@@ -505,6 +518,8 @@ impl EntityPresenter {
                     fx_gpu_sprites: None,
                     texture: material.texture.clone(),
                     alpha_mode: blend_for_alpha(material.blend.custom_shader_alpha_mode(), color[3]),
+
+                    authored_glow: material.authored_glow,
                 });
             }
         }
@@ -714,7 +729,11 @@ impl EntityPresenter {
         let asset = self.load_md3(&submission.model)?;
         let custom = submission.custom_shader.map(|shader| {
             let material = self.fx_material(shader);
-            (material.texture, material.blend.custom_shader_alpha_mode())
+            (
+                material.texture,
+                material.blend.custom_shader_alpha_mode(),
+                material.authored_glow,
+            )
         });
         let mut draws = Vec::with_capacity(asset.surfaces.len());
         for surface_asset in &asset.surfaces {
@@ -737,9 +756,13 @@ impl EntityPresenter {
             for triangle in indices.chunks_exact_mut(3) {
                 triangle.swap(1, 2);
             }
-            let (texture, alpha_mode) = custom
-                .clone()
-                .unwrap_or_else(|| (surface_asset.texture.clone(), surface_asset.alpha_mode));
+            let (texture, alpha_mode, authored_glow) = custom.clone().unwrap_or_else(|| {
+                (
+                    surface_asset.texture.clone(),
+                    surface_asset.alpha_mode,
+                    surface_asset.authored_glow,
+                )
+            });
             draws.push(DynamicModelSurface {
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
@@ -761,6 +784,8 @@ impl EntityPresenter {
                 fx_gpu_sprites: None,
                 texture,
                 alpha_mode: blend_for_alpha(alpha_mode, submission.rgba[3]),
+
+                authored_glow,
             });
         }
         Ok(draws)
@@ -859,6 +884,8 @@ impl EntityPresenter {
                 } else {
                     surface_asset.alpha_mode
                 },
+
+                authored_glow: surface_asset.authored_glow,
             });
         }
         Ok(draws)
@@ -1033,6 +1060,8 @@ impl EntityPresenter {
                 fx_gpu_sprites: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: surface_asset.alpha_mode,
+
+                authored_glow: surface_asset.authored_glow,
             });
         }
         Ok(draws)
@@ -1106,6 +1135,8 @@ impl EntityPresenter {
                 } else {
                     surface_asset.alpha_mode
                 },
+
+                authored_glow: surface_asset.authored_glow,
             });
         }
         Ok(draws)
@@ -1130,11 +1161,13 @@ impl EntityPresenter {
             let model = Arc::new(md3::parse(&bytes)?);
             let mut surfaces = Vec::with_capacity(model.surfaces.len());
             for (surface_index, surface) in model.surfaces.iter().enumerate() {
-                let (texture, alpha_mode) = self.resolve_surface_material(&surface.shader);
+                let (texture, alpha_mode, authored_glow) =
+                    self.resolve_surface_material(&surface.shader);
                 surfaces.push(Md3SurfaceAsset {
                     surface_index,
                     texture,
                     alpha_mode,
+                    authored_glow,
                 });
             }
             devprintln!(
@@ -1178,14 +1211,15 @@ impl EntityPresenter {
         shader_name: &str,
     ) -> Option<Vec<crate::fx::draw::FxMaterial>> {
         use crate::fx::draw::{FxBlend, FxMaterial};
-        let key = shader_name.replace('\\', "/").to_ascii_lowercase();
+        let key = scene::canonical_shader_name(shader_name);
+        let effective = self.shader_remaps.effective_name(&key).into_owned();
         if let Some(materials) = self.fx_materials.get(&key) {
             return Some(materials.clone());
         }
-        if self.shaders.contains_key(&key) {
+        if jka_assets::shader::find_shader(&self.shaders, &effective).is_some() {
             return Some(self.fx_material_stages(shader_name));
         }
-        let texture = self.load_texture_arc(&key, false)?;
+        let texture = self.load_texture_arc(&effective, false)?;
         let materials = vec![FxMaterial {
             texture: Some(texture),
             blend: FxBlend::Alpha,
@@ -1193,6 +1227,9 @@ impl EntityPresenter {
             alpha_vertex: true,
             rgb_const: [1.0; 3],
             alpha_const: 1.0,
+            tc_mods: Vec::new(),
+            shader_time_offset: self.shader_remaps.time_offset_for(&effective),
+            authored_glow: false,
         }];
         self.fx_materials.insert(key, materials.clone());
         Some(materials)
@@ -1204,7 +1241,7 @@ impl EntityPresenter {
     pub fn fx_material_stages(&mut self, shader_name: &str) -> Vec<crate::fx::draw::FxMaterial> {
         use crate::fx::draw::{FxBlend, FxMaterial};
         use jka_assets::shader::{AlphaGen, RgbGen};
-        let key = shader_name.replace('\\', "/").to_ascii_lowercase();
+        let key = scene::canonical_shader_name(shader_name);
         // Engine-built material: untextured vertex-colour additive (enhanced
         // saber melt glow). Not an authored shader, so it never hits the loaders.
         if key == "$melt_glow" {
@@ -1215,14 +1252,20 @@ impl EntityPresenter {
                 alpha_vertex: false,
                 rgb_const: [1.0; 3],
                 alpha_const: 1.0,
+                tc_mods: Vec::new(),
+                shader_time_offset: 0.0,
+                authored_glow: false,
             }];
         }
         if let Some(materials) = self.fx_materials.get(&key) {
             return materials.clone();
         }
 
-        let has_shader_definition = self.shaders.contains_key(&key);
-        let stages = self.shaders.get(&key).map(|shader| {
+        let effective = self.shader_remaps.effective_name(&key).into_owned();
+        let shader_time_offset = self.shader_remaps.time_offset_for(&effective);
+
+        let has_shader_definition = jka_assets::shader::find_shader(&self.shaders, &effective).is_some();
+        let stages = jka_assets::shader::find_shader(&self.shaders, &effective).map(|shader| {
             shader.stages.iter().filter(|stage| {
                 !stage.image.is_empty()
                     && (!stage.image.starts_with('$') || stage.image == "$whiteimage" || stage.image == "$lightmap")
@@ -1236,7 +1279,20 @@ impl EntityPresenter {
             let texture = if stage.image.eq_ignore_ascii_case("$whiteimage") || stage.image.eq_ignore_ascii_case("$lightmap") {
                 None
             } else {
-                Some(self.load_texture_arc_or_missing(&stage.image, stage.clamp, "FX"))
+                let texture = self.load_texture_arc_or_missing(&stage.image, stage.clamp, "FX");
+                if FxBlend::from_blend_func(&stage.blend) == FxBlend::Modulate2x && texture.srgb {
+                    // Doubled-modulation textures encode a multiplier, not light.
+                    // Stock shock_ball/shock_ripple use 128 grey as the neutral
+                    // background. sRGB decoding turns it into ~0.216, causing
+                    // every overlapping quad/pass to darken the scene by ~57%.
+                    // Keep these bytes linear and keep the cached color texture
+                    // intact for stages that use it as ordinary color.
+                    let mut multiplier = (*texture).clone();
+                    multiplier.srgb = false;
+                    Some(Arc::new(multiplier))
+                } else {
+                    Some(texture)
+                }
             };
             materials.push(FxMaterial {
                 texture,
@@ -1245,6 +1301,9 @@ impl EntityPresenter {
                 alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex),
                 rgb_const: if stage.rgb_gen == RgbGen::Const { stage.color.unwrap_or([1.0; 3]) } else { [1.0; 3] },
                 alpha_const: stage.alpha.unwrap_or(1.0),
+                tc_mods: stage.tc_mods.clone(),
+                shader_time_offset,
+                authored_glow: stage.glow,
             });
         }
         if materials.is_empty() {
@@ -1264,6 +1323,9 @@ impl EntityPresenter {
                     alpha_vertex: true,
                     rgb_const: [1.0; 3],
                     alpha_const: 1.0,
+                    tc_mods: Vec::new(),
+                    shader_time_offset,
+                    authored_glow: false,
                 });
             } else {
                 // Faithful RE_RegisterShader behavior: an explicit .shader
@@ -1272,7 +1334,7 @@ impl EntityPresenter {
                 // (CGEN_VERTEX/AGEN_VERTEX, SRC_ALPHA/ONE_MINUS_SRC_ALPHA).
                 // This is exactly how stock image-only FX such as rivet marks
                 // remain transparent/dark instead of becoming opaque gray.
-                match self.load_texture_arc(&key, false) {
+                match self.load_texture_arc(&effective, false) {
                     Some(texture) => materials.push(FxMaterial {
                         texture: Some(texture),
                         blend: FxBlend::Alpha,
@@ -1280,9 +1342,12 @@ impl EntityPresenter {
                         alpha_vertex: true,
                         rgb_const: [1.0; 3],
                         alpha_const: 1.0,
+                        tc_mods: Vec::new(),
+                        shader_time_offset,
+                        authored_glow: false,
                     }),
                     None => {
-                        if let Some(texture) = self.rgb_saber_fallback_texture(&key) {
+                        if let Some(texture) = self.rgb_saber_fallback_texture(&effective) {
                             materials.push(FxMaterial {
                                 texture: Some(texture),
                                 blend: FxBlend::Add,
@@ -1290,6 +1355,9 @@ impl EntityPresenter {
                                 alpha_vertex: false,
                                 rgb_const: [1.0; 3],
                                 alpha_const: 1.0,
+                                tc_mods: Vec::new(),
+                                shader_time_offset,
+                                authored_glow: false,
                             });
                         } else {
                             if let Some(warning) = self.textures.warnings.last() {
@@ -1306,6 +1374,9 @@ impl EntityPresenter {
                                 alpha_vertex: true,
                                 rgb_const: [1.0; 3],
                                 alpha_const: 1.0,
+                                tc_mods: Vec::new(),
+                                shader_time_offset,
+                                authored_glow: false,
                             });
                         }
                     }
@@ -1365,8 +1436,9 @@ impl EntityPresenter {
     fn resolve_surface_material(
         &mut self,
         shader_name: &str,
-    ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode) {
-        let (image_name, clamp, alpha_mode) = jka_assets::shader::find_shader(&self.shaders, shader_name)
+    ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode, bool) {
+        let effective = self.shader_remaps.effective_name(shader_name).into_owned();
+        let (image_name, clamp, alpha_mode, authored_glow) = jka_assets::shader::find_shader(&self.shaders, &effective)
             .and_then(Shader::primary)
             .map(|stage| {
                 let alpha_mode = if !stage.alpha_test.trim().is_empty() {
@@ -1375,15 +1447,20 @@ impl EntityPresenter {
                     crate::fx::draw::FxBlend::from_blend_func(&stage.blend)
                         .custom_shader_alpha_mode()
                 };
-                (stage.image.clone(), stage.clamp, alpha_mode)
+                (stage.image.clone(), stage.clamp, alpha_mode, stage.glow)
             })
-            .unwrap_or((shader_name.to_owned(), false, DynamicModelAlphaMode::Opaque));
+            .unwrap_or((
+                effective,
+                false,
+                DynamicModelAlphaMode::Opaque,
+                false,
+            ));
 
         if image_name.eq_ignore_ascii_case("$whiteimage") {
-            return (None, alpha_mode);
+            return (None, alpha_mode, authored_glow);
         }
         let texture = Some(self.load_texture_arc_or_missing(&image_name, clamp, "ENTITY"));
-        (texture, alpha_mode)
+        (texture, alpha_mode, authored_glow)
     }
 
     fn log_entity_once(&mut self, entity: &PresentedEntity, reason: &str) {
@@ -1570,6 +1647,49 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock PK3s"]
+    fn repeater_impact_uses_neutral_modulation_and_authored_ripple_animation() {
+        use crate::fx::draw::FxBlend;
+        use jka_assets::shader::TcMod;
+        let base = std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE");
+        let mut presenter = EntityPresenter::new(AssetSearchPath::open(std::path::Path::new(&base)).unwrap(), false).unwrap();
+        for (shader, passes) in [("gfx/effects/shock_ball", 1), ("gfx/effects/shock_ripple", 2)] {
+            let color_texture = presenter.load_texture_arc(shader, false).unwrap();
+            assert!(color_texture.srgb);
+            let stages = presenter.fx_material_stages(shader);
+            assert_eq!(stages.len(), passes);
+            for stage in &stages {
+                assert_eq!(stage.blend, FxBlend::Modulate2x);
+                assert!(!stage.rgb_vertex, "stock impact stages use rgbGen identity");
+                let texture = stage.texture.as_ref().unwrap();
+                assert!(!texture.srgb, "multiplier bytes must bypass sRGB decoding");
+                assert_eq!(texture.rgba, color_texture.rgba);
+                // Ten overlapping shock-ball quads must preserve the scene at
+                // their grey borders, rather than turning them into black squares.
+                for byte in &texture.rgba[..3] {
+                    let factor = 2.0 * f32::from(*byte) / 255.0;
+                    assert!((factor.powi(10) - 1.0).abs() < 0.05);
+                }
+            }
+            assert!(presenter.load_texture_arc(shader, false).unwrap().srgb,
+                "the ordinary color cache must keep its sRGB sampling");
+            let cached = presenter.fx_material_stages(shader);
+            assert!(Arc::ptr_eq(stages[0].texture.as_ref().unwrap(), cached[0].texture.as_ref().unwrap()));
+        }
+        let ripple = presenter.fx_material_stages("gfx/effects/shock_ripple");
+        assert_eq!(ripple[0].tc_mods, vec![TcMod::Scale(3.0, 1.0), TcMod::Scroll(0.9, 0.0)]);
+        assert_eq!(ripple[1].tc_mods, vec![TcMod::Scale(2.0, 1.0), TcMod::Scroll(-0.4, 0.0)]);
+        for shader in ["gfx/misc/steam2", "gfx/misc/steam3"] {
+            let stages = presenter.fx_material_stages(shader);
+            assert_eq!(stages[0].blend, FxBlend::Add);
+            assert!(stages[0].texture.as_ref().unwrap().srgb);
+        }
+        let burn = presenter.fx_material_stages("gfx/damage/burnmark4");
+        assert_eq!(burn[0].blend, FxBlend::Alpha);
+        assert!(burn[0].texture.as_ref().unwrap().clamp);
+    }
+
+    #[test]
     fn invulnerability_sphere_matches_taystjk_origin_and_faces_view() {
         let player = [100.0, 200.0, 32.0];
         let view = [20.0, 200.0, 41.0];
@@ -1743,7 +1863,7 @@ mod tests {
         let mut textured = 0usize;
         let mut surfaces_total = 0usize;
         let mut kinds = std::collections::BTreeSet::new();
-        let view = crate::fx::draw::FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0 };
+        let view = crate::fx::draw::FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0 };
         while let Some(record) = reader.next_record().unwrap() {
             let packet = decoder.parse_packet(record.sequence, &record.payload).unwrap();
             for event in packet.events {

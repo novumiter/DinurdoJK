@@ -392,7 +392,6 @@ impl App {
                 ("ALL", DemoConsoleFilter::All),
                 ("PRINT", DemoConsoleFilter::Print),
                 ("CHAT", DemoConsoleFilter::Chat),
-                ("CENTER", DemoConsoleFilter::CenterPrint),
                 ("EVENTS", DemoConsoleFilter::Event),
             ] {
                 if ui

@@ -12,8 +12,20 @@ extern "C" void jka_unlock() { engine_mutex.unlock(); }
 static thread_local std::string last_error;
 extern "C" const char *jka_collision_error() { return last_error.c_str(); }
 
+extern clipMap_t SubBSP[MAX_SUB_BSP];
+extern int NumSubBSP, TotalSubModels;
+extern cmodel_t box_model;
+extern cplane_t *box_planes;
+extern cbrush_t *box_brush;
+int CM_LoadSubBSP(const char *, qboolean);
+
 struct World {
     clipMap_t map{};
+    std::vector<clipMap_t> submaps;
+    int total_models = 0;
+    cmodel_t box{};
+    cplane_t *box_planes = nullptr;
+    cbrush_t *box_brush = nullptr;
     // CM's inline models store offsets between hunk allocations. Keep a single
     // contiguous arena, as the stock engine does, so those offsets remain valid.
     static constexpr size_t capacity = 256u * 1024u * 1024u;
@@ -23,9 +35,29 @@ struct World {
     World() { if (!arena) throw std::bad_alloc(); }
     ~World() { for (void *p : temporary) free(p); free(arena); }
 };
+// OpenJK globals must travel with their owning arena, including sub-BSP
+// checkcounts and the temporary box hull used to clip snapshot player boxes.
+static void activate_world(World *world) {
+    cmg = world->map;
+    NumSubBSP = static_cast<int>(world->submaps.size());
+    std::copy(world->submaps.begin(), world->submaps.end(), SubBSP);
+    TotalSubModels = world->total_models;
+    box_model = world->box;
+    box_planes = world->box_planes;
+    box_brush = world->box_brush;
+}
+static void capture_world(World *world) {
+    world->map = cmg;
+    world->submaps.assign(SubBSP, SubBSP + NumSubBSP);
+    world->total_models = TotalSubModels;
+    world->box = box_model;
+    world->box_planes = box_planes;
+    world->box_brush = box_brush;
+}
 static World *loading;
 static const unsigned char *map_data;
 static int map_length;
+static const char *map_name;
 static cvar_t zero_cvar{}, one_cvar{};
 cvar_t *com_dedicated = &one_cvar;
 qboolean CM_DeleteCachedMap(qboolean);
@@ -72,7 +104,7 @@ cvar_t *Cvar_Get(const char *, const char *value, uint32_t, const char *) {
     return atoi(value) ? &one_cvar : &zero_cvar;
 }
 long FS_FOpenFileRead(const char *name, fileHandle_t *handle, qboolean) {
-    if (strcmp(name, "maps/offline.bsp")) { *handle = 0; return -1; }
+    if (!map_name || strcmp(name, map_name)) { *handle = 0; return -1; }
     *handle = 1; return map_length;
 }
 int FS_Read(void *buffer, int length, fileHandle_t handle) {
@@ -89,19 +121,36 @@ extern "C" void *jka_world_new(const unsigned char *data, int length) {
     World *world = nullptr;
     try {
         world = new World;
-        loading = world; map_data = data; map_length = length;
+        loading = world; map_data = data; map_length = length; map_name = "maps/offline.bsp";
         int checksum;
         CM_LoadMap("maps/offline.bsp", qfalse, &checksum);
-        world->map = cmg;
-        loading = nullptr; map_data = nullptr; map_length = 0;
+        capture_world(world);
+        loading = nullptr; map_data = nullptr; map_length = 0; map_name = nullptr;
         return world;
     } catch (const std::exception &e) {
         last_error = e.what();
         CM_DeleteCachedMap(qtrue);
         CM_ClearMap();
-        loading = nullptr; map_data = nullptr; map_length = 0;
+        loading = nullptr; map_data = nullptr; map_length = 0; map_name = nullptr;
         delete world;
         return nullptr;
+    }
+}
+extern "C" int jka_world_load_sub_bsp(void *handle, const char *name,
+                                      const unsigned char *data, int length) {
+    std::lock_guard<std::recursive_mutex> lock(engine_mutex);
+    World *world = static_cast<World *>(handle);
+    activate_world(world);
+    try {
+        loading = world; map_data = data; map_length = length; map_name = name;
+        const int offset = CM_LoadSubBSP(name, qfalse);
+        capture_world(world);
+        loading = nullptr; map_data = nullptr; map_length = 0; map_name = nullptr;
+        return offset;
+    } catch (const std::exception &e) {
+        last_error = e.what();
+        loading = nullptr; map_data = nullptr; map_length = 0; map_name = nullptr;
+        return -1;
     }
 }
 extern "C" void jka_world_free(void *handle) {
@@ -121,21 +170,21 @@ extern "C" int jka_world_trace(void *handle, jka_trace *out, const float *start,
                                const float *origin, const float *angles) {
     std::lock_guard<std::recursive_mutex> lock(engine_mutex);
     World *world = static_cast<World *>(handle);
-    cmg = world->map;
+    activate_world(world);
     try {
         trace_t t{};
         if (model) CM_TransformedBoxTrace(&t, start, end, mins, maxs, model, mask, origin, angles, 0);
         else CM_BoxTrace(&t, start, end, mins, maxs, 0, mask, 0);
         t.entityNum = (t.fraction < 1 || t.startsolid) ? ENTITYNUM_WORLD : ENTITYNUM_NONE;
         export_trace(t, out);
-        world->map = cmg;
+        capture_world(world);
         return 1;
     } catch (const std::exception &e) { last_error = e.what(); return 0; }
 }
 extern "C" int jka_world_contents(void *handle, const float *point, int model, const float *origin, const float *angles) {
     std::lock_guard<std::recursive_mutex> lock(engine_mutex);
     World *world = static_cast<World *>(handle);
-    cmg = world->map;
+    activate_world(world);
     try {
         return model ? CM_TransformedPointContents(point, model, origin, angles) : CM_PointContents(point, 0);
     } catch (const std::exception &e) { last_error = e.what(); return -1; }
@@ -147,14 +196,14 @@ extern "C" int jka_world_trace_box_entity(void *handle, jka_trace *out, const fl
                                           const float *box_mins, const float *box_maxs, const float *origin) {
     std::lock_guard<std::recursive_mutex> lock(engine_mutex);
     World *world = static_cast<World *>(handle);
-    cmg = world->map;
+    activate_world(world);
     try {
         trace_t t{};
         const vec3_t no_rotation = {0, 0, 0};
         clipHandle_t box = CM_TempBoxModel(box_mins, box_maxs, 0);
         CM_TransformedBoxTrace(&t, start, end, mins, maxs, box, mask, origin, no_rotation, 0);
         export_trace(t, out);
-        world->map = cmg;
+        capture_world(world);
         return 1;
     } catch (const std::exception &e) { last_error = e.what(); return 0; }
 }

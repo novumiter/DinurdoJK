@@ -1,6 +1,29 @@
 //! Chat.
 use crate::app::{App, ChatMode, ChatPlayerCompletionCycle, ChatRecord, Instant, OverlayMode};
 
+/// TaystJK `Message_Key` wire sanitization. JKA reliable commands are tokenized
+/// text, so a literal double quote cannot safely be embedded inside the quoted
+/// `say` argument. TaystJK replaces it with two apostrophes and replaces `%`
+/// with the exact three legacy bytes it uses before queueing the command.
+fn taystjk_chat_wire_text(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    for ch in message.chars() {
+        match ch {
+            '"' => out.push_str("''"),
+            '%' => {
+                // TaystJK writes raw byte 0xB0 followed by `/.`. DinurdoJK's
+                // U+00xx strings are lossless byte containers, so U+00B0 maps
+                // back to protocol byte 0xB0 in `text_to_jka_bytes`.
+                out.push(char::from(0xB0));
+                out.push('/');
+                out.push('.');
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 impl App {
     pub(in crate::app) fn paste_into(
         target: &mut String,
@@ -139,8 +162,12 @@ impl App {
     pub(in crate::app) fn submit_chat(&mut self) {
         self.chat_player_completion = None;
         let message = std::mem::take(&mut self.chat_input);
-        let message = message.trim();
         if !message.is_empty() {
+            // Port TaystJK Message_Key rather than feeding chat through the
+            // generic unquoted command path. Do not trim the field: the stock
+            // edit field preserves leading/trailing spaces inside the quoted
+            // say argument.
+            let message = taystjk_chat_wire_text(&message);
             if self.live_connected() {
                 // The server echoes chat back as a `chat`/`tchat` command.
                 let verb = if self.chat_mode == ChatMode::Team {
@@ -148,9 +175,11 @@ impl App {
                 } else {
                     "say"
                 };
-                self.forward_command_to_server(&format!("{verb} {message}"));
+                self.forward_command_to_server(&format!("{verb} \"{message}\""));
             } else {
-                self.push_chat_line(self.chat_mode, message);
+                // The solo shim has no server command round-trip, so mirror the
+                // text that TaystJK would have put on the wire before displaying it.
+                self.push_chat_line(self.chat_mode, &message);
             }
         }
         // set_overlay publishes the retained UI once; the new chat line is
@@ -166,5 +195,24 @@ impl App {
             connected && self.connected_server_mod() == crate::net::mod_support::ServerMod::Japro,
         );
         connected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::taystjk_chat_wire_text;
+
+    #[test]
+    fn taystjk_chat_wire_substitutions_match_message_key() {
+        assert_eq!(taystjk_chat_wire_text("plain text"), "plain text");
+        assert_eq!(taystjk_chat_wire_text("\""), "''");
+        assert_eq!(
+            taystjk_chat_wire_text("100%"),
+            format!("100{}/.", char::from(0xB0))
+        );
+        assert_eq!(
+            crate::cgame::text_to_jka_bytes(&taystjk_chat_wire_text("%\"")),
+            vec![0xB0, b'/', b'.', b'\'', b'\'']
+        );
     }
 }

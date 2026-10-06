@@ -31,7 +31,7 @@ impl App {
         theme::page_title(
             ui,
             "CONTROLS",
-            "Base JKA, spectator and mouse bindings. Spectator binds override normal keys only while spectating.",
+            "Base JKA, spectator, active-mod and mouse bindings. Spectator binds override normal keys only while spectating.",
         );
 
         if self.controls_waiting_for_key {
@@ -47,6 +47,11 @@ impl App {
         }
         if !keybinds::SPECTATOR_CONTROL_ACTIONS.is_empty() {
             groups.push("Spectate");
+        }
+        if self.ui_mod() == Some(crate::net::mod_support::ServerMod::Japro)
+            && !keybinds::JAPRO_CONTROL_ACTIONS.is_empty()
+        {
+            groups.push("JAPRO");
         }
         let mouse_tab = groups.len();
         self.controls_section = self.controls_section.min(mouse_tab);
@@ -95,11 +100,14 @@ impl App {
                 }
                 let group = groups[section];
                 let spectator_group = group == "Spectate";
+                let japro_group = group == "JAPRO";
                 theme::section(
                     ui,
                     &group.to_uppercase(),
                     if spectator_group {
                         "Overrides used only while spectating. Unassigned keys inherit the normal binding."
+                    } else if japro_group {
+                        "Bindings exposed by the active jaPRO integration."
                     } else {
                         ""
                     },
@@ -119,6 +127,29 @@ impl App {
                                 ("PRESS A KEY…".to_owned(), theme::WARNING)
                             } else if binding == "INHERIT NORMAL" {
                                 ("Inherit normal".to_owned(), theme::TEXT_DISABLED)
+                            } else {
+                                (binding.clone(), theme::ACCENT)
+                            };
+                            let response = binding_slot(ui, &text, color, waiting);
+                            if response.clicked() {
+                                rebind = Some(selection);
+                            }
+                            if response.secondary_clicked() {
+                                clear = Some(selection);
+                            }
+                        });
+                    }
+                } else if japro_group {
+                    for (index, action) in keybinds::JAPRO_CONTROL_ACTIONS.iter().enumerate() {
+                        let selection = keybinds::japro_selection(index);
+                        let waiting = self.controls_waiting_for_key && self.controls_selected == selection;
+                        let binding = self.bindings.display_for_command(action.command);
+                        let tip = format!("Bound to the \"{}\" command.", action.command);
+                        theme::row(ui, &title_case(action.label), &tip, theme::Reset::None, |ui| {
+                            let (text, color) = if waiting {
+                                ("PRESS A KEY…".to_owned(), theme::WARNING)
+                            } else if binding == "UNBOUND" {
+                                ("Unbound".to_owned(), theme::TEXT_DISABLED)
                             } else {
                                 (binding.clone(), theme::ACCENT)
                             };
