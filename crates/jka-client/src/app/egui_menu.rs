@@ -33,9 +33,7 @@ use super::map_editor::MapEditTool;
 use super::ui_catalog::CatalogPayload;
 use super::*;
 
-const TOP_ITEMS: [&str; 7] = [
-    "GAME", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE", "MOD",
-];
+const TOP_ITEMS: [&str; 6] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE"];
 const SETUP_TABS: [&str; 7] = [
     "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE",
 ];
@@ -45,7 +43,6 @@ const TOP_PROFILE: usize = 2;
 const TOP_CONTROLS: usize = 3;
 pub(super) const TOP_SETUP: usize = 4;
 const TOP_VOTE: usize = 5;
-const TOP_MOD: usize = 6;
 
 const SETUP_TAB_GAME: usize = 0;
 const SETUP_TAB_MOVEMENT: usize = 1;

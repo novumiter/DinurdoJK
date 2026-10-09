@@ -235,6 +235,19 @@ fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
     return prepass_output(input.world_position, input.normal);
 }
 
+@fragment
+fn fs_rain_prepass(input: PrepassVertexOut) -> @location(0) f32 {
+    return distance(input.world_position, camera.camera_pos_time.xyz);
+}
+
+@fragment
+fn fs_rain_prepass_mask(input: PrepassVertexOut) -> @location(0) f32 {
+    if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
+        discard;
+    }
+    return distance(input.world_position, camera.camera_pos_time.xyz);
+}
+
 // Entity shadow map (Dynamic shadows = Entity map): depth-only light-space pass.
 // Opaque casters use vs_prepass with no fragment stage; only alpha-tested
 // surfaces need this discard. Same 0.5 cutoff as fs_prepass_mask.
@@ -244,3 +257,14 @@ fn fs_shadow_mask(input: PrepassVertexOut) {
         discard;
     }
 }
+
+// Spectator/demo outline mask. These deliberately ignore material/lighting; the
+// fullscreen compositor extracts only the antialiased silhouette edge.
+@fragment
+fn fs_spec_mask_red() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.045, 0.025, 1.0); }
+@fragment
+fn fs_spec_mask_blue() -> @location(0) vec4<f32> { return vec4<f32>(0.035, 0.22, 1.0, 1.0); }
+@fragment
+fn fs_spec_mask_yellow() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.62, 0.025, 1.0); }
+@fragment
+fn fs_spec_mask_clear() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }

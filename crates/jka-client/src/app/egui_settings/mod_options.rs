@@ -38,73 +38,6 @@ impl App {
         }
     }
 
-    /// Top-level MOD page remains the home for mod-level account/login and any
-    /// settings that have not been deliberately promoted into a more specific
-    /// top-level category.
-    pub(in crate::app) fn egui_mod_settings(&mut self, ui: &mut egui::Ui) {
-        theme::page_title(ui, "MOD", "Account and remaining settings for the active mod.");
-        egui::ScrollArea::vertical()
-            .id_salt("jka_mod_settings")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let active = self.ui_mod();
-
-                theme::section(
-                    ui,
-                    "ACTIVE MOD",
-                    "Detected from the connected server's game state, or the game directory of a local game.",
-                );
-                theme::row(
-                    ui,
-                    "Active mod",
-                    "The server mod detected from its advertised/configstring state.",
-                    theme::Reset::None,
-                    |ui| {
-                        theme::glow_label(
-                            ui,
-                            active.map_or("Not connected", ServerMod::label),
-                            12.5,
-                            theme::TEXT_DIM,
-                        );
-                    },
-                );
-
-                match active {
-                    Some(ServerMod::Japro) => {
-                        self.egui_japro_account(ui);
-
-                        theme::section(
-                            ui,
-                            "JAPRO SETTINGS",
-                            "Other jaPRO settings are grouped by what they affect instead of duplicated here.",
-                        );
-                        theme::label(
-                            ui,
-                            theme::plain(
-                                "Bindings: Controls -> JAPRO  ·  Movement: Setup -> Movement  ·  Presentation/setup: Setup -> JAPRO",
-                                11.5,
-                                theme::TEXT_FAINT,
-                            ),
-                        );
-                    }
-                    Some(_) => {
-                        theme::section(
-                            ui,
-                            "SETTINGS",
-                            "No remaining client-side settings are available for this server mod yet.",
-                        );
-                    }
-                    None => {
-                        theme::section(
-                            ui,
-                            "SETTINGS",
-                            "Connect to a server or start a local game to view settings for its active mod.",
-                        );
-                    }
-                }
-            });
-    }
-
     /// Mod-specific movement preferences shown on Setup -> Movement.
     pub(in crate::app) fn egui_mod_movement_settings(&mut self, ui: &mut egui::Ui) {
         let Some(active) = self.ui_mod() else {
@@ -142,8 +75,8 @@ impl App {
     }
 
     /// Dynamic Setup -> [CURRENT MOD] page. General movement and bindings live
-    /// on their own top-level pages, account/login stays on MOD, and this page
-    /// owns presentation/setup preferences for the active mod.
+    /// on their own pages; account/login lives on Join, while this page owns
+    /// presentation/setup preferences for the active mod.
     pub(in crate::app) fn egui_mod_setup_settings(&mut self, ui: &mut egui::Ui) {
         let active = self.ui_mod();
         let title = active.map_or_else(|| "MOD".to_owned(), |mod_| mod_.label().to_uppercase());

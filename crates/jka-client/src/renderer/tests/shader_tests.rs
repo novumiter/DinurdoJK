@@ -1,5 +1,116 @@
 use super::*;
 
+#[test]
+fn rt_isolation_variants_validate_and_match_receiver_layouts() {
+    use crate::renderer::lighting::{ray_tracing::{ray_traced_world_shader_source_with_features,
+        rt_receiver_layout_entries}, rt_diagnostics::ReceiverFeatures};
+    for denoiser in [false, true] {
+        for glass in [false, true] {
+            let features = ReceiverFeatures { denoiser, glass };
+            for base in [include_str!("../../bsp.wgsl"), include_str!("../../bsp_lean.wgsl")] {
+                let source = compose_world_shader(&ray_traced_world_shader_source_with_features(base, features).unwrap());
+                let module = wgpu::naga::front::wgsl::parse_str(&source)
+                    .unwrap_or_else(|e| panic!("{features:?}: {}", e.emit_to_string(&source)));
+                wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(),
+                    wgpu::naga::valid::Capabilities::all()).validate(&module)
+                    .unwrap_or_else(|e| panic!("{features:?}: {}", e.emit_to_string(&source)));
+                let actual: std::collections::BTreeSet<_> = module.global_variables.iter()
+                    .filter_map(|(_, global)| global.binding.as_ref())
+                    .filter(|binding| binding.group == 3).map(|binding| binding.binding).collect();
+                let expected: std::collections::BTreeSet<_> = rt_receiver_layout_entries(features)
+                    .iter().map(|entry| entry.binding).collect();
+                assert_eq!(actual, expected, "{features:?}: WGSL/layout drift");
+                assert_eq!(source.contains("fn rt_denoised_local_visibility("), denoiser);
+                assert_eq!(source.contains("fn rt_denoiser_debug("), denoiser);
+                assert_eq!(source.contains("fn rt_trace_shadow_throughput("), glass);
+                assert_eq!(source.contains("var<storage, read> raster_glass_slots:"), glass);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU with hardware ray queries; run each isolation mode in a separate process"]
+fn rt_isolation_world_gpu_pipelines() {
+    block_on(async {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions::default()).await.unwrap();
+        println!("RT world pipeline validation: {:?}", adapter.get_info());
+        let (device, _) = adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("RT world isolation"),
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }).await.unwrap();
+        let minimal = std::env::var_os("JKA_RT_GPU_PROBE_MINIMAL").is_some();
+        for (family, base) in [("bsp-rt-enhanced", include_str!("../../bsp.wgsl")),
+            ("bsp-rt-lean", include_str!("../../bsp_lean.wgsl"))] {
+            if minimal && family != "bsp-rt-enhanced" { continue; }
+            let source = if let Some(path) = std::env::var_os("JKA_RT_GPU_PROBE_SOURCE") {
+                std::fs::read_to_string(path).expect("GPU probe WGSL override")
+            } else { compose_world_shader(&ray_traced_world_shader_source(base).unwrap()) };
+            crate::renderer::lighting::rt_diagnostics::dump_shader(family, &source);
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(family), source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            // Same local/sun and legacy fragment entry points as BSP pipelines.
+            // Inferred layouts make this a headless compiler probe; it is not a
+            // substitute for the exact map's recorded key and explicit layout.
+            for pbr in [0.0, 1.0] {
+                if minimal && pbr != 0.0 { continue; }
+                for sun in [0.0, 1.0] {
+                    if minimal && sun != 0.0 { continue; }
+                    for entry in ["fs_main", "fs_main_legacy_fog", "fs_legacy_fog_pass"] {
+                        if minimal && entry != "fs_main" { continue; }
+                        let constants = [("ENABLE_RAY_TRACED_SHADOWS", 1.0),
+                            ("ENABLE_RAY_TRACED_SUN", sun), ("ENABLE_LOCAL_SHADOWS", 1.0),
+                            ("ENABLE_POINT_LIGHTS", 1.0), ("ENABLE_PBR", pbr)];
+                        println!("[RT GPU probe BEGIN] family={family} pbr={pbr} sun={sun} fs={entry}");
+                        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                        let _pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some("RT world isolation probe"), layout: None,
+                            vertex: wgpu::VertexState {
+                                module: &shader, entry_point: Some("vs_main"),
+                                compilation_options: Default::default(),
+                                buffers: &[wgpu::VertexBufferLayout {
+                                    array_stride: std::mem::size_of::<GpuVertex>() as u64,
+                                    step_mode: wgpu::VertexStepMode::Vertex, attributes: &VERTEX_ATTRIBUTES,
+                                }],
+                            },
+                            primitive: Default::default(),
+                            depth_stencil: Some(wgpu::DepthStencilState {
+                                format: DEPTH_FORMAT, depth_write_enabled: Some(true),
+                                depth_compare: Some(camera_depth_compare()),
+                                stencil: Default::default(), bias: Default::default(),
+                            }),
+                            multisample: Default::default(),
+                            fragment: Some(wgpu::FragmentState {
+                                module: &shader, entry_point: Some(entry),
+                                compilation_options: wgpu::PipelineCompilationOptions {
+                                    constants: &constants, ..Default::default()
+                                },
+                                targets: &[Some(wgpu::ColorTargetState {
+                                    format: wgpu::TextureFormat::Rgba16Float,
+                                    blend: None, write_mask: wgpu::ColorWrites::ALL,
+                                })],
+                            }),
+                            multiview_mask: None, cache: None,
+                        });
+                        if let Some(error) = error_scope.pop().await {
+                            panic!("RT GPU probe validation failed: {error}");
+                        }
+                        println!("[RT GPU probe END] family={family} pbr={pbr} sun={sun} fs={entry}");
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Every shader that binds the post buffer reads it through one shared WGSL
 /// struct. If a field is added on one side only, everything after it shifts;
 /// rain_haze_mask.wgsl once kept a private, stale copy for exactly that reason.
@@ -57,6 +168,7 @@ fn post_uniform_matches_the_shared_wgsl_struct() {
         ("rain", offset_of!(PostUniform, rain)),
         ("rain_occlusion", offset_of!(PostUniform, weather_occlusion)),
         ("weather_look", offset_of!(PostUniform, weather_look)),
+        ("legacy_weather", offset_of!(PostUniform, legacy_weather)),
         ("underwater", offset_of!(PostUniform, underwater)),
         (
             "cloud_foreground",
@@ -99,7 +211,9 @@ fn rt_segment_light_preserves_power_and_point_mode() {
         position: [5.0, 2.0, 3.0],
         color: [1.0, 0.2, 0.1],
         radius: 14.0,
+        source_radius: 3.5,
         intensity: 1.0,
+        spot: None,
         segment: Some([[0.0, 2.0, 3.0], [10.0, 2.0, 3.0]]),
         blade_segments: None,
     };
@@ -109,6 +223,8 @@ fn rt_segment_light_preserves_power_and_point_mode() {
     assert_eq!(segment.emitter, [5.0, 0.0, 0.0, -1.0]);
     assert_eq!(segment.color_intensity, point.color_intensity);
     assert_eq!(segment.position_radius, point.position_radius);
+    assert_eq!(point.shadow[2], 3.5, "source radius is separate from attenuation radius");
+    assert_eq!(segment.shadow[2], 3.5, "segments retain a finite cross-section for RT sampling");
     // Cluster radius is influence radius plus half-length; it encloses all
     // endpoint influence spheres rather than incorrectly culling the tips.
     let center = Vec3::from_slice(&segment.position_radius[..3]);
@@ -124,14 +240,49 @@ fn rt_segment_light_preserves_power_and_point_mode() {
 }
 
 #[test]
+fn promoted_spot_light_packs_direction_and_cone_without_stealing_shadow_metadata() {
+    let light = TransientLight {
+        kind: crate::fx::system::FxLightKind::PromotedEffect,
+        position: [1.0, 2.0, 3.0],
+        color: [1.0, 0.5, 0.1],
+        radius: 256.0,
+        source_radius: 12.0,
+        intensity: 1.0,
+        spot: Some(crate::fx::system::FxSpotLight {
+            direction: [2.0, 0.0, 0.0],
+            inner_cone_cos: 0.94,
+            outer_cone_cos: 0.82,
+        }),
+        segment: None,
+        blade_segments: None,
+    };
+    let gpu = transient_light_gpu(&light, 1.0, false);
+    assert_eq!(gpu.emitter, [1.0, 0.0, 0.0, 3.0]);
+    assert_eq!(gpu.shape, [0.94, 0.82, 0.0, 0.0]);
+    assert_eq!(gpu.shadow, [0.0, 0.0, 12.0, 1.0]);
+
+    let mut malformed = light.clone();
+    malformed.spot = Some(crate::fx::system::FxSpotLight {
+        direction: [f32::NAN, 0.0, 0.0],
+        inner_cone_cos: 0.94,
+        outer_cone_cos: 0.82,
+    });
+    let fallback = transient_light_gpu(&malformed, 1.0, false);
+    assert_eq!(fallback.emitter, [0.0; 4], "invalid inferred cones fall back to point lights");
+    assert_eq!(fallback.shape, [0.0; 4]);
+}
+
+#[test]
 fn rt_multiblade_expansion_conserves_aggregate_power() {
     use crate::fx::system::FxLightSegment;
     let light = TransientLight {
         kind: crate::fx::system::FxLightKind::AuthoredEffect,
         position: [0.0; 3],
         radius: 80.0,
+        source_radius: 0.0,
         color: [0.25, 0.0, 0.75],
         intensity: 2.0,
+        spot: None,
         segment: None,
         blade_segments: Some(
             vec![
@@ -392,6 +543,42 @@ fn sky_cloud_stages_become_ordered_sky_batches_with_view_direction_coordinates()
         false,
     );
     assert_eq!(plain_batches.len(), 1);
+}
+
+#[test]
+fn authored_world_lighting_diffuse_does_not_render_white() {
+    use crate::materials::{MaterialStage, StageTexture, SurfaceMaterial};
+    // Same semantics for a BSP world surface (including a vertex-lit one):
+    // lightingDiffuse reads the refEntity lighting, NOT baked vertex RGB.
+    // TaystJK's worldEntity has no ambient/directed terms, so RGB is black
+    // but the texture/constant alpha must remain untouched.
+    let stage = MaterialStage {
+        texture: StageTexture::Image(1), enhancements: Default::default(),
+        blend: Some(crate::materials::BlendFunc {
+            src: crate::materials::BlendFactor::SrcAlpha,
+            dst: crate::materials::BlendFactor::OneMinusSrcAlpha,
+        }),
+        alpha_cutoff: 0.0, opacity: 0.35, color: [1.0, 1.0, 1.0],
+        rgb_gen: RgbGen::LightingDiffuse, alpha_gen: AlphaGen::Identity,
+        tc_gen: TcGen::Base, tc_mods: Vec::new(),
+        depth_write: false, depth_equal: false, glow: false,
+    };
+    let material = SurfaceMaterial {
+        sky: true, explicit: true, stages: vec![stage],
+        ..Default::default()
+    };
+    let mut batches = Vec::new();
+    crate::scene::append_sky_batches(
+        &mut batches, &material, Some(0), None, false, 0..6,
+        None, &[], [0;4], [0.0;4], false,
+    );
+    assert_eq!(batches[1].rgb_gen, RgbGen::LightingDiffuse);
+    let uniform = material_uniform(&batches[1], false);
+    assert_eq!(uniform.color, [0.0, 0.0, 0.0, 0.35]);
+    assert_eq!(uniform.header[2] & 1, 0, "not rgbGen vertex");
+    let mut unaffected = batches[1].clone();
+    unaffected.rgb_gen = RgbGen::Identity;
+    assert_eq!(material_uniform(&unaffected, false).color, [1.0, 1.0, 1.0, 0.35]);
 }
 
 #[test]
@@ -795,9 +982,10 @@ fn all_renderer_shaders_validate() {
     let bsp = compose_world_shader(include_str!("../../bsp.wgsl"));
     let bsp_lean = compose_world_shader(include_str!("../../bsp_lean.wgsl"));
     let bsp_fast = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         include_str!("../../bsp_fast.wgsl"),
-        include_str!("../../surface_deformation.wgsl")
+        include_str!("../../surface_deformation.wgsl"),
+        include_str!("../../sky_fractal.wgsl")
     );
     let post = weather::with_weather_surface(&weather::with_post_settings(include_str!(
         "../../post.wgsl"
@@ -813,7 +1001,9 @@ fn all_renderer_shaders_validate() {
         ("bsp_fast", bsp_fast.as_str()),
         ("post", post.as_str()),
         ("rain", rain.as_str()),
+        ("atmosphere", include_str!("../../atmosphere.wgsl")),
         ("rain_sim", include_str!("../../rain_sim.wgsl")),
+        ("wind_visuals", include_str!("../../wind_visuals.wgsl")),
         (
             "rain_glass",
             include_str!("../../weather/rain_glass.wgsl"),
@@ -836,6 +1026,7 @@ fn all_renderer_shaders_validate() {
         ("cluster_lights", include_str!("../../cluster_lights.wgsl")),
         ("froxel_fog", include_str!("../../froxel_fog.wgsl")),
         ("ocean_windrow", include_str!("../../ocean_windrow.wgsl")),
+        ("ocean_interaction", include_str!("../../ocean_interaction.wgsl")),
         ("ocean_spray", include_str!("../../ocean_spray.wgsl")),
         ("md3", md3.as_str()),
         ("ghoul2_skin", ghoul2_skin.as_str()),
@@ -880,6 +1071,19 @@ fn all_renderer_shaders_validate() {
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
+    }
+}
+
+#[test]
+fn ocean_interaction_shaders_validate() {
+    let bsp = compose_world_shader(include_str!("../../bsp.wgsl"));
+    for (name, source) in [("interactive ocean BSP", bsp.as_str()),
+        ("interactive ocean compute", include_str!("../../ocean_interaction.wgsl"))] {
+        let module = wgpu::naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
+        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all()).validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(source)));
     }
 }
 
@@ -941,6 +1145,7 @@ fn entity_shadow_pass_writes_caster_depth() {
         );
         let mut models = DynamicModelRenderer::new(
             &device,
+            &queue,
             &camera_layout,
             wgpu::TextureFormat::Bgra8UnormSrgb,
             1,
@@ -1186,6 +1391,45 @@ fn blob_shadow_request_projects_onto_a_render_space_floor() {
 }
 
 
+/// `SkinDraw` is a storage-buffer struct matched to its Rust mirror by layout,
+/// not by name, so a field added on one side only silently shifts everything
+/// after it - the per-draw colour, the light grid sample, the jiggle offsets.
+#[test]
+fn ghoul2_draw_uniform_matches_the_skin_draw_wgsl_struct() {
+    use crate::weather::rain_layout::{offset_of_member, wgsl_struct_layout};
+    use std::mem::{offset_of, size_of};
+    for source in [weather::with_model_weather(include_str!("../../ghoul2_skin.wgsl")),
+        include_str!("../../ghoul2_skin_compute.wgsl").to_string()] {
+    let (size, members) = wgsl_struct_layout(&source, "SkinDraw");
+    assert_eq!(size as usize, size_of::<Ghoul2GpuDrawUniform>());
+    for (name, rust_offset) in [
+        ("axis0", offset_of!(Ghoul2GpuDrawUniform, axis0)),
+        ("color", offset_of!(Ghoul2GpuDrawUniform, color)),
+        ("params", offset_of!(Ghoul2GpuDrawUniform, params)),
+        (
+            "classic_ambient",
+            offset_of!(Ghoul2GpuDrawUniform, classic_ambient),
+        ),
+        ("uv_xform", offset_of!(Ghoul2GpuDrawUniform, uv_xform)),
+        ("jiggle3", offset_of!(Ghoul2GpuDrawUniform, jiggle3)),
+        (
+            "source_phong",
+            offset_of!(Ghoul2GpuDrawUniform, source_phong),
+        ),
+        (
+            "source_fresnel",
+            offset_of!(Ghoul2GpuDrawUniform, source_fresnel),
+        ),
+    ] {
+        assert_eq!(
+            offset_of_member(&members, name) as usize,
+            rust_offset,
+            "{name}"
+        );
+    }
+    }
+}
+
 #[test]
 fn ocean_material_uniform_matches_world_shader_layouts() {
     use crate::weather::rain_layout::{offset_of_member, wgsl_struct_layout};
@@ -1193,7 +1437,7 @@ fn ocean_material_uniform_matches_world_shader_layouts() {
     let shaders = [
         compose_world_shader(include_str!("../../bsp.wgsl")),
         compose_world_shader(include_str!("../../bsp_lean.wgsl")),
-        format!("{}\n{}", include_str!("../../bsp_fast.wgsl"), include_str!("../../surface_deformation.wgsl")),
+        format!("{}\n{}\n{}", include_str!("../../bsp_fast.wgsl"), include_str!("../../surface_deformation.wgsl"), include_str!("../../sky_fractal.wgsl")),
     ];
     for shader in shaders {
         let (size, members) = wgsl_struct_layout(&shader, "Material");

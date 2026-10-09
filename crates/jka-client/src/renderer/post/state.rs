@@ -3,6 +3,7 @@ use crate::renderer::{
     cloud_wind, create_auto_exposure_bind_group, create_bloom_bind_groups, create_bloom_pipeline,
     create_cloud_resolve_bind_group, create_dof_bind_group, create_fast_post_bind_group,
     create_gamma_post_bind_group, create_post_bind_group, create_post_pipeline,
+    create_rain_post_pipeline,
     create_ssao_temporal_bind_groups, create_ssr_temporal_bind_groups, pipeline_hash,
     CloudLayerSettings, CloudRenderSettings, CloudSunSettings, GlowMode, Mat4, PipelineJobKey,
     PostAaSettings, PostCameraFxSettings, PostCloudShadowSettings, PostCloudShapingSettings,
@@ -90,6 +91,27 @@ impl Renderer {
         });
     }
 
+    /// Polls/queues the specialized rain-only fullscreen post pipeline.
+    pub(in crate::renderer) fn ensure_rain_post_pipeline(&mut self, needed_now: bool) {
+        if !needed_now || self.rain_post_pipeline.is_some() {
+            return;
+        }
+        let key = PipelineJobKey::new("post-rain", 0, pipeline_hash(&(self.config.format,)));
+        if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+            self.rain_post_pipeline = Some(pipeline);
+            return;
+        }
+        let (device, layout, shader, format) = (
+            self.device.clone(),
+            self.post_pipeline_layout.clone(),
+            self.post_shader.clone(),
+            self.config.format,
+        );
+        self.pipeline_jobs.request(key, "rain-only post", move || {
+            create_rain_post_pipeline(&device, &layout, &shader, format)
+        });
+    }
+
     /// SMAA's third-party target bundles its render pipelines and intermediate
     /// textures. Construct the whole target on the shared pipeline workers so
     /// selecting SMAA never compiles its PSOs inline on a gameplay frame. Until
@@ -170,7 +192,7 @@ impl Renderer {
                 fxaa: if self.fxaa_enabled { 1.0 } else { 0.0 },
                 viewport_width: self.config.width.max(1) as f32,
                 viewport_height: self.config.height.max(1) as f32,
-                taa: if self.taa_enabled { 1.0 } else { 0.0 },
+                taa: if self.taa_enabled { 1.0 } else if self.rt_taa_active() { 1.0 + self.rt_taa_mode as f32 } else { 0.0 },
             },
             taa_params: [
                 if self.hdr_enabled { 1.0 } else { 0.0 },
@@ -196,7 +218,8 @@ impl Renderer {
                     0.0
                 },
                 volumetric_fog: if self.weather.fog.volumetric_effective()
-                    || self.weather.rain.enabled
+                    || (self.weather.rain.enabled && !self.rain_uses_2d_haze())
+                    || self.weather.snow.enabled
                 {
                     1.0
                 } else {
@@ -360,10 +383,18 @@ impl Renderer {
                 PostCloudWindSettings::zeroed()
             },
             rain: [
-                if self.weather.rain.enabled { 1.0 } else { 0.0 },
+                if self.weather.rain.enabled && !self.weather.rain.fast_post { 1.0 } else { 0.0 },
                 self.weather.rain.intensity.shader_value(),
-                self.weather.rain.intensity.haze_strength(),
-                self.weather.rain.puddle_amount,
+                if self.weather.rain.fast_post {
+                    0.0
+                } else {
+                    self.weather.rain.intensity.haze_strength()
+                },
+                if self.weather.rain.fast_post {
+                    0.0
+                } else {
+                    self.weather.rain.puddle_amount
+                },
             ],
             weather_occlusion: match &self.weather.rain.occlusion {
                 WeatherOcclusionCache::Ready(info) => [
@@ -378,13 +409,19 @@ impl Renderer {
             },
             weather_look: [
                 self.weather.rain.puddle_scatter,
-                self.weather.rain.grade_amount(),
+                if self.weather.rain.fast_post { 0.0 } else { self.weather.rain.grade_amount() },
                 if self.weather.rain.puddle_quality.is_high() {
                     1.0
                 } else {
                     0.0
                 },
                 self.weather.rain.lens_drop_amount(),
+            ],
+            legacy_weather: [
+                self.weather.atmosphere.sand_strength(),
+                self.weather.atmosphere.space_strength(),
+                self.weather.rain.acid_strength,
+                if self.rain_uses_2d_haze() { 1.0 } else { 0.0 },
             ],
             // The optics only exist with the GPU ocean; a plain BSP water
             // shader gets no underwater treatment, so clouds are left alone.
@@ -401,7 +438,7 @@ impl Renderer {
             cloud_foreground: [cloud_blade_count, 0.0, 0.0, 0.0],
             cloud_blades,
             camera_pos_time,
-            prev_camera_pos_time: if self.cloud_history_valid {
+            prev_camera_pos_time: if self.cloud_history_valid || (self.rt_taa_active() && history_valid) {
                 [
                     self.previous_camera_position.x,
                     self.previous_camera_position.y,

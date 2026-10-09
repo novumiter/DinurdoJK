@@ -137,6 +137,39 @@ Not used: this dynamic-lights mode never shadows local lights. Choose Forward+ t
                 "Four samples per soft source. Highest quality and GPU cost.",
             ),
         ];
+        const RT_DENOISER: [(u32, &str, &str); 12] = [
+            (0, "Off", "No denoiser compute dispatches."),
+            (1, "Temporal", "Separate HDR sun and finite local-light signals, motion reprojection, per-light history rejection."),
+            (2, "SVGF", "Temporal plus three depth/normal/light-ID-aware variance-guided atrous passes."),
+            (3, "Raw debug", "Unfiltered stochastic sun signal; pink = receiver/prepass mismatch."),
+            (4, "Temporal debug", "Temporally accumulated signal before spatial filtering."),
+            (5, "SVGF debug", "Final spatially filtered sun-light signal."),
+            (6, "Difference", "Fourfold magnification of raw-versus-temporal RGB difference."),
+            (7, "Normals", "RT receiver world-space geometric normals encoded as RGB."),
+            (8, "Local raw", "Stochastic unfiltered finite transient-light visibility; black means shadow."),
+            (9, "Local filtered", "Temporally/spatially filtered finite transient-light visibility."),
+            (10, "Local difference", "Magnified difference between raw and filtered finite-light visibility."),
+            (11, "Local light ID", "False colors identifying which finite transient emitter was selected at each pixel."),
+        ];
+        const RT_TAA: [(u32, &str, &str); 3] = [
+            (0, "Off", "No regional temporal resolve."),
+            (1, "On", "Temporal filtering inside runtime-light influence volumes. Retains MSAA; no extra shadow rays. Also filters textures and FX inside those regions."),
+            (2, "Mask", "Green marks conservative RT light influence volumes; black stays unfiltered. Includes surfaces behind shadow blockers."),
+        ];
+        ui.add_enabled_ui(rt_lights, |ui| {
+            if let Some(index) = mode_row(ui, "RT regional TAA",
+                "A/B option for MSAA plus regional temporal filtering. Enabling turns off global TAA and the radiance denoiser. Performance depends on how much of the view is affected.",
+                theme::Reset::None, self.video.rt_taa, &RT_TAA) {
+                let _ = self.set_console_cvar("r_rtTaa", &RT_TAA[index].0.to_string());
+            }
+        });
+        ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
+            if let Some(index) = mode_row(ui, "RT radiance denoiser",
+                "Opt-in HDR sun and dominant finite runtime-light irradiance filtering. Unmatched/translucent/model surfaces use direct RT rays. Independent of TAA, SSR and SSAO; debug modes 3–7 visualize sun and 8–11 finite local-light signals.",
+                theme::Reset::None, self.video.rt_denoiser_mode, &RT_DENOISER) {
+                let _ = self.set_console_cvar("r_rtDenoiser", &RT_DENOISER[index].0.to_string());
+            }
+        });
         ui.add_enabled_ui(rt_sun || rt_lights, |ui| {
             let note = if rt_sun || rt_lights { "" } else { "\n\nNot used: needs RT Shadows or Ray traced dynamic lights." };
             if let Some(index) = mode_row(ui, "RT samples", &format!("Samples per soft sun or saber light. Point lights stay at one ray. TAA can further reduce noise.{note}"),

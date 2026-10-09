@@ -10,9 +10,15 @@ impl Renderer {
     pub(in crate::renderer) fn load_map(&mut self, mut map: PreparedMap) -> WorldUploadTimings {
         let load_map_started = Instant::now();
         self.promoted_ocean_overrides.clear();
+        self.ocean_interaction.clear(&self.queue);
         // A new world must not inherit transient RE_AddLightToScene submissions
         // from the previous map. The next CGame snapshot will repopulate them.
         self.transient_lights.clear();
+        self.world_flares.load(&map.world_flares);
+        self.world_flares_sky.load(&map.world_flares);
+        for flare_view in &mut self.world_flares_planar {
+            flare_view.load(&map.world_flares);
+        }
         self.debug_volumes.set_map(Arc::clone(&map.debug_volumes));
         // Start the pure-CPU weather heightfield solve immediately so it overlaps
         // GPU/world upload. First rain enable should normally only upload the
@@ -54,6 +60,7 @@ impl Renderer {
         self.ssr_history_valid = false;
         self.ssr_history_read_index = 0;
         self.ssr_frame_index = 0;
+        let scene_format_before_fog = self.scene_format();
         self.weather.fog.install_map(
             map.global_fog,
             map.batches.iter().map(|batch| {
@@ -63,6 +70,10 @@ impl Renderer {
                 )
             }),
         );
+        // Legacy 2's float scene target follows whether this map has fog.
+        if self.scene_format() != scene_format_before_fog {
+            self.request_scene_rebuild();
+        }
         let source_map = map.map_file_stats.is_some();
         let videos = std::mem::take(&mut map.videos);
         // The BLAS needs the uploaded world buffers, so map upload always creates
@@ -164,6 +175,22 @@ impl Renderer {
         upload_timings.post_bind_groups_ms = post_bind_started.elapsed().as_secs_f64() * 1000.0;
         let post_misc_started = Instant::now();
         self.world = Some(world);
+        if let Some(ref world) = self.world {
+            self.world_flares.install_textures(
+                &self.device, &world.textures, &self.white,
+                &self.repeat_sampler, &self.clamp_sampler, &world.texture_clamp,
+            );
+            self.world_flares_sky.install_textures(
+                &self.device, &world.textures, &self.white,
+                &self.repeat_sampler, &self.clamp_sampler, &world.texture_clamp,
+            );
+            for flare_view in &mut self.world_flares_planar {
+                flare_view.install_textures(
+                    &self.device, &world.textures, &self.white,
+                    &self.repeat_sampler, &self.clamp_sampler, &world.texture_clamp,
+                );
+            }
+        }
         self.world_videos = videos
             .iter()
             .filter_map(
@@ -198,10 +225,13 @@ impl Renderer {
             self.weather_wind,
             self.pbr_enabled,
         );
-        // The CPU solve is already running on the weather worker. Rain and the
-        // cloud terrain-interaction experiment share this same heightfield, so
-        // either feature may request the GPU upload during the map switch.
-        if self.weather.rain.enabled || self.cloud_terrain_interaction {
+        // The CPU solve is already running on the weather worker. Rain, snow and
+        // cloud terrain interaction share this same heightfield, so any of them
+        // may request the GPU upload during the map switch.
+        if self.weather.rain.enabled
+            || self.weather.snow.enabled
+            || self.cloud_terrain_interaction
+        {
             self.ensure_weather_occlusion();
         }
         self.rebuild_weather_surface_receiver_bind_group();
@@ -329,15 +359,22 @@ impl Renderer {
         // overlay over the last gameplay frame. Drop all map-owned GPU state so
         // the renderer returns to the same world-less state used at startup.
         self.world = None;
+        self.world_flares.load(&[]);
+        self.world_flares_sky.load(&[]);
+        for flare_view in &mut self.world_flares_planar { flare_view.load(&[]); }
         self.world_videos.clear();
         self.sync_baked_brightness_assets();
         self.inspector_vertex_range = None;
         self.inspector_entity_num = None;
         self.surface_deformation.clear(&self.queue);
         self.weather.rain.start_map_occlusion(None);
+        let scene_format_before_fog = self.scene_format();
         self.weather
             .fog
             .install_map(None, std::iter::empty::<([f32; 4], u64)>());
+        if self.scene_format() != scene_format_before_fog {
+            self.request_scene_rebuild();
+        }
         self.weather.fog.write_legacy_control(&self.queue);
         self.sync_self_legacy_fog();
 

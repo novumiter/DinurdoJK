@@ -2,6 +2,163 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_OCEANINTERACTION {
+        runtime: CvarDef::new("r_oceanInteraction", "", "0|1",
+            "Nearby player water deformation; inherits r_oceanUpdates.", CvarType::String,
+            CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.ocean_settings.interaction)),
+            |app, value| App::cvar_set_ocean_interaction(app, APP_R_OCEANINTERACTION.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.ocean_settings.interaction = parse_bool(value).unwrap_or(settings.ocean_settings.interaction);
+            }),
+            archive: Some((25000, |state| bool_value(state.video.ocean_settings.interaction))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_ocean_interaction(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.interaction = Self::parse_cvar_bool(name, value)?;
+                self.commit_ocean_settings(); Ok(())
+            }
+        }]
+    }
+    APP_R_OCEANINTERACTIONSTRENGTH {
+        runtime: CvarDef::new("r_oceanInteractionStrength", "", "nonnegative finite number",
+            "Nearby water interaction force scale.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.interaction_strength.to_string()),
+            |app, value| App::cvar_set_ocean_interaction_strength(app, APP_R_OCEANINTERACTIONSTRENGTH.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction_strength, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.interaction_strength = v.max(0.0); } }
+            }),
+            archive: Some((25001, |state| state.video.ocean_settings.interaction_strength.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_ocean_interaction_strength(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.interaction_strength = Self::parse_cvar_finite(name,value)?.max(0.0);
+                self.commit_ocean_settings(); Ok(())
+            }
+        }]
+    }
+    APP_R_OCEANINTERACTIONFX {
+        runtime: CvarDef::new("r_oceanInteractionFx", "", "0..5",
+            "Player water FX: 0 off, 1 entry droplets, 2 wake spray, 3 both, 4 entry jets, 5 all.", CvarType::String,
+            CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.interaction_splash_mode.to_string()),
+            |app, value| App::cvar_set_ocean_interaction_fx(app, APP_R_OCEANINTERACTIONFX.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction_fx, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.parse::<u8>() {
+                    settings.ocean_settings.interaction_splash_mode = mode.min(5);
+                }
+            }),
+            archive: Some((25006, |state| state.video.ocean_settings.interaction_splash_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_ocean_interaction_fx(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.parse::<u8>()
+                    .map_err(|_| format!("{name} must be in the range 0..5"))?;
+                if mode > 5 {
+                    return Err(format!("{name} must be in the range 0..5"));
+                }
+                self.video.ocean_settings.interaction_splash_mode = mode;
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_OCEANINTERACTIONLIFETIME {
+        runtime: CvarDef::new("r_oceanInteractionLifetime", "", "0.1..60 seconds",
+            "Seconds after the last moving input before retiring the local field.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.interaction_lifetime.to_string()),
+            |app, value| App::cvar_set_ocean_interaction_falloff(app, APP_R_OCEANINTERACTIONLIFETIME.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction_falloff, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.interaction_lifetime = v.clamp(0.1,60.0); } }
+            }),
+            archive: Some((25002, |state| state.video.ocean_settings.interaction_lifetime.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_ocean_interaction_falloff(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let v = Self::parse_cvar_finite(name,value)?;
+                match name.to_ascii_lowercase().as_str() {
+                    "r_oceaninteractionlifetime" => self.video.ocean_settings.interaction_lifetime = v.clamp(0.1,60.0),
+                    "r_oceaninteractionfade" => self.video.ocean_settings.interaction_fade = v.clamp(0.0,60.0),
+                    "r_oceaninteractiondamping" => self.video.ocean_settings.interaction_damping = v.max(0.0),
+                    "r_oceaninteractionedgefade" => self.video.ocean_settings.interaction_edge_fade = v.clamp(0.0,256.0),
+                    _ => unreachable!(),
+                }
+                self.commit_ocean_settings(); Ok(())
+            }
+        }]
+    }
+    APP_R_OCEANINTERACTIONFADE {
+        runtime: CvarDef::new("r_oceanInteractionFade", "", "0..60 seconds",
+            "Duration of the final smooth fade before field retirement; zero disables temporal fading.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.interaction_fade.to_string()),
+            |app, value| App::cvar_set_ocean_interaction_falloff(app, APP_R_OCEANINTERACTIONFADE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction_falloff, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.interaction_fade = v.clamp(0.0,60.0); } }
+            }),
+            archive: Some((25003, |state| state.video.ocean_settings.interaction_fade.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANINTERACTIONDAMPING {
+        runtime: CvarDef::new("r_oceanInteractionDamping", "", "nonnegative finite number",
+            "Velocity decay per second; zero disables bulk damping; height decay is 0.175 times this rate.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.interaction_damping.to_string()),
+            |app, value| App::cvar_set_ocean_interaction_falloff(app, APP_R_OCEANINTERACTIONDAMPING.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction_falloff, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.interaction_damping = v.max(0.0); } }
+            }),
+            archive: Some((25004, |state| state.video.ocean_settings.interaction_damping.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANINTERACTIONEDGEFADE {
+        runtime: CvarDef::new("r_oceanInteractionEdgeFade", "", "0..256 world units",
+            "Width of the local-window edge fade; sponge width is 1.5 times this value; zero disables both.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.interaction_edge_fade.to_string()),
+            |app, value| App::cvar_set_ocean_interaction_falloff(app, APP_R_OCEANINTERACTIONEDGEFADE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction_falloff, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.interaction_edge_fade = v.clamp(0.0,256.0); } }
+            }),
+            archive: Some((25005, |state| state.video.ocean_settings.interaction_edge_fade.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANINTERACTIONDEBUG {
+        runtime: CvarDef::new("r_oceanInteractionDebug", "", "0|1",
+            "Show nearby interaction height (red/blue) and slopes (green).", CvarType::String,
+            CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.ocean_settings.interaction_debug)),
+            |app, value| App::cvar_set_ocean_interaction_debug(app, APP_R_OCEANINTERACTIONDEBUG.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ocean_interaction_debug, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_ocean_interaction_debug(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.interaction_debug = Self::parse_cvar_bool(name,value)?;
+                self.commit_ocean_settings(); Ok(())
+            }
+        }]
+    }
     APP_R_OCEAN {
         runtime: CvarDef::new(
                 "r_ocean",
@@ -33,6 +190,9 @@ app_cvars! {
                 fn cvar_set_r_ocean(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.ocean = Self::parse_cvar_bool(name, value)?;
+                        if let Some(session) = self.game_session.as_mut() {
+                            session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+                        }
                         // OFF releases the FFT resources immediately, and ON can be
                         // restored live only when the loaded world already carries its
                         // promoted ocean clipmap.
@@ -1372,4 +1532,174 @@ app_cvars! {
             }
         ]
     }
+
+    APP_R_OCEANOPTICSCULL {
+        runtime: CvarDef::new(
+                "r_oceanOpticsCull",
+                "",
+                "0|1",
+                "Skip the underwater optics capture entirely when the camera is dry and no ocean surface is on screen. Nothing can sample it then.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_oceanopticscull(app)),
+                |app, value| {
+                    App::cvar_set_r_oceanopticscull(app, APP_R_OCEANOPTICSCULL.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_oceanopticscull, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ocean_settings.optics.cull =
+                        parse_bool(value).unwrap_or(settings.ocean_settings.optics.cull);
+                }),
+                archive: Some((10424, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.ocean_settings.optics.cull))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_oceanopticscull(&self) -> String {
+                    bool_value(self.video.ocean_settings.optics.cull)
+                }
+                fn cvar_set_r_oceanopticscull(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.ocean_settings.optics.cull = Self::parse_cvar_bool(name, value)?;
+                        self.commit_ocean_settings();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_OCEANOPTICSSCISSOR {
+        runtime: CvarDef::new(
+                "r_oceanOpticsScissor",
+                "",
+                "0|1",
+                "Restrict the underwater optics capture to the screen rectangle the visible water covers instead of the whole framebuffer.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_oceanopticsscissor(app)),
+                |app, value| {
+                    App::cvar_set_r_oceanopticsscissor(app, APP_R_OCEANOPTICSSCISSOR.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_oceanopticsscissor, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ocean_settings.optics.scissor =
+                        parse_bool(value).unwrap_or(settings.ocean_settings.optics.scissor);
+                }),
+                archive: Some((10425, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.ocean_settings.optics.scissor))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_oceanopticsscissor(&self) -> String {
+                    bool_value(self.video.ocean_settings.optics.scissor)
+                }
+                fn cvar_set_r_oceanopticsscissor(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.ocean_settings.optics.scissor = Self::parse_cvar_bool(name, value)?;
+                        self.commit_ocean_settings();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_OCEANSIMWHENHIDDEN {
+        runtime: CvarDef::new(
+                "r_oceanSimWhenHidden",
+                "",
+                "0|1",
+                "Keep advancing the FFT wave simulation even while no water is visible. Off freezes the field, which costs nothing and cannot be seen.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_oceansimwhenhidden(app)),
+                |app, value| {
+                    App::cvar_set_r_oceansimwhenhidden(app, APP_R_OCEANSIMWHENHIDDEN.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_oceansimwhenhidden, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ocean_settings.simulate_when_hidden =
+                        parse_bool(value).unwrap_or(settings.ocean_settings.simulate_when_hidden);
+                }),
+                archive: Some((10426, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.ocean_settings.simulate_when_hidden))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_oceansimwhenhidden(&self) -> String {
+                    bool_value(self.video.ocean_settings.simulate_when_hidden)
+                }
+                fn cvar_set_r_oceansimwhenhidden(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.ocean_settings.simulate_when_hidden = Self::parse_cvar_bool(name, value)?;
+                        self.commit_ocean_settings();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+
+    APP_R_OCEANOPTICSMASKS {
+        runtime: CvarDef::new(
+                "r_oceanOpticsMasks",
+                "",
+                "0|1",
+                "Honour water outline masks in the underwater optics capture. Off is visually wrong on hollow water; it exists to measure the mask cost.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_oceanopticsmasks(app)),
+                |app, value| {
+                    App::cvar_set_r_oceanopticsmasks(app, APP_R_OCEANOPTICSMASKS.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_oceanopticsmasks, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.ocean_settings.optics.masks =
+                        parse_bool(value).unwrap_or(settings.ocean_settings.optics.masks);
+                }),
+                archive: Some((10427, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.ocean_settings.optics.masks))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_oceanopticsmasks(&self) -> String {
+                    bool_value(self.video.ocean_settings.optics.masks)
+                }
+                fn cvar_set_r_oceanopticsmasks(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.ocean_settings.optics.masks = Self::parse_cvar_bool(name, value)?;
+                        self.commit_ocean_settings();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
 }

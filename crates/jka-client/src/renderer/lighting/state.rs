@@ -1,12 +1,46 @@
 //! Lighting state.
 use crate::renderer::{
     legacy_dlight_surface_mask, scene, transient_light_gpu, transient_light_samples,
-    DynamicLightsMode, GpuPointLight, LegacyDlightPerfStats, LightingSettings, Renderer,
-    TransientLight, LOCAL_SHADOW_MAP_SIZE, MAX_DYNAMIC_LIGHTS,
+    DynamicLightsMode, EntityDlight, GpuPointLight, LegacyDlightPerfStats, LightingSettings,
+    Renderer, TransientLight, Vec3, LOCAL_SHADOW_MAP_SIZE, MAX_DYNAMIC_LIGHTS,
+    MAX_ENTITY_DLIGHTS,
 };
 use bytemuck::Zeroable;
 
 impl Renderer {
+    pub(in crate::renderer) fn shader_promoted_area_light_enabled(
+        &self,
+        light: &scene::DynamicLight,
+    ) -> bool {
+        light.shader_promotion_mask != 0
+            && self.shader_light_promotion_enabled
+            && (light.shader_promotion_mask & self.shader_light_promotion_mask) != 0
+            // If this promoted emitter comes from a material that also has
+            // q3map_surfacelight, authored lighting wins while that path is on.
+            // Turning authored area lights off exposes the promotion candidate
+            // immediately for A/B testing without rebuilding the map.
+            && !(self.emissive_area_lights_enabled
+                && (light.shader_promotion_mask
+                    & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP)
+                    != 0)
+    }
+
+    pub(in crate::renderer) fn static_area_light_enabled(
+        &self,
+        light: &scene::DynamicLight,
+    ) -> bool {
+        if light.shader_promotion_mask != 0 {
+            self.shader_promoted_area_light_enabled(light)
+        } else {
+            self.emissive_area_lights_enabled
+        }
+    }
+
+    pub(in crate::renderer) fn any_area_lights_enabled(&self) -> bool {
+        self.emissive_area_lights_enabled
+            || (self.shader_light_promotion_enabled && self.shader_light_promotion_mask != 0)
+    }
+
     pub(in crate::renderer) fn transient_dlight_clusters_enabled(&self) -> bool {
         self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite
     }
@@ -36,7 +70,7 @@ impl Renderer {
                     .iter()
                     .any(|component| component.abs() > 1.0e-6);
                 if is_area {
-                    self.emissive_area_lights_enabled && light.surface_lighting
+                    self.static_area_light_enabled(light) && light.surface_lighting
                 } else {
                     self.static_point_lighting_enabled() && light.surface_lighting
                 }
@@ -99,7 +133,9 @@ impl Renderer {
             match light.kind {
                 crate::fx::system::FxLightKind::Saber => stats.saber_sources += 1,
                 crate::fx::system::FxLightKind::SaberMark => stats.saber_mark_sources += 1,
-                crate::fx::system::FxLightKind::AuthoredEffect => stats.authored_fx_sources += 1,
+                crate::fx::system::FxLightKind::AuthoredEffect
+                | crate::fx::system::FxLightKind::PlayerPowerup => stats.authored_fx_sources += 1,
+                crate::fx::system::FxLightKind::PromotedEffect => stats.promoted_fx_sources += 1,
             }
         }
 
@@ -137,7 +173,9 @@ impl Renderer {
                 match lights[bit].kind {
                     crate::fx::system::FxLightKind::Saber => stats.saber_pairs += 1,
                     crate::fx::system::FxLightKind::SaberMark => stats.saber_mark_pairs += 1,
-                    crate::fx::system::FxLightKind::AuthoredEffect => stats.authored_fx_pairs += 1,
+                    crate::fx::system::FxLightKind::AuthoredEffect
+                    | crate::fx::system::FxLightKind::PlayerPowerup => stats.authored_fx_pairs += 1,
+                    crate::fx::system::FxLightKind::PromotedEffect => stats.promoted_fx_pairs += 1,
                 }
             }
         }
@@ -155,6 +193,32 @@ impl Renderer {
         self.transient_lights.extend_from_slice(lights);
         self.upload_light_buffer();
         self.update_lighting_settings();
+    }
+
+    /// Hands this frame's runtime lights (the same list the BSP light buffer is
+    /// built from) to classic entity lighting, as R_SetupEntityLighting reads
+    /// refdef->dlights. Call after `set_transient_lights` and before the dynamic
+    /// model prepare. `rt_per_pixel` is true when the RT model receivers will
+    /// light this frame's models per pixel, which already includes these lights.
+    pub(in crate::renderer) fn sync_entity_dlights(&mut self, rt_per_pixel: bool) {
+        let enabled = self.runtime_transient_lights_enabled();
+        let brightness = self.dynamic_light_brightness;
+        let models = &mut self.dynamic_model_renderer;
+        models.entity_dlights_rt_per_pixel = rt_per_pixel;
+        models.entity_dlights.clear();
+        if !enabled {
+            return;
+        }
+        models.entity_dlights.extend(
+            self.transient_lights
+                .iter()
+                .take(MAX_ENTITY_DLIGHTS)
+                .map(|light| EntityDlight {
+                    position: Vec3::from_array(light.position),
+                    color: Vec3::from_array(light.color) * (light.intensity.max(0.0) * brightness),
+                    radius: light.radius.max(0.0),
+                }),
+        );
     }
 
     pub(in crate::renderer) fn update_legacy_dlight_surface_masks(&self) {
@@ -216,7 +280,7 @@ impl Renderer {
                 .iter()
                 .any(|component| component.abs() > 1.0e-6);
             if !light.surface_lighting
-                || (is_area && !self.emissive_area_lights_enabled)
+                || (is_area && !self.static_area_light_enabled(light))
                 || (!is_area && !self.static_point_lighting_enabled())
             {
                 continue;
@@ -259,6 +323,12 @@ impl Renderer {
                         0.0
                     },
                 ],
+                shape: [
+                    0.0,
+                    0.0,
+                    (light.shader_promotion_mask & crate::materials::SHADER_LIGHT_ALL) as f32,
+                    0.0,
+                ],
                 shadow: [
                     shadow_slot_by_light.get(index).copied().unwrap_or(0) as f32,
                     light.falloff.shader_value(),
@@ -273,9 +343,9 @@ impl Renderer {
 
         let remaining = MAX_DYNAMIC_LIGHTS.saturating_sub(gpu_lights.len());
         if self.runtime_transient_lights_enabled() {
-            // RenderSnapshot::transient_lights currently comes directly from
-            // authored FX `Light {}` primitives. Full Forward+/RT give those
-            // runtime FX lights a mode gain so the saber lights a wall as strongly
+            // RenderSnapshot::transient_lights contains authored FX lights,
+            // optional promoted emissive FX, sabers, and saber-mark heat lights.
+            // Full Forward+/RT give runtime FX lights a mode gain so the saber lights a wall as strongly
             // as Legacy does (calibrated by screenshot at brightness 1.0, using
             // Legacy as the reference); static map and emissive-area lights above
             // keep their authored intensity. Brightness scales intensity only, in
@@ -330,7 +400,7 @@ impl Renderer {
                     | DynamicLightsMode::Vertex
                     | DynamicLightsMode::ClusteredLite
             )
-            || self.emissive_area_lights_enabled;
+            || self.any_area_lights_enabled();
         let source_map_lighting = self
             .world
             .as_ref()
@@ -356,7 +426,7 @@ impl Renderer {
                 transient_start,
             ],
             feature_flags: [
-                u32::from(self.emissive_area_lights_enabled),
+                u32::from(self.any_area_lights_enabled()),
                 u32::from(
                     self.voxel_probe_gi_enabled
                         && self
@@ -366,13 +436,16 @@ impl Renderer {
                 ),
                 // Used by cluster/froxel consumers. Clustered Lite builds transient-only
                 // lists. Legacy uses OpenJK-style BSP surface dlight masks instead.
-                if self.point_lighting_enabled() {
+                (if self.point_lighting_enabled() {
                     1
                 } else if self.transient_dlight_clusters_enabled() {
                     2
                 } else {
                     0
-                },
+                }) | (if self.dynamic_light_debug { 0x100 } else { 0 })
+                    | (if self.tinted_glass_enabled { 0x200 } else { 0 })
+                    | (if self.tinted_glass_debug == 1 { 0x400 } else { 0 })
+                    | (if self.tinted_glass_debug == 2 { 0x800 } else { 0 }),
                 self.reflection_quality.shader_value(),
             ],
             map_ambient: [

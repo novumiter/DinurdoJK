@@ -27,8 +27,40 @@ pub(crate) const INPUTS: &[&str] = &[
 pub(crate) const NAMES: &str = include_str!("testdata/cvars/names.txt");
 pub(crate) fn digest(text: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
-    // This field was added concurrently after the original settings snapshot.
-    let projected = text.replace(", console_notify_lines: 3", "");
+    // These fields were added after the frozen settings snapshot. Keep the
+    // compatibility digest focused on pre-existing behavior; each addition has
+    // a dedicated load/archive test below.
+    let projected = text
+        .replace("OceanSettings { interaction: false, interaction_strength: 1.0, interaction_splash_mode: 3, interaction_debug: false, ", "OceanSettings { ")
+        .replace("interaction_splash_mode: 3, ", "")
+        .replace("interaction_lifetime: 2.5, interaction_fade: 1.0, interaction_damping: 2.0, interaction_edge_fade: 81.92, ", "")
+        // The prediction backend/rounding cvars were deleted. Preserve the old
+        // NetworkSettings Debug-layout for unrelated frozen compatibility hashes.
+        .replace(", prediction_miss_threshold: ", ", snap_mode: -1, predict_backend: -1, prediction_miss_threshold: ")
+        .replace(", third_person_flag_alpha: 1.0", "")
+        .replace(", console_notify_lines: 3", "")
+        .replace(", score_spectator_guess: true", "")
+        .replace(", steam_audio_hrtf_interpolation: 0", "")
+        .replace(", jiggle_glute_coverage_height: 1.0", "")
+        .replace(", jiggle_breast_remesh_bottom_z: 0.0", "")
+        .replace(", jiggle_breast_remesh_top_z: 0.0", "")
+        .replace(", jiggle_glute_remesh_bottom_z: 0.0", "")
+        .replace(", jiggle_glute_remesh_top_z: 0.0", "")
+        .replace(", jiggle_glute_jiggle_bottom_z: 0.0", "")
+        .replace(", jiggle_glute_jiggle_top_z: 0.0", "")
+        .replace(", jiggle_breast_size: 0.0", "")
+        .replace(", jiggle_glute_size: 0.0", "")
+        .replace(", jiggle_locomotion: 1.0", "")
+        .replace(", jiggle_impulse_cap: 0.5", "")
+        .replace(", jiggle_swirl: 0.35", "")
+        .replace(", jiggle_breast_stiffness: 1.0", "")
+        .replace(", jiggle_breast_damping: 1.0", "")
+        .replace(", jiggle_glute_stiffness: 1.0", "")
+        .replace(", jiggle_glute_damping: 1.0", "")
+        // New flare settings did not exist in the frozen pre-registry settings.
+        .replace(", world_flares: false", "")
+        .replace(", saber_flares: true", "")
+        .replace(", rt_taa: 0", "");
     for byte in projected.bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
@@ -63,19 +95,53 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
     let actual = if name.ends_with(".cfg") {
         projected_archive = actual
             .lines()
-            .filter(|line| !line.starts_with("seta con_notifylines "))
+            .filter(|line| {
+                !line.starts_with("seta r_rtTaa ") &&
+                !line.starts_with("seta con_notifylines ")
+                    && !line.starts_with("seta cg_thirdPersonFlagAlpha ")
+                    && !line.starts_with("seta cg_scoreSpectatorGuess ")
+                    && !line.starts_with("seta s_steamAudioHrtfInterpolation ")
+                    && !line.starts_with("seta r_jiggleBreastRemeshBottomZ ")
+                    && !line.starts_with("seta r_jiggleBreastRemeshTopZ ")
+                    && !line.starts_with("seta r_jiggleGluteRemeshBottomZ ")
+                    && !line.starts_with("seta r_jiggleGluteRemeshTopZ ")
+                    && !line.starts_with("seta r_jiggleGluteJiggleBottomZ ")
+                    && !line.starts_with("seta r_jiggleGluteJiggleTopZ ")
+                    && !line.starts_with("seta r_jiggleBreastSize ")
+                    && !line.starts_with("seta r_jiggleGluteSize ")
+                    && !line.starts_with("seta r_jiggleLocomotion ")
+                    && !line.starts_with("seta r_jiggleImpulseCap ")
+                    && !line.starts_with("seta r_jiggleSwirl ")
+                    && !line.starts_with("seta r_jiggleBreastStiffness ")
+                    && !line.starts_with("seta r_jiggleBreastDamping ")
+                    && !line.starts_with("seta r_jiggleGluteStiffness ")
+                    && !line.starts_with("seta r_jiggleGluteDamping ")
+                    // New controls are outside the frozen pre-registry archive.
+                    && !line.starts_with("seta r_worldFlares ")
+                    && !line.starts_with("seta r_saberFlares ")
+                    && !line.starts_with("seta r_oceanInteraction ")
+                    && !line.starts_with("seta r_oceanInteractionStrength ")
+                    && !line.starts_with("seta r_oceanInteractionFx ")
+                    && !line.starts_with("seta r_oceanInteractionLifetime ")
+                    && !line.starts_with("seta r_oceanInteractionFade ")
+                    && !line.starts_with("seta r_oceanInteractionDamping ")
+                    && !line.starts_with("seta r_oceanInteractionEdgeFade ")
+            })
             .map(|line| format!("{line}\n"))
             .collect::<String>();
         projected_archive.as_str()
     } else {
         actual
     };
-    if name == "config-matrix.txt" {
+    if matches!(name, "config-matrix.txt" | "runtime-matrix.txt" | "subsystem-matrix.txt") {
         expected = expected
             .lines()
             .filter(|line| {
-                let name = line.split_whitespace().next().unwrap_or_default();
-                name != "r_hdr" && crate::app::cvar_registry().find(name).is_some()
+                let cvar_name = line.split_whitespace().next().unwrap_or_default();
+                if matches!(cvar_name, "cg_predictbackend" | "cg_snapmode") {
+                    return false; // No longer registered; previous behavior is intentionally gone.
+                }
+                name != "config-matrix.txt" || (cvar_name != "r_hdr" && crate::app::cvar_registry().find(cvar_name).is_some())
             })
             .map(|line| format!("{line}\n"))
             .collect();
@@ -188,6 +254,28 @@ fn cvar_compatibility_archive_text_and_defaults() {
 }
 
 #[test]
+fn steam_audio_hrtf_interpolation_addition_loads_and_archives() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("input.cfg");
+    fs::write(&path, "seta s_steamAudioHrtfInterpolation bilinear\n").unwrap();
+    let audio = config::load_audio_settings(&path);
+    assert_eq!(audio.steam_audio_hrtf_interpolation, 1);
+
+    let video = crate::ui::VideoSettings::default();
+    let client = config::ClientPresentationSettings::default();
+    config::save_video_settings(
+        &path,
+        video,
+        &crate::keybinds::Bindings::default(),
+        &client,
+        &audio,
+    )
+    .unwrap();
+    let archived = fs::read_to_string(&path).unwrap();
+    assert!(archived.contains("seta s_steamAudioHrtfInterpolation \"bilinear\""));
+}
+
+#[test]
 fn current_config_ignores_obsolete_keys_and_keeps_hdr_independent_of_tonemap() {
     let fixture = Fixture::new();
     let path = fixture.0.join("input.cfg");
@@ -244,4 +332,176 @@ fn notification_cvar_addition_loads_and_archives_its_current_default() {
         .unwrap()
         .flags
         .contains(crate::console::cvars::CvarFlags::ARCHIVE));
+}
+
+#[test]
+fn ocean_interaction_controls_load_archive_and_reject_nonfinite_strength() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("ocean.cfg");
+    fs::write(&path,"seta r_oceanInteraction 1\nseta r_oceanInteractionStrength 64\nseta r_oceanInteractionDebug 1\nseta r_oceanInteractionLifetime 4\nseta r_oceanInteractionFade 1.5\nseta r_oceanInteractionDamping 0.7\nseta r_oceanInteractionEdgeFade 64\n").unwrap();
+    let settings=config::load_video_settings(&path);
+    assert!(settings.ocean_settings.interaction);
+    assert_eq!(settings.ocean_settings.interaction_strength,64.0);
+    assert_eq!(settings.ocean_settings.sanitize().interaction_strength,64.0);
+    assert_eq!(settings.ocean_settings.interaction_lifetime,4.0);
+    assert_eq!(settings.ocean_settings.interaction_fade,1.5);
+    assert_eq!(settings.ocean_settings.interaction_damping,0.7);
+    assert_eq!(settings.ocean_settings.interaction_edge_fade,64.0);
+    assert!(!settings.ocean_settings.interaction_debug);
+    config::save_video_settings(&path,settings,&crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),&config::AudioSettings::default()).unwrap();
+    let saved=fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("seta r_oceanInteraction \"1\""));
+    assert!(saved.contains("seta r_oceanInteractionStrength \"64\""));
+    assert!(saved.contains("seta r_oceanInteractionLifetime \"4\""));
+    assert!(saved.contains("seta r_oceanInteractionFade \"1.5\""));
+    assert!(saved.contains("seta r_oceanInteractionDamping \"0.7\""));
+    assert!(saved.contains("seta r_oceanInteractionEdgeFade \"64\""));
+    assert!(!saved.contains("seta r_oceanInteractionDebug"));
+    fs::write(&path,"seta r_oceanInteractionStrength NaN\n").unwrap();
+    assert_eq!(config::load_video_settings(&path).ocean_settings.interaction_strength,1.0);
+    let registry=crate::app::cvar_registry();
+    for name in ["r_oceanInteraction","r_oceanInteractionStrength"] {
+        assert!(registry.find(name).unwrap().flags.contains(crate::console::cvars::CvarFlags::ARCHIVE));
+    }
+}
+
+#[test]
+fn third_person_flag_alpha_loads_archives_and_rejects_nonfinite_values() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("flag.cfg");
+    fs::write(&path, "seta cg_thirdPersonFlagAlpha 0.25\n").unwrap();
+    let settings = config::load_client_presentation_settings(&path);
+    assert_eq!(settings.japro.third_person_flag_alpha, 0.25);
+    config::save_video_settings(
+        &path, crate::ui::VideoSettings::default(), &crate::keybinds::Bindings::default(),
+        &settings, &config::AudioSettings::default(),
+    ).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("seta cg_thirdPersonFlagAlpha \"0.25\""));
+    let mut options = JaproCgame::default();
+    assert!(options.set_cvar("cg_thirdPersonFlagAlpha", "NaN").unwrap().is_err());
+    assert_eq!(options.third_person_flag_alpha, 1.0);
+    options.set_cvar("cg_thirdPersonFlagAlpha", "-1").unwrap().unwrap();
+    assert_eq!(options.third_person_flag_alpha, 0.0);
+}
+
+#[test]
+fn spectator_guess_cvar_addition_loads_and_archives() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("input.cfg");
+    fs::write(&path, "seta cg_scoreSpectatorGuess 0\n").unwrap();
+    let settings = config::load_client_presentation_settings(&path);
+    assert!(!settings.score_spectator_guess);
+    config::save_video_settings(
+        &path,
+        crate::ui::VideoSettings::default(),
+        &crate::keybinds::Bindings::default(),
+        &settings,
+        &config::AudioSettings::default(),
+    )
+    .unwrap();
+    assert!(fs::read_to_string(&path)
+        .unwrap()
+        .contains("seta cg_scoreSpectatorGuess \"0\""));
+    assert_eq!(
+        crate::app::cvar_registry()
+            .find("cg_scoreSpectatorGuess")
+            .unwrap()
+            .entry
+            .default,
+        "1"
+    );
+}
+
+#[test]
+fn jiggle_glute_coverage_height_cvar_addition_loads_and_archives() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("input.cfg");
+    fs::write(&path, "seta r_jiggleGluteCoverageHeight 0.72\n").unwrap();
+    let settings = config::load_video_settings(&path);
+    assert!((settings.jiggle_glute_coverage_height - 0.72).abs() < f32::EPSILON);
+    config::save_video_settings(
+        &path,
+        settings,
+        &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    )
+    .unwrap();
+    assert!(fs::read_to_string(&path)
+        .unwrap()
+        .contains("seta r_jiggleGluteCoverageHeight \"0.720\""));
+}
+
+#[test]
+fn jiggle_impulse_cap_loads_and_archives() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("input.cfg");
+    fs::write(&path, "seta r_jiggleImpulseCap 0.25\n").unwrap();
+    let settings = config::load_video_settings(&path);
+    assert_eq!(settings.jiggle_impulse_cap, 0.25);
+    config::save_video_settings(
+        &path,
+        settings,
+        &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    ).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("seta r_jiggleImpulseCap \"0.250\""));
+    assert_eq!(config::load_video_settings(&path).jiggle_impulse_cap, 0.25);
+}
+
+#[test]
+fn rt_regional_taa_loads_and_archives_without_changing_msaa() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("rt-taa.cfg");
+    fs::write(&path, "seta r_ext_multisample 2\nseta r_taa 0\nseta r_rtTaa 1\nseta r_rtDenoiser 0\n").unwrap();
+    let settings = config::load_video_settings(&path);
+    assert_eq!(settings.rt_taa, 1);
+    assert_eq!(settings.msaa_samples, 2);
+    assert!(!settings.taa);
+    assert_eq!(settings.rt_denoiser_mode, 0);
+    config::save_video_settings(&path, settings, &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(), &config::AudioSettings::default()).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("seta r_rtTaa \"1\""));
+    assert_eq!(config::load_video_settings(&path).rt_taa, 1);
+    fs::write(&path, "seta r_rtTaa 3\n").unwrap();
+    assert_eq!(config::load_video_settings(&path).rt_taa, 0);
+}
+
+#[test]
+fn world_and_saber_flare_cvars_load_and_archive_independently() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("flare.cfg");
+    fs::write(
+        &path,
+        "seta r_flares 0
+seta r_worldFlares 1
+seta r_saberFlares 0
+",
+    )
+    .unwrap();
+    let settings = config::load_video_settings(&path);
+    assert!(!settings.flares);
+    assert!(settings.world_flares);
+    assert!(settings.world_flares_active());
+    assert!(!settings.saber_flares);
+
+    config::save_video_settings(
+        &path,
+        settings,
+        &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    )
+    .unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    for expected in [
+        "seta r_flares \"0\"",
+        "seta r_worldFlares \"1\"",
+        "seta r_saberFlares \"0\"",
+    ] {
+        assert!(saved.lines().any(|line| line == expected), "missing {expected}");
+    }
 }

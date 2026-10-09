@@ -90,6 +90,18 @@ impl UniformArena {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(in crate::renderer) struct RuntimeOceanClipmap {
+    pub(in crate::renderer) slot: u8,
+    pub(in crate::renderer) quality: usize,
+    pub(in crate::renderer) layout: crate::ocean::PromotedClipmapLayout,
+    pub(in crate::renderer) vertex_base: u32,
+    pub(in crate::renderer) reserved_range: std::ops::Range<u32>,
+    pub(in crate::renderer) active_range: std::ops::Range<u32>,
+    pub(in crate::renderer) current_half_cells: i32,
+    pub(in crate::renderer) current_minimum_level: u32,
+}
+
 #[derive(Clone)]
 pub(in crate::renderer) struct WorldBatch {
     pub(in crate::renderer) source: DrawBatch,
@@ -292,6 +304,7 @@ pub(in crate::renderer) struct InlineModelGpu {
     /// Authored alpha-tested stages that have no opaque depth-writing sibling.
     /// These are added to the same mover BLAS as non-opaque geometries.
     pub(in crate::renderer) rt_mask_sources: Vec<RtAlphaMaskSource>,
+    pub(in crate::renderer) raster_glass_local: Vec<crate::renderer::lighting::glass_transmission::RasterGlassTriangle>,
     pub(in crate::renderer) coarse_batches: Vec<usize>,
     pub(in crate::renderer) full_batches: Vec<usize>,
     /// Last uploaded pose: `None` = never updated (buffer holds the compiled
@@ -319,6 +332,10 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     /// Real outlines of `ocean_surfaces`, by the slot baked into each clipmap.
     pub(in crate::renderer) ocean_masks: Arc<crate::ocean::OceanMasks>,
+    /// Runtime-rebuildable promoted-water index ranges, one per surface and
+    /// mesh quality. These are rewritten only when amplitude or 3D-distance
+    /// crosses an LOD threshold.
+    pub(in crate::renderer) runtime_ocean_clipmaps: Vec<RuntimeOceanClipmap>,
     pub(in crate::renderer) inline_models: Vec<InlineModelGpu>,
     pub(in crate::renderer) vertex_buffer: wgpu::Buffer,
     pub(in crate::renderer) index_buffer: wgpu::Buffer,
@@ -380,6 +397,9 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) froxel_bind_group: Option<wgpu::BindGroup>,
     pub(in crate::renderer) light_count: u32,
     pub(in crate::renderer) local_shadows: LocalShadowResources,
+    pub(in crate::renderer) glass_texture_names: Vec<String>,
+    pub(in crate::renderer) raster_glass_static: Vec<crate::renderer::lighting::glass_transmission::RasterGlassTriangle>,
+    pub(in crate::renderer) raster_glass_dynamic: Vec<crate::renderer::lighting::glass_transmission::RasterGlassTriangle>,
     pub(in crate::renderer) sun: Option<DirectionalSun>,
     pub(in crate::renderer) grass: Option<GrassMapGpu>,
     pub(in crate::renderer) surface_sprite_effects: Vec<SurfaceSpriteEffectGpu>,

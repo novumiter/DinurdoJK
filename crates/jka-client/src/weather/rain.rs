@@ -11,6 +11,7 @@ use super::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
+use jka_assets::pk3::AssetSearchPath;
 use std::{
     sync::Arc,
     thread::{self, JoinHandle},
@@ -19,6 +20,7 @@ use std::{
 use wgpu::util::DeviceExt;
 
 pub(crate) const RAIN_MAX_PARTICLES: u32 = 32_768;
+const MAX_PARTICLE_CLOUDS_COMPAT: u32 = crate::world_effects::MAX_PARTICLE_CLOUDS as u32;
 pub(crate) const RAIN_COMPUTE_GROUP_SIZE: u32 = 128;
 pub(crate) const RAIN_HAZE_MASK_WIDTH: u32 = 64;
 pub(crate) const RAIN_HAZE_MASK_MIN_HEIGHT: u32 = 16;
@@ -144,13 +146,23 @@ struct RainSimUniform {
     camera_dt: [f32; 4],
     spawn: [f32; 4],
     wind_time: [f32; 4],
+    /// stable/base weather wind X/Z; horizontal camera delta X/Z.
     weather: [f32; 4],
     collision_uv: [f32; 4],
     counts: [u32; 4],
-    /// x: number of water volumes. Rain lands on the top of each one.
+    /// x: legacy water-volume count; y: prebaked water-field A/B;
+    /// z: fast bounds/vertex A/B. Rain lands on the top surface.
     water_info: [f32; 4],
     water_min: [[f32; 4]; RAIN_MAX_WATER_VOLUMES],
     water_max: [[f32; 4]; RAIN_MAX_WATER_VOLUMES],
+}
+/// Outlines of the world's promoted water surfaces (`OceanMasks`), so a water
+/// volume's box can have holes. Uploaded only when the world's masks change.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RainWaterMasks {
+    ranges: [[f32; 4]; crate::ocean::OCEAN_MAX_SURFACES],
+    triangles: [[f32; 4]; crate::ocean::OCEAN_MASK_VEC4S],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -168,11 +180,35 @@ const RAIN_MAX_WATER_VOLUMES: usize = 8;
 // How quickly the camera's exposure settles when it walks under or out from cover.
 const CAMERA_EXPOSURE_SECONDS: f32 = 0.6;
 
+fn rain_glass_wind_lens(
+    camera: &Camera,
+    weather_wind: crate::ocean::AtmosphericWind,
+    frame_time: f32,
+) -> [f32; 4] {
+    let forward = camera.forward();
+    let mut right = forward.cross(Vec3::Y).normalize_or_zero();
+    if right.length_squared() <= f32::EPSILON {
+        let (sin_yaw, cos_yaw) = camera.yaw.sin_cos();
+        right = Vec3::new(sin_yaw, 0.0, cos_yaw);
+    }
+    let up = right.cross(forward).normalize_or_zero();
+    let wind = weather_wind.at(frame_time);
+    let wind_world = Vec3::new(wind[0], 0.0, wind[1]);
+    [
+        wind_world.dot(right),
+        wind_world.dot(up),
+        wind_world.dot(-forward),
+        wind_world.length(),
+    ]
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct WeatherOcclusionInfo { pub min_xz: [f32; 2], pub inv_extent_xz: [f32; 2], pub width: u32, pub height: u32 }
 
 pub(crate) struct WeatherOcclusionBuildResult {
     pub info: WeatherOcclusionInfo, pub surface_field: Vec<[f32; 4]>,
+    /// Mip level 1 of the field texture: blurred cover statistics for the soft rain-shadow edge.
+    pub shelter_level: Vec<[f32; 4]>,
     pub brush_count: usize, pub triangle_count: usize, pub topography_triangle_count: usize, pub build_ms: f64,
 }
 
@@ -183,12 +219,17 @@ pub(crate) enum WeatherOcclusionCache {
 pub(crate) struct RainGpuResources {
     pub _collision_texture: wgpu::Texture,
     pub collision_view: wgpu::TextureView,
+    /// Map-space [water bottom, water top, 0, 0] field used by the optional
+    /// O(1) rain/water collision A/B path. Same XZ grid as the weather field.
+    pub _water_height_texture: wgpu::Texture,
+    pub water_height_view: wgpu::TextureView,
     // A view of GrassRenderer's canonical GodotGrass wind texture plus a cheap
     // repeat/linear sampler. The underlying texture is owned only once by grass.
     pub wind_noise_view: wgpu::TextureView,
     pub wind_noise_sampler: wgpu::Sampler,
     pub particle_buffer: wgpu::Buffer,
     pub sim_uniform_buffer: wgpu::Buffer,
+    pub water_mask_buffer: wgpu::Buffer,
     pub sim_layout: wgpu::BindGroupLayout,
     pub sim_bind_group: wgpu::BindGroup,
     pub sim_pipeline: wgpu::ComputePipeline,
@@ -215,6 +256,14 @@ pub(crate) struct RainSystem {
     pub haze: RainHazeResources,
     pub enabled: bool,
     pub intensity: RainIntensity,
+    /// Runtime-only multiplier used by stacked legacy `r_we` rain clouds.
+    pub density_scale: f32,
+    /// Runtime-only RGB color selected by the legacy effect (acid rain).
+    pub tint: [f32; 3],
+    /// Additional post-process atmosphere applied when legacy acid rain is selected.
+    pub acid_strength: f32,
+    /// `r_we freeze`: keep rendering the current particles without advancing them.
+    pub frozen: bool,
     pub surface_wetness: f32,
     pub puddle_amount: f32,
     /// `puddle_debug <mode>`: 0 off, otherwise the diagnostic view the world
@@ -232,13 +281,42 @@ pub(crate) struct RainSystem {
     /// CPU copy of the weather field: camera exposure for the grade, and whether
     /// a footstep landed in water.
     cpu_field: Option<CpuField>,
+    /// The outlines last uploaded to `gpu.water_mask_buffer`.
+    water_masks: Arc<crate::ocean::OceanMasks>,
+    /// Promoted water volumes used to bake the optional constant-time collision field.
+    water_volumes: Vec<crate::ocean::WaterVolume>,
+    /// Rebuild the water field on the next prepared rain frame. Set when the map,
+    /// promoted-water set, outline masks or A/B mode changes.
+    pub(crate) water_field_dirty: bool,
+    /// A/B: remove rain as a reason for depth-aware haze/full spatial post.
+    pub fast_post: bool,
+    /// A/B: one texture load per drop instead of per-drop water triangle scans.
+    pub water_field_enabled: bool,
+    /// A/B: squared compute bounds + early drop center clip rejection.
+    pub fast_vertex: bool,
+    /// A/B: when rain is the only depth consumer, write only linear depth + hardware depth.
+    pub lean_depth: bool,
+    /// A/B: omit dynamic-model geometry from a rain-only linear-depth prepass.
+    pub static_depth: bool,
+    /// A/B: omit alpha-tested BSP from a rain-only linear-depth prepass.
+    pub opaque_depth: bool,
+    /// A/B: include dynamic entities in lean depth with one-target pipelines.
+    pub lean_models: bool,
+    /// A/B: specialized rain-only fullscreen post path.
+    pub lean_post: bool,
     /// Smoothed 0..1 exposure of the camera to the rain (0 indoors).
     camera_exposure: f32,
+    /// Previous precipitation anchor. Falling drops follow normal horizontal
+    /// camera translation, while impact splashes remain fixed to world surfaces.
+    /// This is the usual camera-relative precipitation-volume trick and prevents
+    /// a sparse leading edge when the player walks through the emitter.
+    camera_anchor_xz: Option<[f32; 2]>,
     pub wake: WakeTracker,
     pub surface_wetness_last_time: f32,
     /// Lazily allocated on first exposed-rain frame. This is the native WGPU
     /// port of Toadstorm/RainyGlassShader's fullscreen GrabPass refraction.
     glass: Option<RainGlassResources>,
+    glass_disabled: bool,
     /// Setup > Environment > Rain on lens. Separate from `enabled` so the lens
     /// can be turned off without losing the rain itself.
     pub glass_enabled: bool,
@@ -266,6 +344,10 @@ impl RainSystem {
             haze: create_rain_haze_resources(device),
             enabled: false,
             intensity: RainIntensity::Rain,
+            density_scale: 1.0,
+            tint: [1.0; 3],
+            acid_strength: 0.0,
+            frozen: false,
             surface_wetness: 0.0,
             puddle_amount: 0.0,
             puddle_debug_mode: 0,
@@ -275,10 +357,23 @@ impl RainSystem {
             puddle_scatter: 0.0,
             wet_grade: 0.0,
             cpu_field: None,
+            water_masks: Arc::new(crate::ocean::OceanMasks::default()),
+            water_volumes: Vec::new(),
+            water_field_dirty: true,
+            fast_post: false,
+            water_field_enabled: false,
+            fast_vertex: false,
+            lean_depth: false,
+            static_depth: false,
+            opaque_depth: false,
+            lean_models: false,
+            lean_post: false,
             camera_exposure: 1.0,
+            camera_anchor_xz: None,
             wake: WakeTracker::default(),
             surface_wetness_last_time: 0.0,
             glass: None,
+            glass_disabled: false,
             glass_enabled: true,
         }
     }
@@ -316,8 +411,13 @@ impl RainSystem {
         height: u32,
         format: wgpu::TextureFormat,
         frame_time: f32,
-        lens_up_alignment: f32,
+        camera: &Camera,
+        weather_wind: crate::ocean::AtmosphericWind,
+        mut assets: Option<&mut AssetSearchPath>,
     ) {
+        if self.glass_disabled {
+            return;
+        }
         let amount = if self.glass_enabled {
             self.lens_drop_amount()
         } else {
@@ -328,18 +428,52 @@ impl RainSystem {
         if amount <= 0.001 && self.glass.is_none() {
             return;
         }
-        let glass = self.glass.get_or_insert_with(|| {
-            RainGlassResources::new(device, queue, width, height, format)
-        });
+        if self.glass.is_none() {
+            let Some(assets) = assets.as_deref_mut() else {
+                self.glass_disabled = true;
+                eprintln!("[JKA WEATHER] RainyGlass disabled: asset VFS unavailable");
+                return;
+            };
+            match RainGlassResources::new(device, queue, width, height, format, assets) {
+                Ok(glass) => self.glass = Some(glass),
+                Err(error) => {
+                    self.glass_disabled = true;
+                    eprintln!("[JKA WEATHER] RainyGlass disabled: {error}");
+                    return;
+                }
+            }
+        }
+        let glass = self
+            .glass
+            .as_mut()
+            .expect("RainyGlass resources initialized");
+
+        // Put the same instantaneous gust/veer vector used by the rain particles
+        // into camera/lens space.  Do not integrate this into a UV offset: doing
+        // that pans the entire authored RainyGlass image as one sheet.  The lens
+        // shader instead applies these components only to each drop/rivulet's
+        // local distortion/flow.
+        let forward = camera.forward();
+        let wind_lens = rain_glass_wind_lens(camera, weather_wind, frame_time);
+
         glass.prepare(
-            jobs, device, queue, width, height, format, frame_time, amount,
-            lens_up_alignment,
+            jobs,
+            device,
+            queue,
+            width,
+            height,
+            format,
+            frame_time,
+            amount,
+            forward.y,
+            wind_lens,
         );
     }
 
     pub(crate) fn lens_glass_active(&self) -> bool {
         self.enabled
             && self.glass_enabled
+            && !self.glass_disabled
             && self.glass.as_ref().is_some_and(RainGlassResources::active)
     }
 
@@ -357,7 +491,7 @@ impl RainSystem {
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
     ) {
-        if !self.enabled || !self.glass_enabled {
+        if !self.enabled || !self.glass_enabled || self.glass_disabled {
             return;
         }
         if let Some(glass) = self.glass.as_ref() {
@@ -389,6 +523,9 @@ impl RainSystem {
             .map(start_weather_occlusion_build)
             .unwrap_or(WeatherOcclusionCache::Unavailable);
         self.cpu_field = None;
+        self.water_volumes.clear();
+        self.water_masks = Arc::new(crate::ocean::OceanMasks::default());
+        self.water_field_dirty = true;
         self.camera_exposure = 1.0;
         self.wake.clear();
         self.surface_wetness = 0.0;
@@ -468,15 +605,38 @@ impl RainSystem {
         }
     }
 
+    fn particle_count(&self) -> u32 {
+        let base = self.intensity.particle_count() as f32;
+        let scale = if self.density_scale.is_finite() {
+            self.density_scale.clamp(0.0, MAX_PARTICLE_CLOUDS_COMPAT as f32)
+        } else {
+            1.0
+        };
+        (base * scale).round().clamp(0.0, RAIN_MAX_PARTICLES as f32) as u32
+    }
+
+    fn splash_particle_count(&self) -> u32 {
+        let base = self.intensity.splash_particle_count() as f32;
+        let scale = if self.density_scale.is_finite() {
+            self.density_scale.clamp(0.0, MAX_PARTICLE_CLOUDS_COMPAT as f32)
+        } else {
+            1.0
+        };
+        (base * scale).round().clamp(0.0, self.particle_count() as f32) as u32
+    }
+
     pub(crate) fn collision_view(&self) -> &wgpu::TextureView {
         &self.gpu.collision_view
     }
 
     pub(crate) fn dispatch_simulation(&self, encoder: &mut wgpu::CommandEncoder) {
-        if !self.enabled {
+        if !self.enabled || self.frozen {
             return;
         }
-        let count = self.intensity.particle_count().min(RAIN_MAX_PARTICLES);
+        let count = self.particle_count();
+        if count == 0 {
+            return;
+        }
         let groups = (count + RAIN_COMPUTE_GROUP_SIZE - 1) / RAIN_COMPUTE_GROUP_SIZE;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("JKA GPU rain simulation"),
@@ -500,14 +660,14 @@ impl RainSystem {
         else {
             return;
         };
-        let count = self.intensity.particle_count().min(RAIN_MAX_PARTICLES);
+        let count = self.particle_count();
         pass.set_pipeline(drop_pipeline);
         pass.set_bind_group(0, camera_bind_group, &[]);
         pass.set_bind_group(1, &self.gpu.render_bind_group, &[]);
         pass.draw(0..4, 0..count);
 
         pass.set_pipeline(splash_pipeline);
-        let splash_count = self.intensity.splash_particle_count().min(count);
+        let splash_count = self.splash_particle_count().min(count);
         pass.draw(0..6, 0..splash_count);
     }
 
@@ -715,19 +875,38 @@ impl RainSystem {
             built.info.width,
             built.info.height,
             &built.surface_field,
+            &built.shelter_level,
         );
         let weather_height_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let empty_water = vec![
+            [WEATHER_NO_SURFACE_HEIGHT, WEATHER_NO_SURFACE_HEIGHT, 0.0, 0.0];
+            (built.info.width * built.info.height) as usize
+        ];
+        let (water_height_texture, water_height_view) = create_rain_height_texture(
+            device,
+            queue,
+            "JKA map-wide rain water-height field",
+            built.info.width,
+            built.info.height,
+            &empty_water,
+            &[],
+        );
         self.gpu.sim_bind_group = create_rain_sim_bind_group(
             device,
             &self.gpu.sim_layout,
             &self.gpu.particle_buffer,
             &self.gpu.sim_uniform_buffer,
+            &self.gpu.water_mask_buffer,
             &view,
+            &water_height_view,
             &self.gpu.wind_noise_view,
             &self.gpu.wind_noise_sampler,
         );
         self.gpu._collision_texture = texture;
         self.gpu.collision_view = view;
+        self.gpu._water_height_texture = water_height_texture;
+        self.gpu.water_height_view = water_height_view;
+        self.water_field_dirty = true;
         self.cpu_field = Some(CpuField::new(built.info, built.surface_field));
         self.occlusion = WeatherOcclusionCache::Ready(built.info);
         rverbose!(
@@ -748,12 +927,61 @@ impl RainSystem {
         previous_frame_time: f32,
         viewport_width: u32,
         viewport_height: u32,
-        weather_wind: crate::ocean::OceanWind,
+        weather_wind: crate::ocean::AtmosphericWind,
         sun_color: [f32; 3],
         sun_intensity: f32,
-        water_boxes: &[([f32; 3], [f32; 3])],
+        water_boxes: &[crate::ocean::WaterVolume],
+        water_masks: &Arc<crate::ocean::OceanMasks>,
         camera_underwater: bool,
     ) {
+        let masks_changed = !Arc::ptr_eq(&self.water_masks, water_masks);
+        let volumes_changed = self.water_volumes.as_slice() != water_boxes;
+        if masks_changed {
+            let mut uploaded = RainWaterMasks::zeroed();
+            uploaded.ranges = water_masks.ranges;
+            uploaded.triangles[..water_masks.triangles.len()].copy_from_slice(&water_masks.triangles);
+            queue.write_buffer(&self.gpu.water_mask_buffer, 0, bytemuck::bytes_of(&uploaded));
+            self.water_masks = Arc::clone(water_masks);
+        }
+        if masks_changed || volumes_changed {
+            self.water_volumes.clear();
+            self.water_volumes.extend_from_slice(water_boxes);
+            self.water_field_dirty = true;
+        }
+        if self.water_field_enabled && self.water_field_dirty {
+            if let WeatherOcclusionCache::Ready(info) = &self.occlusion {
+                let started = Instant::now();
+                let field = build_rain_water_height_field(info, water_boxes, water_masks);
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.gpu._water_height_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytemuck::cast_slice(&field),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(info.width * 16),
+                        rows_per_image: Some(info.height),
+                    },
+                    wgpu::Extent3d {
+                        width: info.width,
+                        height: info.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.water_field_dirty = false;
+                rverbose!(
+                    1,
+                    "Rain water field: baked {}x{} for {} promoted volume(s) in {:.2} ms",
+                    info.width,
+                    info.height,
+                    water_boxes.len(),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
         let (streak_length, streak_width, fall_speed, spawn_radius, below, above, opacity, splash_size, splash_time) = match self.intensity {
             RainIntensity::Light => (30.0, 0.68, 1_400.0, 1_000.0, 300.0, 1_050.0, 0.17, 9.0, 0.22),
             RainIntensity::Rain => (38.0, 0.82, 1_650.0, 1_075.0, 350.0, 1_175.0, 0.21, 11.5, 0.26),
@@ -771,6 +999,18 @@ impl RainSystem {
             ),
             WeatherOcclusionCache::Pending(_) | WeatherOcclusionCache::Building(_) | WeatherOcclusionCache::Unavailable => ([0.0; 4], 0, 0),
         };
+        let camera_xz = [camera.position.x, camera.position.z];
+        let mut camera_delta = self.camera_anchor_xz.map_or([0.0, 0.0], |previous| {
+            [camera_xz[0] - previous[0], camera_xz[1] - previous[1]]
+        });
+        self.camera_anchor_xz = Some(camera_xz);
+        // Teleports should let the normal volume-bounds path reseed at the new
+        // location instead of translating a whole old rain field across the map.
+        if camera_delta[0] * camera_delta[0] + camera_delta[1] * camera_delta[1]
+            > (spawn_radius * 0.5) * (spawn_radius * 0.5)
+        {
+            camera_delta = [0.0, 0.0];
+        }
         let sim = RainSimUniform {
             camera_dt: [camera.position.x, camera.position.y, camera.position.z, dt],
             spawn: [spawn_radius, below, above, fall_speed],
@@ -786,45 +1026,64 @@ impl RainSystem {
                 [
                     angle.cos() * weather.speed,
                     angle.sin() * weather.speed,
-                    0.0,
-                    0.0,
+                    camera_delta[0],
+                    camera_delta[1],
                 ]
             },
             collision_uv,
             counts: [
-                self.intensity.particle_count().min(RAIN_MAX_PARTICLES),
+                self.particle_count(),
                 collision_width,
                 collision_height,
-                self.intensity.splash_particle_count().min(RAIN_MAX_PARTICLES),
+                self.splash_particle_count(),
             ],
-            water_info: [water_boxes.len().min(RAIN_MAX_WATER_VOLUMES) as f32, 0.0, 0.0, 0.0],
-            water_min: water_volume_lanes(water_boxes, |(lo, _)| *lo),
-            water_max: water_volume_lanes(water_boxes, |(_, hi)| *hi),
+            water_info: [
+                water_boxes.len().min(RAIN_MAX_WATER_VOLUMES) as f32,
+                if self.water_field_enabled && !self.water_field_dirty { 1.0 } else { 0.0 },
+                if self.fast_vertex { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            // The min lanes' spare w carries each volume's outline slot + 1.
+            water_min: water_volume_lanes(water_boxes, |v| {
+                [v.minimum[0], v.minimum[1], v.minimum[2], v.mask_lane()]
+            }),
+            water_max: water_volume_lanes(water_boxes, |v| {
+                [v.maximum[0], v.maximum[1], v.maximum[2], 0.0]
+            }),
         };
         queue.write_buffer(&self.gpu.sim_uniform_buffer, 0, bytemuck::bytes_of(&sim));
 
         let sun_scale = (sun_intensity / 250.0).max(0.0).sqrt().clamp(0.28, 1.15);
-        let base = Vec3::new(0.72, 0.80, 0.90);
+        let tint = Vec3::from_array(self.tint.map(|channel| channel.clamp(0.0, 1.0)));
+        let base = if (tint - Vec3::ONE).length_squared() > 0.0001 {
+            tint
+        } else {
+            Vec3::new(0.72, 0.80, 0.90)
+        };
         let sun_color = Vec3::from_array(sun_color).max(Vec3::splat(0.05));
         let lit = (base * 0.72 + sun_color * 0.28) * sun_scale;
         let render = RainRenderUniform {
             appearance: [streak_length, streak_width, opacity, splash_size],
             splash: [splash_time, viewport_width.max(1) as f32, viewport_height.max(1) as f32, self.puddle_amount],
             color: [lit.x, lit.y, lit.z, 1.0],
-            look: [self.puddle_scatter, if camera_underwater { 1.0 } else { 0.0 }, 0.0, 0.0],
+            look: [
+                self.puddle_scatter,
+                if camera_underwater { 1.0 } else { 0.0 },
+                if self.fast_vertex { 1.0 } else { 0.0 },
+                0.0,
+            ],
         };
         queue.write_buffer(&self.gpu.render_uniform_buffer, 0, bytemuck::bytes_of(&render));
     }
 }
 
 fn water_volume_lanes(
-    boxes: &[([f32; 3], [f32; 3])],
-    pick: impl Fn(&([f32; 3], [f32; 3])) -> [f32; 3],
+    boxes: &[crate::ocean::WaterVolume],
+    pick: impl Fn(&crate::ocean::WaterVolume) -> [f32; 4],
 ) -> [[f32; 4]; RAIN_MAX_WATER_VOLUMES] {
     let mut lanes = [[0.0; 4]; RAIN_MAX_WATER_VOLUMES];
     for (lane, water) in lanes.iter_mut().zip(boxes) {
-        let [x, y, z] = pick(water);
-        *lane = [x, y, z, 0.0];
+        *lane = pick(water);
     }
     lanes
 }
@@ -944,14 +1203,77 @@ pub(crate) fn build_weather_occlusion_cpu(source: &WeatherOcclusionSource) -> Op
     let triangle_count = source.triangles.len();
     let topography_triangle_count = source.topography_triangles.len();
     let (info, surface_field) = super::field::build_heightfield(source)?;
+    let shelter_level = super::field::build_shelter_level(&info, &surface_field);
     Some(WeatherOcclusionBuildResult {
         info,
         surface_field,
+        shelter_level,
         brush_count,
         triangle_count,
         topography_triangle_count,
         build_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+/// Bake promoted water into the weather XZ grid. The hot rain compute path then
+/// replaces an 8-volume + outline-triangle search with one textureLoad. This is
+/// intentionally CPU work: promoted water changes rarely (normally only map/load
+/// or an authoring edit), while rain simulation runs every rendered frame.
+fn build_rain_water_height_field(
+    info: &WeatherOcclusionInfo,
+    water_boxes: &[crate::ocean::WaterVolume],
+    water_masks: &crate::ocean::OceanMasks,
+) -> Vec<[f32; 4]> {
+    let mut field = vec![
+        [WEATHER_NO_SURFACE_HEIGHT, WEATHER_NO_SURFACE_HEIGHT, 0.0, 0.0];
+        (info.width * info.height) as usize
+    ];
+    if water_boxes.is_empty() || info.width == 0 || info.height == 0 {
+        return field;
+    }
+    let extent_x = 1.0 / info.inv_extent_xz[0];
+    let extent_z = 1.0 / info.inv_extent_xz[1];
+    let step_x = extent_x / info.width as f32;
+    let step_z = extent_z / info.height as f32;
+    let clamp_range = |lo: f32, hi: f32, origin: f32, inv_extent: f32, size: u32| {
+        let a = (((lo - origin) * inv_extent) * size as f32).floor() as i64;
+        let b = (((hi - origin) * inv_extent) * size as f32).ceil() as i64;
+        (a.clamp(0, size as i64) as u32, b.clamp(0, size as i64) as u32)
+    };
+    for water in water_boxes.iter().take(RAIN_MAX_WATER_VOLUMES) {
+        let (x0, x1) = clamp_range(
+            water.minimum[0],
+            water.maximum[0],
+            info.min_xz[0],
+            info.inv_extent_xz[0],
+            info.width,
+        );
+        let (z0, z1) = clamp_range(
+            water.minimum[2],
+            water.maximum[2],
+            info.min_xz[1],
+            info.inv_extent_xz[1],
+            info.height,
+        );
+        for z in z0..z1 {
+            let world_z = info.min_xz[1] + (z as f32 + 0.5) * step_z;
+            for x in x0..x1 {
+                let world_x = info.min_xz[0] + (x as f32 + 0.5) * step_x;
+                if let Some(slot) = water.mask_slot {
+                    if !water_masks.contains(usize::from(slot), [world_x, world_z]) {
+                        continue;
+                    }
+                }
+                let cell = &mut field[(z * info.width + x) as usize];
+                // Rain falls top-down, so the highest overlapping promoted water
+                // is the first physically relevant surface at this XZ.
+                if water.maximum[1] > cell[1] {
+                    *cell = [water.minimum[1], water.maximum[1], 0.0, 0.0];
+                }
+            }
+        }
+    }
+    field
 }
 
 pub(crate) fn create_rain_height_texture(
@@ -961,26 +1283,52 @@ pub(crate) fn create_rain_height_texture(
     width: u32,
     height: u32,
     data: &[[f32; 4]],
+    shelter_level: &[[f32; 4]],
 ) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture_with_data(
-        queue,
-        &wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
+    // Level 1 carries the blurred cover statistics (see field.rs, SHELTER_FOOTPRINT)
+    // and is only present when the caller supplies it. Every other reader of this
+    // texture loads level 0 and never notices.
+    let (half_width, half_height) = ((width / 2).max(1), (height / 2).max(1));
+    let with_shelter = shelter_level.len() == (half_width * half_height) as usize && width >= 2 && height >= 2;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: if with_shelter { 2 } else { 1 },
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let upload = |mip_level: u32, texels: &[[f32; 4]], width: u32, height: u32| {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(texels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 16),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
                 width,
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        wgpu::util::TextureDataOrder::LayerMajor,
-        bytemuck::cast_slice(data),
-    );
+        );
+    };
+    upload(0, data, width, height);
+    if with_shelter {
+        upload(1, shelter_level, half_width, half_height);
+    }
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
 }
@@ -990,7 +1338,9 @@ pub(crate) fn create_rain_sim_bind_group(
     layout: &wgpu::BindGroupLayout,
     particle_buffer: &wgpu::Buffer,
     sim_uniform_buffer: &wgpu::Buffer,
+    water_mask_buffer: &wgpu::Buffer,
     collision_view: &wgpu::TextureView,
+    water_height_view: &wgpu::TextureView,
     wind_noise_view: &wgpu::TextureView,
     wind_noise_sampler: &wgpu::Sampler,
 ) -> wgpu::BindGroup {
@@ -1018,6 +1368,14 @@ pub(crate) fn create_rain_sim_bind_group(
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(wind_noise_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: water_mask_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: wgpu::BindingResource::TextureView(water_height_view),
+            },
         ],
     })
 }
@@ -1039,6 +1397,16 @@ fn create_rain_gpu_resources(
         1,
         1,
         &[[WEATHER_NO_SURFACE_HEIGHT, WEATHER_NO_SURFACE_HEIGHT, 0.0, 0.0]],
+        &[],
+    );
+    let (water_height_texture, water_height_view) = create_rain_height_texture(
+        device,
+        queue,
+        "JKA rain water-height placeholder",
+        1,
+        1,
+        &[[WEATHER_NO_SURFACE_HEIGHT, WEATHER_NO_SURFACE_HEIGHT, 0.0, 0.0]],
+        &[],
     );
 
     // Reuse GrassRenderer's canonical 512x512 GodotGrass wind texture. Rain
@@ -1084,6 +1452,11 @@ fn create_rain_gpu_resources(
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
+    let water_mask_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("JKA GPU rain water outlines"),
+        contents: bytemuck::bytes_of(&RainWaterMasks::zeroed()),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
     let sim_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("JKA GPU rain simulation layout"),
         entries: &[
@@ -1101,6 +1474,8 @@ fn create_rain_gpu_resources(
             },
             filterable_texture_entry_compute(3),
             filtering_sampler_entry_compute(4),
+            uniform_entry(5, wgpu::ShaderStages::COMPUTE),
+            unfilterable_texture_entry_compute(6),
         ],
     });
     let sim_bind_group = create_rain_sim_bind_group(
@@ -1108,7 +1483,9 @@ fn create_rain_gpu_resources(
         &sim_layout,
         &particle_buffer,
         &sim_uniform_buffer,
+        &water_mask_buffer,
         &collision_view,
+        &water_height_view,
         &wind_noise_view,
         &wind_noise_sampler,
     );
@@ -1174,10 +1551,13 @@ fn create_rain_gpu_resources(
     RainGpuResources {
         _collision_texture: collision_texture,
         collision_view,
+        _water_height_texture: water_height_texture,
+        water_height_view,
         wind_noise_view,
         wind_noise_sampler,
         particle_buffer,
         sim_uniform_buffer,
+        water_mask_buffer,
         sim_layout,
         sim_bind_group,
         sim_pipeline,
@@ -1364,5 +1744,31 @@ pub(crate) mod layout_tests {
         let (particle, _) =
             wgsl_struct_layout(include_str!("../rain_sim.wgsl"), "RainParticle");
         assert_eq!(particle as usize, size_of::<RainParticle>());
+    }
+
+    #[test]
+    fn rain_glass_wind_is_projected_into_lens_space() {
+        let camera = Camera::new_with_fov([0.0; 3], 0.0, 80.0);
+        let crosswind = crate::ocean::AtmosphericWind {
+            speed: 180.0,
+            direction: 90.0,
+            gust: 0.0,
+            shift: 0.0,
+        };
+        let cross = rain_glass_wind_lens(&camera, crosswind, 0.0);
+        assert!((cross[0] - 180.0).abs() < 0.001);
+        assert!(cross[1].abs() < 0.001);
+        assert!(cross[2].abs() < 0.001);
+
+        let headwind = crate::ocean::AtmosphericWind {
+            speed: 180.0,
+            direction: 180.0,
+            gust: 0.0,
+            shift: 0.0,
+        };
+        let head = rain_glass_wind_lens(&camera, headwind, 0.0);
+        assert!(head[0].abs() < 0.001);
+        assert!(head[1].abs() < 0.001);
+        assert!((head[2] - 180.0).abs() < 0.001);
     }
 }

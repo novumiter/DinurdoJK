@@ -14,7 +14,8 @@ struct Camera {
 struct PointLight {
     position_radius: vec4<f32>,
     color_intensity: vec4<f32>,
-    emitter: vec4<f32>, // xyz normal; w: 0 point, 1 one-sided area, 2 two-sided area
+    emitter: vec4<f32>, // xyz normal/direction; w: -1 segment, 0 point, 1/2 area, 3 spot
+    shape: vec4<f32>,   // spot: x inner cone cos, y outer cone cos
     shadow: vec4<f32>,
 };
 
@@ -131,13 +132,13 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             iteration >= light_count - transient_start
         );
         let light = lights[light_index];
-        let is_area = light.emitter.w > 0.5;
+        let is_area = light.emitter.w > 0.5 && light.emitter.w < 2.5;
         if (is_area) {
             if (settings.feature_flags.x == 0u) {
                 continue;
             }
         } else {
-            let point_mode = settings.feature_flags.z;
+            let point_mode = settings.feature_flags.z & 0xffu;
             if (point_mode == 0u) {
                 continue;
             }

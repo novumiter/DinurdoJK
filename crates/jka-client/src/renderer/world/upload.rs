@@ -8,7 +8,7 @@ use crate::renderer::{
     create_reflection_pipelines, create_snow_shell_gpu, create_world_bind_group,
     create_world_pipelines, detail_texture_for_source, gpu_point_lights, inspector_texture_meta,
     instantiate_portal_draw_plans, is_upward_water_face, legacy_dlight_runs_for_batch,
-    make_cull_record, material_uniform, ocean_surface_key, rt_alpha_mask_source_from_gpu_vertices,
+    make_cull_record, material_uniform, ocean_surface_key, rt_alpha_mask_source_from_gpu_vertices, rt_glass_source_from_gpu_vertices,
     same_draw_state, scene, upload_reflection_probes, upload_static_light_grid, upload_texture,
     upload_texture_bc3_picmip, upload_texture_picmip, upload_voxel_probe_gi,
     visible_batches_by_cluster, water_surface_extent, weather, Arc, Auto4CollapseCache,
@@ -16,6 +16,7 @@ use crate::renderer::{
     DrawBatch, DrawClass, DrawIndexedIndirectArgs, GpuCullRecord, GpuImage, GpuPointLight,
     GpuVertex, GrassRenderer, HashMap, IndexedGeometryBuilder, InlineModelGpu, InspectorVertex,
     Instant, MaterialUniform, Mutex, PreparedMap, PreparedPortalPlanBatchRef, RtAlphaMaskSource,
+    RuntimeOceanClipmap,
     StaticAoBaseLightmap, StaticAoWorldSource, SurfaceSpriteEffectGpu, SurfaceSpriteEffectRenderer,
     TextureData, UniformArena, WorldBatch, WorldGpu, WorldPipelineVariant, WorldShaderVariantKey,
     WorldUploadTimings, AUTO4_COLLAPSE_CACHE_BYTES, AUTO_DETAIL_ENABLED_BIT, CLUSTER_COUNT,
@@ -174,6 +175,7 @@ pub(in crate::renderer) fn build_world(
     let mut ocean_surfaces = Vec::<crate::ocean::OceanSurface>::new();
     let mut ocean_appearances = BTreeMap::new();
     let mut ocean_masks = crate::ocean::OceanMasks::default();
+    let mut runtime_ocean_clipmaps = Vec::<RuntimeOceanClipmap>::new();
     let mut ocean_coarsest_spacing = 0.0f32;
     let mut diffuse_stages = HashMap::new();
     if build_ocean_meshes {
@@ -193,36 +195,16 @@ pub(in crate::renderer) fn build_world(
         let mut water_face_appearances = Vec::new();
         let mut water_face_sources = Vec::new();
         let mut water_face_triangles = Vec::<Vec<crate::ocean::MaskTriangle>>::new();
-        let mut seen_faces = BTreeSet::<[u32; 6]>::new();
-        for source in coarse_sources.iter().chain(full_sources.iter()) {
-            if !source.water_primary || !is_upward_water_face(source, &vertices) {
-                continue;
-            }
-            let (plane, minimum, maximum) = water_surface_extent(source, &vertices);
-            let key = ocean_surface_key(plane, minimum, maximum, source.bsp_shader_index);
-            if !seen_faces.insert(key) {
-                continue;
-            }
-            let slice = &vertices[source.vertices.start as usize..source.vertices.end as usize];
-            water_face_triangles.push(
-                slice
-                    .chunks_exact(3)
-                    .map(|t| [0, 1, 2].map(|i| [t[i].position[0], t[i].position[2]]))
-                    .collect(),
-            );
-            water_face_keys.push(key);
+        for entry in crate::ocean::surfaces::collect(&vertices, &coarse_sources, &full_sources) {
+            let source = entry.source;
+            water_face_triangles.push(entry.triangles);
+            water_face_keys.push(entry.key);
             water_face_sources.push(source);
             water_face_appearances.push(if source.authored_ocean.is_none() {
                 diffuse_stages.get(&(source.vertices.start, source.vertices.end))
                     .map(|stage| crate::ocean::appearance::from_stage(stage, &vertices, &texture_data))
             } else { None });
-            water_faces.push(crate::ocean::WaterFace {
-                plane,
-                minimum,
-                maximum,
-                authored_ocean: source.authored_ocean,
-                material: source.bsp_shader_index,
-            });
+            water_faces.push(entry.face);
         }
         let clusters = crate::ocean::cluster_water_faces(&water_faces);
         if clusters.len() > MAX_OCEAN_SURFACES {
@@ -267,46 +249,77 @@ pub(in crate::renderer) fn build_world(
                     .iter()
                     .flat_map(|&member| water_face_triangles[member].iter().copied())
                     .collect();
-                ocean_masks.push_surface(slot, &triangles).then_some(slot)
-            };
-            // Both mesh qualities are uploaded so the quality setting stays a
-            // live switch instead of needing a map reload. Ordinary promoted
-            // water additionally scales the physical radius of its LOD rings
-            // from the inferred displacement amplitude: a ~5-unit calm pool
-            // keeps full 10-unit tessellation only near the viewer, whereas a
-            // large swell converges back to the original 128-cell profile.
-            let build = |spacing| {
-                if let Some(appearance) = appearance {
-                    crate::ocean::build_promoted_clipmap(
-                        spacing,
-                        cluster.plane,
-                        cluster.minimum,
-                        cluster.maximum,
-                        mask_slot,
-                        appearance.heuristic.amplitude,
-                    )
+                if crate::ocean::promoted_outline_needs_mask(
+                    cluster.minimum,
+                    cluster.maximum,
+                    &triangles,
+                ) {
+                    ocean_masks.push_surface(slot, &triangles).then_some(slot)
                 } else {
-                    crate::ocean::build_clipmap(
-                        spacing,
-                        cluster.plane,
-                        cluster.minimum,
-                        cluster.maximum,
-                        mask_slot,
-                    )
+                    None
                 }
             };
-            let low = build(crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS);
-            let high = build(crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS);
-            ocean_coarsest_spacing = low.coarsest_spacing;
-            upload_timings.ocean_clipmap_vertices +=
-                (low.vertices.len() + high.vertices.len()) as u64;
-            upload_timings.ocean_clipmap_tris += (high.indices.len() / 3) as u64;
-            upload_timings.ocean_clipmap_spacing = crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS;
-            upload_timings.ocean_coarsest_spacing = low.coarsest_spacing;
-            let ranges = [
-                indexed_builder.append_clipmap(&low.vertices, &low.indices),
-                indexed_builder.append_clipmap(&high.vertices, &high.indices),
-            ];
+            // Both mesh qualities are uploaded so the quality setting stays a
+            // live switch instead of needing a map reload. Promoted water uses
+            // upload-once vertex grids plus rewriteable index ranges: amplitude
+            // overrides and true 3D camera distance can therefore change the
+            // ring topology live instead of being frozen at map upload.
+            let ranges = if let Some(appearance) = appearance {
+                let low = crate::ocean::build_runtime_promoted_clipmap(
+                    crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
+                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                    appearance.heuristic.amplitude,
+                );
+                let high = crate::ocean::build_runtime_promoted_clipmap(
+                    crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
+                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                    appearance.heuristic.amplitude,
+                );
+                ocean_coarsest_spacing = low.coarsest_spacing;
+                upload_timings.ocean_clipmap_vertices +=
+                    (low.vertices.len() + high.vertices.len()) as u64;
+                upload_timings.ocean_clipmap_tris += (high.indices.len() / 3) as u64;
+                upload_timings.ocean_clipmap_spacing = crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS;
+                upload_timings.ocean_coarsest_spacing = low.coarsest_spacing;
+
+                let mut append = |quality: usize, clipmap: crate::ocean::RuntimePromotedClipmap| {
+                    let half_cells = crate::ocean::promoted_clipmap_half_cells(appearance.heuristic.amplitude);
+                    let (active_range, reserved_range, vertex_base) = indexed_builder.append_runtime_clipmap(
+                        &clipmap.vertices, &clipmap.indices, clipmap.index_capacity,
+                    );
+                    runtime_ocean_clipmaps.push(RuntimeOceanClipmap {
+                        slot: slot as u8,
+                        quality,
+                        layout: clipmap.layout,
+                        vertex_base,
+                        reserved_range,
+                        active_range: active_range.clone(),
+                        current_half_cells: half_cells,
+                        current_minimum_level: 0,
+                    });
+                    active_range
+                };
+                [append(0, low), append(1, high)]
+            } else {
+                let low = crate::ocean::build_clipmap(
+                    crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
+                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                );
+                let high = crate::ocean::build_clipmap(
+                    crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
+                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                );
+                ocean_coarsest_spacing = low.coarsest_spacing;
+                upload_timings.ocean_clipmap_vertices +=
+                    (low.vertices.len() + high.vertices.len()) as u64;
+                upload_timings.ocean_clipmap_tris += (high.indices.len() / 3) as u64;
+                upload_timings.ocean_clipmap_spacing = crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS;
+                upload_timings.ocean_coarsest_spacing = low.coarsest_spacing;
+                [
+                    indexed_builder.append_clipmap(&low.vertices, &low.indices),
+                    indexed_builder.append_clipmap(&high.vertices, &high.indices),
+                ]
+            };
             if let Some(source) = promoted_source {
                 let appearance = appearance.expect("promoted water appearance");
                 let name = source.texture.and_then(|i| texture_data.get(i))
@@ -886,6 +899,13 @@ pub(in crate::renderer) fn build_world(
     let mut rt_shadow_ranges = Vec::<std::ops::Range<u32>>::new();
     let mut rt_shadow_surfaces = BTreeSet::<(u32, u32)>::new();
     for batch in &coarse_batches[..inline_coarse_start] {
+        // Glass must not be duplicated in the opaque BLAS (even if its author
+        // used an opaque render stage plus `surfaceparm lightfilter`).
+        if crate::renderer::lighting::glass_transmission::classify_glass(
+                &batch.source,
+                batch.source.texture.and_then(|i| texture_data.get(i)).map(|t| t.label.as_str()),
+                None, true,
+            ).is_some() { continue; }
         if batch.source.pipeline.class != DrawClass::Opaque
             || batch.source.pipeline.blend != BlendMode::Opaque
             || batch.indexed_range.is_empty()
@@ -918,9 +938,14 @@ pub(in crate::renderer) fn build_world(
     let mut rt_mask_surfaces = BTreeSet::<(u32, u32)>::new();
     let mut rt_shadow_masks = Vec::<RtAlphaMaskSource>::new();
     for batch in &coarse_batches[..inline_coarse_start] {
-        if batch.source.pipeline.class != DrawClass::Mask
+        let glass = crate::renderer::lighting::glass_transmission::classify_glass(
+            &batch.source,
+            batch.source.texture.and_then(|i| texture_data.get(i)).map(|t| t.label.as_str()),
+            None, true,
+        ).is_some();
+        if !glass && (batch.source.pipeline.class != DrawClass::Mask
             || batch.source.pipeline.blend != BlendMode::Opaque
-            || !batch.source.pipeline.depth_write
+            || !batch.source.pipeline.depth_write)
             || batch.source.vertices.is_empty()
         {
             continue;
@@ -933,13 +958,16 @@ pub(in crate::renderer) fn build_world(
             .source
             .texture
             .and_then(|index| texture_data.get(index));
-        if let Some(mask) =
+        let caster = if glass {
+            rt_glass_source_from_gpu_vertices(&vertices, &batch.source, texture)
+        } else {
             rt_alpha_mask_source_from_gpu_vertices(&vertices, &batch.source, texture)
-        {
-            rt_shadow_masks.push(mask);
-        }
+        };
+        if let Some(mask) = caster { rt_shadow_masks.push(mask); }
     }
     let rt_vertex_count = u32::try_from(indexed_builder.vertices.len()).unwrap_or(u32::MAX);
+    let glass_texture_names = texture_data.iter().map(|texture| texture.label.clone()).collect();
+    let raster_glass_static = crate::renderer::lighting::glass_transmission::raster_glass_triangles(&rt_shadow_masks);
     // Preserve one object-space opaque triangle list per inline BSP model for
     // hardware RT. Raster movers continue to rewrite their private region of
     // the shared world vertex buffer; RT instead builds this local mesh once and
@@ -954,6 +982,11 @@ pub(in crate::renderer) fn build_world(
                 let Some(batch) = inline_batch_sources.get(batch_index) else {
                     continue;
                 };
+                if crate::renderer::lighting::glass_transmission::classify_glass(
+                    batch,
+                    batch.texture.and_then(|i| texture_data.get(i)).map(|t| t.label.as_str()),
+                    None, true,
+                ).is_some() { continue; }
                 if batch.pipeline.class != DrawClass::Opaque
                     || batch.pipeline.blend != BlendMode::Opaque
                     || batch.vertices.is_empty()
@@ -982,7 +1015,11 @@ pub(in crate::renderer) fn build_world(
                 .clone()
                 .filter_map(|batch_index| inline_batch_sources.get(batch_index))
                 .filter(|batch| {
-                    batch.pipeline.class == DrawClass::Opaque
+                    crate::renderer::lighting::glass_transmission::classify_glass(
+                        batch,
+                        batch.texture.and_then(|i| texture_data.get(i)).map(|t| t.label.as_str()),
+                        None, true,
+                    ).is_none() && batch.pipeline.class == DrawClass::Opaque
                         && batch.pipeline.blend == BlendMode::Opaque
                         && batch.pipeline.depth_write
                 })
@@ -994,9 +1031,14 @@ pub(in crate::renderer) fn build_world(
                 let Some(batch) = inline_batch_sources.get(batch_index) else {
                     continue;
                 };
-                if batch.pipeline.class != DrawClass::Mask
+                let glass = crate::renderer::lighting::glass_transmission::classify_glass(
+                    batch,
+                    batch.texture.and_then(|i| texture_data.get(i)).map(|t| t.label.as_str()),
+                    None, true,
+                ).is_some();
+                if (!glass && (batch.pipeline.class != DrawClass::Mask
                     || batch.pipeline.blend != BlendMode::Opaque
-                    || !batch.pipeline.depth_write
+                    || !batch.pipeline.depth_write))
                     || batch.vertices.is_empty()
                 {
                     continue;
@@ -1006,11 +1048,12 @@ pub(in crate::renderer) fn build_world(
                     continue;
                 }
                 let texture = batch.texture.and_then(|index| texture_data.get(index));
-                if let Some(mask) =
+                let caster = if glass {
+                    rt_glass_source_from_gpu_vertices(&inline_vertices, batch, texture)
+                } else {
                     rt_alpha_mask_source_from_gpu_vertices(&inline_vertices, batch, texture)
-                {
-                    masks.push(mask);
-                }
+                };
+                if let Some(mask) = caster { masks.push(mask); }
             }
             masks
         })
@@ -1081,6 +1124,7 @@ pub(in crate::renderer) fn build_world(
                 base: inline_vertices[model.vertices.start as usize..model.vertices.end as usize]
                     .to_vec(),
                 rt_indices,
+                raster_glass_local: crate::renderer::lighting::glass_transmission::raster_glass_triangles(&rt_mask_sources),
                 rt_mask_sources,
                 coarse_batches: model
                     .batches
@@ -1264,6 +1308,13 @@ pub(in crate::renderer) fn build_world(
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let local_shadows = create_local_shadow_resources(device, shadow_caster_layout);
+    let sunlight_glass_count = crate::renderer::lighting::glass_transmission::upload_raster_sun_glass(
+        queue, &local_shadows.glass_buffer, &raster_glass_static, &[]);
+    if sunlight_glass_count > crate::renderer::lighting::glass_transmission::RASTER_SUN_GLASS_SLOTS
+        * crate::renderer::lighting::glass_transmission::RASTER_GLASS_PER_LIGHT {
+        eprintln!("[JKA TINTED GLASS] {} sun triangles exceed raster capacity: sunlight tint disabled for this map", sunlight_glass_count);
+    }
+
     let static_light_grid_gpu = upload_static_light_grid(device, queue, static_light_grid.as_ref());
     let entity_light_grid = static_light_grid
         .map(scene::StaticLightGrid::into_classic_entity_grid)
@@ -1393,6 +1444,10 @@ pub(in crate::renderer) fn build_world(
                 binding: 16,
                 resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: local_shadows.glass_buffer.as_entire_binding(),
+            },
         ],
     });
 
@@ -1443,6 +1498,10 @@ pub(in crate::renderer) fn build_world(
             wgpu::BindGroupEntry {
                 binding: 16,
                 resource: legacy_dlight_surface_mask_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: local_shadows.glass_buffer.as_entire_binding(),
             },
         ],
     });
@@ -1723,11 +1782,15 @@ pub(in crate::renderer) fn build_world(
             ocean_surfaces,
             promoted_oceans: upload_timings.promoted_oceans.clone(),
             ocean_masks: Arc::new(ocean_masks),
+            runtime_ocean_clipmaps,
             inline_models,
             vertex_buffer,
             index_buffer,
             rt_shadow_ranges,
             rt_shadow_masks,
+            glass_texture_names,
+            raster_glass_static,
+            raster_glass_dynamic: Vec::new(),
             rt_vertex_count,
             ocean_coarsest_spacing: upload_timings.ocean_coarsest_spacing,
             cull_records_buffer,

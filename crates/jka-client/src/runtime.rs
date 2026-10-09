@@ -3,7 +3,7 @@ use crate::{
     thread_activity::{Task, ThreadActivitySample, SLOT_COUNT},
     ui::VsyncMode,
 };
-use std::{path::PathBuf, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 #[derive(Debug, Clone)]
 pub struct RenderStats {
@@ -113,6 +113,13 @@ pub struct WorldUploadTimings {
 pub enum ScreenshotOutput {
     Saved(PathBuf),
     Clipboard,
+    VideoFrame {
+        frame_index: u64,
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
+        depth_f32le: Option<Vec<u8>>,
+    },
 }
 
 pub enum UserEvent {
@@ -143,6 +150,13 @@ pub enum UserEvent {
         completed: u32,
         total: u32,
     },
+    /// Targeted current-BSP acoustic preparation requested by `snd_restart`.
+    /// This does not rebuild or upload the rendered world.
+    SteamAudioScenePrepared {
+        request_id: u64,
+        map_name: String,
+        result: Result<crate::scene::PreparedSteamAudioScene, String>,
+    },
     SteamAudioBakeProgress {
         request_id: u64,
         map_name: String,
@@ -159,6 +173,7 @@ pub enum UserEvent {
         started: Instant,
         name: String,
         map: Box<PreparedMap>,
+        fx_light_promotion: Arc<crate::fx::light_promotion::FxLightPromotionCatalog>,
     },
     /// Rapier static-world mesh built on a worker after client physics was
     /// enabled on an already-loaded map.

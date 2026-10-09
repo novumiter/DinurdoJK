@@ -377,6 +377,76 @@ impl App {
         }
     }
 
+    /// Best-effort follower hint for the scoreboard. JKA does not send the
+    /// followed client number for other spectators, but a following spectator's
+    /// scoreboard ping can mirror the target's ping. Treat that only as a weak
+    /// signal: the spectator must match three consecutive *different* local ping
+    /// values. Duplicate score replies do not advance the streak, and any
+    /// mismatch/absence resets it immediately.
+    fn update_spectator_ping_guesses(&mut self, entries: &mut [UiScoreEntry]) {
+        for entry in entries.iter_mut() {
+            entry.spectating_you = false;
+        }
+
+        if !self.score_spectator_guess {
+            for guess in &mut self.spectator_ping_guesses {
+                guess.reset();
+            }
+            return;
+        }
+
+        // The displayed playerState can belong to the followed player while we
+        // spectate. Use the netchan gamestate's client number instead: this is
+        // the network-owned local slot, so "you" never silently means the POV.
+        let local_client = self
+            .net
+            .as_ref()
+            .map(|net| net.session().decoder().client_number);
+        let Some(local_client) = local_client else {
+            for guess in &mut self.spectator_ping_guesses {
+                guess.reset();
+            }
+            return;
+        };
+        let Some(local_entry) = entries
+            .iter()
+            .find(|entry| entry.client == local_client && entry.team != 3 && entry.ping > 0)
+        else {
+            // Do not try to infer "spectating you" while we are a spectator or
+            // when a listen/LAN server reports an uninformative zero ping.
+            for guess in &mut self.spectator_ping_guesses {
+                guess.reset();
+            }
+            return;
+        };
+        let local_ping = local_entry.ping;
+
+        for client in 0..self.spectator_ping_guesses.len() {
+            let entry = entries
+                .iter_mut()
+                .find(|entry| entry.client == client as i32 && entry.team == 3 && entry.ping >= 0);
+            let guess = &mut self.spectator_ping_guesses[client];
+            let Some(entry) = entry else {
+                guess.reset();
+                continue;
+            };
+
+            if entry.ping != local_ping {
+                guess.reset();
+                continue;
+            }
+
+            if guess.last_matching_ping != Some(local_ping) {
+                guess.last_matching_ping = Some(local_ping);
+                guess.distinct_match_streak = guess.distinct_match_streak.saturating_add(1);
+                if guess.distinct_match_streak >= 3 {
+                    guess.confirmed = true;
+                }
+            }
+            entry.spectating_you = guess.confirmed;
+        }
+    }
+
     /// CG_ServerCommand text output for the console and chat box.
     pub(in crate::app) fn drain_cgame_notices(&mut self) {
         let Some(session) = self.game_session.as_mut() else {
@@ -420,6 +490,25 @@ impl App {
                         self.chat_log
                             .message(kind, team, text.clone(), chat_server_time);
                     }
+                    // TaystJK CG_Chat_f: only ordinary chat/team chat is filtered.
+                    // Keep the server's original text in the persistent chat log.
+                    if self.clean_chatbox != 0 && matches!(kind, crate::cgame::ChatKind::Say | crate::cgame::ChatKind::Team) {
+                        let uncolored = clean_chatbox_strip_codes(&text);
+                        if kind == crate::cgame::ChatKind::Say
+                            && (uncolored.to_ascii_lowercase().contains("media - currently playing: ")
+                                || uncolored.to_ascii_lowercase().contains("hi everybody!")) {
+                            continue;
+                        }
+                        // Compare the full original text, including the sender and color codes.
+                        // TaystJK uses a prefix comparison; exact equality avoids incorrectly
+                        // suppressing a longer follow-up message with a shared prefix.
+                        if self.last_clean_chat_message.as_deref() == Some(text.as_str()) {
+                            continue;
+                        }
+                    }
+                    if matches!(kind, crate::cgame::ChatKind::Say | crate::cgame::ChatKind::Team) {
+                        self.last_clean_chat_message = Some(text.clone());
+                    }
                     let (highlighted, alert) = self.console_chat_notification(kind, &text);
                     let notify_beep_played = if alert {
                         self.fire_console_notification_alert()
@@ -432,21 +521,29 @@ impl App {
                     if !notify_beep_played {
                         self.play_chat_sound(kind, &text);
                     }
-                    if highlighted {
-                        self.push_console_notification(
-                            text.clone(),
-                            crate::logging::ConsoleLineKind::NotifyMention,
-                        );
+                    // TaystJK's enabled chatbox path calls
+                    // `trap->Print("*%s\n", chatStr)`. CL_ConsolePrint strips
+                    // the leading `*` and records a zero notify timestamp, so
+                    // chat remains in console scrollback but never appears in
+                    // Con_DrawNotify. A con_notifywords hit only changes the
+                    // console stamp colour / desktop alert; it does not promote
+                    // the chat line into the top-left notify overlay.
+                    let console_kind = if highlighted {
+                        crate::logging::ConsoleLineKind::NotifyMention
                     } else {
-                        self.push_console_line(text.clone());
-                    }
+                        crate::logging::ConsoleLineKind::Normal
+                    };
+                    self.push_console_line_no_notify(text.clone(), console_kind);
                     if self.chat_lines.len() >= 16 {
                         self.chat_lines.pop_front();
                     }
                     let now = Instant::now();
                     let demo_elapsed_ms = self.current_demo_elapsed_ms(now);
+                    // Keep raw server text in console/history/logs; clean only the
+                    // dedicated chatbox presentation, as controlled by the cvar.
+                    let display_text = clean_chatbox_colors(&text, self.clean_chatbox);
                     self.chat_lines.push_back(ChatRecord {
-                        text,
+                        text: display_text,
                         created: now,
                         demo_elapsed_ms,
                     });
@@ -469,6 +566,33 @@ impl App {
                     });
                     self.last_center_refresh = now;
                     self.publish_transient_ui();
+                }
+                crate::cgame::CgameNotice::SiegeCenterPrint(text) => {
+                    // CG_DrawSiegeMessageNonMenu does *not* use the generic
+                    // server @@@ grammar. A single leading @ names a complete
+                    // StringEd key, then the result is fed to CG_CenterPrint at
+                    // 30% screen height.
+                    let _ = self.translate_server_text(b"x"); // lazily load StringEd
+                    let raw = crate::cgame::bytes_to_lossless_ascii(&text);
+                    let rendered = self.resolve_siege_text(&raw);
+                    let now = Instant::now();
+                    let demo_elapsed_ms = self.current_demo_elapsed_ms(now);
+                    self.center_print = Some(CenterPrintRecord {
+                        text: rendered,
+                        created: now,
+                        demo_elapsed_ms,
+                        y_fraction: 0.30,
+                    });
+                    self.last_center_refresh = now;
+                    self.publish_transient_ui();
+                }
+                crate::cgame::CgameNotice::SiegeRoundMessage(text) => {
+                    // CG_SiegeRoundOver routes wonround/lostround through
+                    // CG_DrawSiegeMessage(..., 0), i.e. UIMENU_SIEGEMESSAGE.
+                    let _ = self.translate_server_text(b"x"); // lazily load StringEd
+                    let raw = crate::cgame::bytes_to_lossless_ascii(&text);
+                    let rendered = self.resolve_siege_text(&raw);
+                    self.show_siege_round_message(rendered);
                 }
                 crate::cgame::CgameNotice::Obituary {
                     target,
@@ -635,7 +759,7 @@ impl App {
                         .map(|session| session.client_deaths)
                         .unwrap_or([0; 32]);
                     let score_deaths_mode = self.score_deaths;
-                    let mapped_entries: Vec<UiScoreEntry> = entries
+                    let mut mapped_entries: Vec<UiScoreEntry> = entries
                         .into_iter()
                         .map(|entry| {
                             let counted = usize::try_from(entry.client)
@@ -656,13 +780,34 @@ impl App {
                                 client: entry.client,
                                 name: entry.name,
                                 score: entry.score,
+                                powerups: entry.powerups,
+                                captures: entry.captures,
+                                assists: entry.assist_count,
+                                defends: entry.defend_count,
                                 deaths,
                                 ping: entry.ping,
                                 time: entry.time,
                                 team: entry.team,
+                                siege_class: entry.siege_class,
+                                siege_icon: None,
+                                spectating_you: false,
                             }
                         })
                         .collect();
+                    self.update_spectator_ping_guesses(&mut mapped_entries);
+                    let scoreboard_icon_paths = if gametype == 7 {
+                        self.game_session
+                            .as_ref()
+                            .map(|session| {
+                                crate::app::siege::siege_scoreboard_icons(
+                                    &mut mapped_entries,
+                                    &session.siege_catalog,
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
                     // TaystJK suppresses score/deaths in Duel and CTF. Power
                     // Duel has the win/loss score path, so keep it there too.
                     let show_deaths = score_deaths_mode != 0
@@ -670,12 +815,21 @@ impl App {
                         && mapped_entries.iter().any(|entry| entry.deaths.is_some());
                     self.scoreboard = Some(UiScoreboard {
                         team_scores,
+                        // The live ready mask comes from the current snapshot at draw time,
+                        // matching TaystJK CG_DrawClientScore rather than the `scores` payload.
+                        ready_clients: 0,
                         // JKA team modes start at GT_TEAM (6): Team FFA, Siege,
                         // CTF and CTY. Duel/FFA scoreboards do not need team UI.
                         team_game: gametype >= 6,
+                        ctf: gametype == 8,
+                        siege: gametype == 7,
+                        siege_win_team: self.game_session.as_ref()
+                            .map(|session| session.client_game.siege_win_team())
+                            .unwrap_or(0),
                         // GT_DUEL / GT_POWERDUEL.
                         spectator_scores: matches!(gametype, 3 | 4),
                         show_deaths,
+                        icon_paths: scoreboard_icon_paths,
                         entries: mapped_entries,
                     });
                     if self.scoreboard_should_show() {
@@ -687,14 +841,74 @@ impl App {
                 }
                 crate::cgame::CgameNotice::MapRestart => {
                     self.predictor.reset();
+                    for guess in &mut self.spectator_ping_guesses {
+                        guess.reset();
+                    }
                     if let Some(session) = self.game_session.as_mut() {
                         session.reward_active = None;
                         session.reward_queue.clear();
                         session.client_deaths = [0; 32];
+                        session.siege_extended.fill(crate::app::session::types::SiegeExtendedClient::default());
+                        session.siege_respawn_time = 0;
+                        session.siege_last_countdown = 0;
                     }
                     self.push_console_line("^3map_restart");
                 }
             }
         }
+    }
+}
+
+/// Remove JKA color escapes for moderation filters. This does not affect the name
+/// or the original console/chat log message.
+fn clean_chatbox_strip_codes(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'^' && i + 1 < bytes.len() && bytes[i + 1] != b'^' {
+            i += 2;
+        } else {
+            let ch = text[i..].chars().next().expect("valid utf8 character");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Match TaystJK CG_ChatBox_AddString: the sender/punctuation retains its
+/// original color codes, while mode 1 strips color codes from the message body
+/// and mode 2 replaces an initial disallowed body color with ^2 (green).
+fn clean_chatbox_colors(text: &str, mode: u8) -> String {
+    if mode == 0 { return text.to_owned(); }
+    let separator = ["^7: ^2", "^7): ^5", "^7]: ^6"]
+        .iter()
+        .find_map(|sep| text.find(sep).map(|i| (i + sep.len(), *sep)));
+    let Some((body_start, _)) = separator else { return text.to_owned(); };
+    let (prefix, body) = text.split_at(body_start);
+    if mode == 1 { return format!("{prefix}{}", clean_chatbox_strip_codes(body)); }
+    let bytes = body.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'^' && matches!(bytes[1], b'0' | b'1' | b'3'..=b'9') {
+        return format!("{prefix}^2{}", &body[2..]);
+    }
+    text.to_owned()
+}
+
+#[cfg(test)]
+mod clean_chatbox_tests {
+    use super::*;
+    #[test]
+    fn mode_one_cleans_body_only() {
+        assert_eq!(clean_chatbox_colors("^1Name^7: ^2^4hello ^6world", 1), "^1Name^7: ^2hello world");
+    }
+    #[test]
+    fn mode_two_recolors_first_body_code() {
+        assert_eq!(clean_chatbox_colors("^1Name^7: ^2^4hello ^6world", 2), "^1Name^7: ^2^2hello ^6world");
+        assert_eq!(clean_chatbox_colors("^1Name^7: ^2plain", 2), "^1Name^7: ^2plain");
+    }
+    #[test]
+    fn mode_zero_unchanged() {
+        assert_eq!(clean_chatbox_colors("^1Name^7: ^2^4hi", 0), "^1Name^7: ^2^4hi");
     }
 }

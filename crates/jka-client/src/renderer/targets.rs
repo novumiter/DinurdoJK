@@ -489,7 +489,8 @@ pub(in crate::renderer) fn create_targets(
         format: wgpu::TextureFormat::R32Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::STORAGE_BINDING,
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let linear_depth_view =

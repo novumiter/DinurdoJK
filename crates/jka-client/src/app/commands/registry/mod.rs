@@ -187,6 +187,7 @@ mod hud_commands;
 pub(crate) mod hud_layout_cvars;
 pub(crate) mod japro_cvars;
 pub(crate) mod jiggle_cvars;
+pub(crate) mod jiggle_bounds_cvars;
 pub(crate) mod material_cvars;
 mod media;
 pub(crate) mod movement_cvars;
@@ -278,6 +279,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(physics_cvars::DEFINITIONS.iter());
         definitions.extend(material_cvars::DEFINITIONS.iter());
         definitions.extend(jiggle_cvars::DEFINITIONS.iter());
+        definitions.extend(jiggle_bounds_cvars::DEFINITIONS.iter());
         definitions
     })
 }
@@ -419,6 +421,17 @@ mod tests {
     }
 
     #[test]
+    fn local_team_command_wins_over_teamoverlay_even_without_a_live_netchan() {
+        let def = command_registry().find("team").expect("team command");
+        assert_eq!(def.scope, CommandScope::Always);
+        assert_eq!(
+            crate::console::find_command("team", false).unwrap().name,
+            "team"
+        );
+        assert!(crate::console::prefix("team", false).any(|entry| entry.name == "teamoverlay"));
+    }
+
+    #[test]
     fn wait_is_registered_and_console_discoverable() {
         let def = command_registry().find("wait").expect("wait command");
         assert_eq!(def.name, "wait");
@@ -487,7 +500,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(cvar_registry().archived().count(), 421);
+        assert_eq!(cvar_registry().archived().count(), 425);
         for name in ["cg_debugEvents", "cg_eventWorkers", "cg_asyncAssets"] {
             assert!(!cvar_registry()
                 .find(name)

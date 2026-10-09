@@ -13,6 +13,7 @@ fn lamp(position: [f32; 3], intensity: f32) -> scene::DynamicLight {
         angle_attenuation: true,
         angle_scale: 0.0,
         extra_distance: 0.0,
+        shader_promotion_mask: 0,
     }
 }
 

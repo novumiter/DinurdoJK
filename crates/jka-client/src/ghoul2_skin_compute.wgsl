@@ -29,6 +29,10 @@ struct SkinDraw {
     jiggle1: vec4<f32>,
     jiggle2: vec4<f32>,
     jiggle3: vec4<f32>,
+    // Same storage-array stride as Ghoul2GpuDrawUniform and ghoul2_skin.wgsl,
+    // even though this compute path does not evaluate Source material lighting.
+    source_phong: vec4<f32>,
+    source_fresnel: vec4<f32>,
 };
 // q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
 fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
@@ -122,12 +126,17 @@ fn jiggle_offset(draw: SkinDraw, region: u32) -> vec3<f32> {
 }
 
 fn jiggle_effective_weight(draw: SkinDraw, weight: f32, coord: f32) -> f32 {
-    let overall = draw.jiggle0.w;
     if (abs(coord) < 2.0) {
-        let vertical = smoothstep(-0.70 + draw.jiggle3.w, -0.15 + draw.jiggle3.w, coord);
-        return weight * overall * draw.jiggle2.w * vertical;
+        let bottom = draw.jiggle0.w;
+        let top = draw.jiggle1.w;
+        let lower = smoothstep(-0.70 + bottom, -0.15 + bottom, coord);
+        var upper = 1.0;
+        if (top < 0.0) {
+            upper = 1.0 - smoothstep(0.65 + top, 1.0 + top, coord);
+        }
+        return weight * lower * upper;
     }
-    return weight * overall * draw.jiggle1.w;
+    return weight;
 }
 
 fn model_to_world(draw: SkinDraw, model_position: vec3<f32>) -> vec3<f32> {

@@ -1,6 +1,7 @@
 //! Models state.
 use crate::renderer::{
-    create_entity_prepass_pipeline, dynamic_model_writes_depth, sampler_entry,
+    create_entity_prepass_pipeline, create_entity_rain_prepass_pipeline,
+    dynamic_model_writes_depth, sampler_entry,
     storage_buffer_entry, texture_entry, uniform_entry, upload_texture, Arc,
     DynamicEntityLightingUniform, DynamicGpuTexture, DynamicModelAlphaMode, DynamicModelRenderer,
     DynamicModelVertex, EntityAmbientLightingMode, EntityLegacyFog, EntityWeather, Entry,
@@ -15,6 +16,7 @@ use wgpu::util::DeviceExt;
 impl DynamicModelRenderer {
     pub(in crate::renderer) fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         camera_layout: &wgpu::BindGroupLayout,
         surface_format: wgpu::TextureFormat,
         samples: u32,
@@ -26,6 +28,10 @@ impl DynamicModelRenderer {
                 texture_entry(0),
                 sampler_entry(1),
                 uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
+                // Source 1 `$bumpmap`. Shared with md3.wgsl and the RT receiver
+                // shaders, which simply do not declare it: wgpu only requires a
+                // shader's bindings to be a subset of its layout.
+                texture_entry(3),
             ],
         });
         let entity_lighting_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -54,7 +60,10 @@ impl DynamicModelRenderer {
             label: Some("JKA Ghoul2 GPU skinning layout"),
             entries: &[
                 storage_buffer_entry(0, true, wgpu::ShaderStages::VERTEX),
-                storage_buffer_entry(1, true, wgpu::ShaderStages::VERTEX),
+                // The per-draw table is also read by the fragment stage, which
+                // is where a Source 1 material's phong and the light it reacts
+                // to are evaluated per pixel.
+                storage_buffer_entry(1, true, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
         let skin_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -93,6 +102,23 @@ impl DynamicModelRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+        let flat_normal = upload_texture(
+            device,
+            queue,
+            &TextureData {
+                label: "JKA flat tangent-space normal".to_owned(),
+                source: None,
+                width: 1,
+                height: 1,
+                // Tangent space's own +Z once decoded by `tex * 2 - 1`.
+                rgba: vec![128, 128, 255, 255],
+                rgba16f: None,
+                mip_level_count: 1,
+                clamp: true,
+                // A normal map is data, never colour.
+                srgb: false,
+            },
+        );
         let fallback_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JKA dynamic model white fallback"),
             layout: &texture_layout,
@@ -108,6 +134,10 @@ impl DynamicModelRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: entity_lighting_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&flat_normal.view),
                 },
             ],
         });
@@ -183,7 +213,7 @@ impl DynamicModelRenderer {
             device,
             &pipeline_layout,
             &shader,
-            md3_vertex_layout,
+            md3_vertex_layout.clone(),
             true,
             "JKA dynamic model alpha-test depth prepass pipeline",
         );
@@ -199,9 +229,41 @@ impl DynamicModelRenderer {
             device,
             &skin_pipeline_layout,
             &skin_shader,
-            skin_vertex_layout,
+            skin_vertex_layout.clone(),
             true,
             "JKA Ghoul2 GPU skin alpha-test depth prepass pipeline",
+        );
+        let rain_prepass_pipeline = create_entity_rain_prepass_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            md3_vertex_layout.clone(),
+            false,
+            "JKA dynamic model rain lean depth prepass pipeline",
+        );
+        let rain_prepass_mask_pipeline = create_entity_rain_prepass_pipeline(
+            device,
+            &pipeline_layout,
+            &shader,
+            md3_vertex_layout,
+            true,
+            "JKA dynamic model alpha-test rain lean depth prepass pipeline",
+        );
+        let skin_rain_prepass_pipeline = create_entity_rain_prepass_pipeline(
+            device,
+            &skin_pipeline_layout,
+            &skin_shader,
+            skin_vertex_layout.clone(),
+            false,
+            "JKA Ghoul2 GPU skin rain lean depth prepass pipeline",
+        );
+        let skin_rain_prepass_mask_pipeline = create_entity_rain_prepass_pipeline(
+            device,
+            &skin_pipeline_layout,
+            &skin_shader,
+            skin_vertex_layout,
+            true,
+            "JKA Ghoul2 GPU skin alpha-test rain lean depth prepass pipeline",
         );
 
         Self {
@@ -209,6 +271,8 @@ impl DynamicModelRenderer {
             entity_lighting_buffer,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             entity_sun_relight: None,
+            entity_dlights: Vec::new(),
+            entity_dlights_rt_per_pixel: false,
             model_brightness: 1.0,
             entity_legacy_fog: EntityLegacyFog::default(),
             entity_weather: EntityWeather::default(),
@@ -243,14 +307,21 @@ impl DynamicModelRenderer {
             skin_wireframe_pipeline: None,
             skin_pipelines: Default::default(),
             skin_glow_pipelines: Default::default(),
+            skin_source_pipelines: Default::default(),
             skin_alpha_mask: 0,
+            skin_source_mask: 0,
             prepass_pipeline,
             prepass_mask_pipeline,
             skin_prepass_pipeline,
             skin_prepass_mask_pipeline,
+            rain_prepass_pipeline,
+            rain_prepass_mask_pipeline,
+            skin_rain_prepass_pipeline,
+            skin_rain_prepass_mask_pipeline,
             entity_shadow_pipelines: [None, None],
             repeat_sampler,
             clamp_sampler,
+            flat_normal,
             fallback_bind_group,
             textures: HashMap::new(),
             vertex_buffer,
@@ -271,6 +342,7 @@ impl DynamicModelRenderer {
             skin_draw_capacity,
             skin_bind_group,
             skin_draws: Vec::new(),
+            skin_instance_entities: Vec::new(),
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             companion_excluded_entity: None,
             ghoul2_input_instances: 0,
@@ -473,20 +545,11 @@ impl DynamicModelRenderer {
         }
     }
 
-    pub(in crate::renderer) fn ensure_texture(
-        &mut self,
-        brightness: &mut crate::renderer::brightness::BakedBrightness,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        texture: Option<&Arc<TextureData>>,
-    ) -> Option<Arc<str>> {
-        let texture = texture?;
-        let pointer_key = Arc::as_ptr(texture) as usize;
-        if let Some(key) = self.frame_texture_keys.get(&pointer_key) {
-            return Some(Arc::clone(key));
-        }
-
-        let key: Arc<str> = Arc::from(format!(
+    /// Cache key for one `TextureData`. Identity is the label plus everything
+    /// that changes the GPU resource, because two decodes of the same file must
+    /// share a bind group while a repack must not reuse a stale one.
+    fn texture_identity(texture: &TextureData) -> String {
+        format!(
             "{}|{}x{}|m{}|c{}|s{}",
             texture.label,
             texture.width,
@@ -494,10 +557,47 @@ impl DynamicModelRenderer {
             texture.mip_level_count,
             u8::from(texture.clamp),
             u8::from(texture.srgb),
-        ));
+        )
+    }
+
+    /// Bind group for one surface's material: its colour map and, for Source 1
+    /// materials, its `$bumpmap`.
+    ///
+    /// Both halves are part of the key. A bind group holds *two* texture views,
+    /// so keying on the colour map alone would let two surfaces that share a
+    /// base texture but differ in normal map collide and silently take each
+    /// other's bind group.
+    pub(in crate::renderer) fn ensure_texture(
+        &mut self,
+        brightness: &mut crate::renderer::brightness::BakedBrightness,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: Option<&Arc<TextureData>>,
+        normal_map: Option<&Arc<TextureData>>,
+    ) -> Option<Arc<str>> {
+        let texture = texture?;
+        let pointer_key = (
+            Arc::as_ptr(texture) as usize,
+            normal_map.map_or(0, |normal| Arc::as_ptr(normal) as usize),
+        );
+        if let Some(key) = self.frame_texture_keys.get(&pointer_key) {
+            return Some(Arc::clone(key));
+        }
+
+        let key: Arc<str> = Arc::from(match normal_map {
+            None => Self::texture_identity(texture),
+            Some(normal) => format!(
+                "{}|n:{}",
+                Self::texture_identity(texture),
+                Self::texture_identity(normal)
+            ),
+        });
         if let Entry::Vacant(entry) = self.textures.entry(Arc::clone(&key)) {
             let image = upload_texture(device, queue, texture);
             brightness.register(&image._texture);
+            // Deliberately not registered with baked brightness: a normal map is
+            // data, not colour, and `register` already skips non-sRGB textures.
+            let normal_image = normal_map.map(|normal| upload_texture(device, queue, normal));
             let sampler = if texture.clamp {
                 &self.clamp_sampler
             } else {
@@ -519,10 +619,19 @@ impl DynamicModelRenderer {
                         binding: 2,
                         resource: self.entity_lighting_buffer.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(
+                            normal_image
+                                .as_ref()
+                                .map_or(&self.flat_normal.view, |normal| &normal.view),
+                        ),
+                    },
                 ],
             });
             entry.insert(DynamicGpuTexture {
                 _image: image,
+                _normal_image: normal_image,
                 bind_group,
             });
         }

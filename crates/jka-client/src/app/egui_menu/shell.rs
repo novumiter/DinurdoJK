@@ -6,7 +6,7 @@ use crate::app::egui_menu::{
     GUTTER, PROFILE_COSMETICS, PROFILE_FORCE, PROFILE_IDENTITY, PROFILE_MODEL, PROFILE_SABER,
     SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
     SETUP_TAB_MOD, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
-    TOP_ITEMS, TOP_MOD, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
+    TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
 };
 
 impl App {
@@ -41,6 +41,7 @@ impl App {
             && self.frontend_page == FrontendPage::AssetViewer
             && self.overlay == OverlayMode::Console;
         (blocking_download_ui
+            || self.siege_dialog.is_some()
             || asset_viewer_behind_console
             || matches!(
                 self.overlay,
@@ -359,6 +360,10 @@ impl App {
             self.egui_server_password_dialog(ui);
             return;
         }
+        if self.siege_dialog.is_some() {
+            self.egui_siege_dialog(ui);
+            return;
+        }
         if self.missing_map_prompt.is_some() {
             self.egui_missing_map_dialog(ui);
             return;
@@ -528,6 +533,12 @@ impl App {
                 return;
             }
         } else {
+            // Opening the in-game Servers tab defaults to most recently visited.
+            // Do not change the separate main-menu browser's sorting behavior.
+            if index == 1 && !self.front_end && self.menu_selected != index {
+                self.server_browser.sort = crate::server_browser::BrowserSort::LastVisited;
+                self.server_browser.sort_ascending = false;
+            }
             self.menu_selected = index;
             if self.overlay != OverlayMode::Game {
                 self.set_overlay(OverlayMode::Game);
@@ -589,6 +600,10 @@ impl App {
                     return;
                 }
             };
+            if page == FrontendPage::ServerBrowser && self.frontend_page != page {
+                self.server_browser.sort = crate::server_browser::BrowserSort::LastVisited;
+                self.server_browser.sort_ascending = false;
+            }
             self.frontend_page = page;
             self.set_overlay(OverlayMode::Game);
             return;
@@ -604,7 +619,7 @@ impl App {
                 self.setup_selected = SETUP_TAB_MOVEMENT;
                 self.set_overlay(OverlayMode::Video);
             }
-            Some(page @ ("resume" | "servers" | "profile" | "controls" | "vote" | "mod")) => {
+            Some(page @ ("join" | "game" | "resume" | "servers" | "profile" | "controls" | "vote")) => {
                 if page == "profile" {
                     self.profile_selected_section = match tab.as_deref() {
                         Some("model") => PROFILE_MODEL,
@@ -615,20 +630,23 @@ impl App {
                     };
                     self.profile_preview_key = None;
                 }
+                if page == "servers" && !self.front_end {
+                    self.server_browser.sort = crate::server_browser::BrowserSort::LastVisited;
+                    self.server_browser.sort_ascending = false;
+                }
                 self.menu_selected = match page {
-                    "resume" => TOP_RESUME,
+                    "join" | "game" | "resume" => TOP_RESUME,
                     "servers" => 1,
                     "profile" => TOP_PROFILE,
                     "controls" => TOP_CONTROLS,
                     "vote" => TOP_VOTE,
-                    "mod" => TOP_MOD,
                     _ => TOP_RESUME,
                 };
                 self.set_overlay(OverlayMode::Game);
             }
             _ => {
                 self.console_status =
-                    "USAGE: uipage resume|servers|profile|controls|movement|vote|mod|setup [game|movement|camera|video|audio|network|interface|mod]".into();
+                    "USAGE: uipage join|servers|profile|controls|movement|vote|setup [game|movement|camera|video|audio|network|interface|mod]".into();
             }
         }
     }
@@ -900,12 +918,16 @@ impl App {
         }
 
         match self.menu_selected {
-            TOP_RESUME => self.egui_resume_page(ui),
+            TOP_RESUME => {
+                egui::ScrollArea::vertical()
+                    .id_salt("jka_join_page")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.egui_resume_page(ui));
+            }
             1 => self.egui_server_browser_page(ui),
             TOP_PROFILE => self.egui_profile_page(ui),
             TOP_CONTROLS => self.egui_controls_page(ui),
             TOP_VOTE => self.egui_vote_page(ui),
-            TOP_MOD => self.egui_mod_settings(ui),
             _ => {}
         }
     }

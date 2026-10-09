@@ -2,185 +2,299 @@
 use crate::app::{App, ElementState, Instant, KeyCode, KeyEvent, OverlayMode, SocketAddr};
 
 impl App {
-    pub(in crate::app) fn refresh_japro_saved_logins(&mut self) {
+    pub(in crate::app) fn refresh_saved_accounts(&mut self) {
         match crate::credential_store::list() {
             Ok(entries) => {
-                self.japro_saved_logins = entries;
-                self.japro_credential_error = None;
+                self.saved_accounts = entries;
+                self.account_credential_error = None;
             }
-            Err(error) => self.japro_credential_error = Some(error),
+            Err(error) => self.account_credential_error = Some(error),
         }
     }
 
-    pub(in crate::app) fn current_japro_server_endpoint(&self) -> Option<SocketAddr> {
-        (self.live_connected()
-            && self.connected_server_mod() == crate::net::mod_support::ServerMod::Japro)
+    pub(in crate::app) fn current_account_server_endpoint(&self) -> Option<SocketAddr> {
+        self.live_connected()
             .then(|| self.net.as_ref().map(|net| net.session().server()))
             .flatten()
     }
 
-    pub(in crate::app) fn begin_new_japro_login(&mut self, server: SocketAddr) {
-        let server_name: String = self
-            .current_server_hostname()
+    fn current_account_server_name(&self) -> String {
+        self.current_server_hostname()
             .map(|name| crate::logging::strip_jka_colors(&name).trim().to_owned())
             .filter(|name| !name.is_empty())
             .unwrap_or_default()
             .chars()
             .take(96)
-            .collect();
-        self.japro_login_editor = Some(crate::app::JaproLoginEditor {
-            server,
-            server_name,
-            username: self.network.ui_username.clone(),
-            password: self.network.ui_password.clone(),
-            new_entry: true,
-        });
-        self.japro_credential_error = None;
+            .collect()
     }
 
-    pub(in crate::app) fn begin_edit_japro_login(&mut self, server: SocketAddr) {
-        let Some(saved) = self
-            .japro_saved_logins
+    pub(in crate::app) fn begin_new_account(&mut self, server: SocketAddr) {
+        use crate::credential_store::AccountType;
+
+        let account_type = AccountType::ALL
             .iter()
-            .find(|entry| entry.server == server)
+            .copied()
+            .find(|kind| {
+                !self
+                    .saved_accounts
+                    .iter()
+                    .any(|entry| entry.server == server && entry.account_type == *kind)
+            })
+            .unwrap_or(AccountType::Login);
+        self.account_editor = Some(crate::app::AccountEditor {
+            server,
+            server_name: self.current_account_server_name(),
+            account_type,
+            original_type: None,
+            username: String::new(),
+            password: String::new(),
+        });
+        self.account_credential_error = None;
+    }
+
+    pub(in crate::app) fn begin_edit_account(
+        &mut self,
+        server: SocketAddr,
+        account_type: crate::credential_store::AccountType,
+    ) {
+        let Some(saved) = self
+            .saved_accounts
+            .iter()
+            .find(|entry| entry.server == server && entry.account_type == account_type)
             .cloned()
         else {
-            self.japro_credential_error = Some(format!("No saved jaPRO login for {server}"));
+            self.account_credential_error = Some(format!(
+                "No saved {} account for {server}",
+                account_type.label()
+            ));
             return;
         };
-        self.japro_login_editor = Some(crate::app::JaproLoginEditor {
+        self.account_editor = Some(crate::app::AccountEditor {
             server,
             server_name: saved.server_name.unwrap_or_default(),
+            account_type: saved.account_type,
+            original_type: Some(saved.account_type),
             username: saved.username,
             // Do not pull the existing password out of Credential Manager just
             // to render an editor. Blank means preserve it when saving.
             password: String::new(),
-            new_entry: false,
         });
-        self.japro_credential_error = None;
+        self.account_credential_error = None;
     }
 
-    pub(in crate::app) fn save_japro_login_edit(
+    pub(in crate::app) fn save_account_edit(
         &mut self,
         server: SocketAddr,
         server_name: &str,
+        account_type: crate::credential_store::AccountType,
+        original_type: Option<crate::credential_store::AccountType>,
         username: &str,
         password: &str,
-        new_entry: bool,
     ) -> Result<(), String> {
-        const LOGIN_LIMIT: usize = 15;
+        use crate::credential_store::AccountType;
+
+        const USERNAME_LIMIT: usize = 64;
+        const PASSWORD_LIMIT: usize = 128;
         const SERVER_NAME_LIMIT: usize = 96;
 
-        let username = username.trim();
         let server_name = server_name.trim();
-        if username.is_empty() {
-            return Err("Enter a jaPRO username".to_owned());
-        }
-        if username.chars().count() > LOGIN_LIMIT {
-            return Err(format!("jaPRO usernames are limited to {LOGIN_LIMIT} characters"));
-        }
+        let username = username.trim();
         if server_name.chars().count() > SERVER_NAME_LIMIT {
             return Err(format!("Server names are limited to {SERVER_NAME_LIMIT} characters"));
         }
         if server_name.chars().any(char::is_control) {
             return Err("Server names cannot contain control characters".to_owned());
         }
-        let invalid_arg = |value: &str| {
+
+        let invalid_command_arg = |value: &str| {
             value.chars().any(char::is_whitespace)
                 || value.chars().any(|c| matches!(c, ';' | '"' | '\\'))
         };
-        if invalid_arg(username) {
-            return Err(
-                "jaPRO usernames cannot contain spaces, semicolons, quotes, or backslashes"
-                    .to_owned(),
-            );
+        if account_type == AccountType::Login {
+            if username.is_empty() {
+                return Err("Enter a username for a Login account".to_owned());
+            }
+            if username.chars().count() > USERNAME_LIMIT {
+                return Err(format!("Usernames are limited to {USERNAME_LIMIT} characters"));
+            }
+            if invalid_command_arg(username) {
+                return Err(
+                    "Login usernames cannot contain spaces, semicolons, quotes, or backslashes"
+                        .to_owned(),
+                );
+            }
         }
 
-        let stored_password = if password.is_empty() && !new_entry {
-            Some(
-                crate::credential_store::read(server)?
-                    .ok_or_else(|| format!("No saved jaPRO login for {server}"))?
-                    .password,
-            )
+        if let Some(original_type) = original_type {
+            if original_type != account_type
+                && crate::credential_store::read(server, account_type)?.is_some()
+            {
+                return Err(format!(
+                    "A saved {} account already exists for {server}",
+                    account_type.label()
+                ));
+            }
+        }
+
+        let stored_password = if password.is_empty() {
+            original_type
+                .map(|kind| {
+                    crate::credential_store::read(server, kind)?.ok_or_else(|| {
+                        format!("No saved {} account for {server}", kind.label())
+                    })
+                })
+                .transpose()?
+                .map(|credential| credential.password)
         } else {
             None
         };
         let password = stored_password.as_deref().unwrap_or(password);
         if password.is_empty() {
-            return Err("Enter a jaPRO password".to_owned());
+            return Err("Enter a password".to_owned());
         }
-        if password.chars().count() > LOGIN_LIMIT {
-            return Err(format!("jaPRO passwords are limited to {LOGIN_LIMIT} characters"));
+        if password.chars().count() > PASSWORD_LIMIT {
+            return Err(format!("Passwords are limited to {PASSWORD_LIMIT} characters"));
         }
-        if invalid_arg(password) {
-            return Err(
-                "jaPRO passwords cannot contain spaces, semicolons, quotes, or backslashes"
-                    .to_owned(),
-            );
+        if password.chars().any(char::is_control) {
+            return Err("Passwords cannot contain control characters".to_owned());
         }
-
-        crate::credential_store::save(
-            server,
-            (!server_name.is_empty()).then_some(server_name),
-            username,
-            password,
-        )?;
-        self.refresh_japro_saved_logins();
-        Ok(())
-    }
-
-    pub(in crate::app) fn login_with_saved_japro_credential(
-        &mut self,
-        server: SocketAddr,
-    ) -> Result<(), String> {
-        let current = self
-            .current_japro_server_endpoint()
-            .ok_or_else(|| "Join a jaPRO server before using a saved login".to_owned())?;
-        if current != server {
+        if matches!(account_type, AccountType::Login | AccountType::Admin)
+            && invalid_command_arg(password)
+        {
             return Err(format!(
-                "Saved login belongs to {server}, but the current server is {current}"
+                "{} passwords cannot contain spaces, semicolons, quotes, or backslashes",
+                account_type.label()
             ));
         }
-        let credential = crate::credential_store::read(server)?
-            .ok_or_else(|| format!("No saved jaPRO login for {server}"))?;
-        let valid = !credential.username.is_empty()
-            && !credential.password.is_empty()
-            && !credential.username.chars().any(char::is_whitespace)
-            && !credential.password.chars().any(char::is_whitespace)
-            && !credential
-                .username
-                .chars()
-                .any(|c| matches!(c, ';' | '"' | '\\'))
-            && !credential
-                .password
-                .chars()
-                .any(|c| matches!(c, ';' | '"' | '\\'));
-        if !valid {
-            return Err(format!("Saved credential for {server} is invalid"));
-        }
 
-        self.forward_command_to_server(&format!(
-            "login {} {}",
-            credential.username, credential.password
-        ));
-        self.console_status = format!("JAPRO LOGIN SENT FOR {}", credential.username);
-        self.push_console_line(format!(
-            "^2jaPRO saved login:^7 {} @ {server}",
-            credential.username
-        ));
+        let stored_username = if account_type == AccountType::Login {
+            username
+        } else {
+            ""
+        };
+        crate::credential_store::save(
+            server,
+            account_type,
+            (!server_name.is_empty()).then_some(server_name),
+            stored_username,
+            password,
+        )?;
+        if let Some(original_type) = original_type {
+            if original_type != account_type {
+                crate::credential_store::delete(server, original_type)?;
+            }
+        }
+        self.refresh_saved_accounts();
         Ok(())
     }
 
-    pub(in crate::app) fn forget_japro_login(&mut self, server: SocketAddr) -> Result<(), String> {
-        crate::credential_store::delete(server)?;
-        if self
-            .japro_login_editor
-            .as_ref()
-            .is_some_and(|editor| editor.server == server)
-        {
-            self.japro_login_editor = None;
+    fn validate_saved_command_arg(value: &str) -> bool {
+        !value.is_empty()
+            && !value.chars().any(char::is_whitespace)
+            && !value.chars().any(|c| matches!(c, ';' | '"' | '\\'))
+    }
+
+    pub(in crate::app) fn login_with_saved_account(
+        &mut self,
+        server: SocketAddr,
+        account_type: crate::credential_store::AccountType,
+    ) -> Result<(), String> {
+        use crate::credential_store::AccountType;
+
+        let current = self
+            .current_account_server_endpoint()
+            .ok_or_else(|| "Join a server before using a saved account".to_owned())?;
+        if current != server {
+            return Err(format!(
+                "Saved account belongs to {server}, but the current server is {current}"
+            ));
         }
-        self.refresh_japro_saved_logins();
+        let credential = crate::credential_store::read(server, account_type)?.ok_or_else(|| {
+            format!("No saved {} account for {server}", account_type.label())
+        })?;
+
+        match account_type {
+            AccountType::Login => {
+                if !Self::validate_saved_command_arg(&credential.username)
+                    || !Self::validate_saved_command_arg(&credential.password)
+                {
+                    return Err(format!("Saved Login account for {server} is invalid"));
+                }
+                self.forward_command_to_server(&format!(
+                    "login {} {}",
+                    credential.username, credential.password
+                ));
+                self.console_status = format!("LOGIN SENT FOR {}", credential.username);
+                self.push_console_line(format!(
+                    "^2Saved login:^7 {} @ {server}",
+                    credential.username
+                ));
+            }
+            AccountType::Admin => {
+                if !Self::validate_saved_command_arg(&credential.password) {
+                    return Err(format!("Saved Admin account for {server} is invalid"));
+                }
+                self.forward_command_to_server(&format!("amlogin {}", credential.password));
+                self.console_status = "ADMIN LOGIN SENT".to_owned();
+                self.push_console_line(format!("^2Saved admin login sent:^7 {server}"));
+            }
+            AccountType::Rcon => {
+                if credential.password.is_empty() || credential.password.chars().any(char::is_control)
+                {
+                    return Err(format!("Saved RCON account for {server} is invalid"));
+                }
+                self.set_console_cvar("rconPassword", &credential.password)?;
+                self.console_status = "RCON PASSWORD SET".to_owned();
+                self.push_console_line(format!("^2Saved RCON password loaded:^7 {server}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::app) fn logout_saved_account(
+        &mut self,
+        server: SocketAddr,
+        account_type: crate::credential_store::AccountType,
+    ) -> Result<(), String> {
+        use crate::credential_store::AccountType;
+
+        let current = self
+            .current_account_server_endpoint()
+            .ok_or_else(|| "Join a server before logging out".to_owned())?;
+        if current != server {
+            return Err(format!(
+                "Saved account belongs to {server}, but the current server is {current}"
+            ));
+        }
+        match account_type {
+            AccountType::Login => {
+                self.forward_command_to_server("logout");
+                self.console_status = "LOGOUT SENT".to_owned();
+            }
+            AccountType::Admin => {
+                self.forward_command_to_server("amlogout");
+                self.console_status = "ADMIN LOGOUT SENT".to_owned();
+            }
+            AccountType::Rcon => {
+                self.set_console_cvar("rconPassword", "")?;
+                self.console_status = "RCON PASSWORD CLEARED".to_owned();
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::app) fn forget_saved_account(
+        &mut self,
+        server: SocketAddr,
+        account_type: crate::credential_store::AccountType,
+    ) -> Result<(), String> {
+        crate::credential_store::delete(server, account_type)?;
+        if self.account_editor.as_ref().is_some_and(|editor| {
+            editor.server == server && editor.original_type == Some(account_type)
+        }) {
+            self.account_editor = None;
+        }
+        self.refresh_saved_accounts();
         Ok(())
     }
 

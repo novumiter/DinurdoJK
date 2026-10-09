@@ -36,12 +36,24 @@ struct OceanRenderSettings {
     mask_triangles: array<vec4<f32>,512>,
 };
 
+struct SplashEvent {
+    position: vec4<f32>, // world XYZ, intensity
+    motion: vec4<f32>,   // incoming XYZ velocity, event time
+    kind: vec4<f32>,     // zero for entry, one for sustained wake spray
+};
+
+struct SplashParams {
+    controls: vec4<f32>, // interaction time, style, event count, spare
+    events: array<SplashEvent, 32>,
+};
+
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var ocean_displacement: texture_2d_array<f32>;
 @group(1) @binding(1) var ocean_normal: texture_2d_array<f32>;
 @group(1) @binding(2) var ocean_sampler: sampler;
 @group(1) @binding(3) var<uniform> ocean: OceanRenderSettings;
 @group(1) @binding(4) var ocean_spray_albedo: texture_2d<f32>;
+@group(1) @binding(8) var<uniform> splash: SplashParams;
 
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
@@ -50,6 +62,7 @@ struct VertexOut {
     @location(2) alpha_fade: f32,
     @location(3) distance_m: f32,
     @location(4) active_flag: f32,
+    @location(5) effect_alpha: f32,
 };
 
 fn hash32(p_in: vec2<u32>) -> vec3<f32> {
@@ -73,6 +86,141 @@ fn hidden_vertex() -> VertexOut {
     out.alpha_fade = 0.0;
     out.distance_m = 0.0;
     out.active_flag = 0.0;
+    out.effect_alpha = 0.0;
+    return out;
+}
+
+fn splash_vertex(vertex_index: u32, splash_instance: u32) -> VertexOut {
+    let mode = u32(splash.controls.y + 0.5);
+    let event_count = min(u32(splash.controls.z + 0.5), 32u);
+    let event_index = splash_instance / 30u;
+    let particle_index = splash_instance % 30u;
+    if (mode == 0u || event_index >= event_count) {
+        return hidden_vertex();
+    }
+    let event = splash.events[event_index];
+    let is_wake = event.kind.x > 0.5;
+    let is_jet = particle_index >= 24u;
+    let entry_droplets = mode == 1u || mode == 3u || mode == 5u;
+    let wake_spray = mode == 2u || mode == 3u || mode == 5u;
+    let entry_jets = mode == 4u || mode == 5u;
+    if ((is_wake && (!wake_spray || is_jet))
+        || (!is_wake && ((!is_jet && !entry_droplets) || (is_jet && !entry_jets)))) {
+        return hidden_vertex();
+    }
+
+    var surface_index = -1;
+    let surface_count = min(u32(ocean.spray_info.x + 0.5), 8u);
+    for (var i = 0u; i < surface_count; i += 1u) {
+        let bounds = ocean.spray_bounds[i];
+        if (event.position.x < bounds.x || event.position.z < bounds.y
+            || event.position.x > bounds.z || event.position.z > bounds.w
+            || abs(event.position.y - ocean.spray_planes[i].x) > 1.0) {
+            continue;
+        }
+        let promoted = ocean.authored_plane.w > 0.5;
+        if (promoted && !ocean_mask_contains(i32(ocean.spray_planes[i].z), event.position.xz)) {
+            continue;
+        }
+        surface_index = i32(i);
+        break;
+    }
+    if (surface_index < 0) {
+        return hidden_vertex();
+    }
+
+    let random = hash32(vec2<u32>(u32(event.kind.y + 0.5) + 17u, particle_index + 101u));
+    let intensity = clamp(event.position.w, 0.0, 2.0);
+    let normalized_intensity = clamp(intensity / 1.25, 0.0, 1.0);
+    let age = splash.controls.x - event.motion.w;
+    let entry_life = mix(0.42, 1.05, random.y) * mix(0.8, 1.15, normalized_intensity);
+    let wake_life = mix(0.2, 0.62, random.y) * mix(0.8, 1.15, normalized_intensity);
+    let life = select(entry_life, wake_life, is_wake);
+    if (age < 0.0 || age > life || intensity < 0.015) {
+        return hidden_vertex();
+    }
+    if (is_wake) {
+        let wake_count = u32(round(mix(4.0, 24.0, normalized_intensity)));
+        if (particle_index >= wake_count) {
+            return hidden_vertex();
+        }
+    } else if (is_jet) {
+        let jet_count = u32(round(mix(2.0, 6.0, normalized_intensity)));
+        if (particle_index - 24u >= jet_count) {
+            return hidden_vertex();
+        }
+    } else {
+        let droplet_count = u32(round(mix(4.0, 24.0, normalized_intensity)));
+        if (particle_index >= droplet_count) {
+            return hidden_vertex();
+        }
+    }
+
+    let angle = random.x * 6.28318530718;
+    let random_dir = vec2<f32>(cos(angle), sin(angle));
+    var impact_dir = event.motion.xz;
+    if (dot(impact_dir, impact_dir) > 1.0e-5) {
+        impact_dir = normalize(impact_dir);
+    } else {
+        impact_dir = vec2<f32>(0.0, 0.0);
+    }
+    let units_per_meter = max(ocean.ocean_info.z, 0.001);
+    let root = event.position.xyz;
+    var centre = root;
+    var particle_scale = vec3<f32>(4.0 + 7.0 * normalized_intensity);
+    if (is_wake) {
+        let direction = normalize(random_dir + impact_dir * 0.85);
+        let drift = vec3<f32>(direction.x, 0.0, direction.y)
+            * (16.0 + 58.0 * normalized_intensity);
+        let launch = vec3<f32>(drift.x, 24.0 + 82.0 * normalized_intensity, drift.z);
+        centre += vec3<f32>(direction.x * (2.0 + 5.0 * normalized_intensity), 1.5,
+            direction.y * (2.0 + 5.0 * normalized_intensity))
+            + launch * age - vec3<f32>(0.0, 80.0 * age * age, 0.0);
+        particle_scale = vec3<f32>(2.5 + 3.5 * normalized_intensity,
+            3.0 + 5.0 * normalized_intensity, 2.5 + 3.5 * normalized_intensity);
+    } else if (is_jet) {
+        let jet_random = random_dir * (5.0 + 12.0 * normalized_intensity);
+        let launch = vec3<f32>(jet_random.x, 115.0 + 235.0 * normalized_intensity, jet_random.y);
+        centre += vec3<f32>(jet_random.x * 0.15, 2.0, jet_random.y * 0.15)
+            + launch * age - vec3<f32>(0.0, 80.0 * age * age, 0.0);
+        particle_scale = vec3<f32>(3.5 + 4.0 * normalized_intensity,
+            10.0 + 30.0 * normalized_intensity, 3.5 + 4.0 * normalized_intensity);
+    } else {
+        let direction = normalize(random_dir + impact_dir * 0.65);
+        let ring = sqrt(random.z) * (3.0 + 8.0 * normalized_intensity);
+        let launch = vec3<f32>(direction.x * (30.0 + 105.0 * normalized_intensity),
+            45.0 + 145.0 * normalized_intensity + random.y * 45.0,
+            direction.y * (30.0 + 105.0 * normalized_intensity));
+        centre += vec3<f32>(direction.x * ring, 2.0, direction.y * ring)
+            + launch * age - vec3<f32>(0.0, 80.0 * age * age, 0.0);
+    }
+
+    let forward = normalize(camera.camera_forward.xyz);
+    var right = cross(forward, vec3<f32>(0.0, 1.0, 0.0));
+    if (dot(right, right) < 1.0e-5) {
+        right = vec3<f32>(1.0, 0.0, 0.0);
+    } else {
+        right = normalize(right);
+    }
+    let up = normalize(cross(right, forward));
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(-0.5, -0.5), vec2<f32>(0.5, -0.5), vec2<f32>(-0.5, 0.5),
+        vec2<f32>(-0.5, 0.5), vec2<f32>(0.5, -0.5), vec2<f32>(0.5, 0.5)
+    );
+    var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0)
+    );
+    let corner = corners[vertex_index];
+    let world = centre + right * corner.x * particle_scale.x + up * corner.y * particle_scale.y;
+    var out: VertexOut;
+    out.clip_position = camera.view_proj * vec4<f32>(world, 1.0);
+    out.uv = uvs[vertex_index];
+    out.dissolve_factor = random.x;
+    out.alpha_fade = 1.0 - clamp(age / life, 0.0, 1.0);
+    out.distance_m = distance(centre.xz, camera.camera_pos_time.xz) / units_per_meter;
+    out.active_flag = 1.0;
+    out.effect_alpha = 2.5 + 2.0 * normalized_intensity;
     return out;
 }
 
@@ -113,9 +261,13 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
 ) -> VertexOut {
     let surface_count = min(u32(ocean.spray_info.x + 0.5), 8u);
     let total_particles = max(u32(ocean.spray_info.y + 0.5), 1u);
-    if (ocean.surface.z < 0.5 || surface_count == 0u || instance_index >= total_particles) {
+    if (surface_count == 0u) {
         return hidden_vertex();
     }
+    if (instance_index >= 32768u) {
+        return splash_vertex(vertex_index, instance_index - 32768u);
+    }
+    if (ocean.surface.z < 0.5 || instance_index >= total_particles) { return hidden_vertex(); }
 
     let surface_index = instance_index % surface_count;
     let particle_index = instance_index / surface_count;
@@ -245,6 +397,7 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
     out.alpha_fade = exp_impulse(t, 10.0);
     out.distance_m = distance(centre.xz, camera.camera_pos_time.xz) / units_per_meter;
     out.active_flag = 1.0;
+    out.effect_alpha = 1.0;
     return out;
 }
 
@@ -278,7 +431,7 @@ fn smooth_noise(p: vec2<f32>) -> f32 {
     let distance_fade = 1.0 - exp(-input.distance_m * 0.04);
     let dissolve_noise = smooth_noise(input.uv * 7.0 + vec2<f32>(camera.camera_pos_time.w * 0.35));
     let dissolve = max((input.alpha_fade + input.dissolve_factor) * 0.5 - dissolve_noise, 0.0);
-    let alpha = albedo_tex.a * 0.666 * distance_fade * dissolve;
+    let alpha = clamp(albedo_tex.a * 0.666 * distance_fade * dissolve * input.effect_alpha, 0.0, 1.0);
     if (alpha < 0.002) {
         discard;
     }

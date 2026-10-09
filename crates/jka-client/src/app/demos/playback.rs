@@ -183,10 +183,22 @@ impl GameSession {
                                 .as_ref()
                                 .map_or_else(|| entry.name.clone(), |info| info.name.clone()),
                             score: entry.score,
+                            powerups: entry.powerups,
+                            captures: entry.captures,
+                            assists: entry.assists,
+                            defends: entry.defends,
                             deaths,
                             ping: entry.ping,
                             time: entry.time,
                             team: current.as_ref().map_or(entry.team, |info| info.team),
+                            siege_class: current.as_ref().map_or_else(
+                                || entry.siege_class.clone(),
+                                |info| info.siege_class.clone(),
+                            ),
+                            siege_icon: None,
+                            // Recorded demos do not have a live local ping stream to
+                            // validate the spectator-follow heuristic against.
+                            spectating_you: false,
                         }
                     })
                     .collect::<Vec<_>>()
@@ -206,14 +218,24 @@ impl GameSession {
             }
         }
 
+        let scoreboard_icon_paths = if gametype == 7 {
+            crate::app::siege::siege_scoreboard_icons(&mut entries, &self.siege_catalog)
+        } else {
+            Vec::new()
+        };
         let show_deaths = score_deaths_mode != 0
             && !matches!(gametype, 3 | 4 | 8)
             && entries.iter().any(|entry| entry.deaths.is_some());
         Some(UiScoreboard {
             team_scores,
+            ready_clients: 0,
             team_game: gametype >= 6,
+            ctf: gametype == 8,
+            siege: gametype == 7,
+            siege_win_team: self.client_game.siege_win_team(),
             spectator_scores: matches!(gametype, 3 | 4),
             show_deaths,
+            icon_paths: scoreboard_icon_paths,
             entries,
         })
     }
@@ -295,7 +317,11 @@ impl GameSession {
         self.audio_followed_entity = None;
         self.demo_spectator_camera_mode = None;
         self.client_deaths = [0; 32];
+        self.attacker_damage_seen = false;
         self.client_game = ClientGameState::new();
+        self.siege_extended.fill(super::super::session::types::SiegeExtendedClient::default());
+        self.siege_respawn_time = 0;
+        self.siege_last_countdown = 0;
         self.presented_entities.clear();
         self.event_presenter.clear();
         self.reward_active = None;
@@ -454,7 +480,8 @@ impl App {
         }
         self.demo_selected = self.demo_selected.min(self.demo_entries.len() - 1);
         let demo_name = self.demo_entries[self.demo_selected].demo_name.clone();
-        self.play_demo_named_from(&demo_name, start_elapsed_ms);
+        let source_game = self.demo_browser_game_path();
+        self.play_demo_named_from_source(&demo_name, start_elapsed_ms, source_game, true);
     }
 
     pub(in crate::app) fn play_demo_named(&mut self, argument: &str) {
@@ -466,6 +493,23 @@ impl App {
         argument: &str,
         start_elapsed_ms: Option<i32>,
     ) {
+        // Console /demo preserves normal JKA lookup semantics: active fs_game
+        // shadows base. The browser passes an explicit source directory instead.
+        self.play_demo_named_from_source(argument, start_elapsed_ms, self.game.clone(), false);
+    }
+
+    fn play_demo_named_from_source(
+        &mut self,
+        argument: &str,
+        start_elapsed_ms: Option<i32>,
+        source_game: Option<std::path::PathBuf>,
+        source_only: bool,
+    ) {
+        if self.demo_video_export.is_some() {
+            self.cancel_demo_video_export();
+        }
+        self.demo_export_in_ms = None;
+        self.demo_export_out_ms = None;
         let argument = argument.trim().trim_matches('"');
         if argument.is_empty() {
             self.push_console_line("^3demo <demoname>".to_owned());
@@ -495,15 +539,21 @@ impl App {
         // Open through the *current* VFS before disconnecting. This preserves
         // mod-local demo lookup when /demo is issued while connected to that mod.
         println!("DEMO: {qpath}");
-        let mut assets =
-            match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
-                Ok(assets) => assets,
-                Err(error) => {
-                    self.console_status = format!("DEMO ASSET PATH ERROR: {error}");
-                    self.push_console_line(format!("^1{}", self.console_status));
-                    return;
-                }
-            };
+        let mut assets = match if source_only {
+            match source_game.as_deref() {
+                Some(game) => jka_assets::pk3::AssetSearchPath::open_search_dirs([game]),
+                None => jka_assets::pk3::AssetSearchPath::open(&self.base),
+            }
+        } else {
+            jka_assets::pk3::AssetSearchPath::open_game(&self.base, source_game.as_deref())
+        } {
+            Ok(assets) => assets,
+            Err(error) => {
+                self.console_status = format!("DEMO ASSET PATH ERROR: {error}");
+                self.push_console_line(format!("^1{}", self.console_status));
+                return;
+            }
+        };
         let asset = match assets.read(&qpath, MAX_DEMO_FILE_BYTES) {
             Ok(Some(asset)) => asset,
             Ok(None) => {
@@ -1081,11 +1131,7 @@ impl App {
         self.publish_transient_ui();
     }
 
-    pub(in crate::app) fn apply_demo_view(
-        &mut self,
-        sample: DemoCameraSample,
-        dt: Duration,
-    ) -> i32 {
+    pub(in crate::app) fn apply_demo_view(&mut self, sample: DemoCameraSample) -> i32 {
         self.demo_view_outside_authoritative = false;
         match self.demo_view_mode {
             DemoViewMode::Authoritative => {
@@ -1118,7 +1164,6 @@ impl App {
                 }
             }
             DemoViewMode::Free => {
-                self.update_demo_free_camera(dt);
                 self.demo_view_outside_authoritative = !self
                     .demo_point_visible_from_authoritative(sample, self.camera.position.to_array());
                 sample.client_num
@@ -1257,11 +1302,19 @@ impl App {
         dt: Duration,
     ) -> Result<DemoAdvance, String> {
         let client_frame_started = Instant::now();
+        // Free demo camera owns its own world-space position. Move it before
+        // capturing the Ghoul2 presentation view so player frustum culling/LOD
+        // and spectator outlines are prepared from the same camera that will be
+        // rendered this frame, rather than from the previous free-camera frame.
+        if self.demo_playback_active() && self.demo_view_mode == DemoViewMode::Free {
+            self.update_demo_free_camera(dt);
+        }
         // Player presentation happens inside GameSession::advance, before the
         // final camera is applied for this frame. Pass the current rendered view
         // shape/pose as a hint: advance() replaces its pose with the exact current
         // sample in first person, while third person retains this previous-frame
-        // collision/orbit camera because that state lives here in App.
+        // collision/orbit camera because that state lives here in App. Free demo
+        // view has already advanced above, so its hint is exact for this frame.
         let ghoul2_view = self.current_ghoul2_view();
         let local_frame = self
             .local_server
@@ -1346,22 +1399,43 @@ impl App {
                 .player_presenter
                 .set_lod_scale(self.video.lod_scale);
             playback.player_presenter.set_jiggle_config(
-                self.video.client_physics && self.video.jiggle_physics,
+                self.video.client_physics && self.video.jiggle_physics != 0,
+                self.video.jiggle_physics,
                 self.video.client_physics_hz,
                 self.video.client_physics_max_substeps,
-                self.video.jiggle_solver,
-                self.video.jiggle_strength,
-                self.video.jiggle_breast_strength,
-                self.video.jiggle_glute_strength,
-                self.video.jiggle_stiffness,
-                self.video.jiggle_damping,
-                self.video.jiggle_glute_lift,
-                self.video.jiggle_jp_stiffness,
-                self.video.jiggle_jp_drag,
-                self.video.jiggle_jp_air_drag,
-                self.video.jiggle_jp_stretch,
-                self.video.jiggle_jp_soften,
-                self.video.jiggle_jp_gravity,
+                crate::cgame::jiggle::JiggleTuning {
+                    solver: crate::cgame::jiggle::JiggleSolver::from_u8(self.video.jiggle_solver),
+                    overall_strength: self.video.jiggle_strength,
+                    breast_strength: self.video.jiggle_breast_strength,
+                    glute_strength: self.video.jiggle_glute_strength,
+                    stiffness_scale: self.video.jiggle_stiffness,
+                    damping_scale: self.video.jiggle_damping,
+                    glute_jiggle_bottom_z: self.video.jiggle_glute_jiggle_bottom_z,
+                    glute_jiggle_top_z: self.video.jiggle_glute_jiggle_top_z,
+                    jp_stiffness: self.video.jiggle_jp_stiffness,
+                    jp_drag: self.video.jiggle_jp_drag,
+                    jp_air_drag: self.video.jiggle_jp_air_drag,
+                    jp_stretch: self.video.jiggle_jp_stretch,
+                    jp_soften: self.video.jiggle_jp_soften,
+                    jp_gravity: self.video.jiggle_jp_gravity,
+                    locomotion: self.video.jiggle_locomotion,
+                    impulse_cap: self.video.jiggle_impulse_cap,
+                    swirl: self.video.jiggle_swirl,
+                    breast_stiffness: self.video.jiggle_breast_stiffness,
+                    breast_damping: self.video.jiggle_breast_damping,
+                    glute_stiffness: self.video.jiggle_glute_stiffness,
+                    glute_damping: self.video.jiggle_glute_damping,
+                    breast_size: self.video.jiggle_breast_size,
+                    glute_size: self.video.jiggle_glute_size,
+                },
+                crate::cgame::jiggle::JiggleRemeshTuning {
+                    breast_bottom_z: self.video.jiggle_breast_remesh_bottom_z,
+                    breast_top_z: self.video.jiggle_breast_remesh_top_z,
+                    glute_bottom_z: self.video.jiggle_glute_remesh_bottom_z,
+                    glute_top_z: self.video.jiggle_glute_remesh_top_z,
+                    breast_size: self.video.jiggle_breast_size,
+                    glute_size: self.video.jiggle_glute_size,
+                },
             );
             playback.player_presenter.set_cloth_config(ClothConfig {
                 enabled: self.video.client_physics && self.video.cloth_physics,
@@ -1470,6 +1544,7 @@ impl App {
                 let settings = &self.network;
                 let session = net.session();
                 let provisional = self.live_provisional;
+                let entity_graph = self.entity_graph.as_deref();
                 let mut logged_failure = false;
                 let mut predict = |snap: &ProtocolSnapshot,
                                    next: Option<&ProtocolSnapshot>,
@@ -1494,6 +1569,7 @@ impl App {
                         entities,
                         settings,
                         provisional,
+                        entity_graph,
                     };
                     let previous_display = predictor
                         .predicted()
@@ -1558,6 +1634,7 @@ impl App {
         // CGame advance above. Apply renderer shader redirects once at this
         // frame boundary before building the rest of presentation.
         self.process_server_shader_remaps();
+        self.process_server_world_effects();
         let listener_entity = if self
             .game_session
             .as_ref()
@@ -1566,7 +1643,7 @@ impl App {
             self.apply_demo_camera(sample);
             sample.client_num
         } else {
-            self.apply_demo_view(sample, dt)
+            self.apply_demo_view(sample)
         };
         // Cinematic strafehelper keeps the exact TaystJK angle/colour decisions,
         // but submits them through the world FX path. Compute before borrowing
@@ -1606,7 +1683,7 @@ impl App {
                     viewport_height as f32 / (2.0 * (fov_y * 0.5).tan()).max(1e-3),
                 );
             }
-            let flare = if self.video.flares {
+            let flare = if self.video.saber_flares {
                 let (viewport_width, viewport_height) = self
                     .window
                     .as_ref()

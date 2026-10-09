@@ -97,34 +97,20 @@ static int animation_open(const char *name, fileHandle_t *handle, fsMode_t mode)
     *handle = 1;
     return animation_length;
 }
-static void animation_read(void *buffer, int length, fileHandle_t handle) {
+static int animation_read(void *buffer, int length, fileHandle_t handle) {
     if (handle != 1 || length < 0 || length > animation_length) host_error(ERR_DROP, "Invalid animation read");
     memcpy(buffer, animation_file, length);
+    return length;
 }
 static void animation_close(fileHandle_t handle) { (void)handle; }
 static void host_malloc(void **p, int size) { *p = calloc(1, size); if (!*p) host_error(ERR_DROP, "Allocation failed"); }
 static void host_free(void **p) { free(*p); *p = NULL; }
 extern void Sys_SnapVector(float *v);
 
-/* trap_SnapVector is the one engine-owned step in PmoveSingle that changes physics: it rounds
- * velocity to integers after every step. The retail game code is identical to OpenJK's here, but
- * retail engines on different platforms do not all round the way OpenJK's Sys_SnapVector does,
- * and at 1 ms steps (1000 "fps") the rounding rule dominates friction and gravity. The mode is
- * chosen by the host (jka_set_snap_mode, defined once in mod_dispatch.c):
- *   0 OpenJK Sys_SnapVector (nearest, ties away from zero)   1 truncate toward zero
- *   2 floor                                                  3 nearest, ties to even
- *   4 no snapping (float velocity) */
-extern int jka_snap_mode;
-static void host_snap_vector(float *v) {
-    int i;
-    switch (jka_snap_mode) {
-    case 1: for (i = 0; i < 3; ++i) v[i] = truncf(v[i]); break;
-    case 2: for (i = 0; i < 3; ++i) v[i] = floorf(v[i]); break;
-    case 3: for (i = 0; i < 3; ++i) v[i] = nearbyintf(v[i]); break;
-    case 4: break;
-    default: Sys_SnapVector(v); break;
-    }
-}
+/* Use the engine's authoritative Sys_SnapVector for every pmove step.
+ * Do not swap rounding implementations based on snapshot replay heuristics.
+ */
+static void host_snap_vector(float *v) { Sys_SnapVector(v); }
 
 int jka_load_animations(const unsigned char *data, int length) {
     if (setjmp(error_target)) return 0;
@@ -237,8 +223,14 @@ int japro_clip_entity(const void *player, const jka_prediction_entity *ent) {
         if (ent->number != ps->duelIndex && ent->entity_type != ET_MOVER) return 0;
     } else {
         if (ent->bolt1 && ent->entity_type == ET_PLAYER) return 0;
-        if (ps->stats[STAT_RACEMODE]) {
+        if (cgs.serverMod == SVMOD_JAPRO && ps->stats[STAT_RACEMODE]) {
+            /* A jaPRO server may still collide with moving func_train brushes.
+             * Do not discard a server-solid ET_MOVER during prediction. */
             if (ent->entity_type != ET_MOVER) return 0;
+            /* TaystJK trDelta filtering is only a fallback when BSP
+             * classname is unknown; it confuses trains with race doors. */
+            if (ent->mover_class == 1) return 1; /* func_train remains solid */
+            if (ent->mover_class == 2) return 0; /* func_door / func_plat */
             if (ent->trajectory_type != TR_SINE &&
                 (VectorLengthSquared(ent->velocity) || VectorLengthSquared(ent->angular_velocity))) return 0;
         }
@@ -309,7 +301,9 @@ void jka_player_teleport(void *player, const float *origin, const float *angles,
     VectorScale(ps->velocity, speed ? speed : 400, ps->velocity);
     ps->pm_time = 160;
     ps->pm_flags |= PMF_TIME_KNOCKBACK;
-    VectorClear(ps->delta_angles);
+    ps->delta_angles[0] = 0;
+    ps->delta_angles[1] = 0;
+    ps->delta_angles[2] = 0;
     VectorCopy(angles, ps->viewangles);
     ps->eFlags ^= EF_TELEPORT_BIT;
 }
@@ -461,6 +455,39 @@ static void local_saber_use_first_valid_style(const saberInfo_t *saber1, const s
             *level = style;
             return;
         }
+    }
+}
+
+/* OpenJK Cmd_ToggleSaber_f, reached from GENCMD_SABERSWITCH (weapon 1 while
+ * the saber is already selected). The real game knocks a thrown saber down;
+ * the lightweight authority has no gentity for that game-side operation, so a
+ * saber in flight remains untouched. The ordinary idle holster/unholster path
+ * is otherwise kept verbatim: saberHolstered 0/1 -> 2, 2 -> 0, with the stock
+ * 400 ms post-holster weapon lockout. */
+static void local_toggle_saber(jka_player *p) {
+    playerState_t *ps = &p->ps;
+    const int now = ps->commandTime;
+
+    if (ps->fd.forceGripCripple && ps->saberHolstered)
+        return;
+    if (ps->saberInFlight)
+        return;
+    if (ps->forceHandExtend != HANDEXTEND_NONE)
+        return;
+    if (ps->weapon != WP_SABER)
+        return;
+    if (ps->duelTime >= now)
+        return;
+    if (ps->saberLockTime >= now)
+        return;
+    if (ps->weaponTime >= 1)
+        return;
+
+    if (ps->saberHolstered == 2) {
+        ps->saberHolstered = 0;
+    } else {
+        ps->saberHolstered = 2;
+        ps->weaponTime = 400;
     }
 }
 
@@ -847,6 +874,9 @@ static void local_process_generic_cmd(jka_player *p, int generic_cmd) {
         p->last_generic_cmd_time = now + 300;
 
     switch (generic_cmd) {
+    case GENCMD_SABERSWITCH:
+        local_toggle_saber(p);
+        break;
     case GENCMD_SABERATTACKCYCLE:
         local_saber_attack_cycle(p);
         /* Show the result now rather than after the next WP_SaberPositionUpdate. */

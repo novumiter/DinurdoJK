@@ -5,10 +5,15 @@ use crate::app::egui_settings::{
     PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
     PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT, PHYS_DISMEMBER_LIFETIME,
     PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES, PHYS_JIGGLE,
-    PHYS_JIGGLE_BREAST, PHYS_JIGGLE_DAMPING, PHYS_JIGGLE_GLUTE, PHYS_JIGGLE_GLUTE_LIFT,
-    PHYS_JIGGLE_JP_AIR_DRAG, PHYS_JIGGLE_JP_DRAG, PHYS_JIGGLE_JP_GRAVITY,
+    PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z, PHYS_JIGGLE_BREAST_REMESH_TOP_Z,
+    PHYS_JIGGLE_DAMPING, PHYS_JIGGLE_GLUTE, PHYS_JIGGLE_GLUTE_JIGGLE_BOTTOM_Z,
+    PHYS_JIGGLE_GLUTE_JIGGLE_TOP_Z, PHYS_JIGGLE_GLUTE_REMESH_BOTTOM_Z,
+    PHYS_JIGGLE_GLUTE_REMESH_TOP_Z, PHYS_JIGGLE_JP_AIR_DRAG, PHYS_JIGGLE_JP_DRAG, PHYS_JIGGLE_JP_GRAVITY,
     PHYS_JIGGLE_JP_SOFTEN, PHYS_JIGGLE_JP_STIFFNESS, PHYS_JIGGLE_JP_STRETCH, PHYS_JIGGLE_SOLVER,
-    PHYS_JIGGLE_STIFFNESS, PHYS_JIGGLE_STRENGTH, PHYS_MAX_SUBSTEPS, PHYS_PLAYER_PUSH, PHYS_PROPS,
+    PHYS_JIGGLE_STIFFNESS, PHYS_JIGGLE_STRENGTH, PHYS_JIGGLE_BREAST_SIZE, PHYS_JIGGLE_GLUTE_SIZE,
+    PHYS_JIGGLE_LOCOMOTION, PHYS_JIGGLE_SWIRL, PHYS_JIGGLE_BREAST_STIFFNESS,
+    PHYS_JIGGLE_BREAST_DAMPING, PHYS_JIGGLE_GLUTE_STIFFNESS, PHYS_JIGGLE_GLUTE_DAMPING,
+    PHYS_MAX_SUBSTEPS, PHYS_PLAYER_PUSH, PHYS_PROPS,
     PHYS_PROP_MAX, PHYS_RAGDOLLS, PHYS_RAGDOLL_LIFETIME, PHYS_RAGDOLL_MAX,
     PHYS_RAGDOLL_SELF_COLLISION, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS, PHYS_WEAPON_IMPULSES,
 };
@@ -146,9 +151,9 @@ impl App {
         self.egui_physics_toggle(
             ui,
             "Weapon knockback ragdolls",
-            "Let authoritative saber/projectile impacts temporarily hand a living victim's limbs/head \
-             to Rapier when the corresponding trajectory shows real knockback. The thorax stays attached \
-             to the server-owned player transform.",
+            "Let non-explosive projectile impacts trigger temporary torso-anchored ragdolls. \
+             The local/followed player's server PMF_TIME_KNOCKBACK flag is required; remote \
+             players use an event-correlated velocity estimate. Saber contacts are excluded.",
             PHYS_WEAPON_IMPULSES,
             self.video.physics_weapon_impulses,
         );
@@ -172,16 +177,19 @@ impl App {
         theme::section(
             ui,
             "SOFT TISSUE (EXPERIMENTAL)",
-            "Profile-driven post-skin secondary motion for stock _humanoid player meshes.",
+            "Soft-tissue motion with controls calibrated to keep a similar feel across physics tick rates.",
         );
-        self.egui_physics_toggle(
+        const JIGGLE_TARGETS: [(u8, &str); 4] = [(0, "Off"), (1, "Female"), (2, "Male"), (3, "Both")];
+        if let Some(mode) = segmented_row(
             ui,
             "Jiggle physics",
-            "Enable _humanoid soft-tissue secondary motion. Chest/glute regions are auto-detected; \
-             model.jiggle overrides Auto. GPU skinning promotes only the interior soft region; a stock-topology guard band hides the transition, with extra refinement reserved for the strongest core.",
-            PHYS_JIGGLE,
+            "Choose which players receive breast/glute size and secondary motion, using the loaded model's authored sex. Client physics must also be enabled.",
+            theme::Reset::Physics(PHYS_JIGGLE),
             self.video.jiggle_physics,
-        );
+            &JIGGLE_TARGETS,
+        ) {
+            let _ = self.set_console_cvar("r_jigglePhysics", &mode.to_string());
+        }
         const JIGGLE_SOLVER: [(u8, &str); 2] = [(0, "KawaiiPhysics"), (1, "JigglePhysics")];
         if let Some(mode) = segmented_row(
             ui,
@@ -198,7 +206,8 @@ impl App {
             ("Overall motion", "Global multiplier for all soft-tissue displacement.", PHYS_JIGGLE_STRENGTH, self.video.jiggle_strength, 0.0, 2.0, "r_jiggleStrength"),
             ("Breast motion", "Multiplier for chest-region displacement only.", PHYS_JIGGLE_BREAST, self.video.jiggle_breast_strength, 0.0, 2.0, "r_jiggleBreastStrength"),
             ("Glute motion", "Multiplier for glute-region displacement only.", PHYS_JIGGLE_GLUTE, self.video.jiggle_glute_strength, 0.0, 2.0, "r_jiggleGluteStrength"),
-            ("Glute lower trim", "Trim the lower glute/upper-thigh falloff without rebuilding the model. Positive values keep motion higher on the glute; negative values include more upper thigh.", PHYS_JIGGLE_GLUTE_LIFT, self.video.jiggle_glute_lift, -0.4, 0.6, "r_jiggleGluteLift"),
+            ("Locomotion kick", "How strongly your own acceleration (start/stop, jumps, landings, direction changes) throws the tissue. Steady running never adds lag; walk/run bounce comes from the animated body.", PHYS_JIGGLE_LOCOMOTION, self.video.jiggle_locomotion, 0.0, 2.0, "r_jiggleLocomotion"),
+            ("Swirl", "Bends straight bounces into mirrored elliptical/circular orbits. Energy-neutral, so damping still settles the motion. 0 = straight bounce.", PHYS_JIGGLE_SWIRL, self.video.jiggle_swirl, 0.0, 1.0, "r_jiggleSwirl"),
         ] {
             theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
                 let mut value = current;
@@ -209,10 +218,59 @@ impl App {
             });
         }
 
+        theme::section(ui, "BODY SHAPE", "Bind-pose mass baked into the promoted jiggle mesh (GPU skinning). Changing a value rebuilds player models in the background; 0.00 is the stock mesh.");
+        for (label, tip, field, current, max, cvar) in [
+            ("Breast size", "Peak mass added at the breast center in JKA units, fading to zero at the soft-region edge. Negative reduces.", PHYS_JIGGLE_BREAST_SIZE, self.video.jiggle_breast_size, 3.0, "r_jiggleBreastSize"),
+            ("Glute size", "Peak mass added at the glute center in JKA units, fading to zero at the soft-region edge and above the upper thigh. Negative reduces.", PHYS_JIGGLE_GLUTE_SIZE, self.video.jiggle_glute_size, 4.0, "r_jiggleGluteSize"),
+        ] {
+            theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
+                let mut value = current;
+                let readout = format!("{value:+.2} u");
+                if theme::slider(ui, &mut value, -2.0..=max, &readout) {
+                    let _ = self.set_console_cvar(cvar, &value.to_string());
+                }
+            });
+        }
+
+        theme::section(ui, "REMESH Z BOUNDS", "Signed model-space Z offsets in JKA units. These change promoted topology/wireframe only; 0.00 preserves the fitted default boundary.");
+        for (label, tip, field, current, cvar) in [
+            ("Breast remesh bottom Z", "Offset the lower breast remesh edge. Positive raises the lower edge; negative lowers it within the fitted mask.", PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z, self.video.jiggle_breast_remesh_bottom_z, "r_jiggleBreastRemeshBottomZ"),
+            ("Breast remesh top Z", "Offset the upper breast remesh edge. Negative lowers the upper edge; positive raises it within the fitted mask.", PHYS_JIGGLE_BREAST_REMESH_TOP_Z, self.video.jiggle_breast_remesh_top_z, "r_jiggleBreastRemeshTopZ"),
+            ("Glute remesh bottom Z", "Offset the lower glute remesh edge. Positive raises the lower edge; negative lowers it toward the fitted mask boundary.", PHYS_JIGGLE_GLUTE_REMESH_BOTTOM_Z, self.video.jiggle_glute_remesh_bottom_z, "r_jiggleGluteRemeshBottomZ"),
+            ("Glute remesh top Z", "Offset the upper glute remesh edge. Negative lowers the upper edge; positive raises it within the fitted mask.", PHYS_JIGGLE_GLUTE_REMESH_TOP_Z, self.video.jiggle_glute_remesh_top_z, "r_jiggleGluteRemeshTopZ"),
+        ] {
+            theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
+                let mut value = current;
+                let readout = format!("{value:+.2} u");
+                if theme::slider(ui, &mut value, -8.0..=8.0, &readout) {
+                    let _ = self.set_console_cvar(cvar, &value.to_string());
+                }
+            });
+        }
+
+        theme::section(ui, "GLUTE JIGGLE Z BOUNDS", "Signed model-space Z offsets in JKA units. These change glute motion weighting only and never rebuild/remesh geometry.");
+        for (label, tip, field, current, cvar) in [
+            ("Glute jiggle bottom Z", "Move the lower glute motion falloff. Positive keeps motion higher; negative allows it farther down toward the upper thigh.", PHYS_JIGGLE_GLUTE_JIGGLE_BOTTOM_Z, self.video.jiggle_glute_jiggle_bottom_z, "r_jiggleGluteJiggleBottomZ"),
+            ("Glute jiggle top Z", "Move the upper glute motion limit. Negative lowers the moving region; positive leaves room up to the fitted mask cap.", PHYS_JIGGLE_GLUTE_JIGGLE_TOP_Z, self.video.jiggle_glute_jiggle_top_z, "r_jiggleGluteJiggleTopZ"),
+        ] {
+            theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
+                let mut value = current;
+                let readout = format!("{value:+.2} u");
+                if theme::slider(ui, &mut value, -8.0..=8.0, &readout) {
+                    let _ = self.set_console_cvar(cvar, &value.to_string());
+                }
+            });
+        }
+
         if self.video.jiggle_solver == 0 {
+            theme::section(ui, "KAWAIIPHYSICS", "Overall multipliers apply to every region; breast/glute multipliers stack on top.");
             for (label, tip, field, current, cvar) in [
-                ("Stiffness", "KawaiiPhysics stiffness multiplier. Higher values pull the virtual soft point toward the animated pose faster.", PHYS_JIGGLE_STIFFNESS, self.video.jiggle_stiffness, "r_jiggleStiffness"),
-                ("Damping", "KawaiiPhysics damping multiplier. Higher values remove secondary velocity faster.", PHYS_JIGGLE_DAMPING, self.video.jiggle_damping, "r_jiggleDamping"),
+                ("Overall stiffness", "KawaiiPhysics stiffness multiplier for all regions. Higher values pull the virtual soft point toward the animated pose faster.", PHYS_JIGGLE_STIFFNESS, self.video.jiggle_stiffness, "r_jiggleStiffness"),
+                ("Overall damping", "KawaiiPhysics damping multiplier for all regions. Higher values remove secondary velocity faster.", PHYS_JIGGLE_DAMPING, self.video.jiggle_damping, "r_jiggleDamping"),
+                ("Breast stiffness", "Breast-only stiffness multiplier. Lower = slower, heavier bounce; higher = quicker and tighter.", PHYS_JIGGLE_BREAST_STIFFNESS, self.video.jiggle_breast_stiffness, "r_jiggleBreastStiffness"),
+                ("Breast damping", "Breast-only damping multiplier. Lower = bounces longer; higher = settles sooner.", PHYS_JIGGLE_BREAST_DAMPING, self.video.jiggle_breast_damping, "r_jiggleBreastDamping"),
+                ("Glute stiffness", "Glute-only stiffness multiplier. Lower = slower, heavier bounce; higher = quicker and tighter.", PHYS_JIGGLE_GLUTE_STIFFNESS, self.video.jiggle_glute_stiffness, "r_jiggleGluteStiffness"),
+                ("Glute damping", "Glute-only damping multiplier. Lower = bounces longer; higher = settles sooner.", PHYS_JIGGLE_GLUTE_DAMPING, self.video.jiggle_glute_damping, "r_jiggleGluteDamping"),
             ] {
                 theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
                     let mut value = current;
@@ -484,7 +542,6 @@ impl App {
             PHYS_SLEEPING => self.video.client_physics_sleeping = value,
             PHYS_RAGDOLLS => self.video.ragdolls = value,
             PHYS_RAGDOLL_SELF_COLLISION => self.video.ragdoll_self_collision = value,
-            PHYS_JIGGLE => self.video.jiggle_physics = value,
             PHYS_CLOTH => self.video.cloth_physics = value,
             PHYS_CLOTH_BODY_COLLISION => self.video.cloth_body_collision = value,
             PHYS_CLOTH_WIND => self.video.cloth_wind = value,

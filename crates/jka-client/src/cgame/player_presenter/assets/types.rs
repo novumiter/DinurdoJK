@@ -1,7 +1,7 @@
 //! Assets types.
 use crate::cgame::player_presenter::{
-    Arc, DynamicModelAlphaMode, Ghoul2GpuVertex, GlaAnimation, GlmModel, JiggleProfile, TcMod,
-    TextureData,
+    Arc, DynamicModelAlphaMode, Ghoul2GpuVertex, GlaAnimation, GlmModel, JiggleProfile,
+    SourceMaterialParams, TcMod, TextureData,
 };
 
 #[derive(Debug)]
@@ -10,7 +10,7 @@ pub(in crate::cgame::player_presenter) struct Ghoul2GpuMeshSource {
     pub(in crate::cgame::player_presenter) base_key: Arc<str>,
     pub(in crate::cgame::player_presenter) base_vertices: Arc<Vec<Ghoul2GpuVertex>>,
     pub(in crate::cgame::player_presenter) cpu_indices: Arc<Vec<u32>>,
-    /// GPU/promoted topology. Jiggle surfaces use one Phong-style subdivision.
+    /// GPU topology for this authored LOD: two, one, or no local promotion passes.
     pub(in crate::cgame::player_presenter) key: Arc<str>,
     pub(in crate::cgame::player_presenter) vertices: Arc<Vec<Ghoul2GpuVertex>>,
     pub(in crate::cgame::player_presenter) indices: Arc<Vec<u32>>,
@@ -88,6 +88,8 @@ pub(in crate::cgame::player_presenter) struct PlayerSurfaceAsset {
     /// Static bind-pose mesh for each authored GLM LOD. A surface can be
     /// absent from a lower LOD, matching Ghoul2's per-LOD surface tables.
     pub(in crate::cgame::player_presenter) gpu_meshes: Vec<Option<Arc<Ghoul2GpuMeshSource>>>,
+    /// Source 1 `$bumpmap`/`$phong` material. `None` for every GLM surface.
+    pub(in crate::cgame::player_presenter) source_material: Option<SourceMaterialParams>,
 }
 
 pub(in crate::cgame::player_presenter) const FPLS_MODE3_OFF_SURFACES: &[&str] = &[
@@ -147,9 +149,22 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     pub(in crate::cgame::player_presenter) key: String,
     pub(in crate::cgame::player_presenter) glm: Arc<GlmModel>,
     pub(in crate::cgame::player_presenter) gla: Arc<GlaAnimation>,
+    /// `players/_humanoid/` skeletons use the normal multiplayer animation/angle
+    /// path.  Creature skeletons use the model-local tables cached below.
+    pub(in crate::cgame::player_presenter) humanoid: bool,
+    /// TaystJK `CG_G2SkelForModel`: non-humanoid GLA-adjacent animation.cfg.
+    pub(in crate::cgame::player_presenter) animations:
+        Option<Arc<jka_assets::animation::AnimationSet>>,
+    /// TaystJK NPC registration: model-directory animevents.cfg (including
+    /// humanoid NPCs; real players use the shared humanoid event table).
+    pub(in crate::cgame::player_presenter) anim_events:
+        Option<Arc<jka_assets::animevents::AnimEvents>>,
     pub(in crate::cgame::player_presenter) surfaces: Vec<PlayerSurfaceAsset>,
     /// Optional post-Ghoul2 soft-tissue profile loaded beside model.glm.
     pub(in crate::cgame::player_presenter) jiggle: Option<Arc<JiggleProfile>>,
+    /// TaystJK/OpenJK `CG_LoadCISounds` gender derived from this model/skin's
+    /// authored `sounds*.cfg`, not from a server-provided userinfo hint.
+    pub(in crate::cgame::player_presenter) female: bool,
 }
 
 pub(in crate::cgame::player_presenter) struct SaberModelAsset {

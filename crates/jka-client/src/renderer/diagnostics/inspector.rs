@@ -27,6 +27,10 @@ pub(in crate::renderer) struct InspectorTextureMeta {
     pub(in crate::renderer) srgb: bool,
     pub(in crate::renderer) sampled_rgb_min: [u8; 3],
     pub(in crate::renderer) sampled_rgb_max: [u8; 3],
+    pub(in crate::renderer) sampled_alpha_min: u8,
+    pub(in crate::renderer) sampled_alpha_max: u8,
+    pub(in crate::renderer) sampled_alpha_mean: f32,
+    pub(in crate::renderer) sampled_alpha_opaque_percent: f32,
     pub(in crate::renderer) sampled_luma_mean: f32,
     pub(in crate::renderer) sampled_luma_stddev: f32,
 }
@@ -41,6 +45,10 @@ pub(in crate::renderer) fn inspector_texture_meta(texture: &TextureData) -> Insp
     let step = pixel_count.div_ceil(4096).max(1);
     let mut minimum = [u8::MAX; 3];
     let mut maximum = [u8::MIN; 3];
+    let mut alpha_min = u8::MAX;
+    let mut alpha_max = u8::MIN;
+    let mut alpha_sum = 0_u64;
+    let mut alpha_opaque_count = 0_u64;
     let mut luma_sum = 0.0_f64;
     let mut luma_sq_sum = 0.0_f64;
     let mut samples = 0_u64;
@@ -55,6 +63,11 @@ pub(in crate::renderer) fn inspector_texture_meta(texture: &TextureData) -> Insp
             minimum[channel] = minimum[channel].min(rgb[channel]);
             maximum[channel] = maximum[channel].max(rgb[channel]);
         }
+        let alpha = texture.rgba[offset + 3];
+        alpha_min = alpha_min.min(alpha);
+        alpha_max = alpha_max.max(alpha);
+        alpha_sum += u64::from(alpha);
+        alpha_opaque_count += u64::from(alpha == u8::MAX);
         let luma =
             0.2126 * f64::from(rgb[0]) + 0.7152 * f64::from(rgb[1]) + 0.0722 * f64::from(rgb[2]);
         luma_sum += luma;
@@ -78,6 +91,10 @@ pub(in crate::renderer) fn inspector_texture_meta(texture: &TextureData) -> Insp
         srgb: texture.srgb,
         sampled_rgb_min: minimum,
         sampled_rgb_max: maximum,
+        sampled_alpha_min: if samples == 0 { 0 } else { alpha_min },
+        sampled_alpha_max: alpha_max,
+        sampled_alpha_mean: if samples == 0 { 0.0 } else { alpha_sum as f32 / samples as f32 },
+        sampled_alpha_opaque_percent: if samples == 0 { 0.0 } else { 100.0 * alpha_opaque_count as f32 / samples as f32 },
         sampled_luma_mean: mean,
         sampled_luma_stddev: stddev,
     }
@@ -546,6 +563,13 @@ impl Renderer {
                 texture.sampled_rgb_max[2],
                 texture.sampled_luma_mean,
                 texture.sampled_luma_stddev,
+            ));
+            lines.push(format!(
+                "SOURCE ALPHA: {}..{}    AVG {:.1}/255    OPAQUE {:.1}%",
+                texture.sampled_alpha_min,
+                texture.sampled_alpha_max,
+                texture.sampled_alpha_mean,
+                texture.sampled_alpha_opaque_percent,
             ));
             if let Some(triangle) = hit_triangle {
                 let density = texture_edge_density(triangle, texture.width, texture.height);

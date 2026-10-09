@@ -82,6 +82,7 @@ mod vgs;
 mod vote;
 mod weather;
 mod windows_timer;
+mod world_effects;
 
 use runtime::UserEvent;
 use std::{
@@ -89,6 +90,38 @@ use std::{
     path::PathBuf,
 };
 use winit::event_loop::{EventLoop, EventLoopProxy};
+
+/// Work around the legacy AMD switchable-graphics implicit Vulkan layer before
+/// wgpu loads the Vulkan loader. Old versions of that layer can return
+/// `VK_INCOMPLETE` from `vkEnumeratePhysicalDevices` with an inconsistent count,
+/// which wgpu/ash correctly surfaces as "A return array was too small for the
+/// result" and then has no adapters to choose from. Native renderers that use a
+/// different enumeration path can appear to work on the same machine.
+///
+/// `DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1` is the layer's own compatibility
+/// escape hatch. Respect an explicit user value; otherwise set it once, before
+/// DinurdoJK starts any worker/render threads. It only affects Vulkan loader
+/// behavior, so selecting DX12 remains unchanged.
+#[cfg(windows)]
+fn apply_windows_vulkan_loader_compat() -> bool {
+    const DISABLE_AMD_SWITCHABLE_LAYER: &str = "DISABLE_LAYER_AMD_SWITCHABLE_GRAPHICS_1";
+    if std::env::var_os(DISABLE_AMD_SWITCHABLE_LAYER).is_some() {
+        return false;
+    }
+
+    // SAFETY: this is called at process startup before DinurdoJK spawns any
+    // threads. Environment mutation is unsafe in Rust 2024 only because racing
+    // concurrent environment access is unsound.
+    unsafe {
+        std::env::set_var(DISABLE_AMD_SWITCHABLE_LAYER, "1");
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn apply_windows_vulkan_loader_compat() -> bool {
+    false
+}
 
 fn spawn_terminal_command_reader(proxy: EventLoopProxy<UserEvent>) {
     if !std::io::stdin().is_terminal() {
@@ -131,7 +164,7 @@ struct Options {
     launch_map: bool,
     game: Option<String>,
     validate: bool,
-    /// OpenJK-style `+command args` startup lines (e.g. `+connect host`).
+    /// OpenJK-style `+command args` startup lines (e.g. `+set fs_game japro`).
     startup_commands: Vec<String>,
     /// Image supplied as a positional argument, e.g. by dragging a screenshot
     /// onto DinurdoJK.exe in Explorer.
@@ -244,6 +277,8 @@ fn main() -> std::process::ExitCode {
     if let Some(code) = display_gamma::helper_entry() {
         return std::process::ExitCode::from(code as u8);
     }
+
+    let disabled_legacy_amd_vulkan_layer = apply_windows_vulkan_loader_compat();
     match logging::init() {
         Ok(path) => {
             logging::write_line_with_path(
@@ -255,6 +290,12 @@ fn main() -> std::process::ExitCode {
             crash::log_environment();
         }
         Err(error) => std::eprintln!("Logging initialization failed: {error}"),
+    }
+
+    if disabled_legacy_amd_vulkan_layer {
+        println!(
+            "[GPU] Vulkan compatibility: disabled legacy AMD switchable-graphics implicit layer for this process"
+        );
     }
 
     for error in display_gamma::recover_before_launch() {
@@ -430,7 +471,18 @@ fn main() -> std::process::ExitCode {
         };
     }
 
-    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
+    let mut event_loop_builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        event_loop_builder.with_msg_hook(|message| {
+            renderer::input_diag_win32_message(message);
+            // False means continue Winit's normal message dispatch. The hook is
+            // observation-only and must never consume WM_INPUT.
+            false
+        });
+    }
+    let event_loop = match event_loop_builder.build() {
         Ok(loop_) => loop_,
         Err(error) => {
             eprintln!("Event loop creation failed: {error}");

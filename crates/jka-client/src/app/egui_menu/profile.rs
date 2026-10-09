@@ -168,7 +168,17 @@ impl App {
             theme::label(
                 ui,
                 if pending {
-                    theme::plain("Changes are local until applied.", 11.0, theme::WARNING)
+                    theme::plain(
+                        if self.profile_model_staged.is_some() {
+                            "Other changes need APPLY · model updates on exit."
+                        } else {
+                            "Changes are local until applied."
+                        },
+                        11.0,
+                        theme::WARNING,
+                    )
+                } else if self.profile_model_staged.is_some() {
+                    theme::plain("Model will change when you leave Profile.", 11.0, theme::TEXT_FAINT)
                 } else {
                     theme::plain("All changes applied.", 11.0, theme::TEXT_FAINT)
                 },
@@ -273,10 +283,12 @@ impl App {
                         egui::FontId::proportional(11.5),
                         theme::TEXT_FAINT,
                     );
+                    let staged_caption = self.profile_model_staged.as_deref()
+                        .and_then(|value| value.split('/').next());
                     let caption = if saber {
                         &self.network.saber1
                     } else {
-                        &self.solo_client_info.model_name
+                        staged_caption.unwrap_or(&self.solo_client_info.model_name)
                     };
                     theme::glow_text(
                         &painter,
@@ -320,7 +332,9 @@ impl App {
             "CURRENT LOADOUT",
             "Uses the same cvars as the stock client",
         );
-        Self::profile_readout(ui, "MODEL", &self.solo_client_info.model_cvar());
+        let display_model = self.profile_model_staged.clone()
+            .unwrap_or_else(|| self.solo_client_info.model_cvar());
+        Self::profile_readout(ui, "MODEL", &display_model);
         Self::profile_readout(ui, "PRIMARY SABER", &self.network.saber1);
         Self::profile_readout(ui, "SECONDARY SABER", &self.network.saber2);
         Self::profile_readout(ui, "FORCE", &self.network.forcepowers);
@@ -392,7 +406,7 @@ impl App {
         theme::section(
             ui,
             "PLAYER MODEL",
-            "One tile per humanoid model · hover a tile to choose its skin variants",
+            "Click a model to preview · hover tiles marked 2+ for skin variants · saved on exit",
         );
 
         ui.horizontal(|ui| {
@@ -440,8 +454,9 @@ impl App {
             }
         });
 
-        let current = self.solo_client_info.model_cvar();
-        let current_model = self.solo_client_info.model_name.clone();
+        let current = self.profile_model_staged.clone()
+            .unwrap_or_else(|| self.solo_client_info.model_cvar());
+        let current_model = current.split('/').next().unwrap_or_default().to_owned();
         let columns = ((ui.available_width() + 8.0) / (92.0 + 8.0))
             .floor()
             .max(1.0) as usize;
@@ -452,6 +467,15 @@ impl App {
         let mut pending_model: Option<String> = None;
         let mut visible_count = 0usize;
 
+        // The Profile grid alone gets a short hover delay. Changing the egui
+        // Context style temporarily (and restoring it below) matters because
+        // tooltip timing is read by egui's tooltip manager, not tile painting.
+        let hover_style = ui.ctx().global_style().interaction.clone();
+        ui.ctx().global_style_mut(|style| {
+            style.interaction.tooltip_delay = 0.08;
+            style.interaction.tooltip_grace_time = 0.45;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
         egui::Grid::new("profile-model-grid")
             .num_columns(columns)
             .spacing(egui::vec2(8.0, 10.0))
@@ -468,6 +492,7 @@ impl App {
                         })
                         .unwrap_or(&variants[0])
                         .clone();
+                    let source_model = representative.source_model;
                     let selected_model = model_name.eq_ignore_ascii_case(&current_model);
                     let (rect, response) = ui.allocate_exact_size(tile, egui::Sense::click());
                     ui.painter().rect_filled(
@@ -512,9 +537,36 @@ impl App {
                         ui.painter().text(
                             image_rect.center(),
                             egui::Align2::CENTER_CENTER,
-                            "NO ICON",
+                            if source_model { "SOURCE 1" } else { "NO ICON" },
                             egui::FontId::proportional(9.0),
                             theme::TEXT_FAINT,
+                        );
+                    }
+                    if variants.len() > 1 {
+                        // Count only variants reachable with the current team
+                        // filter. The popup uses exactly this same set.
+                        let count = variants.len().to_string();
+                        let badge_rect = egui::Rect::from_min_size(
+                            image_rect.right_top() - egui::vec2(24.0, 0.0),
+                            egui::vec2(24.0, 20.0),
+                        );
+                        ui.painter().rect_filled(
+                            badge_rect,
+                            egui::CornerRadius::same(3),
+                            theme::PANEL_FILL,
+                        );
+                        ui.painter().rect_stroke(
+                            badge_rect,
+                            egui::CornerRadius::same(3),
+                            egui::Stroke::new(1.0, theme::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            badge_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            count,
+                            egui::FontId::proportional(11.0),
+                            theme::TEXT,
                         );
                     }
                     ui.painter().text(
@@ -529,56 +581,60 @@ impl App {
                         },
                     );
 
-                    let response = response.on_hover_ui(|ui| {
-                        ui.set_min_width(220.0);
-                        theme::label(
-                            ui,
-                            theme::plain(&model_name.to_ascii_uppercase(), 10.5, theme::TEXT_FAINT),
-                        );
-                        ui.add_space(4.0);
-                        ui.horizontal_wrapped(|ui| {
-                            for entry in &variants {
-                                let variant_size = egui::vec2(60.0, 80.0);
-                                let (vrect, vresponse) =
-                                    ui.allocate_exact_size(variant_size, egui::Sense::click());
-                                let selected = entry.value.eq_ignore_ascii_case(&current);
-                                ui.painter().rect_stroke(
-                                    vrect,
-                                    egui::CornerRadius::same(2),
-                                    egui::Stroke::new(
-                                        if selected { 2.0_f32 } else { 1.0_f32 },
-                                        if selected { theme::ACCENT } else { theme::LINE },
-                                    ),
-                                    egui::StrokeKind::Inside,
-                                );
-                                let vimage = egui::Rect::from_min_max(
-                                    vrect.min + egui::vec2(3.0, 3.0),
-                                    egui::pos2(vrect.max.x - 3.0, vrect.max.y - 20.0),
-                                );
-                                if let Some(texture) = self.profile_model_icon_texture(entry) {
-                                    ui.painter().image(
-                                        texture.id(),
-                                        vimage,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
+                    let response = if variants.len() > 1 {
+                        response.on_hover_ui(|ui| {
+                            ui.set_min_width(220.0);
+                            theme::label(
+                                ui,
+                                theme::plain(&model_name.to_ascii_uppercase(), 10.5, theme::TEXT_FAINT),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for entry in &variants {
+                                    let variant_size = egui::vec2(60.0, 80.0);
+                                    let (vrect, vresponse) =
+                                        ui.allocate_exact_size(variant_size, egui::Sense::click());
+                                    let selected = entry.value.eq_ignore_ascii_case(&current);
+                                    ui.painter().rect_stroke(
+                                        vrect,
+                                        egui::CornerRadius::same(2),
+                                        egui::Stroke::new(
+                                            if selected { 2.0_f32 } else { 1.0_f32 },
+                                            if selected { theme::ACCENT } else { theme::LINE },
                                         ),
-                                        egui::Color32::WHITE,
+                                        egui::StrokeKind::Inside,
                                     );
+                                    let vimage = egui::Rect::from_min_max(
+                                        vrect.min + egui::vec2(3.0, 3.0),
+                                        egui::pos2(vrect.max.x - 3.0, vrect.max.y - 20.0),
+                                    );
+                                    if let Some(texture) = self.profile_model_icon_texture(entry) {
+                                        ui.painter().image(
+                                            texture.id(),
+                                            vimage,
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 0.0),
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                    ui.painter().text(
+                                        egui::pos2(vrect.center().x, vrect.max.y - 9.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        &entry.skin_name,
+                                        egui::FontId::proportional(8.5),
+                                        theme::TEXT_DIM,
+                                    );
+                                    if vresponse.clicked() {
+                                        pending_model = Some(entry.value.clone());
+                                    }
                                 }
-                                ui.painter().text(
-                                    egui::pos2(vrect.center().x, vrect.max.y - 9.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    &entry.skin_name,
-                                    egui::FontId::proportional(8.5),
-                                    theme::TEXT_DIM,
-                                );
-                                if vresponse.clicked() {
-                                    pending_model = Some(entry.value.clone());
-                                }
-                            }
-                        });
-                    });
+                            });
+                        })
+                    } else {
+                        response
+                    };
                     if response.clicked() {
                         pending_model = Some(representative.value.clone());
                     }
@@ -590,13 +646,15 @@ impl App {
                 }
             });
 
+        ui.ctx().global_style_mut(|style| style.interaction = hover_style);
         if let Some(value) = pending_model {
             if !value.eq_ignore_ascii_case(&current) {
-                if let Err(error) = self.profile_set_cvar("model", &value) {
-                    self.console_status = error;
+                self.profile_model_staged = if value.eq_ignore_ascii_case(&self.solo_client_info.model_cvar()) {
+                    None
                 } else {
-                    self.profile_preview_key = None;
-                }
+                    Some(value)
+                };
+                self.profile_preview_key = None;
             }
         }
 
@@ -608,7 +666,7 @@ impl App {
         } else if self.profile_models.is_empty() {
             theme::banner(
                 ui,
-                "No humanoid models/players/*/model.glm assets were found.",
+                "No JKA models or packaged Source player descriptors were found.",
                 theme::WARNING,
             );
         } else if visible_count == 0 {

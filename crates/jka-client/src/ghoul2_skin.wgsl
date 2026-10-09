@@ -13,6 +13,13 @@ override ENABLE_LEGACY_FOG: bool = false;
 // replaying explicitly-authored `glow` stages. Pipeline-specialize that replay
 // rather than changing material classification or blend behavior.
 override FORCE_FOG_BLACK: bool = false;
+// A Source 1 ($bumpmap / $phong) material. False compiles the normal-map
+// sample, the per-pixel tangent frame and all of Valve's phong out of the
+// module, so every JKA model keeps exactly the cost it had. It must be false
+// unless the surface's bind group carries a real normal map, and it is also
+// read by vs_main, which hands the light grid to the fragment stage instead of
+// folding it into the draw colour.
+override ENABLE_SOURCE_MATERIAL: bool = false;
 
 struct BoneMatrix {
     row0: vec4<f32>,
@@ -39,6 +46,12 @@ struct SkinDraw {
     jiggle1: vec4<f32>,
     jiggle2: vec4<f32>,
     jiggle3: vec4<f32>,
+    // Source 1 $phong: boost, exponent, $rimlightboost, $rimlightexponent.
+    // A zero boost means the term is off.
+    source_phong: vec4<f32>,
+    // xyz: $phongfresnelranges, packed ((mid-min)*2, mid, (max-mid)*2) by the
+    // material loader exactly as Valve's helper packs it. w bit 0: $halflambert.
+    source_fresnel: vec4<f32>,
 };
 // q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
 fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
@@ -61,6 +74,9 @@ fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
+// Source 1 `$bumpmap`, linear. A flat (128, 128, 255) 1x1 texture is bound
+// wherever a surface has none, so this is always a legal read.
+@group(1) @binding(3) var normal_texture: texture_2d<f32>;
 
 struct EntityLightingSettings {
     values: vec4<u32>,
@@ -101,6 +117,11 @@ struct VertexOut {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) world_position: vec3<f32>,
+    // `instance_index` is a vertex-stage builtin, so the Source material path
+    // gets its draw's row of `skin_draws` through this flat interpolant. One
+    // 32-bit flat varying, which is why the per-pixel light does not instead
+    // ride along as several interpolated vectors.
+    @location(4) @interpolate(flat) draw_index: u32,
 };
 
 fn transform_point(bone: BoneMatrix, point: vec3<f32>) -> vec3<f32> {
@@ -156,12 +177,17 @@ fn jiggle_offset(draw: SkinDraw, region: u32) -> vec3<f32> {
 }
 
 fn jiggle_effective_weight(draw: SkinDraw, weight: f32, coord: f32) -> f32 {
-    let overall = draw.jiggle0.w;
     if (abs(coord) < 2.0) {
-        let vertical = smoothstep(-0.70 + draw.jiggle3.w, -0.15 + draw.jiggle3.w, coord);
-        return weight * overall * draw.jiggle2.w * vertical;
+        let bottom = draw.jiggle0.w;
+        let top = draw.jiggle1.w;
+        let lower = smoothstep(-0.70 + bottom, -0.15 + bottom, coord);
+        var upper = 1.0;
+        if (top < 0.0) {
+            upper = 1.0 - smoothstep(0.65 + top, 1.0 + top, coord);
+        }
+        return weight * lower * upper;
     }
-    return weight * overall * draw.jiggle1.w;
+    return weight;
 }
 
 fn model_to_world(draw: SkinDraw, model_position: vec3<f32>) -> vec3<f32> {
@@ -233,8 +259,12 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
         output.uv = input.uv * draw.uv_xform.xy + draw.uv_xform.zw;
     }
     output.normal = render_normal;
+    output.draw_index = draw_index;
     var draw_color = draw.color;
-    if (draw.params.y != 0u) {
+    // A Source 1 material reacts to the light grid per pixel, with its own
+    // normal and Valve's diffuse term, so the fragment stage reads the same
+    // numbers straight out of `skin_draws` instead.
+    if (!ENABLE_SOURCE_MATERIAL && draw.params.y != 0u) {
         var incoming = 0.0;
         let light_dir = draw.classic_direction.xyz;
         let light_len_sq = dot(light_dir, light_dir);
@@ -263,12 +293,17 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
     return output;
 }
 
+fn model_brightness() -> f32 {
+    // Setup > Video > Model brightness (extra multiplier, 1.0 = neutral).
+    return bitcast<f32>(entity_lighting.values.y);
+}
+
 fn lit_color(normal: vec3<f32>, tex_in: vec4<f32>) -> vec4<f32> {
     // BSP LIGHTGRID is already applied above from the per-draw OpenJK probe
     // sample. The previous directional placeholder remains only under
     // irradiance-volume mode until Ghoul2 is bound to the ambient-cube data.
     // Setup > Video > Model brightness (extra multiplier, 1.0 = neutral).
-    let tex = vec4<f32>(tex_in.rgb * bitcast<f32>(entity_lighting.values.y), tex_in.a);
+    let tex = vec4<f32>(tex_in.rgb * model_brightness(), tex_in.a);
     if (entity_lighting.values.x != 2u) {
         return tex;
     }
@@ -322,11 +357,193 @@ fn fs_wireframe() -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 1.0, 0.0, 1.0);
 }
 
+// -----------------------------------------------------------------------------
+// Source 1 `VertexLitGeneric` phong, ported from the Source SDK:
+// `common_vertexlitgeneric_dx9.h` (DiffuseTerm, SpecularAndRimTerms, Fresnel,
+// Fresnel4) and the body of `skin_ps20b.fxc`, onto this engine's light set.
+//
+// JKA gives an entity one light grid sample - a direction-independent ambient
+// plus one directed light - and optionally the runtime sun as a second light.
+// Those stand in for Valve's ambient cube and its local light array; nothing
+// else about the model changes. Everything is in render space, which is what
+// the interpolated normal and position are in, and whose .y is JKA's up axis
+// (so it is what Valve's `worldSpaceNormal.z` means in the rim term).
+// -----------------------------------------------------------------------------
+
+/// Per-pixel tangent frame from screen-space derivatives, so no vertex format,
+/// compute-skinning path or geometry cache has to grow a tangent.
+///
+/// T is `+dP/du` and B is `+dP/dv`, which is the frame Source itself uses:
+/// `CalcTriangleTangentSpace` returns exactly those two partials as its
+/// TANGENT/BINORMAL, and `skin_vs20.fxc` puts them in that order. A Source
+/// normal map's green channel therefore means here what it meant there.
+fn source_tangent_normal(
+    n: vec3<f32>,
+    position: vec3<f32>,
+    uv: vec2<f32>,
+    texel: vec3<f32>,
+) -> vec3<f32> {
+    let dp1 = dpdx(position);
+    let dp2 = dpdy(position);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    // Solved against the plane of the normal, so the frame is orthogonal to it
+    // without a separate Gram-Schmidt step.
+    let dp2perp = cross(dp2, n);
+    let dp1perp = cross(n, dp1);
+    let t = dp2perp * duv1.x + dp1perp * duv2.x;
+    let b = dp2perp * duv1.y + dp1perp * duv2.y;
+    // One scale for both axes keeps the frame's shape; a degenerate frame (no
+    // UV gradient) collapses to the geometric normal rather than exploding.
+    let scale = inverseSqrt(max(max(dot(t, t), dot(b, b)), 1.0e-12));
+    let tangent = texel * 2.0 - 1.0;
+    return normalize((t * tangent.x + b * tangent.y) * scale + n * tangent.z);
+}
+
+/// `DiffuseTerm`: a saturated Lambert, or Valve's Half Lambert squared.
+fn source_diffuse_term(n: vec3<f32>, l: vec3<f32>, half_lambert: bool) -> f32 {
+    let n_dot_l = dot(n, l);
+    if (half_lambert) {
+        let scaled = clamp(n_dot_l * 0.5 + 0.5, 0.0, 1.0);
+        return scaled * scaled;
+    }
+    return clamp(n_dot_l, 0.0, 1.0);
+}
+
+/// `Fresnel(vNormal, vEyeDir, vRanges)`, in the engine's own packed form:
+/// `vRanges` arrives as ((mid-min)*2, mid, (max-mid)*2).
+fn source_fresnel_ranges(n: vec3<f32>, v: vec3<f32>, ranges: vec3<f32>) -> f32 {
+    var f = clamp(1.0 - dot(n, v), 0.0, 1.0);
+    f = f * f - 0.5;
+    return ranges.y + select(ranges.x, ranges.z, f >= 0.0) * f;
+}
+
+/// `Fresnel4`: the traditional term squared twice. Valve uses this one, not the
+/// ranges, for the rim.
+fn source_fresnel4(n: vec3<f32>, v: vec3<f32>) -> f32 {
+    let f = clamp(1.0 - dot(n, v), 0.0, 1.0);
+    let f2 = f * f;
+    return f2 * f2;
+}
+
+struct SourceLighting {
+    diffuse: vec3<f32>,
+    specular: vec3<f32>,
+    rim: vec3<f32>,
+};
+
+/// One light's contribution: `DiffuseTerm` plus `SpecularAndRimTerms`.
+/// `direction` is the unnormalized render-space direction toward the light and
+/// `radiance` its 0..255 light grid colour.
+fn source_add_light(
+    sum: SourceLighting,
+    n: vec3<f32>,
+    v: vec3<f32>,
+    direction: vec3<f32>,
+    radiance: vec3<f32>,
+    phong: vec4<f32>,
+    half_lambert: bool,
+) -> SourceLighting {
+    var out = sum;
+    let length_sq = dot(direction, direction);
+    if (length_sq <= 1.0e-8) {
+        return out;
+    }
+    let l = direction * inverseSqrt(length_sq);
+    let color = radiance / 255.0;
+    out.diffuse += color * source_diffuse_term(n, l, half_lambert);
+    if (phong.x > 0.0) {
+        // SpecularAndRimTerms: (L.R)^k, masked by N.L and the light colour. The
+        // rim shares the reflection dot and only changes the exponent.
+        let reflected = n * (2.0 * dot(n, v)) - v;
+        let l_dot_r = clamp(dot(reflected, l), 0.0, 1.0);
+        let n_dot_l = clamp(dot(n, l), 0.0, 1.0);
+        out.specular += color * (pow(l_dot_r, phong.y) * n_dot_l);
+        if (phong.z > 0.0) {
+            out.rim += color * (pow(l_dot_r, phong.w) * n_dot_l);
+        }
+    }
+    return out;
+}
+
+fn source_material_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
+    let draw = skin_draws[input.draw_index];
+    // Sampled before any branch: a texture read may not sit in non-uniform
+    // control flow, and nothing read out of `skin_draws` is provably uniform.
+    let normal_texel = textureSample(normal_texture, base_sampler, input.uv);
+    if (draw.params.y == 0u) {
+        // No light grid sample for this draw (entity lighting off): there is
+        // nothing for Valve's model to react to, so stay on the JKA path.
+        return lit_color(input.normal, tex) * input.color;
+    }
+    let geometric = normalize(input.normal);
+    let n = source_tangent_normal(geometric, input.world_position, input.uv, normal_texel.rgb);
+    let v = normalize(camera.camera_pos_time.xyz - input.world_position);
+    let ambient = draw.classic_ambient.xyz / 255.0;
+    let half_lambert = (u32(draw.source_fresnel.w) & 1u) != 0u;
+
+    var sum: SourceLighting;
+    sum.diffuse = ambient;
+    sum.specular = vec3<f32>(0.0);
+    sum.rim = vec3<f32>(0.0);
+    sum = source_add_light(
+        sum,
+        n,
+        v,
+        draw.classic_direction.xyz,
+        draw.classic_directed.xyz,
+        draw.source_phong,
+        half_lambert,
+    );
+    // The runtime sun, which carries zero radiance while that feature is off.
+    sum = source_add_light(
+        sum,
+        n,
+        v,
+        draw.classic_sun_direction.xyz,
+        draw.classic_sun_directed.xyz,
+        draw.source_phong,
+        half_lambert,
+    );
+
+    // skin_ps20b.fxc: the phong mask is the normal map's alpha, modulated by the
+    // Fresnel ranges and then by $phongboost.
+    var specular = sum.specular
+        * (normal_texel.a
+            * source_fresnel_ranges(n, v, draw.source_fresnel.xyz)
+            * draw.source_phong.x);
+    let rim_boost = draw.source_phong.z;
+    if (rim_boost > 0.0) {
+        // $rimmask needs the specular exponent texture, which is not supported
+        // here, so fRimMask is 1 and fRimMultiply is the plain Fresnel.
+        let rim_multiply = source_fresnel4(n, v);
+        // Folded in with max() so the same light is not added twice, then the
+        // ambient view-ray lookup on top - the flat light grid ambient here.
+        specular = max(specular, sum.rim * rim_multiply);
+        specular += (ambient * rim_boost) * clamp(rim_multiply * n.y, 0.0, 1.0);
+    }
+    // JKA clamps its own light grid sum to 1 before it reaches the texture, and
+    // the grid routinely saturates, so the diffuse half keeps that range.
+    let lighting = clamp(sum.diffuse, vec3<f32>(0.0), vec3<f32>(1.0));
+    let albedo = tex.rgb * model_brightness() * input.color.rgb;
+    return vec4<f32>(albedo * lighting + specular, tex.a * input.color.a);
+}
+
+/// The lit colour for one fragment. `ENABLE_SOURCE_MATERIAL` is a pipeline
+/// constant, so exactly one of these two bodies survives compilation and stock
+/// models never sample a normal map.
+fn shaded_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
+    if (ENABLE_SOURCE_MATERIAL) {
+        return source_material_color(input, tex);
+    }
+    return lit_color(input.normal, tex) * input.color;
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     return fogged(
-        model_wet_color(lit_color(input.normal, tex) * input.color, input.normal, input.world_position),
+        model_wet_color(shaded_color(input, tex), input.normal, input.world_position),
         input.world_position,
         false
     );
@@ -339,7 +556,7 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     return fogged(
-        model_wet_color(lit_color(input.normal, tex) * input.color, input.normal, input.world_position),
+        model_wet_color(shaded_color(input, tex), input.normal, input.world_position),
         input.world_position,
         false
     );
@@ -437,6 +654,19 @@ fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
     return prepass_output(input.world_position, input.normal);
 }
 
+@fragment
+fn fs_rain_prepass(input: PrepassVertexOut) -> @location(0) f32 {
+    return distance(input.world_position, camera.camera_pos_time.xyz);
+}
+
+@fragment
+fn fs_rain_prepass_mask(input: PrepassVertexOut) -> @location(0) f32 {
+    if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
+        discard;
+    }
+    return distance(input.world_position, camera.camera_pos_time.xyz);
+}
+
 // Entity shadow map (Dynamic shadows = Entity map): depth-only light-space pass.
 // Opaque casters use vs_prepass with no fragment stage; only alpha-tested
 // surfaces need this discard. Same 0.5 cutoff as fs_prepass_mask.
@@ -446,3 +676,14 @@ fn fs_shadow_mask(input: PrepassVertexOut) {
         discard;
     }
 }
+
+// Spectator/demo outline mask. These deliberately ignore material/lighting; the
+// fullscreen compositor extracts only the antialiased silhouette edge.
+@fragment
+fn fs_spec_mask_red() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.045, 0.025, 1.0); }
+@fragment
+fn fs_spec_mask_blue() -> @location(0) vec4<f32> { return vec4<f32>(0.035, 0.22, 1.0, 1.0); }
+@fragment
+fn fs_spec_mask_yellow() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.62, 0.025, 1.0); }
+@fragment
+fn fs_spec_mask_clear() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }

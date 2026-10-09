@@ -223,9 +223,13 @@ impl PlayerPresenter {
                 continue;
             }
 
-            let (client_num, info) = if entity.entity_type == ET_NPC {
-                match game.npc_client_info(&entity.state) {
-                    Ok(info) => (usize::from(entity.number), info),
+            let (client_num, info, npc_model_request) = if entity.entity_type == ET_NPC {
+                match game.npc_model_request(&entity.state) {
+                    Ok(request) => (
+                        usize::from(entity.number),
+                        request.client_info.clone(),
+                        Some(request),
+                    ),
                     Err(reason) => {
                         self.report_player_status(
                             entity.number,
@@ -270,7 +274,7 @@ impl PlayerPresenter {
                         }
                     }
                 }
-                (client_num, info)
+                (client_num, info, None)
             };
 
             let look_target_origin = openjk_look_target_origin(entity, &entity_origins);
@@ -283,6 +287,7 @@ impl PlayerPresenter {
             match self.present_player(
                 entity,
                 &info,
+                npc_model_request.as_ref(),
                 current_time,
                 1.0,
                 look_target_origin,
@@ -413,6 +418,7 @@ impl PlayerPresenter {
         let result = self.present_player(
             entity,
             info,
+            None,
             current_time,
             entity_alpha,
             look_target_origin,
@@ -458,6 +464,7 @@ impl PlayerPresenter {
         let result = self.present_player(
             entity,
             info,
+            None,
             current_time,
             entity_alpha.clamp(0.02, 1.0),
             None,
@@ -485,6 +492,7 @@ impl PlayerPresenter {
         &mut self,
         entity: &PresentedEntity,
         info: &crate::cgame::ClientInfo,
+        npc_model_request: Option<&crate::cgame::NpcModelRequest>,
         current_time: i32,
         entity_alpha: f32,
         look_target_origin: Option<[f32; 3]>,
@@ -499,7 +507,8 @@ impl PlayerPresenter {
         // before model registration. Do the same here after any cg_forceModel
         // rewrite, so model caching and async requests see the final team skin.
         let mut team_info = info.clone();
-        if team_info.gametype >= crate::cgame::GT_TEAM
+        if npc_model_request.is_none()
+            && team_info.gametype >= crate::cgame::GT_TEAM
             && team_info.gametype != crate::cgame::GT_SIEGE
             && !team_info.jedi_v_merc
         {
@@ -514,6 +523,12 @@ impl PlayerPresenter {
         }
         let info = &team_info;
 
+        let requested_model_name = npc_model_request
+            .map(|request| request.model_qpath.as_str())
+            .unwrap_or(info.model_name.as_str());
+        let requested_skin_name = npc_model_request
+            .and_then(|request| request.skin_qpath.as_deref())
+            .unwrap_or(info.skin_name.as_str());
         let cached_model = self
             .entities
             .get(&entity.number)
@@ -521,34 +536,50 @@ impl PlayerPresenter {
                 runtime.model_settled
                     && runtime
                         .requested_model_name
-                        .eq_ignore_ascii_case(&info.model_name)
+                        .eq_ignore_ascii_case(requested_model_name)
                     && runtime
                         .requested_skin_name
-                        .eq_ignore_ascii_case(&info.skin_name)
+                        .eq_ignore_ascii_case(requested_skin_name)
             })
             .map(|runtime| Arc::clone(&runtime.model));
         let (model, model_settled) = if let Some(model) = cached_model {
             (model, true)
         } else if !self.async_loading_enabled() {
-            (self.load_model(info)?, true)
+            if let Some(request) = npc_model_request {
+                (self.load_npc_model(request)?, true)
+            } else {
+                (self.load_model(info)?, true)
+            }
         } else {
-            // Request the real model immediately but never wait for it: keep
-            // the entity's previous model, or the resident default body for a
-            // new player, until the worker finishes; then swap automatically.
-            match self.resolve_player_model_async(info) {
+            let resolution = if let Some(request) = npc_model_request {
+                self.resolve_npc_model_async(request)
+            } else {
+                self.resolve_player_model_async(info)
+            };
+            match resolution {
                 ModelResolution::Ready(model) => (model, true),
                 ModelResolution::Provisional(model) => match self.entities.get(&entity.number) {
                     Some(runtime) => (Arc::clone(&runtime.model), false),
                     None => (model, false),
                 },
                 ModelResolution::Loading => match self.entities.get(&entity.number) {
-                    Some(runtime) => (Arc::clone(&runtime.model), false),
-                    None => return Ok(Vec::new()),
+                    // Async NPC model changes may keep their own last exact body
+                    // while the new model loads, but never borrow a player
+                    // fallback/runtime (Kyle/Jan) from this entity slot.
+                    Some(runtime)
+                        if npc_model_request.is_none() || runtime.model.key.starts_with("npc:") =>
+                    {
+                        (Arc::clone(&runtime.model), false)
+                    }
+                    _ => return Ok(Vec::new()),
                 },
                 ModelResolution::Failed(error) => match self.entities.get(&entity.number) {
-                    // Keep showing the last valid model rather than vanishing.
-                    Some(runtime) => (Arc::clone(&runtime.model), true),
-                    None => return Err(error),
+                    Some(runtime)
+                        if npc_model_request.is_none() || runtime.model.key.starts_with("npc:") =>
+                    {
+                        (Arc::clone(&runtime.model), true)
+                    }
+                    _ => return Err(error),
                 },
             }
         };
@@ -579,6 +610,17 @@ impl PlayerPresenter {
                 recreate = false;
             }
         }
+        if !recreate {
+            // Same key, different asset: a rebuilt model (jiggle remesh bounds
+            // changed) shares its key with the one it replaces.
+            if let Some(runtime) = self
+                .entities
+                .get_mut(&entity.number)
+                .filter(|runtime| !Arc::ptr_eq(&runtime.model, &model))
+            {
+                runtime.model = Arc::clone(&model);
+            }
+        }
         if recreate {
             let animation = PlayerAnimationState::new(&model.gla, current_time)?;
             self.entities.insert(
@@ -586,8 +628,8 @@ impl PlayerPresenter {
                 EntityPlayerState {
                     model_key: model.key.clone(),
                     model_settled,
-                    requested_model_name: info.model_name.clone(),
-                    requested_skin_name: info.skin_name.clone(),
+                    requested_model_name: requested_model_name.to_owned(),
+                    requested_skin_name: requested_skin_name.to_owned(),
                     model: Arc::clone(&model),
                     animation,
                     player_angles: PlayerAngleState::reset_from_angles(entity.angles),
@@ -630,14 +672,14 @@ impl PlayerPresenter {
         if runtime.model_settled != model_settled
             || !runtime
                 .requested_model_name
-                .eq_ignore_ascii_case(&info.model_name)
+                .eq_ignore_ascii_case(requested_model_name)
             || !runtime
                 .requested_skin_name
-                .eq_ignore_ascii_case(&info.skin_name)
+                .eq_ignore_ascii_case(requested_skin_name)
         {
             runtime.model_settled = model_settled;
-            runtime.requested_model_name.clone_from(&info.model_name);
-            runtime.requested_skin_name.clone_from(&info.skin_name);
+            runtime.requested_model_name = requested_model_name.to_owned();
+            runtime.requested_skin_name = requested_skin_name.to_owned();
         }
         let previous_e_flags = runtime.last_e_flags;
         let time_rewound = current_time < runtime.last_angle_time;
@@ -824,11 +866,17 @@ impl PlayerPresenter {
         // explicit EF_RAG entities enter the ragdoll seam regardless of whether
         // they have already been copied into the ET_BODY queue. This is crucial
         // for NPCs, which can remain ET_NPC while dead.
-        let corpse_ragdoll_requested =
-            entity.entity_type == ET_BODY || e_flags & (EF_DEAD | EF_RAG) != 0;
-        let force_grip_ragdoll_requested =
-            !corpse_ragdoll_requested && self.force_gripped_entities.contains(&entity.number);
-        let impulse_ragdoll = (!corpse_ragdoll_requested && !force_grip_ragdoll_requested)
+        // TaystJK CG_RagDoll rejects localAnimIndex != 0 ("don't rag
+        // non-humanoids"). Preserve that contract for both the stock corpse
+        // seam and this client's optional grip/impulse Rapier handoffs.
+        let corpse_ragdoll_requested = model.humanoid
+            && (entity.entity_type == ET_BODY || e_flags & (EF_DEAD | EF_RAG) != 0);
+        let force_grip_ragdoll_requested = model.humanoid
+            && !corpse_ragdoll_requested
+            && self.force_gripped_entities.contains(&entity.number);
+        let impulse_ragdoll = (model.humanoid
+            && !corpse_ragdoll_requested
+            && !force_grip_ragdoll_requested)
             .then(|| self.active_impulse_ragdolls.get(&entity.number).copied())
             .flatten()
             .filter(|impulse| current_time < impulse.expires_at);
@@ -842,6 +890,17 @@ impl PlayerPresenter {
         let (axis, torso_angles) = if rapier_corpse {
             runtime.last_angle_time = current_time;
             (angles_to_axis([0.0, entity.angles[1], 0.0]), [0.0; 3])
+        } else if !model.humanoid {
+            // TaystJK's non-humanoid G2 path does not run BG_G2PlayerAngles or
+            // require the humanoid Motion/lumbar chain. Ordinary creatures are
+            // yaw-oriented; an NPC bolted to a vehicle retains full angles.
+            runtime.last_angle_time = current_time;
+            let angles = if entity.state.field_i32("m_iVehicleNum").unwrap_or(0) != 0 {
+                entity.angles
+            } else {
+                [0.0, entity.angles[1], 0.0]
+            };
+            (angles_to_axis(angles), [0.0; 3])
         } else {
             // CG_Player calls CG_G2PlayerAngles (-> BG_G2PlayerAngles) before
             // CG_PlayerAnimation. The Motion bolt and the client's installed
@@ -931,18 +990,31 @@ impl PlayerPresenter {
             (angle_result.axis(), torso_angles)
         };
 
-        // CG_PlayerAnimation runs after CG_G2PlayerAngles: advance the legs/
-        // torso lerp frames, client animation IDs, and Motion bone schedule
-        // now that the angle calculation above has consumed last frame's
-        // values.
+        // CG_G2SkelForModel: creature NPCs use the animation.cfg beside
+        // their loaded GLA. Humanoids keep the global multiplayer table.
+        let animations = if model.humanoid {
+            &self.animations
+        } else {
+            model
+                .animations
+                .as_deref()
+                .ok_or_else(|| format!("{} has no skeleton-local animation.cfg", model.key))?
+        };
+        let anim_events = if npc_model_request.is_some() {
+            model.anim_events.as_deref()
+        } else {
+            Some(&self.anim_events)
+        };
+
         runtime.animation.update(
             &entity.state,
-            &self.animations,
+            animations,
             &model.gla,
             info,
             &self.saber_scales,
             current_time,
             true,
+            model.humanoid,
         )?;
 
         let anim_debug = ViewerAnimDebug {
@@ -965,11 +1037,13 @@ impl PlayerPresenter {
             && entity.entity_type != ET_BODY
             && footsteps::npc_class_steps(entity.state.field_i32("NPC_class").unwrap_or(0))
         {
-            if let Some(step) = runtime.animation.legs_frame_step() {
+            if let (Some(step), Some(anim_events)) =
+                (runtime.animation.legs_frame_step(), anim_events)
+            {
                 let mut seed = self.footstep_rng;
                 footsteps = footsteps::footsteps_between(
-                    &self.anim_events.legs,
-                    &self.animations,
+                    &anim_events.legs,
+                    animations,
                     step.anim,
                     step.old_frame,
                     step.frame,
@@ -1176,6 +1250,16 @@ impl PlayerPresenter {
             current_time,
         )?;
 
+        self.queue_player_powerups(
+            entity,
+            info.gametype,
+            &model,
+            &pose,
+            render_axis,
+            render_origin,
+            submit_geometry,
+        )?;
+
         if !submit_geometry && !self.rt_shadow_casters_enabled {
             // OpenJK still runs CG_Player for the local player in first person
             // and marks the refEntity RF_THIRD_PERSON.  Keep all animation and
@@ -1258,7 +1342,7 @@ impl PlayerPresenter {
             &model.glm,
             &model.gla,
             body_surfaces,
-            model.jiggle.as_deref(),
+            self.jiggle_profile_for_sex(model.jiggle.as_deref(), model.female),
             &pose,
             body_lod,
             render_axis,

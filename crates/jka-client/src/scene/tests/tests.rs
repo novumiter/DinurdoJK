@@ -466,6 +466,120 @@ fn nonidentity_diffuse_stage_does_not_use_plain_lightmap_collapse() {
 }
 
 #[test]
+fn reverse_openjk_modulate_pair_is_recognized_without_changing_default_recipe() {
+    let [lightmap, mut diffuse] = legacy_lightmap_modulate_pair(false);
+    diffuse.blend = Some(materials::BlendFunc {
+        src: BlendFactor::Zero,
+        dst: BlendFactor::SrcColor,
+    });
+    assert!(!can_fold_jka_lightmap_pair(&lightmap, &diffuse));
+    assert!(can_fold_openjk_reverse_lightmap_modulate_pair(&lightmap, &diffuse));
+    let material = SurfaceMaterial {
+        stages: vec![lightmap, diffuse],
+        explicit: true,
+        ..Default::default()
+    };
+    assert_eq!(stage_audit_class(&material), "optional_reverse_lightmap_pair_when_no_fog");
+}
+
+#[test]
+fn reverse_openjk_modulate_pair_batch_recipe_is_strictly_opt_in() {
+    let [lightmap, mut diffuse] = legacy_lightmap_modulate_pair(false);
+    diffuse.blend = Some(materials::BlendFunc {
+        src: BlendFactor::Zero,
+        dst: BlendFactor::SrcColor,
+    });
+    let material = SurfaceMaterial {
+        stages: vec![lightmap, diffuse],
+        explicit: true,
+        ..Default::default()
+    };
+    let encode = |fog: [f32; 4], lightmap: Option<usize>, vertex_lit: bool| {
+        let mut batches = Vec::new();
+        append_material_batches(
+            &mut batches, &material, 0, None, vertex_lit,
+            0..3, lightmap, &[], [0; 4], fog, false,
+        );
+        batches
+    };
+    let no_fog = encode([0.0; 4], Some(0), false);
+    // The immutable cache must ALWAYS retain both authored passes.
+    assert_eq!(no_fog.len(), 2);
+    assert_eq!(no_fog[0].reverse_lightmap_fold_role, 1);
+    assert_eq!(no_fog[1].reverse_lightmap_fold_role, 2);
+    assert!(!no_fog[1].modulate_lightmap);
+    let (optimized, count) = fold_reverse_lightmap_batches(&no_fog);
+    assert_eq!(count, 1);
+    assert_eq!(optimized.len(), 1);
+    assert!(optimized[0].modulate_lightmap);
+    assert_eq!(optimized[0].pipeline.blend, BlendMode::Opaque);
+    assert_eq!(optimized[0].pipeline.class, DrawClass::Opaque);
+    assert!(optimized[0].pipeline.depth_write);
+    assert!(!optimized[0].dlight_in_lightmap_stage);
+    assert!(!optimized[0].reverse_lightmap_fold_detail);
+    // A disable rebuild must reproduce the original authored stages, byte
+    // identities and blend order from the unmodified map cache.
+    assert!(no_fog[0].texture_is_lightmap);
+    assert_eq!(no_fog[1].pipeline.blend, BlendMode::Custom(BlendFactor::Zero, BlendFactor::SrcColor));
+    for untouched in [encode([0.2, 0.3, 0.4, 0.8], Some(0), false),
+                      encode([0.0; 4], None, false),
+                      encode([0.0; 4], Some(0), true)] {
+        assert_eq!(untouched.iter().filter(|b| b.reverse_lightmap_fold_role != 0).count(), 0);
+        let (derived, count) = fold_reverse_lightmap_batches(&untouched);
+        assert_eq!(count, 0);
+        assert_eq!(derived.len(), untouched.len());
+    }
+}
+
+#[test]
+fn reverse_openjk_modulate_pair_rejects_glow_depth_and_pbr_near_misses() {
+    let [lightmap, mut diffuse] = legacy_lightmap_modulate_pair(false);
+    diffuse.blend = Some(materials::BlendFunc {
+        src: BlendFactor::Zero,
+        dst: BlendFactor::SrcColor,
+    });
+    assert!(can_fold_openjk_reverse_lightmap_modulate_pair(&lightmap, &diffuse));
+    let mut glow = diffuse.clone();
+    glow.glow = true;
+    assert!(!can_fold_openjk_reverse_lightmap_modulate_pair(&lightmap, &glow));
+    let mut depth = diffuse.clone();
+    depth.depth_write = true;
+    assert!(!can_fold_openjk_reverse_lightmap_modulate_pair(&lightmap, &depth));
+    let mut enhanced = diffuse.clone();
+    enhanced.enhancements.normal_texture = Some(8);
+    assert!(!can_fold_openjk_reverse_lightmap_modulate_pair(&lightmap, &enhanced));
+    let mut tinted = diffuse.clone();
+    tinted.color = [0.8, 1.0, 1.0];
+    assert!(!can_fold_openjk_reverse_lightmap_modulate_pair(&lightmap, &tinted));
+    let mut wrong_tcgen = diffuse;
+    wrong_tcgen.tc_gen = TcGen::Environment;
+    assert!(!can_fold_openjk_reverse_lightmap_modulate_pair(&lightmap, &wrong_tcgen));
+}
+
+#[test]
+fn material_audit_recognizes_existing_collapse_without_changing_rendering() {
+    let [lightmap, diffuse] = legacy_lightmap_modulate_pair(false);
+    let material = SurfaceMaterial {
+        stages: vec![lightmap, diffuse],
+        explicit: true,
+        ..Default::default()
+    };
+    assert_eq!(stage_audit_class(&material), "existing_lightmap_pair_when_eligible");
+    let mut broken = material.clone();
+    broken.stages[1].color = [0.5, 1.0, 1.0];
+    assert_eq!(stage_audit_class(&broken), "ordered_framebuffer_blend");
+    let mut glow = broken.clone();
+    glow.stages[1].glow = true;
+    assert_eq!(stage_audit_class(&glow), "glow_requires_parity");
+    let mut depth = broken.clone();
+    depth.stages[1].depth_equal = true;
+    assert_eq!(stage_audit_class(&depth), "depth_or_alpha_test");
+    let mut tcgen = broken;
+    tcgen.stages[1].tc_gen = TcGen::Environment;
+    assert_eq!(stage_audit_class(&tcgen), "dynamic_or_special_texcoords");
+}
+
+#[test]
 fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
     let diffuse = MaterialStage {
         texture: StageTexture::Image(7),
@@ -1369,4 +1483,34 @@ fn promoted_water_screen_stage_uses_analyzed_color_without_texture_mapping() {
     let no_uv = crate::ocean::appearance::from_stage(&batch,&different_uvs,&[]);
     assert_eq!(appearance.blend_color,no_uv.blend_color);
     assert_eq!(appearance.heuristic,no_uv.heuristic);
+}
+
+#[test]
+fn runtime_stage_collapse_keeps_other_geometry_and_followup_stages() {
+    let [lightmap, mut diffuse] = legacy_lightmap_modulate_pair(false);
+    diffuse.blend = Some(materials::BlendFunc {
+        src: BlendFactor::Zero, dst: BlendFactor::SrcColor,
+    });
+    let mut material = SurfaceMaterial {
+        stages: vec![lightmap, diffuse], explicit: true, ..Default::default()
+    };
+    let mut batches = Vec::new();
+    append_material_batches(
+        &mut batches, &material, 0, None, false, 0..3, Some(0),
+        &[], [0;4], [0.0;4], false,
+    );
+    assert_eq!(batches.len(), 2);
+    // Verify the same-lightmap fold does not accidentally consume a second
+    // surface whose source indices share neither the same geometry nor marker.
+    material.stages[1].blend = None;
+    append_material_batches(
+        &mut batches, &material, 0, None, false, 3..6, Some(0),
+        &[], [0;4], [0.0;4], false,
+    );
+    let (derived, folded) = fold_reverse_lightmap_batches(&batches);
+    assert_eq!(folded, 1);
+    assert_eq!(derived.len(), 3);
+    assert_eq!(derived[0].vertices, 0..3);
+    assert_eq!(derived[1].vertices, 3..6);
+    assert_eq!(derived[2].vertices, 3..6);
 }

@@ -199,10 +199,12 @@ pub(crate) fn prepare_event_visual(
         }
         // HUD timer bar and score plums are queued by the app (`note_hud_events`).
         EntityEvent::EV_LOCALTIMER | EntityEvent::EV_SCOREPLUM => (EventDispatchResult::Handled("HUD_EVENT"), None),
+        // Siege message/sound/respawn state is applied by the app
+        // (`note_siege_events`) because it owns parsed .siege data and UI.
         EntityEvent::EV_SIEGE_ROUNDOVER
         | EntityEvent::EV_SIEGE_OBJECTIVECOMPLETE
-        | EntityEvent::EV_SIEGESPEC
-        | EntityEvent::EV_GIVE_NEW_RANK
+        | EntityEvent::EV_SIEGESPEC => (EventDispatchResult::Handled("SIEGE_EVENT"), None),
+        EntityEvent::EV_GIVE_NEW_RANK
         | EntityEvent::EV_SET_FREE_SABER
         | EntityEvent::EV_SET_FORCE_DISABLE
         | EntityEvent::EV_DEBUG_LINE

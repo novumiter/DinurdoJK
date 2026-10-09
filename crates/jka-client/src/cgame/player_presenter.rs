@@ -1,4 +1,6 @@
 //! cgame::player_presenter module facade. Implementations are grouped by responsibility.
+mod source_player;
+mod source_vtf;
 mod assets;
 mod attachments;
 mod bodies;
@@ -9,6 +11,7 @@ mod effects;
 mod events;
 mod physics;
 mod pose;
+mod powerups;
 mod presentation;
 mod previews;
 mod sabers;
@@ -62,7 +65,7 @@ use pose::{foot_bolts_timed, model_bolt_origin_timed, skin_surface_timed};
 use sabers::state::{EntityPlayerState, SaberBladeLengthKey, SaberBladeLengthState};
 use state::resolve_vehicle_model_request;
 use submission::mesh::{
-    build_lod_gpu_meshes, gpu_bones_from_pose, is_asset_pending, player_model_key,
+    build_joined_breast_bakes, build_lod_gpu_meshes, gpu_bones_from_pose, is_asset_pending, player_model_key,
     sibling_default_skin_qpath, static_model_key, ASSET_PENDING,
 };
 use view::{
@@ -71,7 +74,7 @@ use view::{
     BLOB_SHADOW_MINS, BLOB_SHADOW_RADIUS, CLASS_REMOTE, CLASS_SEEKER, EF2_SHIP_DEATH, EF_DEAD,
     EF_NODRAW, EF_RAG, EF_TELEPORT_BIT, G2_MODELPART_HEAD, G2_MODELPART_LARM, G2_MODELPART_LLEG,
     G2_MODELPART_RARM, G2_MODELPART_RHAND, G2_MODELPART_RLEG, G2_MODELPART_WAIST, G2_MODEL_PART,
-    MASK_PLAYERSOLID, MAX_GLA_BYTES, MAX_GLM_BYTES, MAX_JIGGLE_BYTES, MAX_SKIN_BYTES, PW_CLOAKED,
+    MASK_PLAYERSOLID, MAX_GLA_BYTES, MAX_GLM_BYTES, MAX_SKIN_BYTES, PW_CLOAKED,
     WP_BRYAR_PISTOL, WP_SABER,
 };
 pub use view::{Ghoul2PresentationView, ViewerAnimDebug};
@@ -87,8 +90,10 @@ pub use view::{Ghoul2PresentationView, ViewerAnimDebug};
 use super::cloth::{
     ClothCapsule, ClothConfig, ClothMotion, ClothOutput, ClothSurfaceFrame, ClothSystem,
 };
+use super::cloth_worker::AsyncClothSystem;
 use super::footsteps::{self, FootstepImpact, FootstepStages};
-use super::jiggle::{JiggleProfile, JiggleSystem};
+use super::jiggle_worker::AsyncJiggleSystem;
+use super::jiggle::{JiggleProfile, JiggleRemeshTuning};
 use super::player_animation::PlayerAnimationState;
 use super::ragdoll::{
     DetachedLimbGeneration, DetachedLimbSpawn, PhysicsMapMesh, RagdollConfig, RagdollMode,
@@ -105,6 +110,7 @@ use crate::{
     renderer::{
         DynamicModelAlphaMode, DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass,
         FxGpuSpriteInstance, FxGpuSprites, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
+        SourceMaterialParams,
     },
     scene,
     ui::Ghoul2SkinningMode,
@@ -239,11 +245,16 @@ pub struct PlayerPresenter {
     /// Ghoul2 animation/model state across frames.
     external_live_entities: HashSet<u16>,
     /// Lightweight post-Ghoul2 soft-tissue secondary motion. Stock `_humanoid`
-    /// models auto-compile chest/glute masks; `model.jiggle` remains an override.
-    jiggle: JiggleSystem,
+    /// models auto-compile chest/glute masks.
+    jiggle: AsyncJiggleSystem,
+    /// r_jigglePhysics target selection by the loaded model's authored sex.
+    jiggle_sex_filter: u8,
+    /// Topology-only breast/glute height offsets. A change invalidates the cached
+    /// player-model meshes so wireframe and promoted geometry update immediately.
+    jiggle_remesh: JiggleRemeshTuning,
     /// Experimental presentation-only cloth on authored cape/cloak/robe surfaces.
-    cloth: ClothSystem,
-    cloth_weather_wind: Option<crate::ocean::OceanWind>,
+    cloth: AsyncClothSystem,
+    cloth_weather_wind: Option<crate::ocean::AtmosphericWind>,
     cloth_body_templates: HashMap<(String, usize, Vec<usize>), Vec<(usize, ClothCapsule)>>,
     /// Broadsword-compatible presentation seam backed by Rapier.
     ragdolls: RagdollWorld,

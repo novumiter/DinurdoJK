@@ -79,11 +79,28 @@ fn race_collision_rules_do_not_leak_into_base() {
     assert!(p.clips_prediction_entity(&other));
     p.configure(&japro()).unwrap();
     assert!(!p.clips_prediction_entity(&other));
+    // Unknown classname keeps TaystJK's trajectory fallback.
     assert!(!p.clips_prediction_entity(&mover));
-    mover.trajectory_type = 5; // TR_SINE: bobbing platforms remain solid
+    mover.mover_class = 1; // func_train remains solid
+    assert!(p.clips_prediction_entity(&mover));
+    mover.mover_class = 2; // func_door / func_plat pass through
+    assert!(!p.clips_prediction_entity(&mover));
+    mover.trajectory_type = 5; // known race door stays pass-through
+    assert!(!p.clips_prediction_entity(&mover));
+    mover.mover_class = 0;
+    assert!(p.clips_prediction_entity(&mover)); // TR_SINE fallback
+    // TaystJK cg_predict.c: only jaPRO race mode excludes moving movers.
+    p.configure(&PredictSettings { backend: 1, server_mod: 0, ..PredictSettings::default() }).unwrap();
+    assert!(p.clips_prediction_entity(&mover));
+    p.configure(&PredictSettings { backend: 1, server_mod: 2, ..PredictSettings::default() }).unwrap();
+    assert!(p.clips_prediction_entity(&mover));
+    p.configure(&japro()).unwrap();
     assert!(p.clips_prediction_entity(&mover));
     mover.trajectory_type = 0;
     mover.velocity = [0.0; 3];
+    mover.angular_velocity = [0.0, 90.0, 0.0];
+    assert!(!p.clips_prediction_entity(&mover));
+    mover.angular_velocity = [0.0; 3];
     assert!(p.clips_prediction_entity(&mover));
     p.configure(&PredictSettings::default()).unwrap();
     assert!(p.clips_prediction_entity(&other));

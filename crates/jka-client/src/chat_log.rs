@@ -1,4 +1,4 @@
-//! Session-oriented live chat logging.
+//! Daily per-server live chat logging (with connection boundaries).
 //!
 //! The gameplay thread only enqueues small typed events. All directory creation,
 //! HTML generation and file I/O happens on `chatlog-writer`, so a slow filesystem
@@ -9,7 +9,7 @@
 use crate::cgame::ChatKind;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -202,7 +202,8 @@ struct SessionFile {
     writer: BufWriter<File>,
     path: PathBuf,
     dirty: bool,
-    messages: u64,
+    last_unix_ms: u64,
+    local_day: String,
 }
 
 fn writer_main(rx: Receiver<Command>, dropped_messages: Arc<AtomicU64>) {
@@ -221,6 +222,12 @@ fn writer_main(rx: Receiver<Command>, dropped_messages: Arc<AtomicU64>) {
             Ok(Command::Update(update)) => {
                 let Some(session) = active.as_mut() else { continue };
                 let effect = session.meta.update(update);
+                // Map changes can arrive just after midnight before any chat.
+                // Don't write a next-day map event to yesterday's transcript.
+                let event_ms = unix_ms_now();
+                if session.file.as_ref().is_some_and(|file| file.local_day != format_local_date(event_ms)) {
+                    finish_file(session, "Log continued on next day");
+                }
                 if effect.directory_changed && session.file.is_some() {
                     // fs_game changed under a live connection. Keep artifacts in
                     // the directory that owned them and lazily begin another file
@@ -232,7 +239,7 @@ fn writer_main(rx: Receiver<Command>, dropped_messages: Arc<AtomicU64>) {
                 {
                     if let Err(error) = write_session_event(
                         session.file.as_mut().expect("checked above"),
-                        unix_ms_now(),
+                        event_ms,
                         &format!("Map changed to {}", effect.current_map),
                     ) {
                         fail_file(session, error);
@@ -241,10 +248,32 @@ fn writer_main(rx: Receiver<Command>, dropped_messages: Arc<AtomicU64>) {
             }
             Ok(Command::Message(message)) => {
                 let Some(session) = active.as_mut() else { continue };
+                // File rollover is determined from the *message* timestamp, not
+                // the session start. A connection spanning midnight keeps its
+                // logical session, but its later chat belongs to the next day.
+                let message_day = format_local_date(message.unix_ms);
+                let rolled_over = session.file.as_ref().is_some_and(|file| file.local_day != message_day);
+                if rolled_over {
+                    finish_file(session, "Log continued on next day");
+                }
                 let first_message = session.file.is_none();
                 if first_message {
-                    match open_session_file(&session.meta) {
-                        Ok(file) => session.file = Some(file),
+                    match open_session_file(&session.meta, message.unix_ms) {
+                        Ok(mut file) => {
+                            let boundary = if rolled_over { "Session continued" } else { "Connected" };
+                            let detail = format!(
+                                "{boundary}: {} ({}) | Player: {} | Map: {}",
+                                session.meta.hostname,
+                                session.meta.server_address,
+                                session.meta.player_name,
+                                session.meta.map_name,
+                            );
+                            if let Err(error) = write_session_event(&mut file, message.unix_ms, &detail) {
+                                eprintln!("CHATLOG: couldn't write connection marker to {}: {error}", file.path.display());
+                                continue;
+                            }
+                            session.file = Some(file);
+                        }
                         Err(error) => {
                             eprintln!("CHATLOG: {error}");
                             continue;
@@ -327,73 +356,176 @@ fn fail_file(session: &mut ActiveSession, error: std::io::Error) {
 
 fn finish_file(session: &mut ActiveSession, reason: &str) {
     let Some(mut file) = session.file.take() else { return };
-    let ended_ms = unix_ms_now();
+    // Don't put an end marker for the new calendar day into yesterday's file.
+    let now = unix_ms_now();
+    let ended_ms = if file.local_day == format_local_date(now) { now } else { file.last_unix_ms };
     let _ = write_session_event(&mut file, ended_ms, reason);
     let ended = format_local_timestamp(ended_ms);
     let _ = writeln!(file.writer, "</section>");
     let _ = writeln!(
         file.writer,
-        "<footer>Session ended {} &middot; {} message{}</footer></main></body></html>",
+        "<footer>Last session ended {}</footer></main></body></html>",
         escape_html(&ended),
-        file.messages,
-        if file.messages == 1 { "" } else { "s" }
     );
     if let Err(error) = file.writer.flush() {
         eprintln!("CHATLOG: final flush failed for {}: {error}", file.path.display());
     }
 }
 
-fn open_session_file(meta: &SessionMetadata) -> Result<SessionFile, String> {
-    let started = local_datetime_parts(meta.started_unix_ms);
-    let month = format!("{:04}-{:02}", started.year, started.month);
-    let directory = meta.directory.join(month);
-    fs::create_dir_all(&directory)
+/// The deterministic daily filename is intentionally *different* from the old
+/// timestamped-per-session names. Old HTML archives are not touched or migrated.
+fn daily_log_path(meta: &SessionMetadata, unix_ms: u64) -> (PathBuf, String) {
+    let local_day = format_local_date(unix_ms);
+    let month = &local_day[..7];
+    let safe_address = sanitize_filename_component(&meta.server_address.to_string());
+    (
+        meta.directory
+            .join(month)
+            .join(format!("{local_day}__{safe_address}.html")),
+        local_day,
+    )
+}
+
+fn open_session_file(meta: &SessionMetadata, unix_ms: u64) -> Result<SessionFile, String> {
+    let (path, local_day) = daily_log_path(meta, unix_ms);
+    let directory = path.parent().expect("daily log always has a parent");
+    fs::create_dir_all(directory)
         .map_err(|error| format!("couldn't create {}: {error}", directory.display()))?;
 
-    let safe_address = sanitize_filename_component(&meta.server_address.to_string());
-    let stem = format!(
-        "{:04}-{:02}-{:02}_{:02}-{:02}-{:02}__{}",
-        started.year,
-        started.month,
-        started.day,
-        started.hour,
-        started.minute,
-        started.second,
-        safe_address
-    );
-    let (file, path) = create_unique(&directory, &stem)
-        .map_err(|error| format!("couldn't create chat log in {}: {error}", directory.display()))?;
-    let mut writer = BufWriter::with_capacity(WRITER_BUFFER_BYTES, file);
-    write_header(&mut writer, meta)
-        .map_err(|error| format!("couldn't initialize {}: {error}", path.display()))?;
+    // A Windows write handle shares read access (HTML browser, native catalog),
+    // but not writes, preventing two game processes from corrupting one file.
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x0000_0001); // FILE_SHARE_READ
+    }
+    let (mut file, path, existing) = match options.open(&path) {
+        Ok(mut file) => match prepare_existing_daily_file(&mut file, &meta.server_address.to_string()) {
+            Ok(existing) => (file, path, existing),
+            Err(error) => {
+                // Never truncate a foreign, damaged, or unrecognized file. Use
+                // a uniquely suffixed recovery file rather than lose new chat.
+                eprintln!("CHATLOG: can't safely resume {}: {error}; creating a separate log", path.display());
+                let stem = path.file_stem().unwrap().to_string_lossy();
+                let (file, fallback) = create_unique(directory, &stem)
+                    .map_err(|error| format!("couldn't create recovery log in {}: {error}", directory.display()))?;
+                (file, fallback, false)
+            }
+        },
+        Err(error) => {
+            // Also covers a daily file held open by another game process.
+            eprintln!("CHATLOG: can't open {}: {error}; creating a separate log", path.display());
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            let (file, fallback) = create_unique(directory, &stem)
+                .map_err(|error| format!("couldn't create alternate log in {}: {error}", directory.display()))?;
+            (file, fallback, false)
+        }
+    };
 
+    if !existing {
+        // On day rollover the file's date is the new day, even when the
+        // connection itself began yesterday.
+        let mut header_meta = meta.clone();
+        if format_local_date(header_meta.started_unix_ms) != local_day {
+            header_meta.started_unix_ms = unix_ms;
+        }
+        write_header(&mut file, &header_meta)
+            .map_err(|error| format!("couldn't initialize {}: {error}", path.display()))?;
+    }
+    let writer = BufWriter::with_capacity(WRITER_BUFFER_BYTES, file);
     println!("CHATLOG: {}", path.display());
     Ok(SessionFile {
         writer,
         path,
         dirty: true,
-        messages: 0,
+        last_unix_ms: unix_ms,
+        local_day,
     })
 }
 
+/// The live file is intentionally unfinished until disconnect/quit. A closed
+/// file must have its HTML footer removed before writing the next session.
+/// After a crash, discard only a potentially torn last entry, not prior chat.
+fn prepare_existing_daily_file(file: &mut File, address: &str) -> std::io::Result<bool> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut prefix = vec![0; len.min(32 * 1024) as usize];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut prefix)?;
+    let prefix = String::from_utf8_lossy(&prefix);
+    let transcript_open = "<section id=\"transcript\">";
+    let header_end = prefix.find(transcript_open).map(|pos| pos + transcript_open.len());
+    if !prefix.contains("DinurdoJK Chat Log")
+        || metadata_value(&prefix, "Address").as_deref() != Some(address)
+        || header_end.is_none()
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unrecognized chat log header or server address"));
+    }
+    let header_end = header_end.unwrap() as u64;
+
+    // Seek/read only the tail: daily logs can be large and the reopen path
+    // must not require loading their entire transcript into memory.
+    const TAIL_BYTES: u64 = 256 * 1024;
+    let tail_start = len.saturating_sub(TAIL_BYTES);
+    file.seek(SeekFrom::Start(tail_start))?;
+    let mut tail = vec![0; (len - tail_start) as usize];
+    file.read_exact(&mut tail)?;
+    let end = b"</main></body></html>";
+    let trimmed = trim_ascii_end(&tail);
+    let truncate_at = if trimmed.ends_with(end) {
+        // The footer belongs outside the transcript and must be recreated at
+        // the end of the new session. Preserve the preceding session marker.
+        let closing = b"</section>\n<footer>";
+        let pos = find_last_bytes(trimmed, closing)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "closed log is missing its footer boundary"))?;
+        tail_start + pos as u64
+    } else {
+        // A hard kill can interrupt a write anywhere inside an entry. Keep
+        // only the last complete transcript row, never a half-written div.
+        let complete = find_last_bytes(&tail, b"</div>\n")
+            .map(|index| tail_start + (index + b"</div>\n".len()) as u64)
+            .filter(|end| *end >= header_end);
+        match complete {
+            Some(end) => end,
+            None if header_end >= tail_start => header_end,
+            None => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "couldn't find a safe entry boundary near EOF")),
+        }
+    };
+    file.set_len(truncate_at)?;
+    file.seek(SeekFrom::Start(truncate_at))?;
+    Ok(true)
+}
+
+fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
+    let len = bytes.iter().rposition(|b| !b.is_ascii_whitespace()).map_or(0, |p| p + 1);
+    &bytes[..len]
+}
+
+fn find_last_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|window| window == needle)
+}
+
 fn create_unique(directory: &Path, stem: &str) -> std::io::Result<(File, PathBuf)> {
-    for suffix in 0..1000_u32 {
-        let name = if suffix == 0 {
-            format!("{stem}.html")
-        } else {
-            format!("{stem}-{suffix}.html")
-        };
-        let path = directory.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+    for suffix in 1..1000_u32 {
+        let path = directory.join(format!("{stem}-{suffix}.html"));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0x0000_0001); // FILE_SHARE_READ
+        }
+        match options.open(&path) {
             Ok(file) => return Ok((file, path)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "too many chat logs with the same timestamp",
-    ))
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "too many daily chat log collisions"))
 }
 
 fn write_header(out: &mut impl Write, meta: &SessionMetadata) -> std::io::Result<()> {
@@ -414,7 +546,7 @@ addEventListener('DOMContentLoaded',()=>{document.querySelectorAll('input').forE
         "<main class=\"wrap\" data-session-start-ms=\"{}\"><h1>DinurdoJK Chat Log</h1>",
         meta.started_unix_ms
     )?;
-    writeln!(out, "<div class=\"sub\">Live server chat session</div>")?;
+    writeln!(out, "<div class=\"sub\">Server chat archive &middot; connections grouped by day</div>")?;
     writeln!(out, "<section class=\"meta\">")?;
     metadata_row(out, "Server", &meta.hostname)?;
     metadata_row(out, "Address", &meta.server_address.to_string())?;
@@ -466,7 +598,7 @@ fn write_message(file: &mut SessionFile, message: &ChatMessage) -> std::io::Resu
         escape_html(&timestamp),
         jka_to_html(&message.text)
     )?;
-    file.messages += 1;
+    file.last_unix_ms = message.unix_ms;
     file.dirty = true;
     Ok(())
 }
@@ -478,6 +610,7 @@ fn write_session_event(file: &mut SessionFile, unix_ms: u64, text: &str) -> std:
         escape_html(&format_local_hms_ms(unix_ms)),
         escape_html(text)
     )?;
+    file.last_unix_ms = unix_ms;
     file.dirty = true;
     Ok(())
 }
@@ -1088,6 +1221,149 @@ mod tests {
         assert!(html.contains("<span class=\"jka c1\">Red &lt;script&gt;</span>"));
         assert!(html.contains("<span class=\"jka c7\"> &amp; safe</span>"));
         assert!(!html.contains("<script>"));
+    }
+
+    fn test_meta(root: &Path, started_unix_ms: u64) -> SessionMetadata {
+        SessionMetadata {
+            directory: root.join("chatlogs"),
+            started_unix_ms,
+            player_name: "^2Tester".into(),
+            server_address: "127.0.0.1:29070".parse().unwrap(),
+            hostname: "Test Server".into(),
+            fs_game: "base".into(),
+            map_name: "mp/ffa3".into(),
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dinurdo-chatlog-{label}-{}-{}-{}",
+            std::process::id(), unix_ms_now(), NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn test_message(unix_ms: u64, text: &str) -> ChatMessage {
+        ChatMessage {
+            kind: ChatKind::Say,
+            team: false,
+            text: text.to_string(),
+            unix_ms,
+            server_time: Some(1234),
+        }
+    }
+
+    #[test]
+    fn reconnect_appends_to_daily_server_file_and_keeps_one_html_document() {
+        let root = temp_root("reconnect");
+        let start = 1_791_460_800_000_u64; // 2026-10-08 12:00 UTC
+        let meta = test_meta(&root, start);
+        let mut first = open_session_file(&meta, start).unwrap();
+        let path = first.path.clone();
+        write_session_event(&mut first, start, "Connected: first session").unwrap();
+        write_message(&mut first, &test_message(start, "first message")).unwrap();
+        let mut session = ActiveSession { meta: meta.clone(), file: Some(first) };
+        finish_file(&mut session, "Disconnected");
+
+        let mut second = open_session_file(&meta, start + 60_000).unwrap();
+        assert_eq!(second.path, path);
+        write_session_event(&mut second, start + 60_000, "Connected: second session").unwrap();
+        write_message(&mut second, &test_message(start + 60_000, "second message")).unwrap();
+        session.file = Some(second);
+        finish_file(&mut session, "Disconnected");
+
+        let html = fs::read_to_string(&path).unwrap();
+        assert_eq!(html.matches("<!doctype html>").count(), 1);
+        assert_eq!(html.matches("</main></body></html>").count(), 1);
+        let detail = read_browser_detail(&path).unwrap();
+        assert!(detail.cleanly_closed);
+        assert_eq!(detail.entries.iter().filter(|entry| entry.kind == BrowserEntryKind::Say).count(), 2);
+        assert!(detail.entries.iter().any(|entry| entry.text == "Connected: first session"));
+        assert!(detail.entries.iter().any(|entry| entry.text == "Connected: second session"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn crash_torn_entry_is_removed_before_resuming_today() {
+        let root = temp_root("crash");
+        let start = 1_791_460_800_000_u64;
+        let meta = test_meta(&root, start);
+        let mut first = open_session_file(&meta, start).unwrap();
+        let path = first.path.clone();
+        write_message(&mut first, &test_message(start, "before crash")).unwrap();
+        first.writer.flush().unwrap();
+        drop(first); // simulated hard process exit: no HTML footer
+        OpenOptions::new().append(true).open(&path).unwrap()
+            .write_all(b"<div class=\"entry\" data-kind=\"say\" broken")
+            .unwrap();
+
+        let mut second = open_session_file(&meta, start + 5_000).unwrap();
+        write_message(&mut second, &test_message(start + 5_000, "after restart")).unwrap();
+        let mut session = ActiveSession { meta, file: Some(second) };
+        finish_file(&mut session, "Disconnected");
+        let detail = read_browser_detail(&path).unwrap();
+        assert!(detail.cleanly_closed);
+        let messages: Vec<_> = detail.entries.iter()
+            .filter(|entry| entry.kind == BrowserEntryKind::Say)
+            .map(|entry| entry.text.as_str()).collect();
+        assert_eq!(messages, ["before crash", "after restart"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollover_changes_daily_path_and_month_folder() {
+        let root = temp_root("rollover");
+        let meta = test_meta(&root, 1_791_460_800_000);
+        // Two calendar days, at the same UTC clock time.
+        let day1 = 1_791_460_800_000_u64;
+        let day2 = day1 + 86_400_000;
+        let (path1, _) = daily_log_path(&meta, day1);
+        let (path2, _) = daily_log_path(&meta, day2);
+        assert_ne!(path1, path2);
+        assert!(path1.to_string_lossy().contains("__127.0.0.1_29070.html"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_connection_rolls_over_when_message_date_changes() {
+        let root = temp_root("live-rollover");
+        let day1 = 1_791_460_800_000_u64;
+        let day2 = day1 + 86_400_000;
+        let meta = test_meta(&root, day1);
+        let (old_path, _) = daily_log_path(&meta, day1);
+        let (new_path, _) = daily_log_path(&meta, day2);
+        let (tx, rx) = mpsc::sync_channel(8);
+        tx.send(Command::Begin(meta)).unwrap();
+        tx.send(Command::Message(test_message(day1, "yesterday"))).unwrap();
+        tx.send(Command::Message(test_message(day2, "today"))).unwrap();
+        tx.send(Command::End { reason: "Disconnected".into() }).unwrap();
+        drop(tx);
+        writer_main(rx, Arc::new(AtomicU64::new(0)));
+
+        let old = read_browser_detail(&old_path).unwrap();
+        let new = read_browser_detail(&new_path).unwrap();
+        assert!(old.cleanly_closed && new.cleanly_closed);
+        assert_eq!(old.entries.iter().filter(|e| e.kind == BrowserEntryKind::Say).count(), 1);
+        assert_eq!(new.entries.iter().filter(|e| e.kind == BrowserEntryKind::Say).count(), 1);
+        assert!(new.entries.iter().any(|e| e.text.starts_with("Session continued:")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_foreign_file_is_never_overwritten() {
+        let root = temp_root("foreign");
+        let start = 1_791_460_800_000_u64;
+        let meta = test_meta(&root, start);
+        let (path, _) = daily_log_path(&meta, start);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not a chat log").unwrap();
+        let alt = open_session_file(&meta, start).unwrap();
+        assert_ne!(alt.path, path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not a chat log");
+        drop(alt);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

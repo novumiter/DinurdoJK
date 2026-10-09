@@ -625,6 +625,8 @@ fn minimal_key() -> WorldShaderVariantKey {
         cascaded_shadows: false,
         ray_traced_shadows: false,
         ray_traced_sun: false,
+        rt_receiver_denoiser: false,
+        rt_receiver_glass: false,
         planar_reflections: false,
         legacy_fog: false,
         jump_shade: false,
@@ -662,9 +664,10 @@ fn specialized_lean_module(key: WorldShaderVariantKey) -> Module {
 
 fn fast_module() -> Module {
     let source = format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         include_str!("../../bsp_fast.wgsl"),
-        include_str!("../../surface_deformation.wgsl")
+        include_str!("../../surface_deformation.wgsl"),
+        include_str!("../../sky_fractal.wgsl")
     );
     naga::front::wgsl::parse_str(&source)
         .unwrap_or_else(|e| panic!("bsp_fast: {}", e.emit_to_string(&source)))

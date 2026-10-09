@@ -54,7 +54,7 @@ impl App {
             }
             ui.add_space(8.0);
         } else if self.live_connected() {
-            theme::page_title(ui, "GAME", &format!("Currently {}.", mode.to_lowercase()));
+            theme::page_title(ui, "JOIN", &format!("Currently {}.", mode.to_lowercase()));
             if let Some(hostname) = self.current_server_hostname() {
                 ui.horizontal(|ui| {
                     theme::glow_label(ui, "On", 12.0, theme::TEXT_FAINT);
@@ -63,11 +63,27 @@ impl App {
                         13.0,
                         theme::TEXT,
                     )));
+                    if let Some(active_mod) = self.ui_mod() {
+                        theme::label(ui, theme::plain("·", 11.5, theme::TEXT_FAINT));
+                        theme::glow_label(ui, active_mod.label(), 11.5, theme::TEXT_DIM);
+                    }
+                    // The live gamestate supplies the authoritative map name;
+                    // use the active session so this follows map changes too.
+                    if let Some(map_name) = self
+                        .game_session
+                        .as_ref()
+                        .filter(|session| session.live)
+                        .and_then(|session| session.map_name.as_deref())
+                        .filter(|name| !name.is_empty())
+                    {
+                        theme::label(ui, theme::plain("·", 11.5, theme::TEXT_FAINT));
+                        theme::glow_label(ui, map_name, 11.5, theme::TEXT_DIM);
+                    }
                 });
                 ui.add_space(8.0);
             }
         } else {
-            theme::page_title(ui, "GAME", &format!("Currently {}.", mode.to_lowercase()));
+            theme::page_title(ui, "JOIN", &format!("Currently {}.", mode.to_lowercase()));
         }
 
         let can_join = self.live_connected()
@@ -124,19 +140,14 @@ impl App {
             self.join_as(JoinMode::Spectator);
             return;
         }
+        self.egui_companion_window_selector(ui);
         self.egui_spectator_actions(ui);
+
+        ui.add_space(16.0);
+        self.egui_account(ui);
 
         ui.add_space(12.0);
         theme::section(ui, "TOOLS", "Client-side training and analysis tools.");
-        if menu_action(
-            ui,
-            "Strafe trails",
-            "Load recorded jaPRO trails, trace live players, and record race lines.",
-            true,
-        ) {
-            self.open_strafe_trails();
-            return;
-        }
         if menu_action(
             ui,
             "Race ghosts",
@@ -173,8 +184,22 @@ impl App {
 
     pub(in crate::app) fn join_as(&mut self, mode: JoinMode) {
         if self.live_connected() {
+            // OpenJK/TaystJK Cmd_Team_f refuses an active player's
+            // `team spectator` in Duel, while Cmd_FollowCycle_f (`follownext`)
+            // is the intended tournament escape path: it first moves the
+            // player to TEAM_SPECTATOR, then selects a follow target.
+            //
+            // Preserve the ordinary `team spectator` command when already
+            // spectating so this button does not unexpectedly cycle a follow.
+            let leave_duel_via_follow = mode == JoinMode::Spectator
+                && !self.is_spectating_live()
+                && self
+                    .game_session
+                    .as_ref()
+                    .is_some_and(|session| matches!(session.client_game.gametype(), 3 | 4));
             let command = match mode {
                 JoinMode::Player => "team free",
+                JoinMode::Spectator if leave_duel_via_follow => "follownext",
                 JoinMode::Spectator => "team spectator",
             };
             self.forward_command_to_server(command);

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::ops::Range;
 mod collision;
+pub mod bathymetry;
 mod marks;
 mod visibility;
 pub use collision::{CollisionLeaf, CollisionNode, CollisionTree};
@@ -103,12 +104,26 @@ pub enum SurfaceKind {
     Flare,
 }
 
+/// BSP MST_FLARE payload (TaystJK/OpenJK ParseFlare). No render vertices are
+/// required: RBSP uses the lightmap origin / direction slots for flare data.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlareData {
+    /// `dsurface_t.lightmapOrigin`, in authored JKA world coordinates.
+    pub origin: [f32; 3],
+    /// `dsurface_t.lightmapVecs[0]`, authored linear RGB intensity.
+    pub color: [f32; 3],
+    /// `dsurface_t.lightmapVecs[2]`; may be all zero.
+    pub normal: [f32; 3],
+}
+
 #[derive(Debug, Clone)]
 pub struct Surface {
     pub shader: usize,
     /// BSP fog volume assigned by the surface record, or -1 when unassigned.
     pub fog_num: i32,
     pub kind: SurfaceKind,
+    /// Authored flare data, only present on MST_FLARE surfaces.
+    pub flare: Option<FlareData>,
     pub vertices: Range<usize>,
     pub indices: Range<usize>,
     pub lightmaps: [i32; 4],
@@ -410,7 +425,19 @@ impl Bsp {
             } else {
                 [0, 0]
             };
+            // Flare payload offsets follow dsurface_t, not mapVert_t. The
+            // lightmapOrigin/Vecs slots overlap no patch width/height fields.
+            let flare = if kind == SurfaceKind::Flare {
+                Some(FlareData {
+                    origin: floats(row, 92)?,
+                    color: floats(row, 104)?,
+                    normal: floats(row, 128)?,
+                })
+            } else {
+                None
+            };
             surfaces.push(Surface {
+                flare,
                 shader: index(int(row, 0), shaders.len(), "surface shader")?,
                 fog_num: int(row, 4),
                 kind,

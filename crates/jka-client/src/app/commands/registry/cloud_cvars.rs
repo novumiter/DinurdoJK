@@ -1591,4 +1591,31 @@ app_cvars! {
             }
         ]
     }
+    APP_R_SKYFRACTAL {
+        runtime: CvarDef::new(
+                "r_skyFractal", "", "0|1",
+                "Experimental Star Nest sky override: 0 map sky, 1 procedural fractal sky. Affects BSP sky faces only. High GPU cost; A/B test.",
+                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+                |app: &App| CvarValue::String(bool_value(app.video.sky_fractal_override)),
+                |app, value| App::cvar_set_r_skyfractal(app, APP_R_SKYFRACTAL.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_r_skyfractal, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.sky_fractal_override = parse_bool(value).unwrap_or(settings.sky_fractal_override)
+                }),
+                archive: Some((66, |state| format!("{}", u8::from(state.video.sky_fractal_override)))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_set_r_skyfractal(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.sky_fractal_override = Self::parse_cvar_bool(name, value)?;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
 }

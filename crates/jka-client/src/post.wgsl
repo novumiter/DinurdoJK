@@ -61,6 +61,29 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOut {
     return out;
 }
 
+// Legacy OpenGL enables GL_DITHER by default before converting fragment colors
+// to a fixed-point framebuffer. WGPU exposes no equivalent raster state, so do
+// a tiny deterministic ordered dither immediately before the 8-bit sRGB
+// presentation target. The amplitude approximates one sRGB code step in linear
+// space from scene luminance; using one scalar offset preserves neutral fog hues.
+fn output_dither_srgb8(color: vec3<f32>, pixel_position: vec2<f32>) -> vec3<f32> {
+    let bayer4 = array<f32, 16>(
+         0.0,  8.0,  2.0, 10.0,
+        12.0,  4.0, 14.0,  6.0,
+         3.0, 11.0,  1.0,  9.0,
+        15.0,  7.0, 13.0,  5.0
+    );
+    let x = u32(pixel_position.x) & 3u;
+    let y = u32(pixel_position.y) & 3u;
+    let ordered = (bayer4[y * 4u + x] + 0.5) / 16.0 - 0.5;
+    let clamped = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+    let luma = clamp(dot(clamped, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+    let dark_lsb = 1.0 / (255.0 * 12.92);
+    let bright_lsb = 2.275 / 255.0;
+    let linear_lsb = mix(dark_lsb, bright_lsb, sqrt(luma));
+    return clamp(color + vec3<f32>(ordered * linear_lsb), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
@@ -2887,6 +2910,58 @@ fn apply_rain_haze(color: vec3<f32>, uv: vec2<f32>, world: vec3<f32>, depth: f32
     return mix(color, haze_color, amount);
 }
 
+// Cheap distance-domain atmosphere for the modernized legacy r_we clouds.
+// This intentionally stays out of the froxel volume: sand/spacedust need only
+// one exponential per active effect, and acid rain can reuse rain's shelter mask.
+fn apply_legacy_weather_air(color_in: vec3<f32>, uv: vec2<f32>, depth: f32) -> vec3<f32> {
+    var color = color_in;
+    let sand = clamp(settings.legacy_weather.x, 0.0, 1.35);
+    let space = clamp(settings.legacy_weather.y, 0.0, 1.25);
+    let acid = clamp(settings.legacy_weather.z, 0.0, 1.0);
+    let has_surface = valid_depth(depth);
+
+    if (sand > 0.001) {
+        // Sand is the opaque member of the family: visibility should collapse
+        // over a few thousand JKA units, with a warm dusty extinction rather
+        // than stock's flat smoke sprites. Multiple sand clouds naturally stack.
+        let travel = select(1650.0, max(depth - 135.0, 0.0), has_surface);
+        let extinction = 1.0 - exp(-travel * 0.00062 * sand);
+        let ceiling = select(0.54, 0.72, has_surface) * min(sand, 1.0);
+        let amount = min(extinction, ceiling);
+        let luma = clamp(luminance(color), 0.0, 1.25);
+        let dust_air = vec3<f32>(0.48, 0.34, 0.185) * mix(0.70, 1.05, min(luma, 1.0));
+        color = mix(color, dust_air, amount);
+    }
+
+    if (space > 0.001 && has_surface) {
+        // Spacedust is particulate, not terrestrial fog. Keep its depth veil
+        // restrained so black space stays black and the motes remain the read.
+        let travel = max(depth - 820.0, 0.0);
+        let extinction = 1.0 - exp(-travel * 0.000075 * space);
+        let amount = min(extinction, 0.12 * min(space, 1.0));
+        let cold_dust = vec3<f32>(0.18, 0.225, 0.29);
+        color = mix(color, cold_dust, amount);
+    }
+
+    if (acid > 0.001) {
+        // Acid rain shares rain's low-resolution outdoor/shelter classification;
+        // unlike sand it must disappear promptly when the camera moves under cover.
+        let field = rain_haze_field(uv);
+        let exposure = field.x;
+        if (exposure > 0.001) {
+            let travel = select(1050.0, max(depth - 310.0, 0.0), has_surface);
+            let extinction = 1.0 - exp(-travel * 0.00036 * acid);
+            let ceiling = select(0.24, 0.42, has_surface);
+            let amount = min(extinction, ceiling) * exposure;
+            let luma = clamp(luminance(color), 0.0, 1.0);
+            let toxic_air = vec3<f32>(0.18, 0.35, 0.145) * mix(0.72, 1.04, luma);
+            color = mix(color, toxic_air, amount);
+        }
+    }
+
+    return color;
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
@@ -2940,12 +3015,16 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
             color *= ssao_factor(pixel, centre_depth);
         }
         color = apply_volumetric_fog(color, input.uv, centre_depth);
+        if (settings.legacy_weather.w > 0.5) {
+            color = apply_rain_haze(color, input.uv, world, centre_depth);
+        }
     }
 
     // The transfer buffer is depth-clipped, so the same composite now handles
     // sky pixels, clouds behind scene geometry, and low clouds physically in
     // front of opaque/alpha-tested surfaces.
     color = render_clouds(color, input.uv);
+    color = apply_legacy_weather_air(color, input.uv, centre_depth);
 
     if (bloom_enabled) {
         let levels = bloom_levels(input.uv);
@@ -2975,6 +3054,59 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         color *= 1.0 - edge * 0.28;
     }
     color = film_grain(color, input.uv);
+    if (settings.taa_params.x < 0.5) {
+        color = output_dither_srgb8(color, input.position.xy);
+    }
+    return vec4<f32>(color, 1.0);
+}
+
+// Specialized A/B path for frames where rain is the only spatial post effect.
+// It deliberately preserves rain's depth haze/froxel composite, final puddle film,
+// wet-weather grade and compact display grading while avoiding unrelated post work.
+@fragment
+fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
+    let gamma = max(settings.color.x, 0.05);
+    let tonemap_enabled = settings.color.y > 0.5;
+    let dims = textureDimensions(linear_depth_texture);
+    let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
+    let max_pixel = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    let raw_pixel = vec2<i32>(
+        i32(input.uv.x * dims_f.x),
+        i32(input.uv.y * dims_f.y)
+    );
+    let pixel = clamp(raw_pixel, vec2<i32>(0), max_pixel);
+    let centre_depth = depth_at_pixel(pixel);
+
+    var color = scene(input.uv);
+    if (valid_depth(centre_depth)) {
+        let world = world_position(input.uv, centre_depth);
+        let normal = surface_normal(pixel);
+        let cloud_shadow = projected_cloud_shadow_factor(world, normal, pixel);
+        let saber_foreground = saber_glow_over_receiver(input.uv, centre_depth);
+        color = color * cloud_shadow + saber_foreground * (1.0 - cloud_shadow);
+        let puddle = post_puddle_amount(world, normal.y);
+        color = finalize_puddle_film(color, world, puddle);
+        color = apply_volumetric_fog(color, input.uv, centre_depth);
+        if (settings.legacy_weather.w > 0.5) {
+            color = apply_rain_haze(color, input.uv, world, centre_depth);
+        }
+    }
+    color = apply_legacy_weather_air(color, input.uv, centre_depth);
+
+    color *= exp2(settings.grain.w + auto_exposure_state.exposure_ev);
+    if (tonemap_enabled) {
+        color = aces_fitted(color);
+    }
+    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+    color = apply_rain_grade(color, settings.weather_look.y);
+    color = apply_color_lut(color);
+    if (settings.film.z > 0.5) {
+        let edge = smoothstep(0.28, 0.78, distance(input.uv, vec2<f32>(0.5)));
+        color *= 1.0 - edge * 0.28;
+    }
+    if (settings.taa_params.x < 0.5) {
+        color = output_dither_srgb8(color, input.position.xy);
+    }
     return vec4<f32>(color, 1.0);
 }
 
@@ -3042,12 +3174,16 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
             color *= ssao_factor(pixel, centre_depth);
         }
         color = apply_volumetric_fog(color, input.uv, centre_depth);
+        if (settings.legacy_weather.w > 0.5) {
+            color = apply_rain_haze(color, input.uv, world, centre_depth);
+        }
     }
 
     // The transfer buffer is depth-clipped, so the same composite now handles
     // sky pixels, clouds behind scene geometry, and low clouds physically in
     // front of opaque/alpha-tested surfaces.
     color = render_clouds(color, input.uv);
+    color = apply_legacy_weather_air(color, input.uv, centre_depth);
 
     if (bloom_enabled) {
         let levels = bloom_levels(input.uv);
@@ -3078,7 +3214,13 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     }
     color = film_grain(color, input.uv);
     var out: TaaFragmentOut;
-    out.display = vec4<f32>(color, 1.0);
+    // Dither LDR presentation only. HDR already preserved the fog gradient,
+    // while temporal history must always stay free of the ordered pattern.
+    var display_color = color;
+    if (settings.taa_params.x < 0.5) {
+        display_color = output_dither_srgb8(color, input.position.xy);
+    }
+    out.display = vec4<f32>(display_color, 1.0);
     out.history = vec4<f32>(temporal_history, taa.history_confidence);
     return out;
 }

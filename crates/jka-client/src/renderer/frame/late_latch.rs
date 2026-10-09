@@ -50,7 +50,7 @@ pub(in crate::renderer) struct LatestViewSample {
     pub(in crate::renderer) input: Option<InputLatencySample>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(in crate::renderer) struct ViewSampleMeasurement {
     pub(in crate::renderer) input: InputLatencySample,
     pub(in crate::renderer) sampled_at: Instant,

@@ -116,6 +116,8 @@ enum FxWorkerCommand {
     SetLodView { origin: [f32; 3], px_per_unit: f32 },
     /// Worker-owned clone of the map CM world for FX particle traces.
     SetCollision(Option<CollisionWorld>),
+    /// Immutable promotion metadata prepared by the map worker.
+    SetLightPromotionCatalog(std::sync::Arc<crate::fx::light_promotion::FxLightPromotionCatalog>),
     PlayDir { name: String, origin: [f32; 3], dir: [f32; 3] },
     PlayDirClass { name: String, origin: [f32; 3], dir: [f32; 3], class: FxClass },
     PlayAxis { name: String, origin: [f32; 3], axis: [[f32; 3]; 3] },
@@ -148,6 +150,9 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
             FxWorkerCommand::SetLodView { origin, px_per_unit } => worker.fx.set_lod_view(origin, px_per_unit),
             FxWorkerCommand::SetCollision(world) => {
                 worker.fx.set_collision(world.map(|world| Box::new(world) as Box<dyn TraceWorld + Send>));
+            }
+            FxWorkerCommand::SetLightPromotionCatalog(catalog) => {
+                worker.fx.set_light_promotion_catalog(catalog);
             }
             FxWorkerCommand::PlayDir { name, origin, dir } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir(id, origin, dir); } }
             FxWorkerCommand::PlayDirClass { name, origin, dir, class } => { let id = worker.effect(&name); if id != 0 { worker.fx.play_effect_dir_class(id, origin, dir, class); } }
@@ -1007,6 +1012,18 @@ impl WeaponFx {
         self.saber_trail = value.clamp(0, 2);
     }
 
+    /// Install the EFX light-promotion catalog produced by map preparation.
+    /// The command channel is ordered, so any later Play/Frame command observes
+    /// the new metadata without synchronizing with the render/presentation loop.
+    pub fn set_light_promotion_catalog(
+        &mut self,
+        catalog: std::sync::Arc<crate::fx::light_promotion::FxLightPromotionCatalog>,
+    ) {
+        let _ = self
+            .worker_tx
+            .send(FxWorkerCommand::SetLightPromotionCatalog(catalog));
+    }
+
     /// `fx_physics`: stock TaystJK particle physics on the CM world.
     pub fn set_fx_physics(&mut self, mode: u32) {
         let mode = mode.min(crate::fx::FX_PHYSICS_ALL);
@@ -1732,7 +1749,7 @@ impl WeaponFx {
             let radius = visible_length * 1.4 + self.runner_rng.flrand(0.0, 1.0) * 3.0;
             self.immediate_lights.push(FxLight {
                 kind: FxLightKind::Saber,
-                origin: midpoint, radius, rgb,
+                origin: midpoint, radius, source_radius: 0.0, rgb, spot: None,
                 segment: Some([origin, madd3(origin, direction, visible_length)]),
                 blade_segments: None,
             });
@@ -1819,13 +1836,27 @@ impl WeaponFx {
                     blade
                 }).collect::<Vec<_>>().into()
             });
-            lights.push(FxLight { kind: FxLightKind::Saber, origin, radius, rgb, segment: None, blade_segments });
+            lights.push(FxLight { kind: FxLightKind::Saber, origin, radius, source_radius: 0.0, rgb, spot: None, segment: None, blade_segments });
         }
     }
 
     /// Force-power visuals requested by CG_Player.
     pub fn player_fx(&mut self, request: &PlayerFxRequest) {
         match request {
+            PlayerFxRequest::PowerupLight { origin, rgb } => {
+                // jaPRO CG_PlayerPowerups: 200 + (rand() & 31).
+                let radius = 200.0 + self.runner_rng.irand(0, 31) as f32;
+                self.immediate_lights.push(FxLight {
+                    kind: FxLightKind::PlayerPowerup,
+                    origin: *origin,
+                    radius,
+                    source_radius: 0.0,
+                    rgb: *rgb,
+                    spot: None,
+                    segment: None,
+                    blade_segments: None,
+                });
+            }
             PlayerFxRequest::Effect { name, origin, axis } => {
                 let _ = self.worker_tx.send(FxWorkerCommand::PlayAxis { name: (*name).to_owned(), origin: *origin, axis: *axis });
             }
@@ -2121,9 +2152,11 @@ impl WeaponFx {
                     self.immediate_lights.push(FxLight {
                         kind: FxLightKind::SaberMark,
                         origin: madd3(hit.end, hit_normal, 1.1),
+                        spot: None,
                         segment: None,
                         blade_segments: None,
                         radius: 48.0 + 72.0 * heat01,
+                        source_radius: 0.0,
                         rgb: [1.0 * flicker, (0.24 + 0.24 * heat01) * flicker, (0.025 + 0.055 * heat01) * flicker],
                     });
                 } else {
@@ -3497,6 +3530,23 @@ fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_carrier_light_uses_japro_radius_and_has_no_persistent_trail() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.begin_frame(1000);
+        fx.player_fx(&PlayerFxRequest::PowerupLight {
+            origin: [10.0, 20.0, 30.0], rgb: [1.0, 0.2, 0.2],
+        });
+        let frame = fx.end_frame();
+        assert_eq!(frame.lights.len(), 1);
+        assert_eq!(frame.lights[0].origin, [10.0, 20.0, 30.0]);
+        assert_eq!(frame.lights[0].rgb, [1.0, 0.2, 0.2]);
+        assert!((200.0..=231.0).contains(&frame.lights[0].radius));
+        fx.begin_frame(1016);
+        assert!(fx.end_frame().lights.is_empty(), "dropping the flag stops its light immediately");
+    }
 
     #[test]
     fn black_saber_uses_tayst_assets_and_has_no_dynamic_light() {

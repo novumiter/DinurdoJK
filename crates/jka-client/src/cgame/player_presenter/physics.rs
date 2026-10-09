@@ -3,8 +3,9 @@ use crate::cgame::player_presenter::{
     angles_to_axis, force_grip_target_alive, force_grip_target_still_valid,
     impulse_weapon_is_explosive, infer_force_grip_target, presented_entity_in_knockdown,
     presented_entity_velocity, AnimationSet, Arc, ClothConfig, CollisionWorld, DynamicModelSurface,
-    DynamicWireframeClass, EntityEvent, FxGpuSprites, Ghoul2PerfStats, Ghoul2SkinningMode, HashMap,
-    HashSet, PhysicsMapMesh, PlayerPresenter, PresentationEvent, PresentedEntity, RagdollConfig,
+    AssetRegistry, DynamicWireframeClass, EntityEvent, FxGpuSprites, Ghoul2PerfStats,
+    Ghoul2SkinningMode, HashMap, HashSet, JiggleRemeshTuning, PhysicsMapMesh, PlayerPresenter,
+    PresentationEvent, PresentedEntity, RagdollConfig,
     Vec3, EF_DEAD, ET_NPC, ET_PLAYER, FP_GRIP,
 };
 
@@ -64,17 +65,10 @@ impl PlayerPresenter {
         let explosive = impulse_weapon_is_explosive(weapon, alt);
 
         match event.event {
-            EntityEvent::EV_SABER_HIT if self.ragdolls.weapon_impulses_enabled() => {
-                if let Ok(target) = u16::try_from(state.field_i32("otherEntityNum").unwrap_or(-1)) {
-                    self.queue_impulse_candidate(
-                        target,
-                        ImpulseRagdollSource::Weapon,
-                        event.position,
-                        false,
-                        event.server_time,
-                    );
-                }
-            }
+            // EV_SABER_HIT means saber contact, not that G_Damage applied
+            // knockback. A subsequent motion delta must not convert ordinary
+            // saber damage into a living-player ragdoll.
+            EntityEvent::EV_SABER_HIT => {}
             EntityEvent::EV_MISSILE_HIT => {
                 let source = if explosive {
                     ImpulseRagdollSource::Explosion
@@ -145,53 +139,61 @@ impl PlayerPresenter {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn set_jiggle_config(
         &mut self,
         enabled: bool,
+        sex_filter: u8,
         hz: u32,
         max_substeps: u32,
-        solver: u8,
-        overall_strength: f32,
-        breast_strength: f32,
-        glute_strength: f32,
-        stiffness_scale: f32,
-        damping_scale: f32,
-        glute_lift: f32,
-        jp_stiffness: f32,
-        jp_drag: f32,
-        jp_air_drag: f32,
-        jp_stretch: f32,
-        jp_soften: f32,
-        jp_gravity: f32,
+        tuning: crate::cgame::jiggle::JiggleTuning,
+        remesh: JiggleRemeshTuning,
     ) {
-        self.jiggle.set_config(
-            enabled,
-            hz,
-            max_substeps,
-            crate::cgame::jiggle::JiggleTuning {
-                solver: crate::cgame::jiggle::JiggleSolver::from_u8(solver),
-                overall_strength,
-                breast_strength,
-                glute_strength,
-                stiffness_scale,
-                damping_scale,
-                glute_lift,
-                jp_stiffness,
-                jp_drag,
-                jp_air_drag,
-                jp_stretch,
-                jp_soften,
-                jp_gravity,
-            },
-        );
+        let sex_filter = sex_filter.min(3);
+        if self.jiggle_sex_filter != sex_filter {
+            self.jiggle_sex_filter = sex_filter;
+            self.jiggle.clear();
+        }
+        let remesh = remesh.clamped();
+        if self.jiggle_remesh != remesh {
+            // The async worker caches an immutable profile per model. A new
+            // promoted mesh must invalidate that profile and its old results.
+            self.jiggle.clear();
+            self.jiggle_remesh = remesh;
+            self.models.clear();
+            self.failed_models.clear();
+            // Dropping the registry invalidates queued jobs via AssetRegistry's
+            // alive token, so stale topology cannot race back into the cache.
+            self.async_models = AssetRegistry::new("player model");
+            self.last_gpu.clear();
+            // Settled entities reuse their own model Arc and never consult
+            // `models`; unsettle them so they re-resolve the rebuilt topology
+            // (they keep drawing the old mesh until it is ready).
+            for runtime in self.entities.values_mut() {
+                runtime.model_settled = false;
+            }
+            self.prime_default_player_models();
+        }
+        self.jiggle.set_config(enabled, hz, max_substeps, tuning);
+    }
+
+    pub(in crate::cgame::player_presenter) fn jiggle_profile_for_sex<'a>(
+        &self,
+        profile: Option<&'a crate::cgame::jiggle::JiggleProfile>,
+        female: bool,
+    ) -> Option<&'a crate::cgame::jiggle::JiggleProfile> {
+        profile.filter(|_| match self.jiggle_sex_filter {
+            1 => female,
+            2 => !female,
+            3 => true,
+            _ => false,
+        })
     }
 
     pub(crate) fn set_cloth_config(&mut self, config: ClothConfig) {
         self.cloth.set_config(config);
     }
 
-    pub(crate) fn set_cloth_wind(&mut self, wind: Option<crate::ocean::OceanWind>) {
+    pub(crate) fn set_cloth_wind(&mut self, wind: Option<crate::ocean::AtmosphericWind>) {
         self.cloth_weather_wind = wind;
     }
 
@@ -455,7 +457,10 @@ impl PlayerPresenter {
             let velocity = presented_entity_velocity(target);
             let previous = self.previous_impulse_velocity.get(&target.number).copied();
             let candidate = self.pending_impulse_ragdolls.get(&target.number).copied();
-            let exact_local_knockback = followed_num == Some(target.number) && local_knockback;
+            // Only the local/followed player's playerState carries the
+            // authoritative PMF_TIME_KNOCKBACK bit. The remote fallback below
+            // is necessary because standard entityState omits pm_flags.
+            let has_local_playerstate = followed_num == Some(target.number);
 
             if !self.force_gripped_entities.contains(&target.number)
                 && force_grip_target_alive(target)
@@ -474,9 +479,14 @@ impl PlayerPresenter {
                     let direction_matches = expected.length_squared() < 1.0e-6
                         || delta_len < 1.0e-6
                         || velocity_delta.normalize_or_zero().dot(expected) >= 0.20;
-                    if exact_local_knockback
-                        || (delta_len >= IMPULSE_DELTA_MIN && direction_matches)
-                    {
+                    let has_knockback_evidence = if has_local_playerstate {
+                        // Never let the trajectory heuristic override a negative
+                        // PMF_TIME_KNOCKBACK reading for the local/followed player.
+                        local_knockback
+                    } else {
+                        delta_len >= IMPULSE_DELTA_MIN && direction_matches
+                    };
+                    if has_knockback_evidence {
                         activations.push((target.number, candidate.source, previous));
                     }
                 }

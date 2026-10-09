@@ -10,7 +10,7 @@ use super::{
     template::*,
 };
 use jka_movement::{TraceQuery, TraceWorld};
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 pub type EffectId = u32; // 0 = none, like OpenJK handles
 
@@ -63,6 +63,14 @@ struct Scheduled {
     origin: [f32; 3],
     axis: Axis,
     class: FxClass,
+    auto_light_driver: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AutoLightRuntime {
+    effect: EffectId,
+    score: i16,
+    spot: Option<FxSpotLight>,
 }
 
 /// One live primitive (CParticle/CLine/CTail/... state).
@@ -70,6 +78,7 @@ struct Scheduled {
 struct Primitive {
     class: FxClass,
     kind: PrimType,
+    auto_light: Option<AutoLightRuntime>,
     flags: u32,
     time_start: i32,
     time_end: i32,
@@ -161,6 +170,10 @@ pub enum FxLightKind {
     /// Authored `Light {}` primitive from an .efx file.
     #[default]
     AuthoredEffect,
+    /// Inferred from an emissive legacy EFX that had no authored Light{} stage.
+    PromotedEffect,
+    /// CG_PlayerPowerups flag-carrier / quad light.
+    PlayerPowerup,
     /// CG_DoSaber / CG_DoSaberLight blade light.
     Saber,
     /// DinurdoJK enhanced saber-mark heat light.
@@ -172,11 +185,25 @@ pub enum FxLightKind {
 pub struct FxLight {
     pub kind: FxLightKind,
     pub origin: [f32; 3],
+    /// Illumination/falloff radius, matching RE_AddLightToScene semantics.
     pub radius: f32,
+    /// Physical emitter radius used only by finite-emitter RT shadow sampling.
+    /// Zero preserves the authored/JKA mathematical point-light behavior.
+    pub source_radius: f32,
     pub rgb: [f32; 3],
+    /// Optional projected/spot-light cone in JKA space. Point and segment
+    /// lights leave this unset.
+    pub spot: Option<FxSpotLight>,
     /// Optional rendered blade endpoints in JKA space. Legacy modes use origin.
     pub segment: Option<[[f32; 3]; 2]>,
     pub blade_segments: Option<std::sync::Arc<[FxLightSegment]>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FxSpotLight {
+    pub direction: [f32; 3],
+    pub inner_cone_cos: f32,
+    pub outer_cone_cos: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -209,8 +236,25 @@ pub struct FxFrame {
     pub draws: Vec<FxDraw>,
     pub blades: Vec<FxBlade>,
     pub lights: Vec<FxLight>,
+    /// Material-aware second-stage candidates for inferred lights. These are
+    /// intentionally kept separate from authored lights until the main thread
+    /// can inspect the resolved shader and decoded texture.
+    pub auto_light_candidates: Vec<FxAutoLightCandidate>,
     pub sounds: Vec<FxSound>,
     pub shakes: Vec<FxShake>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxAutoLightCandidate {
+    pub effect: EffectId,
+    pub score: i16,
+    pub kind: PrimType,
+    pub origin: [f32; 3],
+    pub radius: f32,
+    pub rgba: [u8; 4],
+    pub shader: String,
+    pub spot: Option<FxSpotLight>,
+    pub segment: Option<[[f32; 3]; 2]>,
 }
 
 /// A `CameraShake` primitive that spawned: `CG_DoCameraShake` inputs.
@@ -336,6 +380,9 @@ pub struct FxSystem {
     /// Presentation-only world for CParticle physics traces. Without one,
     /// particles fly freely exactly as they did before `fx_physics` existed.
     collision: Option<Box<dyn TraceWorld + Send>>,
+    /// Promotion metadata prepared by the map worker. Runtime EFX parsing stays
+    /// lazy for normal OpenJK behavior, but it no longer scans materials/images.
+    light_promotion: Arc<super::light_promotion::FxLightPromotionCatalog>,
 }
 
 impl Default for FxSystem {
@@ -367,6 +414,7 @@ impl FxSystem {
             lod_saved: 0,
             physics_mode: super::FX_PHYSICS_DEFAULT,
             collision: None,
+            light_promotion: Arc::new(super::light_promotion::FxLightPromotionCatalog::default()),
         }
     }
 
@@ -396,6 +444,21 @@ impl FxSystem {
     /// World used by `fx_physics` traces (`None` disables collision).
     pub fn set_collision(&mut self, world: Option<Box<dyn TraceWorld + Send>>) {
         self.collision = world;
+    }
+
+    /// Install the immutable promotion profiles prepared during map loading.
+    /// Existing registered templates are patched too because a live CGame can
+    /// be created before the overlapped map worker finishes.
+    pub fn set_light_promotion_catalog(
+        &mut self,
+        catalog: Arc<super::light_promotion::FxLightPromotionCatalog>,
+    ) {
+        self.light_promotion = catalog;
+        for effect in &mut self.effects {
+            effect.template.auto_light = self
+                .light_promotion
+                .effect_profile(&effect.template.name);
+        }
     }
 
     pub fn stats(&self) -> FxStats {
@@ -447,7 +510,8 @@ impl FxSystem {
             self.failed.insert(key);
             return 0;
         };
-        let template = parse_effect(&key, &gp2::parse(&bytes));
+        let mut template = parse_effect_without_auto_light(&key, &gp2::parse(&bytes));
+        template.auto_light = self.light_promotion.effect_profile(&key);
         // Reserve the id before resolving links so self-references terminate.
         let id = (self.effects.len() + 1) as EffectId;
         self.ids.insert(key, id);
@@ -541,15 +605,19 @@ impl FxSystem {
                 Some((index, count, factor, even))
             })
             .collect();
+        let auto_light_profile = self.effects[(id - 1) as usize].template.auto_light;
         for (index, count, factor, even) in count_per_prim {
             for t in 0..count {
+                let auto_light_driver = t == 0
+                    && auto_light_profile
+                        .is_some_and(|profile| profile.driver_primitive == index);
                 let delay = if even {
                     (t as f32 * factor) as i32
                 } else {
                     self.effects[(id - 1) as usize].template.primitives[index].spawn_delay.get(&mut self.rng) as i32
                 };
                 if delay < 1 {
-                    self.create_effect(id, index, origin, axis, -delay, class);
+                    self.create_effect(id, index, origin, axis, -delay, class, auto_light_driver);
                 } else if self.scheduled.len() < MAX_SCHEDULED {
                     self.scheduled.push(Scheduled {
                         start_time: self.time + delay,
@@ -558,6 +626,7 @@ impl FxSystem {
                         origin,
                         axis,
                         class,
+                        auto_light_driver,
                     });
                 } else {
                     self.dropped += 1;
@@ -597,6 +666,7 @@ impl FxSystem {
                 scheduled.axis,
                 0,
                 scheduled.class,
+                scheduled.auto_light_driver,
             );
         }
 
@@ -647,6 +717,7 @@ impl FxSystem {
         axis: Axis,
         late_time: i32,
         class: FxClass,
+        auto_light_driver: bool,
     ) {
         // FX_Add* refuse new primitives while paused (mFrameTime < 1).
         if self.frame_time < 1 {
@@ -655,6 +726,9 @@ impl FxSystem {
         let effect = &self.effects[(id - 1) as usize];
         let fx = effect.template.primitives[index].clone();
         let links = effect.links.get(index).cloned().unwrap_or_default();
+        let auto_light_profile = auto_light_driver
+            .then_some(effect.template.auto_light)
+            .flatten();
         let rng = &mut self.rng;
         let mut ax = axis;
         let flags = fx.flags;
@@ -716,6 +790,26 @@ impl FxSystem {
                 }
             }
         }
+
+        // Freeze the inferred spot direction at spawn from the authored mean
+        // emission axis. Do not use the randomized driver's live velocity: that
+        // would make a flame-jet cone wobble as particle variance/gravity changes.
+        let auto_light = auto_light_profile.map(|profile| AutoLightRuntime {
+            effect: id,
+            score: profile.score,
+            spot: profile.spot.and_then(|spot| {
+                let direction = if fx.spawn_flags & FX_VEL_IS_ABSOLUTE != 0 {
+                    normalize(spot.local_direction)
+                } else {
+                    normalize(combine(ax, spot.local_direction))
+                };
+                (dot(direction, direction) > 0.5).then_some(FxSpotLight {
+                    direction,
+                    inner_cone_cos: spot.inner_cone_cos,
+                    outer_cone_cos: spot.outer_cone_cos,
+                })
+            }),
+        });
 
         let mut org2 = [0.0; 3];
         if matches!(fx.kind, PrimType::Line | PrimType::Electricity) {
@@ -803,6 +897,7 @@ impl FxSystem {
         let primitive = Primitive {
             class,
             kind: fx.kind,
+            auto_light,
             flags,
             time_start: time,
             time_end: time + life,
@@ -916,13 +1011,35 @@ fn update_primitive(
             let radius = percent(prim.size.2, prim.size.0, prim.size.1, FX_SIZE_SHIFT, rng);
             let rgb = rgb_at(prim, time, rng);
             if visible {
-                out.lights.push(FxLight { kind: FxLightKind::AuthoredEffect, origin: prim.origin, radius, rgb, segment: None, blade_segments: None });
+                out.lights.push(FxLight { kind: FxLightKind::AuthoredEffect, origin: prim.origin, radius, source_radius: 0.0, rgb, spot: None, segment: None, blade_segments: None });
             }
         }
         _ => {
             let shader = prim.shader.clone().unwrap_or_default();
             let radius = percent(prim.size.2, prim.size.0, prim.size.1, FX_SIZE_SHIFT, rng);
             let rgba = rgba_at(prim, time, rng);
+            if visible && !shader.is_empty() {
+                if let Some(auto) = prim.auto_light {
+                    let segment = if matches!(prim.kind, PrimType::Line | PrimType::Electricity) {
+                        Some([prim.origin, prim.origin2])
+                    } else {
+                        None
+                    };
+                    let spot = auto.spot;
+                    let light_origin = if spot.is_some() { prim.old_origin } else { prim.origin };
+                    out.auto_light_candidates.push(FxAutoLightCandidate {
+                        effect: auto.effect,
+                        score: auto.score,
+                        kind: prim.kind,
+                        origin: light_origin,
+                        radius,
+                        rgba,
+                        shader: shader.clone(),
+                        spot,
+                        segment,
+                    });
+                }
+            }
             match prim.kind {
                 PrimType::Particle => {
                     rotate(prim, frame_time);

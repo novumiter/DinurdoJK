@@ -564,11 +564,15 @@ impl App {
                             };
                             ui.label(ping);
                             ui.label(entry.time.to_string());
-                            ui.label(match entry.team {
-                                1 => "Red",
-                                2 => "Blue",
-                                3 => "Spectator",
-                                _ => "Free",
+                            ui.label(if entry.spectating_you {
+                                "Spectating you"
+                            } else {
+                                match entry.team {
+                                    1 => "Red",
+                                    2 => "Blue",
+                                    3 => "Spectator",
+                                    _ => "Free",
+                                }
                             });
                             ui.end_row();
                         }

@@ -187,6 +187,9 @@ impl PlayerPresenter {
                         bulge_height: 0.0,
                         env_map: false,
                         jiggle_offsets: skin.jiggle_offsets,
+                        // Gore surfaces are JKA-only: dismemberment keys off JKA
+                        // surface names, which Source surfaces never match.
+                        source_material: None,
                     }),
                     fx_gpu_sprites: None,
                     texture: texture.clone(),

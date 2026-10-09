@@ -215,6 +215,8 @@ pub struct JaproCgame {
     pub race_start_y: f32,
     /// `cg_startGoal`: start speed at which the readout turns green (0 = never).
     pub start_goal: f32,
+    /// `cg_specHud`: draw team-coloured through-wall player outlines while spectating or watching demos.
+    pub spec_hud: bool,
     /// `cg_specFollowFastest`: while spectating, automatically follow the fastest player.
     pub follow_fastest: bool,
     /// `cg_speedometer` and its position/size cvars, plus `cg_jumpGoal`.
@@ -225,6 +227,8 @@ pub struct JaproCgame {
     /// `mp/drain(wide)_japro.efx`. Only the Force-drain hand effect
     /// (`activeForcePass > FORCE_LEVEL_3`); force lightning is unaffected.
     pub drain_fx: u8,
+    /// jaPRO cg_thirdPersonFlagAlpha: opacity of the viewer's carried flag.
+    pub third_person_flag_alpha: f32,
 }
 
 impl Default for JaproCgame {
@@ -240,10 +244,12 @@ impl Default for JaproCgame {
             race_start_x: 300.0,
             race_start_y: 280.0,
             start_goal: 0.0,
+            spec_hud: true,
             follow_fastest: false,
             speedometer: crate::speedometer::Settings::default(),
             lagometer: crate::lagometer::Settings::default(),
             drain_fx: 2,
+            third_person_flag_alpha: 1.0,
         }
     }
 }

@@ -31,17 +31,23 @@ pub(in crate::ui) fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapsho
             h,
         );
     }
-    let panel_y = h as f32 - 46.0;
+
+    let panel_y = h as f32 - 72.0;
+    let header = state.hover_text.as_deref().map_or_else(
+        || format!("{}   [ / ] POV   F FREE   HOME RECORDED", state.camera_label),
+        str::to_owned,
+    );
     text(
         out,
-        &format!(
-            "{}   [ / ] POV   F FREE   HOME RECORDED",
-            state.camera_label
-        ),
+        &header,
         16.0,
         panel_y - 18.0,
         0.90,
-        [0.78, 0.84, 0.90, 0.95],
+        if state.hover_text.is_some() {
+            [0.96, 0.86, 0.58, 0.98]
+        } else {
+            [0.78, 0.84, 0.90, 0.95]
+        },
         w,
         h,
     );
@@ -50,8 +56,8 @@ pub(in crate::ui) fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapsho
         8.0,
         panel_y,
         w as f32 - 16.0,
-        42.0,
-        [0.01, 0.016, 0.024, 0.84],
+        68.0,
+        [0.01, 0.016, 0.024, 0.88],
         w,
         h,
     );
@@ -62,21 +68,6 @@ pub(in crate::ui) fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapsho
         w as f32 - 16.0,
         1.0,
         [0.24, 0.31, 0.40, 0.95],
-        w,
-        h,
-    );
-
-    let paused = state.paused;
-    let [px, py, pw, ph] = layout.play;
-    rect(out, px, py, pw, ph, [0.07, 0.10, 0.14, 0.96], w, h);
-    rect(out, px, py, pw, 1.0, [0.30, 0.40, 0.52, 0.95], w, h);
-    text(
-        out,
-        if paused { ">" } else { "||" },
-        px + if paused { 10.0 } else { 6.5 },
-        py + 6.0,
-        1.35,
-        [0.92, 0.96, 1.0, 1.0],
         w,
         h,
     );
@@ -94,18 +85,22 @@ pub(in crate::ui) fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapsho
     };
     let current_text = format_demo_time(preview_ms);
     let total_text = format_demo_time(state.duration_ms);
-    text(
-        out,
-        &current_text,
-        52.0,
-        panel_y + 13.0,
-        1.05,
-        [0.82, 0.88, 0.94, 1.0],
-        w,
-        h,
-    );
 
     let [tx, ty, tw, th] = layout.track;
+    // A marked render range is a real selection, not just two hairlines: tint
+    // the whole selected span so the clip that will be exported is obvious at a glance.
+    if let (Some(in_ms), Some(out_ms)) = (state.export_in_ms, state.export_out_ms) {
+        if out_ms > in_ms {
+            let in_f = (in_ms as f32 / state.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+            let out_f = (out_ms as f32 / state.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+            let x = tx + tw * in_f;
+            let width = (tw * (out_f - in_f)).max(1.0);
+            rect(out, x, ty - 2.0, width, th + 4.0, [0.30, 0.56, 0.92, 0.18], w, h);
+            rect(out, x, ty - 2.0, width, 1.0, [0.55, 0.76, 1.0, 0.78], w, h);
+            rect(out, x, ty + th + 1.0, width, 1.0, [0.55, 0.76, 1.0, 0.52], w, h);
+        }
+    }
+
     let line_y = ty + th * 0.5 - 2.0;
     rect(out, tx, line_y, tw, 4.0, [0.12, 0.16, 0.21, 1.0], w, h);
     rect(
@@ -154,6 +149,17 @@ pub(in crate::ui) fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapsho
         }
     }
 
+    for (mark, color) in [
+        (state.export_in_ms, [0.30, 0.95, 0.55, 1.0]),
+        (state.export_out_ms, [1.0, 0.55, 0.25, 1.0]),
+    ] {
+        if let Some(ms) = mark {
+            let mf = (ms as f32 / state.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+            let x = tx + tw * mf;
+            rect(out, x - 1.5, ty - 3.0, 3.0, th + 6.0, color, w, h);
+        }
+    }
+
     let thumb_x = tx + tw * fraction;
     rect(
         out,
@@ -170,11 +176,75 @@ pub(in crate::ui) fn build_demo_timeline(out: &mut Vec<UiVertex>, ui: &UiSnapsho
         out,
         &total_text,
         tx + tw + 10.0,
-        panel_y + 13.0,
+        panel_y + 11.0,
         1.05,
         [0.62, 0.70, 0.78, 1.0],
         w,
         h,
+    );
+
+    let paused = state.paused;
+    let [px, py, pw, ph] = layout.play;
+    rect(out, px, py, pw, ph, [0.07, 0.10, 0.14, 0.96], w, h);
+    rect(out, px, py, pw, 1.0, [0.30, 0.40, 0.52, 0.95], w, h);
+    text(
+        out,
+        if paused { ">" } else { "||" },
+        px + if paused { 10.0 } else { 6.5 },
+        py + 6.0,
+        1.35,
+        [0.92, 0.96, 1.0, 1.0],
+        w,
+        h,
+    );
+    text(
+        out,
+        &current_text,
+        52.0,
+        py + 7.0,
+        1.05,
+        [0.82, 0.88, 0.94, 1.0],
+        w,
+        h,
+    );
+
+    let draw_button = |out: &mut Vec<UiVertex>, r: [f32; 4], label: &str, enabled: bool, scale: f32| {
+        let [x, y, bw, bh] = r;
+        let fill = if enabled { [0.07, 0.10, 0.14, 0.96] } else { [0.04, 0.05, 0.07, 0.82] };
+        let fg = if enabled { [0.82, 0.90, 0.96, 1.0] } else { [0.34, 0.38, 0.43, 1.0] };
+        rect(out, x, y, bw, bh, fill, w, h);
+        rect(out, x, y, bw, 1.0, [0.25, 0.31, 0.40, 0.95], w, h);
+        text(out, label, x + 7.0, y + 7.0, scale, fg, w, h);
+    };
+    draw_button(out, layout.mark_in, "IN", true, 0.82);
+    draw_button(out, layout.mark_out, "OUT", state.export_in_ms.is_some(), 0.82);
+    draw_button(
+        out,
+        layout.export_fps,
+        &format!("{}FPS", state.export_fps),
+        true,
+        0.68,
+    );
+    draw_button(
+        out,
+        layout.export_depth,
+        if state.export_depth { "DEPTH ON" } else { "DEPTH OFF" },
+        true,
+        0.62,
+    );
+    draw_button(
+        out,
+        layout.export_preset,
+        &state.export_preset_label,
+        true,
+        0.65,
+    );
+    draw_button(
+        out,
+        layout.export,
+        "EXPORT",
+        state.export_available && state.export_in_ms.is_some() && state.export_out_ms.is_some(),
+        0.82,
     );
 
     let [sx, sy, sw, sh] = layout.speed;

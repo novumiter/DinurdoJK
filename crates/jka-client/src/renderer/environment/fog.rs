@@ -43,10 +43,18 @@ impl Renderer {
             fog_params: [fog_density, fog_height_falloff, 768.0, map_fog_depth],
             fog_color_anisotropy: [fog_color[0], fog_color[1], fog_color[2], 0.35],
             rain_params: [
-                if self.weather.rain.enabled { 1.0 } else { 0.0 },
+                if self.weather.rain.enabled && !self.rain_uses_2d_haze() {
+                    1.0
+                } else {
+                    0.0
+                },
                 self.weather.rain.intensity.shader_value(),
                 self.weather.rain.intensity.haze_strength(),
-                0.0,
+                if self.weather.snow.enabled {
+                    self.weather.snow.density_scale
+                } else {
+                    0.0
+                },
             ],
             rain_occlusion,
             rain_wind: [

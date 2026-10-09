@@ -12,7 +12,21 @@ use crate::renderer::{
 impl Renderer {
     /// Format the gameplay scene renders into, ignoring the asset viewer.
     pub(in crate::renderer) fn gameplay_scene_format(&self) -> wgpu::TextureFormat {
-        if self.hdr_enabled || self.glow_mode.enabled() || self.halation_enabled {
+        // Legacy OpenGL starts with GL_DITHER enabled, and the OpenJK/TaystJK
+        // vanilla renderer path leaves that default in place. WGPU has no
+        // equivalent fixed-function framebuffer dither, so r_drawfog 2 otherwise
+        // quantizes its smooth EXP2
+        // blend directly into our 8-bit sRGB scene target and produces obvious
+        // contour bands. Keep only Legacy 2 on a float scene target, then do the
+        // single 8-bit quantization in the presentation pass where we can dither
+        // it explicitly. This is deliberately narrower than r_hdr: it changes
+        // precision/order only, not tone mapping or any HDR lighting semantics.
+        let legacy2_precision = self.weather.fog.legacy2_precision_active();
+        if self.hdr_enabled
+            || self.glow_mode.enabled()
+            || self.halation_enabled
+            || legacy2_precision
+        {
             wgpu::TextureFormat::Rgba16Float
         } else {
             self.config.format
@@ -64,8 +78,8 @@ impl Renderer {
                 return;
             };
             match key.family() {
-                WorldShaderFamily::Enhanced => (&rt.world_pipeline_layout, &rt.world_shader),
-                WorldShaderFamily::Lean => (&rt.world_pipeline_layout_lean, &rt.world_shader_lean),
+                WorldShaderFamily::Enhanced => (&rt.world_pipeline_layout, rt.world_shader_for_variant(key)),
+                WorldShaderFamily::Lean => (&rt.world_pipeline_layout_lean, rt.world_shader_for_variant(key)),
             }
         } else {
             match key.family() {
@@ -269,6 +283,8 @@ impl Renderer {
             self.ssr_enabled,
             self.cloud_render_resolution,
         );
+        self.world_flares.invalidate_depth_binding();
+        self.world_flares_sky.invalidate_depth_binding();
         let ssr_visibility_resources =
             create_ssr_visibility_resources(&self.device, &self.targets, samples);
         let (ssr_visibility_layout, ssr_visibility_pipeline, ssr_visibility_bind_group) =
@@ -282,6 +298,15 @@ impl Renderer {
         self.weather
             .rain
             .rebuild_render_pipelines(&self.device, scene_format, samples);
+        self.weather
+            .snow
+            .rebuild_render_pipeline(scene_format, samples);
+        self.weather
+            .atmosphere
+            .rebuild_render_pipeline(scene_format, samples);
+        self.weather
+            .wind_visuals
+            .rebuild_render_pipelines(scene_format, samples);
         self.grass_renderer
             .rebuild_pipeline(&self.device, scene_format, samples);
         self.surface_sprite_effect_renderer
@@ -329,6 +354,7 @@ impl Renderer {
     /// inspector, or the cull-rejection overlay are active. Runs on the cold
     /// pre-frame path so the frame recorder can borrow them immutably.
     pub(in crate::renderer) fn ensure_lazy_scene_pipelines(&mut self) {
+        self.ensure_rt_taa_pipeline();
         let scene_format = self.scene_format();
         let samples = self.msaa_samples;
 
@@ -589,6 +615,17 @@ pub(in crate::renderer) fn material_uniform(
     }
     out.header[3] |= u32::from(source.surface_material & 31) << 8;
     out.color = source.color;
+    // TaystJK rd-vanilla/tr_shade_calc.cpp RB_CalcDiffuseColor evaluates
+    // the CURRENT refEntity's ambient + max(dot(N,L),0)*directed lighting.
+    // BSP world surfaces use tr.worldEntity, whose ambient/directed fields
+    // are zero (unlike dynamic refEntities, which have lightgrid lighting).
+    // Accordingly CGEN_LIGHTING_DIFFUSE on a world surface produces black
+    // RGB while preserving the separately authored alpha. Do NOT substitute
+    // BSP vertex color: that's the distinct CGEN_VERTEX/EXACT_VERTEX mode.
+    // Models retain their own existing lightgrid/model-lighting path.
+    if matches!(source.rgb_gen, RgbGen::LightingDiffuse | RgbGen::LightingDiffuseEntity) {
+        out.color[..3].fill(0.0);
+    }
     out.params[0] = source.alpha_cutoff;
     out.params[1] = source.parallax_depth;
     // Tayst/OpenJK R_RemapShader's timeOffset is subtracted from shader time.
@@ -1214,6 +1251,59 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
     })
 }
 
+/// Rain-only linear-depth pipeline: one R32F target instead of the general
+/// prepass's linear-depth + motion-vector + reflection-policy MRT set.
+pub(in crate::renderer) fn create_rain_depth_prepass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    alpha_test: bool,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(if alpha_test {
+            "JKA rain lean alpha-tested depth prepass pipeline"
+        } else {
+            "JKA rain lean depth prepass pipeline"
+        }),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(if alpha_test { "vs_mask" } else { "vs_main" }),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &VERTEX_ATTRIBUTES,
+            }],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if alpha_test { "fs_rain_mask" } else { "fs_rain" }),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// Depth-only world pipeline for the Hi-Z early pass. Opaque surfaces have no
 /// fragment stage at all; alpha-tested ones run only the cutout test.
 pub(in crate::renderer) fn create_hiz_prepass_pipeline(
@@ -1380,6 +1470,56 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
                     write_mask: wgpu::ColorWrites::ALL,
                 }),
             ],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+pub(in crate::renderer) fn create_entity_rain_prepass_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    vertex_layout: wgpu::VertexBufferLayout<'_>,
+    alpha_test: bool,
+    label: &'static str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_prepass"),
+            compilation_options: Default::default(),
+            buffers: &[vertex_layout],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if alpha_test {
+                "fs_rain_prepass_mask"
+            } else {
+                "fs_rain_prepass"
+            }),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
         }),
         multiview_mask: None,
         cache: None,

@@ -1,3 +1,5 @@
+use std::env;
+
 fn main() {
     cc::Build::new()
         .include("native")
@@ -17,6 +19,7 @@ fn main() {
         .flag_if_supported("/we4013")
         .flag_if_supported("-fno-strict-aliasing")
         .flag_if_supported("-ffp-contract=off");
+    define_linux_arch_string(&mut movement);
     for file in [
         "codemp/game/bg_pmove.c",
         "codemp/game/bg_slidemove.c",
@@ -51,7 +54,9 @@ fn main() {
         .flag_if_supported("/fp:precise")
         .flag_if_supported("/we4013")
         .flag_if_supported("-fno-strict-aliasing")
+        .flag_if_supported("-fcommon")
         .flag_if_supported("-ffp-contract=off");
+    define_linux_arch_string(&mut japro);
     for file in [
         "codemp/game/bg_pmove.c",
         "codemp/game/bg_slidemove.c",
@@ -86,6 +91,7 @@ fn main() {
         .flag_if_supported("/EHsc")
         .flag_if_supported("-fno-strict-aliasing")
         .flag_if_supported("-ffp-contract=off");
+    define_linux_arch_string(&mut collision);
     for file in [
         "cm_load.cpp",
         "cm_trace.cpp",
@@ -101,4 +107,20 @@ fn main() {
         .compile("jka_collision");
     println!("cargo:rerun-if-changed=vendor");
     println!("cargo:rerun-if-changed=native");
+}
+
+fn define_linux_arch_string(build: &mut cc::Build) {
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() != Some("linux") {
+        return;
+    }
+
+    let Some(arch) = env::var("CARGO_CFG_TARGET_ARCH").ok() else {
+        return;
+    };
+    let arch = match arch.as_str() {
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let value = format!("\"{arch}\"");
+    build.define("ARCH_STRING", Some(value.as_str()));
 }

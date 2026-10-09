@@ -1,0 +1,72 @@
+# Ocean cost on RaceArena_Pro. Run:  bench.cmd bench\plans\ocean.bench
+#
+# Question: why is FPS low when only a sliver of water is in the PVS?
+#
+# RaceArena_Pro is the worst case and the reason this plan exists. Its BSP has
+# 27 distinct water planes; the 8 largest get promoted (OCEAN_MAX_SURFACES), and
+# the biggest is the z=7946 "donut" spanning x -27567..25746 / y -32040..29196.
+# The player spawns at z=7819, INSIDE that donut's hollow, so almost no water is
+# on screen - exactly the case being investigated.
+#
+# Read these columns first:
+#   sea_draws  clipmap draws encoded (one per promoted surface the frustum kept)
+#   sea_tris   triangles those draws submitted
+# The clipmap is camera-centred, not footprint-sized, so one visible sliver
+# submits that whole surface's mesh and the shape mask then discards the
+# fragments outside the real outline. If sea_tris is in the hundreds of
+# thousands while barely any water is visible, that is the finding.
+#
+# And these GPU passes:
+#   ocean_sim      FFT cascades + wind-foam transport. Runs whether or not any
+#                  water is visible (new pass; it used to be unattributed).
+#   ocean_surface  the clipmap draw itself.
+#   ocean_optics   scene capture + underwater composite.
+
+map       RaceArena_Pro
+launches  3        # single runs vary +/-15%
+settle    3
+sample    5
+timeout   420      # big map, cold caches
+
+cfg r_gpuTimings 1
+cfg r_perfTrace 1
+# Force the general renderer in every case. Without this, `ocean_off` would also
+# become FastBaseline-eligible (plan.rs requires !ocean_enabled), and the
+# baseline would measure two changes at once instead of one.
+cfg r_worldPath unified
+
+# Spawn (info_player_start), two facings. Both stand on solid ground inside the
+# hollow; only the amount of water on screen differs.
+spot hollow_e  -1985 -1238 7819 0
+spot hollow_w  -1985 -1238 7819 180
+
+# --- cases ------------------------------------------------------------------
+# r_ocean goes in the cfg: turning it on live needs the world's ocean pipeline
+# variant already compiled, so the map has to load in the state being measured.
+case ocean_off      cfg:r_ocean=0
+case ocean_on       cfg:r_ocean=1
+
+# Geometry lever. Low mesh = 1 m inner cells instead of 0.25 m, roughly a
+# quarter of the triangles for identical screen coverage. A large win here means
+# vertex/primitive bound; no change means the cost is in the fragments that the
+# shape mask discards.
+case mesh_low       cfg:r_ocean=1 r_oceanMeshQuality=0
+
+# Simulation levers. NOTE: r_oceanUpdates 0 does NOT disable the sim - ocean.rs
+# treats 0 as "always due", so it runs the FFT every frame. 1 is the cheap end.
+case sim_1hz        cfg:r_ocean=1 r_oceanUpdates=1
+case sim_60hz       cfg:r_ocean=1 r_oceanUpdates=60
+case fft_256        cfg:r_ocean=1 r_oceanMapSize=256
+
+# Per-frame compute that is not gated by visibility at all.
+case windfoam_off   cfg:r_ocean=1 r_oceanWindFoam=0
+case spray_off      cfg:r_ocean=1 r_oceanSeaSpray=0
+
+# Underwater optics: the scene capture runs whenever the map has any ocean
+# surface, and the composite only when the camera is submerged.
+case optics_cheap   cfg:r_ocean=1 r_oceanRefraction=0 r_oceanCaustics=0 r_oceanDepthDarkening=0
+
+# Everything cheap at once. If this still sits far below ocean_off, the cost is
+# structural (clipmap size, mask discard, the passes render_ocean forces on) and
+# not in any one setting.
+case all_cheap      cfg:r_ocean=1 r_oceanMeshQuality=0 r_oceanUpdates=1 r_oceanMapSize=256 r_oceanWindFoam=0 r_oceanSeaSpray=0 r_oceanRefraction=0 r_oceanCaustics=0 r_oceanDepthDarkening=0

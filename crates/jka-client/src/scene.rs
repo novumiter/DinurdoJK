@@ -33,7 +33,8 @@ mod vegetation;
 mod visibility;
 pub(crate) use cache::FoldHasher;
 pub(crate) use shader_remap::{
-    apply_shader_remaps, apply_shader_remaps_in_place, canonical_shader_name, ShaderRemapState,
+    apply_shader_remaps, apply_shader_remaps_in_place, apply_reverse_lightmap_collapse_in_place,
+    canonical_shader_name, ShaderRemapState,
 };
 use cache::{map_content_hash, static_bsp_ao_cache_info, StageFingerprint};
 pub use cache::{PrepStageKeys, StaticBspAoCacheInfo};
@@ -43,8 +44,9 @@ pub use coordinates::{jka_position, render_position};
 pub use entities::SkyPortal;
 pub(crate) use entities::{append_authored_ocean_planes, bsp_brush_entities};
 use entities::{
-    bsp_dynamic_lights, bsp_fx_runners, bsp_sky_portal, bsp_worldspawn_distance_cull,
-    load_movement, map_dynamic_lights, map_worldspawn_distance_cull, parse_light_triplet,
+    bsp_dynamic_lights, bsp_fx_runners, bsp_sky_portal, bsp_world_effect_registrations,
+    bsp_worldspawn_distance_cull, load_movement, map_dynamic_lights,
+    map_world_effect_registrations, map_worldspawn_distance_cull, parse_light_triplet,
 };
 #[cfg(test)]
 use entities::{dynamic_light_from_values, map_dynamic_light, parse_distance_cull};
@@ -69,15 +71,23 @@ use lightmaps::{
 };
 pub(crate) use material_batches::append_sky_batches;
 use material_batches::{
-    append_material_batches, can_fold_jka_lightmap_pair, class_for, material_debug_info,
+    append_material_batches, class_for, material_debug_info,
     material_render_is_guaranteed_discarded, prepared_stages, resolved_bsp_surface_fog,
     stage_batch,
 };
+use material_batches::can_fold_jka_lightmap_pair;
 #[cfg(test)]
-use material_batches::{blend_for, effective_world_cull, stage_class, stage_pipeline};
+use shader_remap::fold_reverse_lightmap_batches;
+#[cfg(test)]
+use material_batches::{
+    blend_for, can_fold_openjk_reverse_lightmap_modulate_pair,
+    effective_world_cull, stage_class, stage_pipeline, stage_audit_class,
+};
 #[cfg(test)]
 pub use prepare::prepare_with_seed;
-pub use prepare::{prepare, prepare_with_jobs_options, prepare_with_options};
+pub use prepare::{
+    prepare, prepare_steam_audio_scene, prepare_with_jobs_options, prepare_with_options,
+};
 #[cfg(test)]
 use reflections::planar_batch_plane;
 use reflections::{
@@ -148,7 +158,12 @@ use std::{
 };
 
 const LIGHTMAP_BY_VERTEX: i32 = -3;
-const MAX_EXTRACTED_SURFACE_LIGHTS: usize = 128;
+// Surface emitters are useful indirect-light sources, but expensive when all of
+// them are also evaluated as real-time clustered lights. Keep a small per-source
+// hot-path budget while preserving the historical authored-emitter budget for the
+// one-time voxel/probe GI bake.
+const MAX_REALTIME_SURFACE_LIGHTS: usize = 16;
+const MAX_VOXEL_GI_SURFACE_LIGHTS: usize = 128;
 const MAX_SURFACE_LIGHT_SUBDIVISION_DEPTH: u8 = 8;
 const VOXEL_GI_MAX_AXIS: u32 = 42;
 const VOXEL_GI_MIN_CELL_SIZE: f32 = 96.0;
@@ -241,6 +256,14 @@ pub struct DrawBatch {
     pub lightmap: Option<usize>,
     /// True only for the compact implicit material path.
     pub modulate_lightmap: bool,
+    /// 0=ordinary, 1=first $lightmap stage, 2=second diffuse stage of a
+    /// strictly eligible *reverse* OpenJK lightmap modulation pair. Recorded
+    /// on the map-preparation worker; the unmodified batches remain the
+    /// pristine source for runtime A/B recipe rebuilds.
+    pub reverse_lightmap_fold_role: u8,
+    /// Detail-eligible *after* stripping the second stage blend. Preserve the
+    /// authored-detail exclusion when deriving the optimized runtime recipe.
+    pub reverse_lightmap_fold_detail: bool,
     /// Multi-stage material with an explicit `$lightmap` stage and no PBR
     /// companion maps: point/RT local lights are added once in the lightmap
     /// stage (which every other stage is multiplied by) instead of in the base
@@ -436,12 +459,23 @@ pub fn select_spawn_index(
 /// same protocol/CGame boundary as a remote game server.
 #[derive(Debug, Clone)]
 pub struct MapFxRunner {
+    /// Original BSP entity index. Used only by the local-server shim to preserve
+    /// G_EffectIndex registration order with fx_rain/fx_snow/fx_wind.
+    pub source_entity_index: usize,
     pub effect: String,
     pub origin: [f32; 3],
     pub angles: [f32; 3],
     pub delay_ms: i32,
     pub random_ms: i32,
     pub spawnflags: i32,
+}
+
+/// One server-side map weather registration, retaining the source entity order
+/// so the local-server shim can reproduce G_EffectIndex ordering exactly.
+#[derive(Debug, Clone)]
+pub struct MapWorldEffectRegistration {
+    pub source_entity_index: usize,
+    pub effect: String,
 }
 
 /// A BSP entity whose `model` key names an inline model (`*N`), kept as the
@@ -818,6 +852,10 @@ pub struct DynamicLight {
     pub angle_scale: f32,
     /// q3map2 `_extradist`, folded into the distance before attenuation.
     pub extra_distance: f32,
+    /// Non-zero only for geometry emitters inferred from visible shader
+    /// semantics. Bits use materials::SHADER_LIGHT_* and are filtered at
+    /// runtime so promotion categories can be A/B tested without reloading.
+    pub shader_promotion_mask: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1265,7 +1303,35 @@ pub struct LegacyDlightSurface {
 }
 
 #[derive(Clone)]
+pub struct PreparedSteamAudioScene {
+    pub acoustic_mesh: Arc<jka_assets::bsp::AcousticMesh>,
+    pub bake: Option<Arc<crate::steam_audio::SteamAudioBakeData>>,
+    pub bake_request: Option<crate::steam_audio::SteamAudioBakeRequest>,
+}
+
+/// Immutable authored world flare, keyed by RBSP surface index. Kept out of
+/// triangle/material draw batches and reused by the independent flare renderer.
+#[derive(Debug, Clone)]
+pub struct WorldFlare {
+    pub surface_id: u32,
+    pub origin: [f32; 3],
+    pub normal: [f32; 3],
+    pub color: [f32; 3],
+    pub shader: String,
+    pub shader_index: usize,
+    pub fog_num: i32,
+    pub fog: [f32; 4],
+    pub fog_is_global: bool,
+    pub radius: f32,
+    pub alpha_portal_stages: Vec<bool>,
+    pub stages: Vec<materials::MaterialStage>,
+    pub clusters: Vec<usize>,
+}
+
+#[derive(Clone)]
 pub struct PreparedMap {
+    /// Background static coastal geometry; never waited on by map loading or rendering.
+    pub coastal_bathymetry: Option<Arc<crate::ocean::bathymetry::Job>>,
     /// Parsed renderer shader table retained on the CPU so runtime
     /// R_RemapShader-style redirects can resolve a replacement material
     /// without reparsing every .shader/.mtr file or taxing the render loop.
@@ -1290,6 +1356,8 @@ pub struct PreparedMap {
     pub physics_collision: crate::cgame::ragdoll::PhysicsMapMesh,
     pub weather_occlusion: Option<WeatherOcclusionSource>,
     pub vertices: Vec<GpuVertex>,
+    /// Flare candidates, separate from triangulated world geometry.
+    pub world_flares: Vec<WorldFlare>,
     /// Original BSP surface for every static-world source triangle.
     pub legacy_dlight_triangle_surfaces: Vec<u32>,
     /// OpenJK-style coarse dlight rejection metadata, indexed by BSP surface.
@@ -1367,6 +1435,10 @@ pub struct PreparedMap {
     /// Map-authored `fx_runner`s retained for the local server shim. Remote
     /// servers provide the equivalent state as CS_EFFECTS + ET_FX snapshots.
     pub fx_runners: Vec<MapFxRunner>,
+    /// CS_EFFECTS registrations emitted by JKA's server-side fx_rain/fx_snow/
+    /// fx_spacedust/fx_wind spawn functions. Entries beginning with `*` are
+    /// parsed by CGame as renderer world-effect commands.
+    pub world_effect_registrations: Vec<MapWorldEffectRegistration>,
     /// Entities that own inline BSP models, for the local server shim.
     pub brush_entities: Vec<MapBrushEntity>,
     /// Entity blueprint (entities, target links, floor plan) for the
@@ -1448,6 +1520,13 @@ pub struct MaterialDebugEntry {
     /// Canonical shader-script block retained from the parsed .shader/.mtr.
     pub definition_text: Option<String>,
     pub enhanced: bool,
+    /// Exact stage metadata retained for offline/read-only performance audits.
+    pub authored_stage_count: usize,
+    pub resolved_stage_count: usize,
+    pub stage_audit_class: &'static str,
+    /// Render recipe depends on vertex-lit/LM availability; this classification
+    /// is a conservative candidate analysis, NOT proof of an applied collapse.
+    pub stage_sequence: Vec<String>,
     /// Resolved stage/base/PBR image providers used by this material.
     pub image_sources: Vec<String>,
     pub lines: Vec<String>,

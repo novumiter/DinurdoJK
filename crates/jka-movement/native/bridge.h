@@ -114,6 +114,9 @@ typedef struct jka_prediction_entity_s {
     int32_t number, entity_type, model_index, bolt1, trajectory_type;
     float origin[3], velocity[3], angular_velocity[3];
     int32_t legs_anim, torso_anim, saber_move;
+    /* BSP map classname classification, not inferred from trajectory.
+       0 = unknown; 1 = func_train; 2 = race pass-through door/plat. */
+    int32_t mover_class;
 } jka_prediction_entity;
 
 /* Read-only OpenJK presentation queries used by the Rust CGame renderer. */

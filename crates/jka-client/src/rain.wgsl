@@ -16,7 +16,7 @@ struct RainRenderUniform {
     appearance: vec4<f32>, // streak length world units, feather width world units, opacity, splash size world units
     splash: vec4<f32>,     // splash duration, viewport width, viewport height, puddle accumulation
     color: vec4<f32>,
-    look: vec4<f32>,       // scattered puddle amount, camera underwater, remaining lanes reserved
+    look: vec4<f32>,       // scattered puddle amount, camera underwater, fast vertex A/B, reserved
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -47,6 +47,22 @@ fn vs_drop(
     }
 
     let position = particle.position_state.xyz;
+    if (rain.look.z > 0.5) {
+        // Reject obviously invisible drops before velocity normalization, width
+        // reconstruction, cross products and smoothstep work. A generous clip
+        // margin retains streaks whose center is just outside the viewport.
+        let center_clip = camera.view_proj * vec4<f32>(position, 1.0);
+        let clip_margin = max(center_clip.w, 0.0) * 1.35;
+        if (center_clip.w <= 0.01
+            || abs(center_clip.x) > clip_margin
+            || abs(center_clip.y) > clip_margin) {
+            out.position = vec4<f32>(2.5, 2.5, 0.0, 1.0);
+            out.across = 0.0;
+            out.along = 0.0;
+            out.opacity = 0.0;
+            return out;
+        }
+    }
     let speed = max(length(particle.velocity_age.xyz), 1.0);
     let velocity = particle.velocity_age.xyz / speed;
 
@@ -102,7 +118,7 @@ fn vs_drop(
     // Fade drops out as they near the lens, and keep the middle distance readable:
     // thin drops keep most of their opacity and gain a little with range to make
     // up for the haze that would otherwise swallow them.
-    let near_fade = smoothstep(90.0, 240.0, distance);
+    let near_fade = smoothstep(48.0, 80.0, distance);
     let distance_fade = 1.0 - smoothstep(1500.0, 2300.0, distance);
     let thinness = rain.appearance.y / width_world;
     let mid_range = 1.0 + 0.55 * smoothstep(250.0, 800.0, distance);

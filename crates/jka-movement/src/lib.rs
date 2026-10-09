@@ -118,6 +118,8 @@ pub const ENTITY_NONE: i32 = 1023;
 pub const BUTTON_ATTACK: i32 = 1;
 pub const BUTTON_WALKING: i32 = 16;
 pub const BUTTON_ALT_ATTACK: i32 = 128;
+/// OpenJK `GENCMD_SABERSWITCH` (`genCmds_t` in q_shared.h).
+pub const GENCMD_SABERSWITCH: u8 = 1;
 /// OpenJK `GENCMD_SABERATTACKCYCLE` (`genCmds_t` in q_shared.h).
 pub const GENCMD_SABERATTACKCYCLE: u8 = 26;
 pub const WP_SABER: u8 = 3;
@@ -236,15 +238,6 @@ impl Default for UserCmd {
         }
     }
 }
-/// How the native pmove rounds velocity after every step (`trap_SnapVector`): 0 OpenJK's
-/// `Sys_SnapVector` (nearest, ties away from zero), 1 truncate, 2 floor, 3 nearest-even,
-/// 4 none. Process-wide; the retail game code is the same everywhere but the engine's rounding
-/// is not, and at 1 ms steps it decides friction and gravity.
-pub fn set_snap_mode(mode: i32) {
-    let _guard = ffi::NativeGuard::new();
-    unsafe { ffi::jka_set_snap_mode(mode) };
-}
-
 pub fn angle_to_short(angle: f32) -> i32 {
     ((angle * (65536.0 / 360.0)) as i32) & 65535
 }
@@ -648,6 +641,8 @@ pub struct PredictionEntity {
     pub legs_anim: i32,
     pub torso_anim: i32,
     pub saber_move: i32,
+    /// 0 unknown, 1 func_train, 2 func_door/func_plat.
+    pub mover_class: i32,
 }
 // Ownership is exclusive; native globals are always protected by NativeGuard.
 unsafe impl Send for PlayerState {}

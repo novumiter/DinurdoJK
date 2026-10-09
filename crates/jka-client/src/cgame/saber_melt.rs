@@ -881,9 +881,11 @@ impl SaberMelt {
             lights.push(FxLight {
                 kind: FxLightKind::SaberMark,
                 origin,
+                spot: None,
                 segment: None,
                 blade_segments: None,
                 radius: 34.0 + 84.0 * h,
+                source_radius: 0.0,
                 rgb: [flicker * h.powf(1.5), (0.16 + 0.22 * h) * flicker * h.powf(1.5), 0.03 * flicker * h.powf(1.5)],
             });
         }

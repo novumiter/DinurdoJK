@@ -115,6 +115,28 @@ fn weather_slope_slack(normal_y: f32, texel_units: f32) -> f32 {
     return min(tangent * texel_units * 1.5, 40.0);
 }
 
+// Soft rain shadow. Level 1 of the field texture (built by build_shelter_level in
+// weather/field.rs) summarises each 64 unit window of cover as
+// [tallest blocker, lowest blocker, fraction standing 24+ above the lowest, 0].
+// Compared with the fragment's own height that gives how much of the window shelters
+// it, and the bilinear blend of those turns the one-texel (8 unit) wet/dry edge into
+// a ramp that reaches fully dry about 32..44 units from the cover. The doubling
+// makes the window half-full (the edge itself) read as fully sheltered, so the ramp
+// runs from the edge outwards and the covered side keeps the hard test.
+const WEATHER_SHELTER_GAIN: f32 = 2.0;
+
+fn weather_shelter_load(field: texture_2d<f32>, texel: vec2<i32>) -> vec4<f32> {
+    let dims = textureDimensions(field, 1);
+    let last = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
+    return textureLoad(field, clamp(texel, vec2<i32>(0), last), 1);
+}
+
+fn weather_shelter_window(stats: vec4<f32>, cover_y: f32) -> f32 {
+    let beneath_all = smoothstep(6.0, 24.0, stats.y - cover_y);
+    let beneath_some = smoothstep(6.0, 24.0, stats.x - cover_y);
+    return mix(stats.z, 1.0, beneath_all) * beneath_some;
+}
+
 // Bilinear weather sample at a world position. Outside the mapped area the sky
 // is open and nothing can pool. A texel only contributes to flat_area and basin
 // when its top surface is at the fragment's own height, so a roof never lends its
@@ -148,6 +170,21 @@ fn weather_sample_field(
     let e01 = weather_exposure_from_cover(s01.x, cover_y);
     let e11 = weather_exposure_from_cover(s11.x, cover_y);
     result.exposure = mix(mix(e00, e10, blend.x), mix(e01, e11, blend.x), blend.y);
+
+    if (textureNumLevels(field) > 1u) {
+        // The window spans about 48 units each way, so a slope rises that much more
+        // within it than the one-texel slack above allows for.
+        let soft_cover_y = world.y + weather_slope_slack(normal_y, 32.0);
+        let shelter_position = uv * vec2<f32>(textureDimensions(field, 1)) - vec2<f32>(0.5);
+        let shelter_base = vec2<i32>(floor(shelter_position));
+        let shelter_blend = fract(shelter_position);
+        let w00 = weather_shelter_window(weather_shelter_load(field, shelter_base), soft_cover_y);
+        let w10 = weather_shelter_window(weather_shelter_load(field, shelter_base + vec2<i32>(1, 0)), soft_cover_y);
+        let w01 = weather_shelter_window(weather_shelter_load(field, shelter_base + vec2<i32>(0, 1)), soft_cover_y);
+        let w11 = weather_shelter_window(weather_shelter_load(field, shelter_base + vec2<i32>(1, 1)), soft_cover_y);
+        let shelter = mix(mix(w00, w10, shelter_blend.x), mix(w01, w11, shelter_blend.x), shelter_blend.y);
+        result.exposure = min(result.exposure, 1.0 - clamp(shelter * WEATHER_SHELTER_GAIN, 0.0, 1.0));
+    }
 
     let m00 = 1.0 - smoothstep(6.0, 20.0, abs(s00.y - world.y));
     let m10 = 1.0 - smoothstep(6.0, 20.0, abs(s10.y - world.y));

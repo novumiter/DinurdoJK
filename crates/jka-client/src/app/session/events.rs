@@ -366,6 +366,98 @@ impl GameSession {
         }
     }
 
+    /// Core Siege entity events from `CG_EntityEvent`: respawn deadline,
+    /// objective-complete message/sound, and round-over message/sound. The map
+    /// data selection follows TaystJK/OpenJK exactly: objective data belongs to
+    /// the team that completed it, while message/sound variants are selected by
+    /// the viewer's team.
+    pub(in crate::app) fn note_siege_events(&mut self, event: &crate::cgame::PresentationEvent) {
+        use crate::cgame::CgameNotice;
+        use EntityEvent as E;
+        use jka_assets::siege::{SIEGE_TEAM1, SIEGE_TEAM2};
+
+        if self.client_game.gametype() != 7 {
+            return;
+        }
+
+        match event.event {
+            E::EV_SIEGESPEC => {
+                // OpenJK: if (es->owner == cg.predictedPlayerState.clientNum)
+                // cg_siegeDeathTime = es->time. Presentation ownership is the
+                // same slot in live play and intentionally follows the POV in demos.
+                let Some(viewer) = self.client_game.presentation_client_num() else {
+                    return;
+                };
+                if event.state.field_i32("owner") == Some(viewer) {
+                    self.siege_respawn_time = event.state.field_i32("time").unwrap_or(0);
+                }
+            }
+            E::EV_SIEGE_OBJECTIVECOMPLETE => {
+                let viewer_team = self.siege_viewer_team();
+                if !matches!(viewer_team, SIEGE_TEAM1 | SIEGE_TEAM2) {
+                    return;
+                }
+                let completed_team = event.parm;
+                let Some(objective_number) = event
+                    .state
+                    .field_i32("trickedentindex")
+                    .and_then(|value| usize::try_from(value).ok())
+                else {
+                    return;
+                };
+                let Some(team) = self.siege_map_team(completed_team) else {
+                    return;
+                };
+                let Some(objective) = team
+                    .objectives
+                    .iter()
+                    .find(|objective| objective.number == objective_number)
+                else {
+                    return;
+                };
+                let (message, sound) = if viewer_team == SIEGE_TEAM1 {
+                    (objective.message_team1.clone(), objective.sound_team1.clone())
+                } else {
+                    (objective.message_team2.clone(), objective.sound_team2.clone())
+                };
+                if !message.trim().is_empty() {
+                    self.client_game
+                        .push_notice(CgameNotice::SiegeCenterPrint(message.into_bytes()));
+                }
+                if !self.suppress_audio && !sound.trim().is_empty() {
+                    if let Some(presenter) = self.sound_presenter.as_mut() {
+                        presenter.play_announcer_sound(&[sound.as_str()]);
+                    }
+                }
+            }
+            E::EV_SIEGE_ROUNDOVER => {
+                let viewer_team = self.siege_viewer_team();
+                if !matches!(viewer_team, SIEGE_TEAM1 | SIEGE_TEAM2) {
+                    return;
+                }
+                let Some(team) = self.siege_map_team(viewer_team) else {
+                    return;
+                };
+                let won = event.parm == viewer_team;
+                let (message, sound) = if won {
+                    (team.won_round, team.roundover_sound_wewon)
+                } else {
+                    (team.lost_round, team.roundover_sound_welost)
+                };
+                if !message.trim().is_empty() {
+                    self.client_game
+                        .push_notice(CgameNotice::SiegeRoundMessage(message.into_bytes()));
+                }
+                if !self.suppress_audio && !sound.trim().is_empty() {
+                    if let Some(presenter) = self.sound_presenter.as_mut() {
+                        presenter.play_announcer_sound(&[sound.as_str()]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// EV_ITEM_PICKUP / EV_GLOBAL_ITEM_PICKUP for the viewer: HUD icon, "Picked
     /// up" line and weapon auto-select (`CG_ItemPickup`).
     pub(in crate::app) fn note_item_pickup(&mut self, event: &crate::cgame::PresentationEvent) {
@@ -521,11 +613,13 @@ impl GameSession {
         // this frame's player/body rendering. Event-worker preparation never
         // owns or mutates presenter state; ordered application stays here.
         self.player_presenter.apply_entity_event(&event);
+        self.entity_presenter.note_shield_hit(&event);
         self.note_out_of_ammo(&event);
         self.note_view_kick(&event);
         self.note_weapon_shake(&event);
         self.note_item_pickup(&event);
         self.note_hud_events(&event);
+        self.note_siege_events(&event);
         self.note_obituary(&event);
         self.note_kill_message(&event);
         self.note_stringed_messages(&event);

@@ -38,6 +38,10 @@ SAMPLE_RE = re.compile(
     r"view=\((-?\d+) (-?\d+) (-?\d+)\) yaw=(-?[\d.]+) pitch=(-?[\d.]+)"
 )
 MS_FIELD_RE = re.compile(r"(\w+)=(-?[\d.]+)ms")
+# [JKA OCEAN PERF] counters. The ocean clipmap is camera-centred, so these are
+# the numbers that show whether cost tracks what is actually on screen.
+OCEAN_TRIS_RE = re.compile(r"\[JKA OCEAN PERF\].*? triangles=(\d+)")
+OCEAN_DRAWN_RE = re.compile(r"\[JKA OCEAN PERF\].*? clipmaps\[visible=(\d+) drawn=(\d+)")
 
 
 @dataclass
@@ -224,7 +228,15 @@ def parse_log(lines, plan):
             "passes": {},
             "variant": None,
         }
-        per_second = {"acquire": [], "encode": [], "submit": [], "present": [], "encoded": []}
+        per_second = {
+            "acquire": [],
+            "encode": [],
+            "submit": [],
+            "present": [],
+            "encoded": [],
+            "ocean_tris": [],
+            "ocean_draws": [],
+        }
         passes = {}
         for line in window:
             if "[JKA PERF] fps=" in line:
@@ -237,6 +249,13 @@ def parse_log(lines, plan):
             elif "[JKA PERF GPU]" in line:
                 for name, value in MS_FIELD_RE.findall(line):
                     passes.setdefault(name, []).append(number(value))
+            elif "[JKA OCEAN PERF]" in line:
+                found = OCEAN_TRIS_RE.search(line)
+                if found:
+                    per_second["ocean_tris"].append(float(found.group(1)))
+                found = OCEAN_DRAWN_RE.search(line)
+                if found:
+                    per_second["ocean_draws"].append(float(found.group(2)))
             elif "[JKA PERF STATE]" in line:
                 found = re.search(r"pipeline_variant=(\S+)", line)
                 if found:
@@ -323,7 +342,7 @@ def build_report(plan, results, started, exe_info, log_dir):
         for case in plan.cases:
             runs = [launch[spot.name] for launch in results[case.name] if launch and spot.name in launch]
             if not runs:
-                rows.append([case.name, 0, "FAILED", "", "", "", "", "", "", ""])
+                rows.append([case.name, 0, "FAILED", "", "", "", "", "", "", "", "", ""])
                 warnings.append(f"{case.name}/{spot.name}: no sample in any launch (see {log_dir.name}/)")
                 continue
             views = [(r["yaw"], r["pitch"]) for r in runs]
@@ -341,13 +360,15 @@ def build_report(plan, results, started, exe_info, log_dir):
                 case.name, len(runs), fmt(fps_mean), f"{min(fps):.0f}..{max(fps):.0f}", f"{noise:.1f}",
                 fmt(ms, 3), f"{ms - baseline_ms:+.3f}", fmt(mean(r["gpu_frame"] for r in runs), 3),
                 fmt(mean(r["cpu_frame"] for r in runs), 3), fmt(mean(r["encoded"] for r in runs), 0),
+                fmt(mean(r["ocean_draws"] for r in runs), 1),
+                fmt(mean(r["ocean_tris"] for r in runs), 0),
             ])
             detail.append([
                 case.name, fmt(mean(r["acquire"] for r in runs), 3), fmt(mean(r["encode"] for r in runs), 3),
                 *[fmt(mean(r["passes"].get(p) for r in runs), 3) for p in pass_names],
                 next((r["variant"] for r in runs if r["variant"]), "--"),
             ])
-        out += table(rows, ["case", "n", "fps", "fps range", "noise%", "ms/frame", "dms", "gpu_ms", "cpu_ms", "draws"])
+        out += table(rows, ["case", "n", "fps", "fps range", "noise%", "ms/frame", "dms", "gpu_ms", "cpu_ms", "draws", "sea_draws", "sea_tris"])
         out.append("")
         out.append("per-pass GPU ms (needs r_gpuTimings 1; '--' otherwise), CPU acquire/encode, shader variant:")
         out += table(detail, ["case", "acquire", "encode", *pass_names, "variant"])

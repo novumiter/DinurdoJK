@@ -4,7 +4,8 @@ use crate::scene::{
     build_voxel_probe_gi, cache_reflection_decisions, can_fold_jka_lightmap_pair,
     canonical_map_shader, class_for, fs, is_utility_shader, load_movement, log_reflection_cache,
     map_asset_name, map_chunk_key, map_dynamic_lights, map_portal_surface_anchors,
-    map_spawn_points, map_world_lighting, map_worldspawn_distance_cull, mark_surfaces_from_batches,
+    map_spawn_points, map_world_effect_registrations, map_world_lighting,
+    map_worldspawn_distance_cull, mark_surfaces_from_batches,
     material_debug_info, material_uv_size, materials, planar_group_key, prepare,
     prepare_with_jobs_options, prepared_stages, push_face_triangles, reconstruct_source_brushes,
     render_position, retain_authored_planar_mirrors, shader_is_render_utility,
@@ -656,7 +657,10 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         .flatten();
 
     let mark_surfaces = mark_surfaces_from_batches(&vertices, &batches);
+    let world_effect_registrations = map_world_effect_registrations(&document.entities);
     Ok(PreparedMap {
+        coastal_bathymetry: None,
+        world_flares: Vec::new(),
         shader_library: Arc::new(library),
         shader_origins: Arc::new(library_debug.origins.clone()),
         sub_bsp_names: Vec::new(),
@@ -701,6 +705,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         warnings,
         spawns,
         fx_runners: Vec::new(),
+        world_effect_registrations,
         brush_entities: Vec::new(),
         entity_graph: None,
         distance_cull,

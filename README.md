@@ -12,6 +12,7 @@ AI tools were used extensively to create and modify this codebase. AI-generated 
 - Detects JAPRO servers and selects native JAPRO movement prediction. The Mod menu exposes movement preferences; see [mod support scope and review items](crates/jka-movement/MOD_SUPPORT.md).
 - Plays demos through the same CGame presentation path used for live sessions.
 - Loads user-provided Jedi Academy PK3 assets and BSP maps. No game assets are included.
+- Ships DinurdoJK's optional RainyGlass masks in `assets/dinurdo-assets.pk3`; the build output copies it into the runtime base directory.
 - Includes a native winit/wgpu renderer, Ghoul2 character rendering, world entities, effects, sabers, and a diagnostic tool (`jka-probe`). Compatibility and visual gaps remain.
 
 ## Near-term plan

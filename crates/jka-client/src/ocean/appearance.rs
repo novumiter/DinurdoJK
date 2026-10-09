@@ -7,8 +7,8 @@ use crate::{
 use jka_assets::shader::{AlphaGen, RgbGen, Shader, TcGen, TcMod};
 
 /// Ordinary promoted water should never collapse into an almost-flat sheet.
-pub const DEFAULT_PROMOTED_AMPLITUDE: f32 = 5.0;
-pub const MIN_PROMOTED_AMPLITUDE: f32 = 5.0;
+pub const DEFAULT_PROMOTED_AMPLITUDE: f32 = 10.0;
+pub const MIN_PROMOTED_AMPLITUDE: f32 = 10.0;
 /// Keep a small coherent Gerstner component so authored tcMod scroll can still
 /// steer the promoted swell while the GodotOceanWaves FFT field dominates.
 pub const DEFAULT_PROMOTED_FFT_BLEND: f32 = 0.95;
@@ -78,7 +78,7 @@ pub fn wave_heuristic(variation: f32, deformation: Option<f32>) -> WaveHeuristic
     };
     let amplitude = deformation
         .filter(|a| a.is_finite())
-        .unwrap_or(4.0 + 12.0 * v)
+        .unwrap_or(8.0 + 24.0 * v)
         .clamp(MIN_PROMOTED_AMPLITUDE, 16384.0);
     // Deforms can imply a stronger sea than the painted texture alone.
     let activity = v.max((amplitude / 64.0).clamp(0.0, 1.0));
@@ -219,6 +219,18 @@ pub struct PromotedOcean {
     pub swell_direction: Option<f32>,
 }
 
+// The source image contains baked highlights and foam. Treat its hue as a
+// color cue, not its brightness as the water body color. Applied only to
+// automatically promoted surfaces; manual pool colors remain untouched.
+fn promoted_water_color(color: [f32; 3]) -> [f32; 3] {
+    let peak = color.iter().copied().fold(0.0_f32, f32::max);
+    let floor = color.iter().copied().fold(1.0_f32, f32::min);
+    let saturation = if peak > 1.0e-6 { (peak - floor) / peak } else { 0.0 };
+    let target_saturation = (saturation * 1.35).min(1.0);
+    let scale = if saturation > 1.0e-6 { target_saturation / saturation } else { 1.0 };
+    color.map(|channel| (0.60 * (peak + (channel - peak) * scale)).clamp(0.0, 1.0))
+}
+
 impl PromotedOcean {
     pub fn settings(&self, mut shared: super::OceanSettings) -> super::OceanSettings {
         shared.authored.amplitude = self.heuristic.amplitude;
@@ -231,8 +243,8 @@ impl PromotedOcean {
         }
         shared.authored.wind_chop = self.heuristic.chop;
         shared.authored.foam = self.heuristic.foam;
-        shared.normal_strength = 0.5 + 0.5 * self.heuristic.variation;
-        shared.water_color = self.color;
+        // Keep the global normal-strength setting rather than weakening promoted water.
+        shared.water_color = promoted_water_color(self.color);
         shared.roughness = self.roughness.unwrap_or(shared.roughness);
         shared.bounds = None;
         shared
@@ -258,6 +270,7 @@ pub fn surface_settings(
 ) -> super::OceanSettings {
     let mut settings = local.unwrap_or_else(|| descriptor.settings(shared));
     settings.map_size = shared.map_size;
+    settings.simulate_when_hidden = shared.simulate_when_hidden;
     settings.updates_per_second = shared.updates_per_second;
     settings.mesh_quality = shared.mesh_quality;
     settings.cascades = shared.cascades;

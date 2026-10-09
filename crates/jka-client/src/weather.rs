@@ -1,12 +1,16 @@
+mod atmosphere;
 mod cpu_field;
 mod field;
 pub(crate) mod fog;
 mod rain;
 mod rain_glass;
+mod snow;
+mod wind_visuals;
 pub(crate) mod wake;
 #[cfg(test)]
 pub(crate) use rain::layout_tests as rain_layout;
 
+pub(crate) use atmosphere::AtmosphereSystem;
 pub(crate) use fog::{FogSystem, FroxelUniform, FROXEL_X, FROXEL_Y, FROXEL_Z};
 pub(crate) use rain::{
     rain_haze_mask_dimensions, RainSystem, WeatherOcclusionCache, WeatherSurfaceEnvironment,
@@ -14,6 +18,8 @@ pub(crate) use rain::{
     RAIN_PUDDLE_EPSILON, RAIN_SKY_BLEND_CEILING, RAIN_SKY_BLEND_WINDOW, RAIN_WETNESS_EPSILON,
     RAIN_WETNESS_FADE_END, RAIN_WETNESS_FADE_START,
 };
+pub(crate) use snow::SnowSystem;
+pub(crate) use wind_visuals::WindVisualSystem;
 
 const WEATHER_SURFACE_WGSL: &str = include_str!("weather_surface.wgsl");
 const WEATHER_SURFACE_WORLD_WGSL: &str = include_str!("weather_surface_world.wgsl");
@@ -64,7 +70,10 @@ pub(crate) fn with_world_weather(base: &str) -> String {
 
 pub(crate) struct WeatherSystem {
     pub rain: RainSystem,
+    pub snow: SnowSystem,
+    pub atmosphere: AtmosphereSystem,
     pub fog: FogSystem,
+    pub wind_visuals: WindVisualSystem,
 }
 
 impl WeatherSystem {
@@ -76,16 +85,43 @@ impl WeatherSystem {
         sample_count: u32,
         wind_noise_texture: &wgpu::Texture,
     ) -> Self {
+        let rain = RainSystem::new(
+            device,
+            queue,
+            camera_layout,
+            surface_format,
+            sample_count,
+            wind_noise_texture,
+        );
+        let snow = SnowSystem::new(
+            device,
+            camera_layout,
+            surface_format,
+            sample_count,
+            rain.collision_view(),
+            &rain.gpu.wind_noise_view,
+            &rain.gpu.wind_noise_sampler,
+        );
+        let wind_visuals = WindVisualSystem::new(
+            device,
+            camera_layout,
+            surface_format,
+            sample_count,
+            rain.collision_view(),
+            &rain.gpu.wind_noise_view,
+            &rain.gpu.wind_noise_sampler,
+        );
         Self {
-            rain: RainSystem::new(
+            rain,
+            snow,
+            atmosphere: AtmosphereSystem::new(
                 device,
-                queue,
                 camera_layout,
                 surface_format,
                 sample_count,
-                wind_noise_texture,
             ),
             fog: FogSystem::new(device),
+            wind_visuals,
         }
     }
 }

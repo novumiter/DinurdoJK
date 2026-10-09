@@ -9,6 +9,7 @@ impl App {
         allow_asset_overrides: bool,
     ) -> Result<
         (
+            jka_assets::siege::SiegeCatalog,
             Vec<jka_assets::siege::SiegeClassVisual>,
             PlayerPresenter,
             EntityPresenter,
@@ -23,12 +24,13 @@ impl App {
             })
         };
         let mut assets = open().map_err(|error| format!("ASSET PATH ERROR: {error}"))?;
-        let siege_classes = jka_assets::siege::load_siege_class_visuals(&mut assets)
-            .map_err(|error| format!("SIEGE CLASS LOAD ERROR: {error}"))?;
+        let siege_catalog = jka_assets::siege::load_siege_catalog(&mut assets)
+            .map_err(|error| format!("SIEGE DATA LOAD ERROR: {error}"))?;
+        let siege_classes = siege_catalog.visuals();
         devprintln!(
             1,
-            "CGAME: loaded {} Siege class definition(s)",
-            siege_classes.len()
+            "CGAME: loaded {} Siege classes, {} teams, {} maps",
+            siege_catalog.classes.len(), siege_catalog.teams.len(), siege_catalog.maps.len()
         );
         let player_presenter = PlayerPresenter::new(assets, pbr)
             .map_err(|error| format!("PLAYER ASSET ERROR: {error}"))?;
@@ -36,7 +38,7 @@ impl App {
         let entity_presenter = EntityPresenter::new(entity_assets, pbr)
             .map_err(|error| format!("ENTITY ASSET ERROR: {error}"))?;
         let fx_assets = open().map_err(|error| format!("FX ASSET PATH ERROR: {error}"))?;
-        Ok((siege_classes, player_presenter, entity_presenter, fx_assets))
+        Ok((siege_catalog, siege_classes, player_presenter, entity_presenter, fx_assets))
     }
 
     /// CL_InitCGame's asset side: Siege classes and the player, entity, FX
@@ -47,7 +49,7 @@ impl App {
         source: String,
         demo_bytes: Vec<u8>,
     ) -> Result<GameSession, String> {
-        let (siege_classes, player_presenter, entity_presenter, fx_assets) =
+        let (siege_catalog, siege_classes, player_presenter, entity_presenter, fx_assets) =
             Self::build_cgame_cpu_assets(
                 &self.base,
                 self.game.as_deref(),
@@ -58,12 +60,15 @@ impl App {
             qpath,
             source,
             demo_bytes,
+            siege_catalog,
             siege_classes,
             player_presenter,
             entity_presenter,
             crate::cgame::weapon_fx::WeaponFx::new(fx_assets),
             self.forced_player_models.clone(),
         );
+        session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+        session.set_fx_light_promotion_catalog(Arc::clone(&self.fx_light_promotion_catalog));
         session
             .weapon_fx
             .set_modern_sabers(self.video.modern_sabers);
@@ -98,6 +103,7 @@ impl App {
             self.video.fx_count_scale,
             self.video.fx_lod_scale,
         );
+        session.promote_fx_lights = self.video.promote_fx_lights;
         session.apply_client_options(
             self.screen_shake,
             self.audio.game,
@@ -113,6 +119,7 @@ impl App {
                     self.audio.steam_audio_binaural,
                     self.audio.steam_audio_environmental,
                 );
+                sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);
@@ -177,14 +184,26 @@ impl App {
     /// Enqueue the latest authoritative local state exactly where a decoded
     /// `svc_snapshot` would enter a network GameSession.
     pub(in crate::app) fn push_local_snapshot(&mut self, force: bool) {
-        let snapshot = self
-            .local_server
-            .as_mut()
-            .and_then(|server| server.take_snapshot(force));
-        let Some(snapshot) = snapshot else { return };
-        let Some(session) = self.game_session.as_mut().filter(|session| session.local) else {
+        // Keep the local authority on the same ordering as CL_ParseServerMessage:
+        // reliable server commands are made visible to CGame before the snapshot
+        // that advances `server_command_num` and executes them.
+        if !self.game_session.as_ref().is_some_and(|session| session.local) {
             return;
+        }
+        let (commands, snapshot) = {
+            let Some(server) = self.local_server.as_mut() else { return };
+            let snapshot = server.take_snapshot(force);
+            let commands = server.drain_server_commands();
+            (commands, snapshot)
         };
+        let session = self
+            .game_session
+            .as_mut()
+            .expect("local game session checked above");
+        for command in commands {
+            session.client_game.queue_server_command(command);
+        }
+        let Some(snapshot) = snapshot else { return };
         if session.live_snapshots.len() >= 128 {
             session.live_snapshots.pop_front();
         }
@@ -193,6 +212,8 @@ impl App {
     }
 
     pub(in crate::app) fn sync_local_client_info(&mut self) {
+        self.solo_client_info.female = self.network.sex.as_bytes().first()
+            .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'f'));
         let saber_movement = self.load_local_saber_movement();
         let value = {
             let Some(server) = self.local_server.as_mut() else {
@@ -228,6 +249,7 @@ impl App {
                     self.audio.steam_audio_binaural,
                     self.audio.steam_audio_environmental,
                 );
+                sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);

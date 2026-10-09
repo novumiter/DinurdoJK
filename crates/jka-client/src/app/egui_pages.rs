@@ -914,56 +914,113 @@ impl App {
         );
     }
 
-    /// Quick spectator actions on the Game page while spectating a server.
-    pub(super) fn egui_spectator_actions(&mut self, ui: &mut egui::Ui) {
-        if !self.is_spectating_live() {
-            return;
-        }
-        theme::section(ui, "SPECTATING", "Choose who to watch.");
-        ui.horizontal_wrapped(|ui| {
-            if theme::ghost_button(ui, "FOLLOW FASTEST").clicked() {
-                self.follow_fastest_now();
-            }
-            if theme::ghost_button(ui, "NEXT PLAYER").clicked() {
-                self.forward_command_to_server("follownext");
-            }
-            if theme::ghost_button(ui, "PREVIOUS PLAYER").clicked() {
-                self.forward_command_to_server("followprev");
-            }
-        });
-        let targets = self.companion_spectator_targets();
+    /// Companion window selector on the Join page. This is the single control
+    /// for opening/closing the companion and choosing its optional second POV.
+    pub(super) fn egui_companion_window_selector(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.companion_enabled();
         let current_target = self.companion_scene_target;
-        let selected_text = current_target
-            .map(|client| crate::logging::strip_jka_colors(&self.companion_scene_target_name(client)))
-            .unwrap_or_else(|| "Dashboard".to_owned());
-        let mut next_target = current_target;
+        let targets = self.companion_spectator_targets();
+        let selected_text = if !enabled {
+            "Off".to_owned()
+        } else {
+            current_target
+                .map(|client| {
+                    crate::logging::strip_jka_colors(&self.companion_scene_target_name(client))
+                })
+                .unwrap_or_else(|| "Dashboard".to_owned())
+        };
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum CompanionChoice {
+            Off,
+            Dashboard,
+            Player(i32),
+        }
+
+        let current_choice = if !enabled {
+            CompanionChoice::Off
+        } else {
+            current_target.map_or(CompanionChoice::Dashboard, CompanionChoice::Player)
+        };
+        let mut next_choice = current_choice;
         theme::row(
             ui,
-            "Companion spectator view",
-            "Show a second player's POV on the companion monitor. Only players present in your current spectator snapshot/PVS are available; the companion itself stays passive.",
+            "Companion window",
+            "Open the second-monitor companion as a passive dashboard, close it, or while spectating use a player as its second POV.",
             theme::Reset::None,
             |ui| {
-                egui::ComboBox::from_id_salt("companion_spectator_view")
+                egui::ComboBox::from_id_salt("companion_window_mode")
                     .selected_text(selected_text)
                     .width(190.0)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(next_target.is_none(), "Dashboard").clicked() {
-                            next_target = None;
+                        if ui
+                            .selectable_label(next_choice == CompanionChoice::Off, "Off")
+                            .clicked()
+                        {
+                            next_choice = CompanionChoice::Off;
+                        }
+                        if ui
+                            .selectable_label(next_choice == CompanionChoice::Dashboard, "Dashboard")
+                            .clicked()
+                        {
+                            next_choice = CompanionChoice::Dashboard;
                         }
                         for (client, name) in &targets {
                             let label = crate::logging::strip_jka_colors(name);
                             if ui
-                                .selectable_label(next_target == Some(*client), label)
+                                .selectable_label(next_choice == CompanionChoice::Player(*client), label)
                                 .clicked()
                             {
-                                next_target = Some(*client);
+                                next_choice = CompanionChoice::Player(*client);
                             }
                         }
                     });
             },
         );
-        if next_target != current_target {
-            self.set_companion_scene_target(next_target);
+
+        if next_choice != current_choice {
+            match next_choice {
+                CompanionChoice::Off => self.set_companion_enabled(false),
+                CompanionChoice::Dashboard => {
+                    self.set_companion_enabled(true);
+                    self.set_companion_scene_target(None);
+                }
+                CompanionChoice::Player(client) => {
+                    self.set_companion_scene_target(Some(client));
+                }
+            }
+        }
+    }
+
+    /// Quick spectator/demo actions on the Join page while watching players.
+    pub(super) fn egui_spectator_actions(&mut self, ui: &mut egui::Ui) {
+        let live_spectator = self.is_spectating_live();
+        let demo = self.demo_playback_active();
+        if !live_spectator && !demo {
+            return;
+        }
+        theme::section(
+            ui,
+            if demo { "DEMO VIEW" } else { "SPECTATING" },
+            if demo {
+                "Options while watching this demo."
+            } else {
+                "Spectator presentation and automatic follow options."
+            },
+        );
+        theme::row(
+            ui,
+            "Player outlines",
+            "cg_specHud. Outline other living players through walls. Team players are red/blue; neutral/FFA players are yellow.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(on) = theme::switch(ui, self.japro_cg.spec_hud) {
+                    let _ = self.set_console_cvar("cg_specHud", if on { "1" } else { "0" });
+                }
+            },
+        );
+        if !live_spectator {
+            return;
         }
         let capture = self
             .game_session
@@ -980,16 +1037,6 @@ impl App {
                 }
             });
         }
-        if let Some(mode) = segmented_row(
-            ui,
-            "Camera",
-            "Your local spectator camera while following a player. First person uses their POV; Third person uses the normal collision-aware chase camera; Orbit lets you rotate freely around them with the mouse and zoom with the wheel.",
-            theme::Reset::None,
-            self.spectator_camera.mode.as_i32(),
-            &[(0, "First person"), (1, "Third person"), (2, "Orbit")],
-        ) {
-            let _ = self.set_console_cvar("cg_thirdPerson", &mode.to_string());
-        }
         theme::row(
             ui,
             "Face direction of motion",
@@ -999,29 +1046,6 @@ impl App {
                 ui.add_enabled_ui(self.spectator_camera.mode == crate::camera::SpectatorCameraMode::ThirdPerson, |ui| {
                     if let Some(on) = theme::switch(ui, self.spectator_camera.motion_direction) {
                         let _ = self.set_console_cvar("cg_specCameraMotion", if on { "1" } else { "0" });
-                    }
-                });
-            },
-        );
-        theme::row(
-            ui,
-            "Orbit distance",
-            "cg_specOrbitRange. Starting/current orbit distance. While Orbit is active and the game has mouse capture, the scroll wheel changes this directly.",
-            theme::Reset::None,
-            |ui| {
-                ui.add_enabled_ui(self.spectator_camera.mode == crate::camera::SpectatorCameraMode::Orbit, |ui| {
-                    let mut range = self.spectator_camera.orbit_range;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut range)
-                                .range(crate::camera::MIN_SPECTATOR_ORBIT_RANGE..=crate::camera::MAX_SPECTATOR_ORBIT_RANGE)
-                                .speed(2.0)
-                                .max_decimals(1)
-                                .update_while_editing(false),
-                        )
-                        .changed()
-                    {
-                        let _ = self.set_console_cvar("cg_specOrbitRange", &range.to_string());
                     }
                 });
             },

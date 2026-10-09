@@ -1,7 +1,8 @@
 //! Session advance.
 use crate::app::{
     event_debug, event_workers, local_player_alpha, playerstate_vec3, race_ghost,
-    rendering_third_person, scene, snapshot_discontinuity, snapshot_owns_playerstate_events, Arc,
+    attacker_damage_transition, rendering_third_person, scene, snapshot_discontinuity,
+    snapshot_owns_playerstate_events, Arc,
     ClientFramePerf, DemoAdvance, DemoCameraSample, EventCheckDisposition, GameSession,
     Ghoul2PresentationView, Instant, LivePredictionFrame, PlayerPresentationInput, PresentedEntity,
     ProtocolSnapshot, SessionPhase, SpectatorCameraMode, SpectatorCameraSettings, ThirdPersonSettings,
@@ -158,6 +159,11 @@ impl GameSession {
         {
             if let (Some(current), Some(next)) = (&self.current_snapshot, &self.next_snapshot) {
                 camera_teleported |= snapshot_discontinuity(current, next);
+                // CG_TransitionPlayerState -> CG_DamageFeedback -> cg.attackerTime.
+                // Server damageEvent/count already exist in our protocol PlayerState.
+                if attacker_damage_transition(&current.player_state, &next.player_state) {
+                    self.attacker_damage_seen = true;
+                }
                 // TaystJK CG_TransitionSnapshot: when client-side movement
                 // prediction does not own the presented playerState, committed
                 // snapshots must drive CG_TransitionPlayerState themselves.
@@ -221,6 +227,10 @@ impl GameSession {
             _ => None,
         };
         if let Some(prediction) = &predicted {
+            // Apply the same CG_DamageFeedback gate to predicted presentation.
+            if attacker_damage_transition(&prediction.previous_display, &prediction.display) {
+                self.attacker_damage_seen = true;
+            }
             // CG_TransitionPlayerState / CG_CheckPlayerstateEvents on the state
             // being presented, so events land on the frame they are drawn.
             self.client_game.transition_predicted_player_state(
@@ -254,6 +264,12 @@ impl GameSession {
         // person needs collision/orbit state owned by App, so it uses the previous
         // rendered third-person camera as a one-frame hint. Never reuse that hint
         // across a teleport/snapshot discontinuity.
+        // `sample` is still sourced from the snapshot playerState in demos even
+        // when presentation has detached from that player. Keep camera mode and
+        // first-person body ownership separate: fake-follow and freecam must not
+        // hide the recorder merely because its playerState supplied the sample.
+        let presentation_client = self.client_game.presentation_client_num();
+        let sample_owns_camera = presentation_client == Some(sample.client_num);
         let sample_third_person = if self.live && sample.following {
             spectator_camera.mode != SpectatorCameraMode::FirstPerson
         } else if let Some(mode) = self.demo_spectator_camera_mode {
@@ -472,6 +488,35 @@ impl GameSession {
         self.client_perf.events_ms = events_started.elapsed().as_secs_f64() * 1000.0;
 
         self.player_position = Some(glam::Vec3::from_array(sample.player_position));
+        // Presentation records, once per entity rather than once per model
+        // surface. Explicit identity also covers first/third-person prediction.
+        let actors = Arc::make_mut(&mut self.ocean_actors);
+        actors.clear();
+        if self.ocean_interaction_enabled {
+        if sample.policy.pm_type < 2 && self.presented_player_state.as_ref()
+            .is_none_or(|ps| ps.field_i32("m_iVehicleNum").unwrap_or(0) == 0) {
+            actors.push(crate::ocean::interaction::ActorSample {
+                id: sample.client_num as u16, origin: sample.player_position,
+                velocity: Some(scene::render_position(sample.velocity)),
+                head_height: sample.view_height as f32, time_ms: target_server_time,
+                continuity: self.presented_player_state.as_ref().and_then(|ps| ps.field_i32("eFlags")).unwrap_or(0) & 8,
+            });
+        }
+        for entity in self.presented_entities.iter().filter(|e| e.entity_type == 1) {
+            if actors.len() >= 64 { break; }
+            if actors.iter().any(|a| a.id == entity.number)
+                || entity.state.field_i32("eFlags").unwrap_or(0) & 1 != 0
+                || entity.state.field_i32("m_iVehicleNum").unwrap_or(0) != 0 { continue; }
+            if self.client_game.client_info(usize::from(entity.number), &self.siege_classes).is_some_and(|info| info.team == 3) { continue; }
+            actors.push(crate::ocean::interaction::ActorSample {
+                id: entity.number, origin: scene::render_position(entity.origin), head_height: 26.0,
+                velocity: match [entity.state.field_f32("pos.trDelta[0]"),entity.state.field_f32("pos.trDelta[1]"),entity.state.field_f32("pos.trDelta[2]")] {
+                    [Some(x),Some(y),Some(z)]=>Some(scene::render_position([x,y,z])), _=>None,
+                },
+                time_ms: target_server_time, continuity: entity.state.field_i32("eFlags").unwrap_or(0) & 8,
+            });
+        }
+        }
         self.update_race_timer(target_server_time);
         // CG_AddLagometerFrameInfo: cg.time - cg.latestSnapshotTime, where the latest
         // snapshot is the newest one received, not just the newest one read.
@@ -515,13 +560,16 @@ impl GameSession {
             local_force_gripped,
             target_server_time,
         );
-        // PMF_TIME_KNOCKBACK is available only for the local/followed
-        // playerState. Remote victims are confirmed from event-correlated
-        // entity trajectory changes inside PlayerPresenter.
+        // PMF_TIME_KNOCKBACK is available only for our local/followed
+        // playerState (not for remote entityState). Read the received snapshot,
+        // rather than the predicted/display state, for server-owned evidence.
         const PMF_TIME_KNOCKBACK: i32 = 64;
         let local_knockback = self
-            .presented_player_state()
-            .is_some_and(|ps| ps.field_i32("pm_flags").unwrap_or(0) & PMF_TIME_KNOCKBACK != 0);
+            .current_snapshot
+            .as_ref()
+            .is_some_and(|snap| {
+                snap.player_state.field_i32("pm_flags").unwrap_or(0) & PMF_TIME_KNOCKBACK != 0
+            });
         self.player_presenter.prepare_impulse_ragdolls(
             &self.presented_entities,
             followed_entity.as_ref(),
@@ -592,6 +640,18 @@ impl GameSession {
             &self.client_game,
             sphere_view_origin,
         ));
+        // CG_PlayerHitFX: armor-absorbed hits flash a half-shield on the victim
+        // (never on your own first-person body).
+        dynamic_models.extend(self.entity_presenter.present_shield_hits(
+            &self.presented_entities,
+            followed_entity.as_ref(),
+            target_server_time,
+            if sample_owns_camera && !sample_third_person {
+                followed_entity_num
+            } else {
+                None
+            },
+        ));
         self.client_perf.player_present_ms =
             player_present_started.elapsed().as_secs_f64() * 1000.0;
         // EternalJK keeps the local Ghoul2 instance active for first-person
@@ -603,11 +663,16 @@ impl GameSession {
         // EternalJK only applies cg_fpls to the local non-followed player;
         // spectator/follow presentation disables it rather than putting the
         // followed player's Ghoul2 instance around the camera.
-        let first_person_saber = !sample_third_person
+        let first_person_saber = sample_owns_camera
+            && !sample_third_person
             && first_person_lightsaber
             && !sample.following
             && matches!(sample.policy.weapon, WP_MELEE | WP_SABER);
-        let render_followed_body = sample_third_person || first_person_saber;
+        // The snapshot/predicted entity is special only while it actually owns
+        // the camera. In demo fake-follow and freecam it is just another world
+        // player and must be submitted so spectator outlines (and ordinary world
+        // rendering) can see it.
+        let render_followed_body = !sample_owns_camera || sample_third_person || first_person_saber;
         let followed_started = Instant::now();
         let intermission = sample.policy.pm_type == crate::cgame::PM_INTERMISSION;
         if let Some(entity) = followed_entity
@@ -678,7 +743,8 @@ impl GameSession {
                     // The bg_itemlist view_model is attached to the invisible
                     // _hand.md3 tag parent with RF_DEPTHHACK semantics.
                     const TEAM_SPECTATOR: i32 = 3;
-                    if !sample_third_person
+                    if sample_owns_camera
+                        && !sample_third_person
                         && sample.policy.team != TEAM_SPECTATOR
                         && !intermission
                         && sample.policy.zoom_mode == 0
@@ -823,7 +889,7 @@ impl GameSession {
                 .footstep(&impact, stages, self.local && impact.entity < 32);
         }
         // FX_AddScheduledEffects + FX_Add after every CGame submission.
-        let fx_frame = self.weapon_fx.end_frame();
+        let mut fx_frame = self.weapon_fx.end_frame();
         if self.screen_shake_level >= 1 {
             let view = scene::jka_position(sample.eye_position);
             for shake in &fx_frame.shakes {
@@ -835,6 +901,13 @@ impl GameSession {
                     shake.time_ms,
                 );
             }
+        }
+        if self.promote_fx_lights && !fx_frame.auto_light_candidates.is_empty() {
+            let promoter = &mut self.fx_light_promoter;
+            let presenter = &mut self.entity_presenter;
+            let mut resolve = |shader: &str| presenter.fx_material_stages(shader);
+            let promoted = promoter.promote(&fx_frame.auto_light_candidates, &mut resolve);
+            fx_frame.lights.extend(promoted);
         }
         self.fx_draws = fx_frame.draws;
         self.fx_blades = Arc::new(
@@ -863,10 +936,15 @@ impl GameSession {
                     position: scene::render_position(light.origin),
                     color: light.rgb.map(|value| value.max(0.0)),
                     radius: light.radius,
+                    source_radius: light.source_radius.max(0.0),
                     // OpenJK's FX primitive passes RGB plus radius to
                     // RE_AddLightToScene; the renderer's point-light intensity
                     // scale of 1.0 is the matching neutral source strength.
                     intensity: 1.0,
+                    spot: light.spot.map(|spot| crate::fx::system::FxSpotLight {
+                        direction: scene::render_position(spot.direction),
+                        ..spot
+                    }),
                     segment: light.segment.map(|ends| ends.map(scene::render_position)),
                     blade_segments: light.blade_segments.as_ref().map(|blades| {
                         blades

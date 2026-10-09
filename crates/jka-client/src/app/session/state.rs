@@ -6,6 +6,14 @@ use crate::app::{
 };
 
 impl GameSession {
+    pub(in crate::app) fn set_fx_light_promotion_catalog(
+        &mut self,
+        catalog: Arc<crate::fx::light_promotion::FxLightPromotionCatalog>,
+    ) {
+        self.fx_light_promoter.set_catalog(Arc::clone(&catalog));
+        self.weapon_fx.set_light_promotion_catalog(catalog);
+    }
+
     /// Push the app-level client options every presenter of this session reads.
     pub(in crate::app) fn apply_client_options(
         &mut self,
@@ -83,6 +91,7 @@ impl GameSession {
         qpath: String,
         source: String,
         bytes: Vec<u8>,
+        siege_catalog: jka_assets::siege::SiegeCatalog,
         siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
         player_presenter: PlayerPresenter,
         entity_presenter: EntityPresenter,
@@ -128,10 +137,17 @@ impl GameSession {
             demo_hidden_view_client: None,
             demo_spectator_camera_mode: None,
             client_deaths: [0; 32],
+            attacker_damage_seen: false,
             player_position: None,
+            ocean_actors: Arc::new(Vec::new()),
+            ocean_interaction_enabled: false,
             presented_player_state: None,
             client_game: ClientGameState::new(),
+            siege_catalog,
             siege_classes,
+            siege_extended: [super::types::SiegeExtendedClient::default(); 32],
+            siege_respawn_time: 0,
+            siege_last_countdown: 0,
             presented_entities: Vec::new(),
             audio_followed_entity: None,
             predicted_saber_cache: None,
@@ -161,6 +177,8 @@ impl GameSession {
             follow_fastest: crate::japro_cg::FollowFastest::default(),
             sound_presenter: None,
             weapon_fx,
+            fx_light_promoter: crate::fx::light_promotion::FxLightPromoter::default(),
+            promote_fx_lights: false,
             fx_draws: Vec::new(),
             fx_lights: Arc::new(Vec::new()),
             fx_blades: Arc::new(Vec::new()),

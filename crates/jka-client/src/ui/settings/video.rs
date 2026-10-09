@@ -112,7 +112,8 @@ pub struct VideoSettings {
     pub ragdoll_lifetime: f32,
     pub ragdoll_self_collision: bool,
     /// Profile-driven post-Ghoul2 soft-tissue secondary motion.
-    pub jiggle_physics: bool,
+    /// 0 off, 1 female, 2 male, 3 both (reported player sex).
+    pub jiggle_physics: u8,
     /// 0 = KawaiiPhysics-derived point solver, 1 = naelstrof/JigglePhysics Verlet solver.
     pub jiggle_solver: u8,
     pub jiggle_strength: f32,
@@ -120,7 +121,37 @@ pub struct VideoSettings {
     pub jiggle_glute_strength: f32,
     pub jiggle_stiffness: f32,
     pub jiggle_damping: f32,
+    /// Deprecated legacy normalized remesh control kept for config compatibility.
+    pub jiggle_glute_coverage_height: f32,
+    /// Legacy normalized lower-trim cvar retained for config compatibility; the
+    /// explicit world-unit Z controls below own remesh/motion height tuning.
     pub jiggle_glute_lift: f32,
+    /// Signed model-space Z offsets, in JKA units, from the automatically fitted
+    /// breast/glute remesh bounds. Bottom + raises the lower edge; top + raises
+    /// the upper edge. These affect cached promoted topology only.
+    pub jiggle_breast_remesh_bottom_z: f32,
+    pub jiggle_breast_remesh_top_z: f32,
+    pub jiggle_glute_remesh_bottom_z: f32,
+    pub jiggle_glute_remesh_top_z: f32,
+    /// Signed model-space Z offsets, in JKA units, from the default glute motion
+    /// envelope. These affect deformation weighting only, never topology.
+    pub jiggle_glute_jiggle_bottom_z: f32,
+    pub jiggle_glute_jiggle_top_z: f32,
+    /// Peak bind-pose mass added at the breast/glute region center, JKA units.
+    /// Baked into the promoted jiggle mesh (rebuilds player models).
+    pub jiggle_breast_size: f32,
+    pub jiggle_glute_size: f32,
+    /// Origin-acceleration kick multiplier; steady travel never contributes.
+    pub jiggle_locomotion: f32,
+    /// Locomotion impulse ceiling per 60 Hz step; scaled for r_physicsHz.
+    pub jiggle_impulse_cap: f32,
+    /// Gyroscopic orbit coupling, 0 = straight bounce.
+    pub jiggle_swirl: f32,
+    /// Per-region KawaiiPhysics multipliers stacked on jiggle_stiffness/damping.
+    pub jiggle_breast_stiffness: f32,
+    pub jiggle_breast_damping: f32,
+    pub jiggle_glute_stiffness: f32,
+    pub jiggle_glute_damping: f32,
     pub jiggle_jp_stiffness: f32,
     pub jiggle_jp_drag: f32,
     pub jiggle_jp_air_drag: f32,
@@ -181,6 +212,8 @@ pub struct VideoSettings {
     pub fxaa: bool,
     pub smaa: bool,
     pub taa: bool,
+    /// 0 off, 1 regional temporal resolve, 2 influence-mask debug. Retains MSAA.
+    pub rt_taa: u32,
     pub contact_shadows: bool,
     pub fog_mode: FogMode,
     pub fog_strength: f32,
@@ -201,6 +234,8 @@ pub struct VideoSettings {
     pub entity_sun_lighting: bool,
     /// 0 = map/default distanceCull; otherwise multiplier applied to that base.
     pub distance_cull_scale: f32,
+    /// Experimental Star Nest procedural override of map-authored sky faces.
+    pub sky_fractal_override: bool,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,
@@ -209,7 +244,11 @@ pub struct VideoSettings {
     pub cloud_thickness: f32,
     pub cloud_shadows: bool,
     /// One authoritative atmospheric wind shared by clouds, precipitation, grass, and ocean.
-    pub weather_wind: crate::ocean::OceanWind,
+    pub weather_wind: crate::ocean::AtmosphericWind,
+    /// Strength of camera-centred dust/motes and sparse gust wisps that make the shared atmospheric wind visible.
+    pub wind_visuals: f32,
+    /// Archived weather choice (`r_we`), independent of server world effects.
+    pub weather_type: crate::world_effects::WeatherType,
     pub rain: bool,
     pub rain_intensity: RainIntensity,
     /// Rain on the camera's own lens: the RainyGlass droplet/rivulet refraction
@@ -221,6 +260,24 @@ pub struct VideoSettings {
     /// Strength of the wet-weather colour grade (cool shadows, warm highlights,
     /// richer neon) while it rains, 0..1.
     pub rain_grade: f32,
+    /// Runtime A/B: omit rain's depth-aware haze/full spatial post requirement.
+    /// Rain particles and wet world shading remain; rain haze/grade/final puddle post treatment is omitted.
+    pub rain_fast_post: bool,
+    /// Runtime A/B: use a prebaked map-space water-height field in the rain compute shader
+    /// instead of scanning promoted-water volumes/outline triangles per drop.
+    pub rain_water_field: bool,
+    /// Runtime A/B: cheap radius math plus early center-point clip rejection in rain VS.
+    pub rain_fast_vertex: bool,
+    /// Runtime A/B: rain-only prepass writes only linear depth instead of motion/reflection MRTs.
+    pub rain_lean_depth: bool,
+    /// Runtime A/B: skip dynamic models in a rain-only depth prepass.
+    pub rain_static_depth: bool,
+    /// Runtime A/B: skip alpha-tested BSP in a rain-only depth prepass.
+    pub rain_opaque_depth: bool,
+    /// Runtime A/B: keep dynamic models in lean rain depth using R32-only entity pipelines.
+    pub rain_lean_models: bool,
+    /// Runtime A/B: use a rain-only specialized fullscreen post shader.
+    pub rain_lean_post: bool,
     pub footprints: FootprintMode,
     pub grass: bool,
     /// Runtime A/B diagnostic: hoist root wind/clump work to a compute pass.
@@ -280,7 +337,19 @@ pub struct VideoSettings {
     pub hiz_occlusion: bool,
     pub entity_ambient_lighting: EntityAmbientLightingMode,
     pub dynamic_lights: DynamicLightsMode,
+    /// Diagnostic receiver view: neutral dark BSP surfaces plus runtime dynamic-light contribution only.
+    pub dynamic_light_debug: bool,
+    /// Infer transient lights from emissive legacy EFX that omit Light{} stages.
+    pub promote_fx_lights: bool,
+    /// Master for BSP shader-driven area-light promotion. q3map_surfacelight is
+    /// intentionally separate and remains controlled by emissive_area_lights.
+    pub promote_shader_lights: bool,
+    pub promote_shader_glow: bool,
+    pub promote_shader_additive: bool,
+    pub promote_shader_emissive: bool,
     pub rt_samples: u32,
+    /// 0 Off, 1 temporal, 2 SVGF; currently only direct RT sun radiance.
+    pub rt_denoiser_mode: u32,
     /// 0 = stock JKA 1 - d^2/r^2, 1 = windowed inverse-square.
     pub dynamic_light_falloff: u32,
     pub rt_half_resolution: bool,
@@ -295,9 +364,15 @@ pub struct VideoSettings {
     /// Optional continuous-ribbon saber presentation. False keeps the OpenJK-style
     /// RT_SABER_GLOW sprite chain + RT_LINE core.
     pub modern_sabers: bool,
-    /// Screen-space flare overlays such as the OpenJK saber clash flash.
-    /// This does not disable the underlying impact FX, sounds, or marks.
+    /// Standard OpenJK/TaystJK `r_flares`: authored RBSP MST_FLARE world flares.
     pub flares: bool,
+    /// Experiment: permit conservative reverse-lightmap pair fusion when the
+    /// CPU world-material recipe is rebuilt from its retained baseline.
+    pub stage_collapse_extra: bool,
+    /// Optional world-flare override; either world cvar enables the same renderer.
+    pub world_flares: bool,
+    /// Screen-space saber clash flare overlay, separate from authored hit EFX.
+    pub saber_flares: bool,
     /// Authored saber-hit/block EFX presentation. The FX system retains tagged
     /// live primitives so this can be A/B toggled on a paused demo frame.
     pub saber_impact_fx: bool,
@@ -320,12 +395,28 @@ pub struct VideoSettings {
     pub dynamic_shadows: DynamicShadowsMode,
     pub entity_shadow_light: EntityShadowLight,
     pub local_light_shadows: bool,
+    /// Experimental RGB glass throughput for hardware RT local lights. Default OFF.
+    pub tinted_glass: bool,
+    /// 0=off, 1=affected receiver overlay, 2=transmitted/blocked RGB debug.
+    pub tinted_glass_debug: u32,
     pub cascaded_shadows: bool,
     pub cull_debug: CullDebugMode,
     pub planar_reflection_debug: PlanarReflectionDebugMode,
 }
 
 impl VideoSettings {
+    /// r_jigglePhysics: 0 off, 1 female, 2 male, 3 both. Textual on/off
+    /// remain accepted for older config scripts.
+    pub(crate) fn parse_jiggle_mode(value: &str) -> Option<u8> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" => Some(0),
+            "1" | "female" | "f" => Some(1),
+            "2" | "male" | "m" => Some(2),
+            "3" | "both" | "on" | "true" => Some(3),
+            _ => None,
+        }
+    }
+
     /// Extra linear multiplier for model lighting. Locked (the default) leaves the
     /// master gamma as the only brightness control; unlocked, the slider value is
     /// expressed on the master's scale, so unlocking never changes the picture.
@@ -362,6 +453,40 @@ impl VideoSettings {
         if self.dynamic_light_brightness_locked {
             self.dynamic_light_brightness = self.gamma;
         }
+    }
+}
+
+impl VideoSettings {
+    /// Both names enable the same RBSP renderer: `r_worldFlares` is an
+    /// independent override, not a second rendering pass. No duplicate draws.
+    pub fn world_flares_active(&self) -> bool {
+        self.flares || self.world_flares
+    }
+}
+
+#[cfg(test)]
+mod flare_cvar_tests {
+    use super::VideoSettings;
+
+    #[test]
+    fn world_flares_are_enabled_by_either_cvar_without_affecting_saber_flares() {
+        let mut settings = VideoSettings::default();
+        assert!(settings.world_flares_active());
+        assert!(settings.saber_flares);
+
+        settings.flares = false;
+        settings.world_flares = false;
+        assert!(!settings.world_flares_active());
+
+        settings.world_flares = true;
+        assert!(settings.world_flares_active());
+        settings.saber_flares = false;
+        assert!(settings.world_flares_active());
+
+        settings.world_flares = false;
+        settings.flares = true;
+        assert!(settings.world_flares_active());
+        assert!(!settings.saber_flares);
     }
 }
 
@@ -423,14 +548,30 @@ impl Default for VideoSettings {
             ragdoll_max: 8,
             ragdoll_lifetime: 20.0,
             ragdoll_self_collision: false,
-            jiggle_physics: false,
+            jiggle_physics: 0,
             jiggle_solver: 0,
             jiggle_strength: 1.0,
             jiggle_breast_strength: 1.0,
             jiggle_glute_strength: 1.0,
             jiggle_stiffness: 1.0,
             jiggle_damping: 1.0,
+            jiggle_glute_coverage_height: 1.0,
             jiggle_glute_lift: 0.0,
+            jiggle_breast_remesh_bottom_z: 0.0,
+            jiggle_breast_remesh_top_z: 0.0,
+            jiggle_glute_remesh_bottom_z: 0.0,
+            jiggle_glute_remesh_top_z: 0.0,
+            jiggle_glute_jiggle_bottom_z: 0.0,
+            jiggle_glute_jiggle_top_z: 0.0,
+            jiggle_breast_size: 0.0,
+            jiggle_glute_size: 0.0,
+            jiggle_locomotion: 1.0,
+            jiggle_impulse_cap: 0.5,
+            jiggle_swirl: 0.35,
+            jiggle_breast_stiffness: 1.0,
+            jiggle_breast_damping: 1.0,
+            jiggle_glute_stiffness: 1.0,
+            jiggle_glute_damping: 1.0,
             // Initial body-region preset for naelstrof/JigglePhysics semantics.
             // Gravity intentionally starts at zero for soft tissue; raise it for
             // deliberate sag while the solver controls remain upstream-shaped.
@@ -484,6 +625,7 @@ impl Default for VideoSettings {
             fxaa: false,
             smaa: false,
             taa: false,
+            rt_taa: 0,
             contact_shadows: false,
             fog_mode: FogMode::Off,
             fog_strength: 0.0,
@@ -496,6 +638,7 @@ impl Default for VideoSettings {
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
             distance_cull_scale: 0.0,
+            sky_fractal_override: false,
             clouds: true,
             cloud_type: CloudType::Storm,
             cloud_quality: 1.0,
@@ -503,18 +646,28 @@ impl Default for VideoSettings {
             cloud_height: 4600.0,
             cloud_thickness: 1200.0,
             cloud_shadows: true,
-            weather_wind: crate::ocean::OceanWind {
+            weather_wind: crate::ocean::AtmosphericWind {
                 speed: 167.0,
                 direction: 220.0,
                 gust: 0.2,
                 shift: 0.0,
             },
+            wind_visuals: 0.0,
+            weather_type: crate::world_effects::WeatherType::Clear,
             rain: false,
             rain_intensity: RainIntensity::Rain,
             rain_glass: true,
             puddle_quality: PuddleQuality::High,
             puddle_scatter: 0.8,
             rain_grade: 0.5,
+            rain_fast_post: false,
+            rain_water_field: false,
+            rain_fast_vertex: false,
+            rain_lean_depth: false,
+            rain_static_depth: false,
+            rain_opaque_depth: false,
+            rain_lean_models: false,
+            rain_lean_post: false,
             footprints: FootprintMode::ThreeD,
             grass: true,
             grass_precompute: true,
@@ -566,7 +719,14 @@ impl Default for VideoSettings {
             hiz_occlusion: false,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             dynamic_lights: DynamicLightsMode::Off,
+            dynamic_light_debug: false,
+            promote_fx_lights: false,
+            promote_shader_lights: false,
+            promote_shader_glow: true,
+            promote_shader_additive: true,
+            promote_shader_emissive: true,
             rt_samples: 1,
+            rt_denoiser_mode: 0,
             dynamic_light_falloff: 0,
             rt_half_resolution: false,
             map_light_simulation: false,
@@ -575,6 +735,9 @@ impl Default for VideoSettings {
             lightmap_only: false,
             modern_sabers: false,
             flares: true,
+            stage_collapse_extra: false,
+            world_flares: false,
+            saber_flares: true,
             saber_impact_fx: true,
             saber_marks: SaberMarkMode::Legacy,
             pbr: true,
@@ -587,6 +750,8 @@ impl Default for VideoSettings {
             dynamic_shadows: DynamicShadowsMode::Off,
             entity_shadow_light: EntityShadowLight::Lightgrid,
             local_light_shadows: false,
+            tinted_glass: false,
+            tinted_glass_debug: 0,
             cascaded_shadows: false,
             cull_debug: CullDebugMode::Off,
             planar_reflection_debug: PlanarReflectionDebugMode::Off,

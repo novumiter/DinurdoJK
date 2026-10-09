@@ -77,23 +77,37 @@ fn vec4(v: [f64; 3]) -> [f32; 4] {
     [v[0] as f32, v[1] as f32, v[2] as f32, 0.0]
 }
 
+/// Continuous erosion-volume drift. Keep the old minimum evolution speed and
+/// cross-/along-wind weighting, but integrate the animated wind before using
+/// it as a displacement. Multiplying the *current* gusting speed/direction by
+/// total elapsed time makes every gust or veer retroactively change the whole
+/// accumulated displacement, which causes increasingly violent jumps during
+/// long sessions.
+fn detail_slip_at(wind: CloudWind, time: f64) -> [f64; 3] {
+    let detail_wind = CloudWind {
+        speed: wind.speed.max(24.0),
+        ..wind
+    };
+    let travel = offset_at(detail_wind, time);
+    let cross = [-travel[2], 0.0, travel[0]];
+    [
+        travel[0] * 0.022 + cross[0] * 0.075,
+        0.0,
+        travel[2] * 0.022 + cross[2] * 0.075,
+    ]
+}
+
 /// `previous_time` equals `time` when there is no valid history to reproject.
 pub fn terms(wind: CloudWind, time: f32, previous_time: f32) -> CloudWindTerms {
     let t = f64::from(time);
     let now = offset_at(wind, t);
     let before = offset_at(wind, f64::from(previous_time));
     let dir = direction_at(wind, t);
-    let perp = [-dir[2], 0.0, dir[0]];
-    let drift = speed_at(wind, t).max(24.0) * t;
     CloudWindTerms {
         direction: vec4(dir),
         offset: vec4(now),
         delta: vec4([now[0] - before[0], 0.0, now[2] - before[2]]),
-        detail_slip: vec4([
-            (perp[0] * 0.075 + dir[0] * 0.022) * drift,
-            0.0,
-            (perp[2] * 0.075 + dir[2] * 0.022) * drift,
-        ]),
+        detail_slip: vec4(detail_slip_at(wind, t)),
         detail_billow: vec4([
             (t * 0.052).sin() + 0.35 * (t * 0.019 + 1.1).sin(),
             (t * 0.043 + 2.1).sin(),
@@ -135,6 +149,21 @@ mod tests {
             let b = offset_at(wind, time + h);
             let speed = ((b[0] - a[0]).powi(2) + (b[2] - a[2]).powi(2)).sqrt() / (2.0 * h);
             assert!((speed - speed_at(wind, time)).abs() < 1e-3 * speed.max(1.0), "t={time}: {speed} vs {}", speed_at(wind, time));
+        }
+    }
+
+    /// Shape evolution must have a bounded velocity that does not grow with
+    /// total session time. This catches the old `speed_at(t) * t` bug, where
+    /// a small gust change after minutes or hours caused huge texture jumps.
+    #[test]
+    fn detail_slip_velocity_stays_bounded_over_long_sessions() {
+        let wind = CloudWind { angle: 0.6, speed: 167.0, gust: 0.2, shift: 0.5 };
+        let h = 1e-3;
+        for time in [1.0f64, 60.0, 600.0, 3_600.0, 86_400.0] {
+            let a = detail_slip_at(wind, time - h);
+            let b = detail_slip_at(wind, time + h);
+            let speed = ((b[0] - a[0]).powi(2) + (b[2] - a[2]).powi(2)).sqrt() / (2.0 * h);
+            assert!(speed < 25.0, "t={time}: detail-slip speed grew to {speed}");
         }
     }
 

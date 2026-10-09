@@ -99,6 +99,7 @@ pub enum Task {
     UiCatalog = 22,
     MapMaterials = 23,
     MapGeometry = 24,
+    MapFxLightProfiles = 25,
 }
 
 impl Task {
@@ -129,6 +130,7 @@ impl Task {
             Self::UiCatalog => "UI CATALOG",
             Self::MapMaterials => "MATERIALS",
             Self::MapGeometry => "WORLD GEOMETRY",
+            Self::MapFxLightProfiles => "FX LIGHT PROFILES",
         }
     }
 
@@ -158,6 +160,7 @@ impl Task {
             22 => Self::UiCatalog,
             23 => Self::MapMaterials,
             24 => Self::MapGeometry,
+            25 => Self::MapFxLightProfiles,
             _ => Self::Idle,
         }
     }

@@ -1,9 +1,10 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [switch]$Check,
     [switch]$Fetch,
-    [switch]$Fast
+    [switch]$Fast,
+    [switch]$Faster
 )
 $ErrorActionPreference = 'Stop'
 $stableCargoPath = Join-Path $env:USERPROFILE '.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\cargo.exe'
@@ -59,13 +60,33 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
     $env:Path = "$toolchainBin;$env:Path"
 }
 
-# -Fast overrides the release profile's LTO/codegen-units via env vars (no Cargo.toml
-# edit needed) so local iteration doesn't pay the whole-program-optimization link cost.
+# Build-speed modes ---------------------------------------------------------
+# -Fast is intentionally conservative: it enables incremental compilation while
+# explicitly preserving Release's normal 16 codegen units. rustc otherwise changes
+# the default to 256 codegen units whenever incremental compilation is enabled.
+# LTO and every other Release setting are left untouched. The first -Fast build may
+# be slower while the incremental cache is populated; subsequent rebuilds benefit.
+#
+# -Faster is the more aggressive iteration mode. In addition to incremental
+# compilation, it disables LTO and raises codegen-units to favor compile/link speed
+# over final runtime performance. Do not use -Faster for FPS benchmarking.
+if ($Fast -and $Faster) {
+    throw 'Use either -Fast or -Faster, not both.'
+}
+
+$existingIncremental = $env:CARGO_PROFILE_RELEASE_INCREMENTAL
 $existingLto = $env:CARGO_PROFILE_RELEASE_LTO
 $existingCodegenUnits = $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+
 if ($Fast) {
-    $env:CARGO_PROFILE_RELEASE_LTO = 'false'
+    $env:CARGO_PROFILE_RELEASE_INCREMENTAL = 'true'
+    # Important: incremental compilation changes rustc's default codegen-units
+    # from 16 to 256 unless we pin it. Keep normal Release partitioning here.
     $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '16'
+} elseif ($Faster) {
+    $env:CARGO_PROFILE_RELEASE_INCREMENTAL = 'true'
+    $env:CARGO_PROFILE_RELEASE_LTO = 'off'
+    $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '256'
 }
 
 # WGPU backend hygiene -------------------------------------------------------
@@ -178,8 +199,16 @@ try {
     & $cargoPath @cargoArguments
     if ($LASTEXITCODE -ne 0) { throw 'Build failed. Check the Rust and MSVC toolchain messages above.' }
     $executable = Join-Path $PSScriptRoot "target\$($Configuration.ToLowerInvariant())\DinurdoJK.exe"
+    $rainGlassPackagePath = Join-Path $PSScriptRoot 'assets\dinurdo-assets.pk3'
+    if (-not (Test-Path -LiteralPath $rainGlassPackagePath)) {
+        throw "RainyGlass package is missing: $rainGlassPackagePath"
+    }
+    $runtimeBase = Join-Path (Split-Path -Parent $executable) 'base'
+    New-Item -ItemType Directory -Force -Path $runtimeBase | Out-Null
+    Copy-Item -LiteralPath $rainGlassPackagePath -Destination (Join-Path $runtimeBase 'dinurdo-assets.pk3') -Force
     Write-Host "`nBuilt: $executable"
-    if ($Fast) { Write-Host '(-Fast build: LTO and codegen-units=1 disabled, larger/slower binary for quicker iteration)' }
+    if ($Fast) { Write-Host '(-Fast build: incremental enabled; Release codegen-units kept at 16; LTO unchanged)' }
+    if ($Faster) { Write-Host '(-Faster build: incremental enabled, LTO off, codegen-units=256; quicker builds but not for FPS benchmarking)' }
     Write-Host 'Place a GameData-style base folder beside the executable. Assets may be loose files or live in any .pk3.'
     Write-Host 'Launch the client for mp/ffa3. Choose Join Game or Join Spectate; Escape opens the menu.'
     Write-Host 'WASD moves; Space jumps; hold Space for Force jump; Ctrl crouches/rolls; Shift walks.'
@@ -189,6 +218,7 @@ try {
     Pop-Location
     $env:CARGO_ENCODED_RUSTFLAGS = $existingEncoded
     $env:Path = $existingPath
+    $env:CARGO_PROFILE_RELEASE_INCREMENTAL = $existingIncremental
     $env:CARGO_PROFILE_RELEASE_LTO = $existingLto
     $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = $existingCodegenUnits
 }

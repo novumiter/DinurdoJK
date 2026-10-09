@@ -123,9 +123,35 @@ pub struct SurfaceLight {
     pub color: [f32; 3],
     /// q3map_lightsubdivide, or q3map2's classic 120-unit default.
     pub subdivide: f32,
-    /// True when this emitter was inferred from an emissive companion texture
-    /// instead of explicit q3map_surfacelight metadata.
+    /// Retained for material-debug/backward test compatibility. Runtime shader
+    /// promotion is now represented separately so it can never duplicate an
+    /// authored q3map_surfacelight emitter.
     pub inferred_from_emissive: bool,
+}
+
+/// Independent evidence bits for runtime light promotion from visible shader
+/// semantics. q3map_surfacelight is deliberately not a promotion reason: it is
+/// already represented by `SurfaceLight` and has its own renderer toggle.
+pub const SHADER_LIGHT_GLOW: u32 = 1 << 0;
+pub const SHADER_LIGHT_ADDITIVE: u32 = 1 << 1;
+pub const SHADER_LIGHT_EMISSIVE_COMPANION: u32 = 1 << 2;
+/// Internal metadata bit: the same material also has authored q3map_surfacelight.
+/// This is not a user-selectable promotion reason; the renderer uses it to let
+/// authored lighting win when enabled while still allowing promotion A/B tests
+/// when authored area lights are disabled.
+pub const SHADER_LIGHT_AUTHORED_OVERLAP: u32 = 1 << 31;
+pub const SHADER_LIGHT_ALL: u32 =
+    SHADER_LIGHT_GLOW | SHADER_LIGHT_ADDITIVE | SHADER_LIGHT_EMISSIVE_COMPANION;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ShaderLightPromotion {
+    pub value: f32,
+    pub color: [f32; 3],
+    pub subdivide: f32,
+    /// Bitwise OR of SHADER_LIGHT_* evidence. A surface with multiple reasons
+    /// still produces one emitter; source toggles select it when any enabled
+    /// evidence bit matches.
+    pub reasons: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -184,9 +210,14 @@ pub struct SurfaceMaterial {
     pub sky_cloud_height: f32,
     pub hidden: bool,
     /// Authored q3map area emitter metadata. This is compile-time material
-    /// information and is independent of whether the visible stage has an
-    /// emissive companion texture.
+    /// information and is deliberately independent from runtime shader-light
+    /// promotion so the two systems can never double-count one surface.
     pub surface_light: Option<SurfaceLight>,
+    /// Runtime-only light inferred from visible shader semantics (`glow`,
+    /// additive emission, or an emissive companion map). This is classified
+    /// independently from authored q3map_surfacelight so either interpretation
+    /// can be A/B tested; the renderer prevents both from contributing at once.
+    pub shader_light: Option<ShaderLightPromotion>,
     /// Procedural per-blade grass emitted by a JKA `surfaceSprites vertical` stage.
     pub grass: Option<GrassMaterial>,
     /// Raven QuickSprite effect stages retained separately from ordinary BSP
@@ -226,6 +257,7 @@ impl Default for SurfaceMaterial {
             sky_cloud_height: 0.0,
             hidden: false,
             surface_light: None,
+            shader_light: None,
             grass: None,
             surface_sprite_effects: Vec::new(),
             surface_sprite_cull_quirk: false,
@@ -1944,6 +1976,114 @@ fn emissive_surface_light_stats(texture: &TextureData) -> Option<([f32; 3], f32)
     Some((color, value))
 }
 
+fn shader_stage_light_stats(stage: &MaterialStage, textures: &Textures) -> Option<([f32; 3], f32)> {
+    let (mut color, mut value) = match stage.texture {
+        StageTexture::Image(index) => match textures.images.get(index) {
+            // If the image is present and analysis says it is effectively dark,
+            // that is useful negative evidence. Do not turn a black additive
+            // stage into a white light merely because its blend mode is additive.
+            Some(texture) => emissive_surface_light_stats(texture)?,
+            // Missing texture data can still be promoted from authored glow/
+            // additive semantics; its colour simply cannot be inferred yet.
+            None => ([1.0; 3], 260.0),
+        },
+        StageTexture::White => ([1.0; 3], 320.0),
+        StageTexture::Lightmap => return None,
+    };
+
+    // Constant/identity stage colour is already resolved into MaterialStage::color.
+    // Multiplying it here keeps white glow masks tinted by their authored shader
+    // colour without trying to predict dynamic entity vertex colour on BSP.
+    let modulation = stage.color.map(|channel| channel.max(0.0));
+    if modulation.iter().copied().fold(0.0_f32, f32::max) <= 1.0e-5 {
+        return None;
+    }
+    let opacity = stage.opacity.clamp(0.0, 1.0);
+    if opacity <= 1.0e-4 {
+        return None;
+    }
+    let tinted = [
+        color[0] * modulation[0],
+        color[1] * modulation[1],
+        color[2] * modulation[2],
+    ];
+    let tint_len = (tinted[0] * tinted[0] + tinted[1] * tinted[1] + tinted[2] * tinted[2]).sqrt();
+    if tint_len <= 1.0e-6 {
+        return None;
+    }
+    color = tinted.map(|channel| channel / tint_len);
+    let tint_luma = modulation[0] * 0.2126 + modulation[1] * 0.7152 + modulation[2] * 0.0722;
+    value *= tint_luma.max(0.05);
+    value *= opacity;
+    Some((color, value.clamp(48.0, 1000.0)))
+}
+
+fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Option<ShaderLightPromotion> {
+    let mut reasons = 0_u32;
+    let mut weighted = [0.0_f32; 3];
+    let mut total_weight = 0.0_f32;
+    let mut strongest = 0.0_f32;
+
+    let mut add_candidate = |reason: u32, color: [f32; 3], value: f32| {
+        if !value.is_finite() || value <= 0.0 || color.iter().any(|c| !c.is_finite()) {
+            return;
+        }
+        reasons |= reason;
+        let weight = value.max(1.0);
+        for channel in 0..3 {
+            weighted[channel] += color[channel].max(0.0) * weight;
+        }
+        total_weight += weight;
+        strongest = strongest.max(value);
+    };
+
+    for stage in stages {
+        if stage.glow {
+            if let Some((color, value)) = shader_stage_light_stats(stage, textures) {
+                add_candidate(SHADER_LIGHT_GLOW, color, value * 1.15);
+            }
+        }
+
+        let additive = matches!(
+            stage.blend,
+            Some(BlendFunc { src: BlendFactor::One, dst: BlendFactor::One })
+                | Some(BlendFunc { src: BlendFactor::SrcAlpha, dst: BlendFactor::One })
+        );
+        if additive {
+            if let Some((color, value)) = shader_stage_light_stats(stage, textures) {
+                add_candidate(SHADER_LIGHT_ADDITIVE, color, value);
+            }
+        }
+
+        if let Some(index) = stage.enhancements.emissive_texture {
+            if let Some((color, value)) = textures
+                .images
+                .get(index)
+                .and_then(emissive_surface_light_stats)
+            {
+                add_candidate(SHADER_LIGHT_EMISSIVE_COMPANION, color, value);
+            }
+        }
+    }
+
+    if reasons == 0 || total_weight <= 0.0 {
+        return None;
+    }
+    let average = weighted.map(|channel| channel / total_weight);
+    let length = (average[0] * average[0] + average[1] * average[1] + average[2] * average[2]).sqrt();
+    let color = if length > 1.0e-6 {
+        average.map(|channel| channel / length)
+    } else {
+        [1.0; 3]
+    };
+    Some(ShaderLightPromotion {
+        value: strongest.clamp(48.0, 1000.0),
+        color,
+        subdivide: 120.0,
+        reasons,
+    })
+}
+
 pub fn primary_texture_requests(
     used_shader_names: &[String],
     library: &BTreeMap<String, Shader>,
@@ -2092,7 +2232,7 @@ pub fn describe(
         .iter()
         .filter(|stage| !stage_is_omitted(stage))
         .any(|stage| stage.surface_sprite.is_some());
-    let mut surface_light = (definition.surface_light > 0.0).then(|| {
+    let surface_light = (definition.surface_light > 0.0).then(|| {
         // q3map uses q3map_lightimage for emitter color when present; without
         // one, its shader info falls back to the surface image's average color.
         let color_image = definition.light_image.as_deref().or_else(|| {
@@ -2380,27 +2520,17 @@ pub fn describe(
         stages = sky_cloud_stages(name, definition, assets, textures, preferred_source);
     }
 
-    // Modern material packs often express glow only through an emissive
-    // companion map and have no q3map_surfacelight directive. Promote the first
-    // meaningful emissive companion to an opt-in runtime area emitter. The
-    // conservative strength estimate is based on linear-space texture energy so
-    // a mostly-black mask does not light the whole map like a full-white panel.
-    if surface_light.is_none() {
-        let emissive_texture = stages
-            .iter()
-            .find_map(|stage| stage.enhancements.emissive_texture);
-        if let Some((color, value)) = emissive_texture
-            .and_then(|index| textures.images.get(index))
-            .and_then(emissive_surface_light_stats)
-        {
-            surface_light = Some(SurfaceLight {
-                value,
-                color,
-                subdivide: 120.0,
-                inferred_from_emissive: true,
-            });
-        }
-    }
+    // Shader-driven runtime promotion is intentionally classified independently
+    // from q3map surface-light metadata. A material may therefore carry both an
+    // authored emitter and a shader-promotion candidate. Scene extraction tags
+    // that overlap so the renderer can give q3map_surfacelight priority when the
+    // authored path is enabled, while still allowing Glow/Additive/Emissive A/B
+    // testing when authored area lights are switched off.
+    let shader_light = if !sky && !base_hidden {
+        shader_light_promotion(&stages, textures)
+    } else {
+        None
+    };
 
     for unsupported in definition.unsupported.iter().chain(
         definition
@@ -2419,6 +2549,7 @@ pub fn describe(
             && (base_hidden
                 || (explicit && stages.is_empty() && surface_sprite_effects.is_empty())),
         surface_light,
+        shader_light,
         grass,
         surface_sprite_effects,
         surface_sprite_cull_quirk,
@@ -2569,6 +2700,23 @@ mod tests {
         assert_eq!(material.stages[2].texture, StageTexture::Lightmap);
     }
     #[test]
+    fn trickarena_glass_keeps_authored_diffuse_and_optional_reflection() {
+        let script = "test {\nq3map_nolightmap\ncull twosided\n{\nmap textures/trickarena/newglass\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\nrgbGen lightingDiffuse\n}\n{\nmap textures/trickarena/glass_reflect_cpm\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\ndetail\nalphaGen const 0.05\ntcGen environment\ntcMod scale 1.5 1.5\n}\n}";
+        let legacy = material_with_environment_policy(script, false);
+        assert_eq!(legacy.stages.len(), 2);
+        assert_eq!(legacy.stages[0].rgb_gen, RgbGen::LightingDiffuse);
+        assert_eq!(legacy.stages[0].alpha_gen, AlphaGen::Identity);
+        assert_eq!(legacy.stages[1].tc_gen, TcGen::Environment);
+        assert_eq!(legacy.stages[1].alpha_gen, AlphaGen::Const);
+        assert!((legacy.stages[1].opacity - 0.05).abs() < 1.0e-5);
+        // Reflections OFF intentionally removes tcGen environment by policy;
+        // it must not silently turn the surviving base into identity/fullbright.
+        let off = material_with_environment_policy(script, true);
+        assert_eq!(off.stages.len(), 1);
+        assert_eq!(off.stages[0].rgb_gen, RgbGen::LightingDiffuse);
+    }
+
+    #[test]
     fn reflection_off_omits_environment_stage_without_touching_siblings() {
         let material = material_with_environment_policy(
             "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\n}\n{\nmap $lightmap\nblendFunc GL_DST_COLOR GL_ZERO\n}\n}",
@@ -2709,6 +2857,84 @@ blendFunc GL_ONE GL_ONE
             assert!(water.water);
             assert_eq!(water.water_amplitude, amplitude, "{deform}");
         }
+    }
+
+    #[test]
+    fn shader_light_promotion_tracks_glow_and_additive_with_q3map_overlap_metadata() {
+        let glow = material(
+            "test {\n{\nmap $whiteimage\nglow\nrgbGen const ( 1 0.25 0.1 )\n}\n}",
+        );
+        let promoted = glow.shader_light.expect("glow stage should promote");
+        assert_ne!(promoted.reasons & SHADER_LIGHT_GLOW, 0);
+        assert_eq!(promoted.reasons & SHADER_LIGHT_ADDITIVE, 0);
+        assert!(promoted.color[0] > promoted.color[1]);
+
+        let additive = material(
+            "test {\n{\nmap $whiteimage\nblendFunc GL_ONE GL_ONE\n}\n}",
+        );
+        let promoted = additive.shader_light.expect("additive stage should promote");
+        assert_ne!(promoted.reasons & SHADER_LIGHT_ADDITIVE, 0);
+
+        let black_additive = material(
+            "test {
+{
+map $whiteimage
+blendFunc GL_ONE GL_ONE
+rgbGen const ( 0 0 0 )
+}
+}",
+        );
+        assert!(
+            black_additive.shader_light.is_none(),
+            "an additive stage with zero visible output must not become a light"
+        );
+
+        let authored = material(
+            "test {\nq3map_surfacelight 600\n{\nmap $whiteimage\nblendFunc GL_ONE GL_ONE\nglow\n}\n}",
+        );
+        assert!(authored.surface_light.is_some());
+        let promoted = authored
+            .shader_light
+            .expect("authored q3map metadata must not erase independently visible glow/additive evidence");
+        assert_ne!(promoted.reasons & SHADER_LIGHT_GLOW, 0);
+        assert_ne!(promoted.reasons & SHADER_LIGHT_ADDITIVE, 0);
+    }
+
+    #[test]
+    fn shader_light_promotion_can_be_driven_by_emissive_companion() {
+        let mut textures = Textures::new();
+        textures.images.push(TextureData {
+            label: "emissive".into(),
+            source: None,
+            width: 2,
+            height: 2,
+            rgba: [255_u8, 64, 16, 255].repeat(4),
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: false,
+            srgb: true,
+        });
+        let stage = MaterialStage {
+            texture: StageTexture::White,
+            enhancements: StageEnhancements {
+                emissive_texture: Some(0),
+                ..Default::default()
+            },
+            blend: None,
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+            glow: false,
+        };
+        let promoted = shader_light_promotion(&[stage], &textures).expect("emissive map should promote");
+        assert_eq!(promoted.reasons, SHADER_LIGHT_EMISSIVE_COMPANION);
+        assert!(promoted.color[0] > promoted.color[1]);
     }
 
 }

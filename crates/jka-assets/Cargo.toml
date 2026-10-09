@@ -6,3 +6,6 @@ publish.workspace = true
 
 [dependencies]
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+image = { version = "=0.25.10", default-features = false, features = ["png"] }

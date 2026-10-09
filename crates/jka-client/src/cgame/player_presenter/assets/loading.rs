@@ -1,12 +1,20 @@
 //! Assets loading.
+use jka_assets::{
+    animation::parse_animation_cfg,
+    animevents::parse_animation_events,
+};
+
+use crate::cgame::player_presenter::source_player::{
+    self, build_source_player_model, source_descriptor_qpath,
+};
 use crate::cgame::player_presenter::{
-    asset_jobs, build_lod_gpu_meshes, load_skin, materials, openjk_default_gla, parse_gla,
+    asset_jobs, build_joined_breast_bakes, build_lod_gpu_meshes, load_skin, materials, openjk_default_gla, parse_gla,
     parse_glm, player_model_key, static_model_key, AlphaGen, Arc, AssetPriority, AssetSearchPath,
-    AssetSource, AssetState, BTreeMap, DynamicModelAlphaMode, GlaAnimation, HashMap, JiggleProfile,
+    AssetSource, AssetState, BTreeMap, DynamicModelAlphaMode, GlaAnimation, HashMap, JiggleProfile, JiggleRemeshTuning,
     Mutex, OnceLock, PlayerModelAsset, PlayerPresenter, PlayerSurfaceAsset, Requested,
     ResolvedMaterial, ResolvedStage, RgbGen, SaberDefinition, SaberModelAsset, Shader,
     SurfaceOverlay, TcGen, TcMod, TextureData, Textures, Vec3, Wave, WaveFunc, ASSET_PENDING,
-    MAX_GLA_BYTES, MAX_GLM_BYTES, MAX_JIGGLE_BYTES, MAX_SKIN_BYTES, OPENJK_DEFAULT_GLA_NAME,
+    MAX_GLA_BYTES, MAX_GLM_BYTES, MAX_SKIN_BYTES, OPENJK_DEFAULT_GLA_NAME,
 };
 
 pub(in crate::cgame::player_presenter) enum ModelLookup {
@@ -552,20 +560,76 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
     }
 }
 
-pub(in crate::cgame::player_presenter) fn player_jiggle_qpath(model_qpath: &str) -> String {
-    model_qpath.rsplit_once('.').map_or_else(
-        || format!("{model_qpath}.jiggle"),
-        |(base, _)| format!("{base}.jiggle"),
-    )
+const MAX_MODEL_SOUND_CONFIG_BYTES: usize = 4096;
+
+/// TaystJK/OpenJK `CG_LoadCISounds` model-gender source. The player configstring
+/// can carry a gender hint, but the loaded character's authored gender is taken
+/// from the selected `sounds*.cfg`: default skins try `sounds.cfg` then
+/// `sounds_default.cfg`; named skins try `sounds_<skin>.cfg` then `sounds.cfg`.
+/// The final line carries the legacy `f` marker for female models.
+fn authored_model_is_female(
+    source: &mut dyn ModelSource,
+    info: &crate::cgame::ClientInfo,
+) -> bool {
+    let model = info.model_name.as_str();
+    let candidates = if info.skin_name.is_empty() || info.skin_name.eq_ignore_ascii_case("default") {
+        [
+            format!("models/players/{model}/sounds.cfg"),
+            format!("models/players/{model}/sounds_default.cfg"),
+        ]
+    } else {
+        [
+            format!("models/players/{model}/sounds_{}.cfg", info.skin_name),
+            format!("models/players/{model}/sounds.cfg"),
+        ]
+    };
+
+    for qpath in candidates {
+        let Ok(Some(bytes)) = source.read_optional(&qpath, MAX_MODEL_SOUND_CONFIG_BYTES) else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        // Match TaystJK CG_LoadCISounds: only the final line is the gender
+        // marker, and the stock convention is a lowercase `f`.
+        return text.lines().last().is_some_and(|line| line.contains('f'));
+    }
+    false
 }
 
 /// OpenJK `CG_RegisterClientModelname`: GLM + GLA + skin -> drawable surfaces.
-pub(in crate::cgame::player_presenter) fn build_player_model(
+const MAX_CHARACTER_ANIMATION_CFG_BYTES: usize = 60_000 - 1;
+const MAX_CHARACTER_ANIMEVENTS_CFG_BYTES: usize = 80_000 - 1;
+
+fn gla_sibling_qpath(gla_qpath: &str, filename: &str) -> Option<String> {
+    let normalized = gla_qpath.replace('\\', "/");
+    let (directory, _) = normalized.rsplit_once('/')?;
+    Some(format!("{directory}/{filename}"))
+}
+
+enum CowAnimationSet<'a> {
+    Borrowed(&'a jka_assets::animation::AnimationSet),
+    Owned(jka_assets::animation::AnimationSet),
+}
+
+impl CowAnimationSet<'_> {
+    fn as_ref(&self) -> &jka_assets::animation::AnimationSet {
+        match self {
+            Self::Borrowed(value) => value,
+            Self::Owned(value) => value,
+        }
+    }
+}
+
+fn build_character_model(
     source: &mut dyn ModelSource,
-    info: &crate::cgame::ClientInfo,
+    model_qpath: String,
+    requested_skin_qpath: Option<String>,
+    fallback_skin_qpath: Option<String>,
+    female: bool,
+    npc_model: bool,
     key: String,
+    jiggle_remesh: JiggleRemeshTuning,
 ) -> Result<PlayerModelAsset, String> {
-    let model_qpath = info.model_qpath();
     let model_bytes = source.read_model(&model_qpath)?;
     let glm = Arc::new(parse_glm(&model_bytes)?);
 
@@ -575,10 +639,6 @@ pub(in crate::cgame::player_presenter) fn build_player_model(
         format!("{}.gla", glm.anim_name)
     };
     let gla = source.load_gla(&gla_qpath)?;
-    // OpenJK mdx_format.h: mdxmHeader_t::numBones exists for an
-    // in-game version/safety check to ensure the mesh does not reference
-    // MORE bones than its GLA provides. Equality is not required; weapon
-    // and saber meshes commonly use only a subset of a shared skeleton.
     if glm.num_bones > gla.skeleton.len() {
         return Err(format!(
             "GLM references {} bones but GLA only provides {}",
@@ -587,44 +647,64 @@ pub(in crate::cgame::player_presenter) fn build_player_model(
         ));
     }
 
-    let jiggle_qpath = player_jiggle_qpath(&model_qpath);
-    let explicit_jiggle = match source.read_optional(&jiggle_qpath, MAX_JIGGLE_BYTES) {
-        Ok(Some(bytes)) => match String::from_utf8(bytes)
-            .map_err(|error| format!("not UTF-8: {error}"))
-            .and_then(|text| JiggleProfile::parse(&text, &glm, &gla))
-        {
-            Ok(profile) => {
-                devprintln!(
-                    2,
-                    "PLAYER JIGGLE: {jiggle_qpath} override loaded regions={}",
-                    profile.region_count(),
-                );
-                Some(profile)
+    let normalized_gla = gla_qpath.replace('\\', "/").to_ascii_lowercase();
+    let humanoid = normalized_gla.contains("players/_humanoid/");
+    if !humanoid && !npc_model {
+        // TaystJK CG_RegisterClientModelname retries the stock player model when
+        // a multiplayer client GLM does not use players/_humanoid/. Creature
+        // skeletons are accepted only through CG_G2AnimEntModelLoad (ET_NPC).
+        return Err(format!(
+            "unsupported multiplayer model GLA {gla_qpath:?}: expected players/_humanoid/"
+        ));
+    }
+
+    // TaystJK CG_G2AnimEntModelLoad / CG_CacheG2AnimInfo:
+    // - a non-humanoid's animation.cfg is selected from the loaded GLA directory;
+    // - every NPC's animevents.cfg is selected from the original GLM directory.
+    // Real players keep the presenter's already-loaded shared humanoid tables.
+    let animation_qpath = gla_sibling_qpath(&gla_qpath, "animation.cfg")
+        .ok_or_else(|| format!("{gla_qpath}: cannot derive animation.cfg path"))?;
+    let animations = if humanoid {
+        None
+    } else {
+        let animation_bytes = source
+            .read_optional(&animation_qpath, MAX_CHARACTER_ANIMATION_CFG_BYTES)?
+            .ok_or_else(|| format!("missing {animation_qpath}"))?;
+        Some(Arc::new(parse_animation_cfg(&animation_bytes)?))
+    };
+    let anim_events = if npc_model {
+        let event_animations = if let Some(animations) = animations.as_deref() {
+            CowAnimationSet::Borrowed(animations)
+        } else {
+            // Humanoid NPCs still get events from their model directory in
+            // TaystJK, indexed against localAnimIndex 0 (the humanoid table).
+            let animation_bytes = source
+                .read_optional(&animation_qpath, MAX_CHARACTER_ANIMATION_CFG_BYTES)?
+                .ok_or_else(|| format!("missing {animation_qpath}"))?;
+            CowAnimationSet::Owned(parse_animation_cfg(&animation_bytes)?)
+        };
+        let events_qpath = gla_sibling_qpath(&model_qpath, "animevents.cfg");
+        if let Some(events_qpath) = events_qpath {
+            match source.read_optional(&events_qpath, MAX_CHARACTER_ANIMEVENTS_CFG_BYTES)? {
+                Some(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    Some(Arc::new(parse_animation_events(&text, event_animations.as_ref())))
+                }
+                None => None,
             }
-            Err(error) => {
-                rverbose!(
-                    1,
-                    "PLAYER JIGGLE WARNING: {jiggle_qpath}: {error}; trying _humanoid auto profile"
-                );
-                None
-            }
-        },
-        Ok(None) => None,
-        Err(error) => {
-            rverbose!(
-                1,
-                "PLAYER JIGGLE WARNING: {error}; trying _humanoid auto profile"
-            );
+        } else {
             None
         }
+    } else {
+        None
     };
-    let jiggle = match explicit_jiggle {
-        Some(profile) => Some(Arc::new(profile)),
-        None => match JiggleProfile::auto_humanoid(&glm, &gla) {
+
+    let jiggle = if humanoid {
+        match JiggleProfile::auto_humanoid(&glm, &gla) {
             Ok(Some(profile)) => {
                 devprintln!(
                     2,
-                    "PLAYER JIGGLE: {model_qpath} auto regions={} (model.jiggle override supported)",
+                    "PLAYER JIGGLE: {model_qpath} auto regions={}",
                     profile.region_count(),
                 );
                 Some(Arc::new(profile))
@@ -634,30 +714,46 @@ pub(in crate::cgame::player_presenter) fn build_player_model(
                 rverbose!(1, "PLAYER JIGGLE AUTO WARNING: {model_qpath}: {error}");
                 None
             }
-        },
+        }
+    } else {
+        None
     };
 
-    let skin_qpath = info.skin_qpath();
-    let skin = match source.load_skin(&skin_qpath) {
-        Ok(skin) => skin,
-        Err(primary_error) => {
-            let fallback = info.default_skin_qpath();
-            rverbose!(
-                1,
-                "PLAYER SKIN FALLBACK: {skin_qpath}: {primary_error}; trying {fallback}"
-            );
-            source.load_skin(&fallback)?
-        }
+    let skin_map = if let Some(skin_qpath) = requested_skin_qpath.as_deref() {
+        let skin = match source.load_skin(skin_qpath) {
+            Ok(skin) => Some(skin),
+            Err(primary_error) => {
+                if let Some(fallback) = fallback_skin_qpath.as_deref() {
+                    rverbose!(
+                        1,
+                        "PLAYER SKIN FALLBACK: {skin_qpath}: {primary_error}; trying {fallback}"
+                    );
+                    Some(source.load_skin(fallback)?)
+                } else {
+                    // Ghoul2 skin handle 0: an NPC model remains valid when an
+                    // appended skin fails to register; embedded GLM shaders win.
+                    rverbose!(
+                        1,
+                        "NPC APPENDED SKIN WARNING: {skin_qpath}: {primary_error}; using model shaders"
+                    );
+                    None
+                }
+            }
+        };
+        skin.map_or_else(HashMap::new, |skin| {
+            skin.into_iter()
+                .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
+                .collect::<HashMap<_, _>>()
+        })
+    } else {
+        HashMap::new()
     };
-    let skin_map = skin
-        .into_iter()
-        .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
-        .collect::<HashMap<_, _>>();
 
     let lod = glm
         .lods
         .first()
         .ok_or_else(|| format!("{model_qpath} has no GLM LODs"))?;
+    let joined_breast_bakes = build_joined_breast_bakes(&glm, jiggle.as_deref(), jiggle_remesh)?;
     let mut surfaces = Vec::with_capacity(lod.surfaces.len());
     for surface in &lod.surfaces {
         let hierarchy = glm.hierarchy.get(surface.surface_index).ok_or_else(|| {
@@ -672,9 +768,6 @@ pub(in crate::cgame::player_presenter) fn build_player_model(
         let skin_off = skin_shader.is_some_and(|shader| shader.eq_ignore_ascii_case("*off"));
         const G2SURFACEFLAG_OFF: u32 = 0x0000_0002;
         let default_visible = !skin_off && hierarchy.flags & G2SURFACEFLAG_OFF == 0;
-        // OpenJK keeps `*off` surfaces in the Ghoul2 instance and only toggles
-        // their runtime flags. Keep a drawable material resident for those
-        // dormant surfaces so stump/limb caps can be enabled without I/O.
         let shader_name = if skin_off {
             hierarchy.shader.as_str()
         } else {
@@ -697,33 +790,107 @@ pub(in crate::cgame::player_presenter) fn build_player_model(
             overlay: material.overlay,
             stages: material.stages,
             fallback_gray: false,
+            // GLM surfaces are described by a JKA shader, never a VMT.
+            source_material: None,
             gpu_meshes: build_lod_gpu_meshes(
                 &model_qpath,
                 &glm,
                 surface.surface_index,
                 two_sided,
                 jiggle.as_deref(),
+                jiggle_remesh,
+                &joined_breast_bakes,
             )?,
         });
     }
 
     devprintln!(
         2,
-        "PLAYER MODEL: {} skin={} surfaces={} gla={} bones={}",
+        "GHOUL2 CHARACTER MODEL: {} skin={} surfaces={} gla={} bones={} humanoid={}",
         model_qpath,
-        skin_qpath,
+        requested_skin_qpath.as_deref().unwrap_or("<none>"),
         surfaces.len(),
         gla_qpath,
         gla.skeleton.len(),
+        humanoid,
     );
 
     Ok(PlayerModelAsset {
         key,
         glm,
         gla,
+        humanoid,
+        animations,
+        anim_events,
         surfaces,
         jiggle,
+        female,
     })
+}
+
+/// OpenJK/TaystJK multiplayer player registration remains humanoid/fallback
+/// based.  Only ET_NPC takes the exact model-index path below.
+pub(in crate::cgame::player_presenter) fn build_player_model(
+    source: &mut dyn ModelSource,
+    info: &crate::cgame::ClientInfo,
+    key: String,
+    jiggle_remesh: JiggleRemeshTuning,
+) -> Result<PlayerModelAsset, String> {
+    // A Source 1 / Garry's Mod character is declared by source_model.json and has
+    // no model.glm at all. It is rebound onto `_humanoid.gla` here, so from this
+    // point on it is an ordinary Ghoul2 player to every other consumer.
+    let descriptor_qpath = source_descriptor_qpath(&info.model_name);
+    if let Some(descriptor) =
+        source.read_optional(&descriptor_qpath, source_player::MAX_DESCRIPTOR_BYTES)?
+    {
+        return build_source_player_model(
+            source,
+            &info.model_name,
+            key,
+            &descriptor_qpath,
+            &descriptor,
+        );
+    }
+    let female = authored_model_is_female(source, info);
+    build_character_model(
+        source,
+        info.model_qpath(),
+        Some(info.skin_qpath()),
+        Some(info.default_skin_qpath()),
+        female,
+        false,
+        key,
+        jiggle_remesh,
+    )
+}
+
+pub(in crate::cgame::player_presenter) fn build_npc_model(
+    source: &mut dyn ModelSource,
+    request: &crate::cgame::NpcModelRequest,
+    key: String,
+    jiggle_remesh: JiggleRemeshTuning,
+) -> Result<PlayerModelAsset, String> {
+    build_character_model(
+        source,
+        request.model_qpath.clone(),
+        request.skin_qpath.clone(),
+        None,
+        false,
+        true,
+        key,
+        jiggle_remesh,
+    )
+}
+
+pub(in crate::cgame::player_presenter) fn npc_model_key(
+    request: &crate::cgame::NpcModelRequest,
+) -> String {
+    format!(
+        "npc:{}|{}",
+        request.model_qpath,
+        request.skin_qpath.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase()
 }
 
 pub(in crate::cgame::player_presenter) fn build_static_glm(
@@ -824,12 +991,15 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
             overlay: material.overlay,
             stages: material.stages,
             fallback_gray,
+            source_material: None,
             gpu_meshes: build_lod_gpu_meshes(
                 &model_qpath,
                 &glm,
                 surface.surface_index,
                 false,
                 None,
+                JiggleRemeshTuning::default(),
+                &HashMap::new(),
             )?,
         });
     }
@@ -862,6 +1032,47 @@ impl PlayerPresenter {
                         fallback.model_name, fallback.skin_name,
                     )
                 })
+            }
+        }
+    }
+
+    /// NPC counterpart to `load_model`: exact CS_MODELS model, no Kyle/Jan
+    /// fallback.  This matches TaystJK's per-centity Ghoul2 ownership.
+    pub(in crate::cgame::player_presenter) fn load_npc_model(
+        &mut self,
+        request: &crate::cgame::NpcModelRequest,
+    ) -> Result<Arc<PlayerModelAsset>, String> {
+        self.try_load_npc_model(request)
+    }
+
+    pub(in crate::cgame::player_presenter) fn try_load_npc_model(
+        &mut self,
+        request: &crate::cgame::NpcModelRequest,
+    ) -> Result<Arc<PlayerModelAsset>, String> {
+        let key = npc_model_key(request);
+        match self.lookup_model(&key) {
+            ModelLookup::Ready(model) => return Ok(model),
+            ModelLookup::Failed(error) => return Err(error),
+            ModelLookup::Pending | ModelLookup::Missing => {}
+        }
+
+        let jiggle_remesh = self.jiggle_remesh;
+        let result = build_npc_model(
+            &mut SyncModelSource { presenter: self },
+            request,
+            key.clone(),
+            jiggle_remesh,
+        );
+        match result {
+            Ok(model) => {
+                let model = Arc::new(model);
+                self.models.insert(key, Arc::clone(&model));
+                Ok(model)
+            }
+            Err(error) => {
+                println!("NPC MODEL REGISTRATION FAILED: {key}: {error}");
+                self.failed_models.insert(key, error.clone());
+                Err(error)
             }
         }
     }
@@ -910,7 +1121,13 @@ impl PlayerPresenter {
         info: &crate::cgame::ClientInfo,
         key: String,
     ) -> Result<PlayerModelAsset, String> {
-        build_player_model(&mut SyncModelSource { presenter: self }, info, key)
+        let jiggle_remesh = self.jiggle_remesh;
+        build_player_model(
+            &mut SyncModelSource { presenter: self },
+            info,
+            key,
+            jiggle_remesh,
+        )
     }
 
     pub(in crate::cgame::player_presenter) fn lookup_model(&self, key: &str) -> ModelLookup {
@@ -946,6 +1163,7 @@ impl PlayerPresenter {
         let shared = Arc::clone(&self.load_shared);
         let job_info = info.clone();
         let job_key = key.to_owned();
+        let jiggle_remesh = self.jiggle_remesh;
         let requested = self
             .async_models
             .request(key, AssetPriority::High, move || {
@@ -957,6 +1175,7 @@ impl PlayerPresenter {
                         },
                         &job_info,
                         job_key,
+                        jiggle_remesh,
                     )
                 })?
             });
@@ -965,6 +1184,55 @@ impl PlayerPresenter {
             Requested::Pending => ModelLookup::Pending,
             Requested::Failed(error) => ModelLookup::Failed(error),
             Requested::Rejected => ModelLookup::Missing,
+        }
+    }
+
+    pub(in crate::cgame::player_presenter) fn request_npc_model(
+        &mut self,
+        request: &crate::cgame::NpcModelRequest,
+        key: &str,
+    ) -> ModelLookup {
+        let lookup = self.lookup_model(key);
+        if !matches!(lookup, ModelLookup::Missing) {
+            if matches!(lookup, ModelLookup::Pending) {
+                self.async_models.note_duplicate();
+            }
+            return lookup;
+        }
+        let source = Arc::clone(&self.asset_source);
+        let shared = Arc::clone(&self.load_shared);
+        let job_request = request.clone();
+        let job_key = key.to_owned();
+        let jiggle_remesh = self.jiggle_remesh;
+        let requested = self.async_models.request(key, AssetPriority::High, move || {
+            asset_jobs::with_worker_vfs(&source, |vfs| {
+                build_npc_model(
+                    &mut WorkerModelSource { vfs, shared: &shared },
+                    &job_request,
+                    job_key,
+                    jiggle_remesh,
+                )
+            })?
+        });
+        match requested {
+            Requested::Ready(model) => ModelLookup::Ready(model),
+            Requested::Pending => ModelLookup::Pending,
+            Requested::Failed(error) => ModelLookup::Failed(error),
+            Requested::Rejected => ModelLookup::Missing,
+        }
+    }
+
+    /// Exact async NPC resolution.  Deliberately has no provisional/default
+    /// player body: TaystJK never turns a failed Wampa registration into Kyle.
+    pub(in crate::cgame::player_presenter) fn resolve_npc_model_async(
+        &mut self,
+        request: &crate::cgame::NpcModelRequest,
+    ) -> ModelResolution {
+        let key = npc_model_key(request);
+        match self.request_npc_model(request, &key) {
+            ModelLookup::Ready(model) => ModelResolution::Ready(model),
+            ModelLookup::Failed(error) => ModelResolution::Failed(error),
+            ModelLookup::Pending | ModelLookup::Missing => ModelResolution::Loading,
         }
     }
 

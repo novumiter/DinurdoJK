@@ -9,7 +9,7 @@ name = "DinurdoJK"
 path = "src/main.rs"
 
 [dependencies]
-bytemuck = { version = "=1.25.2", features = ["derive"] }
+bytemuck = { version = "=1.25.2", features = ["derive", "min_const_generics"] }
 futures-lite = "=2.6.1"
 fastnoise-lite = "=1.1.1"
 egui = "=0.34.3"

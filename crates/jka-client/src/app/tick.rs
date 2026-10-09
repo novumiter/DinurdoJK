@@ -25,6 +25,14 @@ impl App {
     }
 
     pub(in crate::app) fn tick(&mut self) {
+        let input_diag_notices = self
+            .render
+            .as_ref()
+            .map(|render| render.take_input_diagnostic_notices())
+            .unwrap_or_default();
+        for line in input_diag_notices {
+            self.push_console_line(line);
+        }
         let console_changed = self.sync_console_log();
         if console_changed && self.overlay == OverlayMode::Console {
             self.publish_ui();
@@ -148,7 +156,12 @@ impl App {
             .as_ref()
             .is_some_and(|playback| playback.phase == SessionPhase::Playing);
         if session_is_playing {
-            match self.tick_demo_playback(now, dt) {
+            let advance_result = if self.demo_video_export.is_some() {
+                self.tick_demo_video_export(now)
+            } else {
+                self.tick_demo_playback(now, dt)
+            };
+            match advance_result {
                 Ok(DemoAdvance::Running) => {}
                 Ok(DemoAdvance::Completed) => {
                     let summary = self.game_session.as_ref().map(|playback| {
@@ -191,6 +204,7 @@ impl App {
                 }
             }
             self.drain_cgame_notices();
+            self.drain_siege_server_actions();
             // jaPRO calls CG_DoAsync at the end of each CGame frame, after
             // CG_DrawActive. Queue any due vstr now; it executes next App tick.
             self.tick_japro_do();
@@ -259,6 +273,7 @@ impl App {
         self.update_player_name_visibility(now);
         self.ensure_inline_instance_capacity();
         self.publish_snapshot();
+        self.queue_demo_video_capture();
 
         let follow_name = self.current_follow_name();
         let game_timer = self.game_timer_text();

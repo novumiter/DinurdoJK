@@ -21,32 +21,84 @@ fn rt_sample_count() -> u32 {
 }
 
 fn rt_local_sample_count(light: PointLight) -> u32 {
-    // Point lights and q3map metadata need one visibility query, regardless of quality.
-    return select(1u, rt_sample_count(), light.emitter.w < -0.5 && light.shadow.w >= 0.5);
+    // q3map metadata and true mathematical point lights need one query. Runtime
+    // line/capsule emitters plus promoted spherical/spot-aperture emitters use
+    // the configured 1/2/4 stochastic sample count.
+    let finite_transient = light.shadow.w >= 0.5
+        && (light.emitter.w < -0.5 || light.shadow.z > 1.0e-4);
+    return select(1u, rt_sample_count(), finite_transient);
 }
 
 fn rt_sample_local_emitter(light: PointLight, input: VertexOut, light_index: u32, sample_index: u32, sample_count: u32) -> PointLight {
-    // Negative emitter.w also encodes authored q3map angle attenuation. Only
-    // transient lights may use it as a finite-emitter marker.
-    if (light.emitter.w >= -0.5 || light.shadow.w < 0.5) {
+    // Negative emitter.w also encodes authored q3map angle attenuation, while
+    // shadow.z is q3map extra_distance for static lights. shadow.w distinguishes
+    // runtime transients, for which emitter.w<0 is a line and shadow.z is the
+    // physical source radius.
+    let is_transient = light.shadow.w >= 0.5;
+    let is_segment = is_transient && light.emitter.w < -0.5;
+    let is_spot = is_transient && light.emitter.w > 2.5;
+    let source_radius = select(0.0, max(light.shadow.z, 0.0), is_transient);
+    if (!is_segment && source_radius <= 1.0e-4) {
         return light;
     }
-    // Uniform line-source integration: use a normalized distribution along the
-    // authored visible blade, preserving the existing total light strength.
-    // The entire lighting evaluation (distance, BRDF and visibility) consumes
-    // this same sample. Sampling only visibility would leave a point-light BRDF.
+
+    // The entire local-light evaluation consumes the sampled emitter position,
+    // so distance, BRDF and visibility agree. With one sample this changes every
+    // frame and converges through the existing temporal RT path; 2/4 samples
+    // reduce noise at proportionally higher shadow-ray cost.
     let pixel = vec2<u32>(max(input.clip_position.xy, vec2<f32>(0.0)));
     let width = max(lighting_settings.values.z, 1u);
     var rng = (pixel.x + pixel.y * width) ^ (light_index * 2246822519u) ^ (camera.render_flags.w * 3266489917u);
     rng ^= sample_index * 668265263u;
-    // One jittered sample per equal interval (PBRT stratified sampling).
-    let sample_t = (f32(sample_index) + rt_rand_f(&rng)) / f32(sample_count);
+
     var sampled = light;
-    sampled.position_radius = vec4<f32>(
-        light.position_radius.xyz + light.emitter.xyz * (2.0 * sample_t - 1.0),
-        light.position_radius.w
-    );
-    sampled.emitter = vec4<f32>(0.0);
+    if (is_segment) {
+        // One jittered sample per equal interval (PBRT stratified sampling).
+        let sample_t = (f32(sample_index) + rt_rand_f(&rng)) / f32(sample_count);
+        sampled.position_radius = vec4<f32>(
+            light.position_radius.xyz + light.emitter.xyz * (2.0 * sample_t - 1.0),
+            light.position_radius.w
+        );
+    }
+
+    if (source_radius > 1.0e-4) {
+        // Sample the spherical emitter's projected disk as seen by this receiver.
+        // For a segment this is a cross-section around the chosen line sample,
+        // giving the existing saber/electricity source a capsule-like thickness.
+        let to_center = sampled.position_radius.xyz - input.world_position;
+        let distance_squared = dot(to_center, to_center);
+        if (distance_squared > 1.0e-8) {
+            // A spot models a finite lens/aperture, so sample a disk perpendicular
+            // to its projection direction. Point/segment sources keep the old
+            // receiver-facing disk approximation (sphere/capsule silhouette).
+            let disk_normal = select(
+                to_center * inverseSqrt(distance_squared),
+                normalize(light.emitter.xyz),
+                is_spot
+            );
+            let helper = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), abs(disk_normal.z) > 0.95);
+            let tangent = normalize(cross(helper, disk_normal));
+            let bitangent = cross(disk_normal, tangent);
+            let u = rt_rand_f(&rng);
+            let v = rt_rand_f(&rng);
+            let disk_radius = source_radius * sqrt(u);
+            let phi = v * 6.28318530717958647692;
+            sampled.position_radius = vec4<f32>(
+                sampled.position_radius.xyz
+                    + tangent * (disk_radius * cos(phi))
+                    + bitangent * (disk_radius * sin(phi)),
+                sampled.position_radius.w
+            );
+        }
+    }
+
+    if (!is_spot) {
+        sampled.emitter = vec4<f32>(0.0);
+        sampled.shape = vec4<f32>(0.0);
+    }
+    // The sample is now a resolved point/aperture sample; clear source size so downstream code
+    // cannot accidentally treat the already-sampled light as finite again.
+    sampled.shadow.z = 0.0;
     sampled.color_intensity = vec4<f32>(light.color_intensity.rgb / f32(sample_count), light.color_intensity.a);
     return sampled;
 }
@@ -90,35 +142,46 @@ fn rt_alpha_repeat_coord(value: i32, size: i32) -> i32 {
     return select(remainder + size, remainder, remainder >= 0);
 }
 
-fn rt_alpha_texel(texture: RtAlphaTexture, x: i32, y: i32) -> f32 {
+fn rt_rgba_texel(texture: RtAlphaTexture, x: i32, y: i32) -> vec4<f32> {
     let width = max(i32(texture.values.y), 1);
     let height = max(i32(texture.values.z), 1);
     var sx = x;
     var sy = y;
-    if (texture.values.w != 0u) {
+    if ((texture.values.w & 1u) != 0u) {
         sx = clamp(sx, 0, width - 1);
         sy = clamp(sy, 0, height - 1);
     } else {
         sx = rt_alpha_repeat_coord(sx, width);
         sy = rt_alpha_repeat_coord(sy, height);
     }
-    let linear_index = u32(sy * width + sx);
-    let packed = rt_alpha_texels[texture.values.x + linear_index / 4u];
-    let shift = (linear_index & 3u) * 8u;
-    return f32((packed >> shift) & 0xffu) * (1.0 / 255.0);
+    let index = u32(sy * width + sx);
+    if ((texture.values.w & 2u) == 0u) {
+        let packed_alpha = rt_alpha_texels[texture.values.x + index / 4u];
+        let alpha = f32((packed_alpha >> ((index & 3u) * 8u)) & 0xffu) / 255.0;
+        return vec4<f32>(1.0, 1.0, 1.0, alpha);
+    }
+    let packed = rt_alpha_texels[texture.values.x + index];
+    return vec4<f32>(
+        f32(packed & 0xffu), f32((packed >> 8u) & 0xffu),
+        f32((packed >> 16u) & 0xffu), f32(packed >> 24u)
+    ) / 255.0;
 }
 
-fn rt_sample_alpha(texture_index: u32, uv: vec2<f32>) -> f32 {
+fn rt_sample_rgba(texture_index: u32, uv: vec2<f32>) -> vec4<f32> {
     let texture = rt_alpha_textures[texture_index];
     let size = vec2<f32>(f32(max(texture.values.y, 1u)), f32(max(texture.values.z, 1u)));
     let sample_position = uv * size - vec2<f32>(0.5);
     let base = vec2<i32>(floor(sample_position));
     let fraction = fract(sample_position);
-    let a00 = rt_alpha_texel(texture, base.x, base.y);
-    let a10 = rt_alpha_texel(texture, base.x + 1, base.y);
-    let a01 = rt_alpha_texel(texture, base.x, base.y + 1);
-    let a11 = rt_alpha_texel(texture, base.x + 1, base.y + 1);
+    let a00 = rt_rgba_texel(texture, base.x, base.y);
+    let a10 = rt_rgba_texel(texture, base.x + 1, base.y);
+    let a01 = rt_rgba_texel(texture, base.x, base.y + 1);
+    let a11 = rt_rgba_texel(texture, base.x + 1, base.y + 1);
     return mix(mix(a00, a10, fraction.x), mix(a01, a11, fraction.x), fraction.y);
+}
+
+fn rt_sample_alpha(texture_index: u32, uv: vec2<f32>) -> f32 {
+    return rt_sample_rgba(texture_index, uv).a;
 }
 
 fn rt_alpha_generated_uv(
@@ -191,6 +254,9 @@ fn rt_alpha_candidate_blocks(candidate: RayIntersection) -> bool {
     let geometry_index = candidate.instance_custom_data + candidate.geometry_index;
     let geometry = rt_alpha_geometries[geometry_index];
     let material = rt_alpha_materials[geometry.values.z];
+    // Legacy OFF semantics: transparent glass was not a caster; an authored
+    // lightfilter stage that had been opaque must still behave as opaque.
+    if (material.texture.y != 0u) { return material.texture.z != 0u; }
     let first_index = geometry.values.y + candidate.primitive_index * 3u;
     let first_vertex = geometry.values.x;
     let i0 = first_vertex + rt_alpha_indices[first_index];
@@ -235,34 +301,64 @@ fn rt_alpha_candidate_blocks(candidate: RayIntersection) -> bool {
     return alpha >= material.params.x;
 }
 
-fn rt_trace_shadow_visibility(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32) -> f32 {
-    // RayDesc requires t_max >= t_min. Very close emitters have no traceable
-    // segment after the receiver and emitter endpoint biases are applied.
-    if (max_distance <= 0.25) {
-        return 1.0;
-    }
-    var query: ray_query;
-    // TERMINATE_ON_FIRST_HIT | SKIP_AABBS. Opaque BLAS triangles auto-commit;
-    // non-opaque mask triangles interrupt traversal as candidates so their
-    // authored alpha test can decide whether traversal continues.
-    rayQueryInitialize(
-        &query,
-        rt_shadow_scene,
-        RayDesc(0x204u, 0xffu, 0.25, max_distance, origin, direction_to_light)
+// Source texture RGB is sRGB like the ordinary BSP diffuse sampler. Convert
+// before using the texel as light throughput; no light color is globally edited.
+fn rt_candidate_glass_throughput(candidate: RayIntersection) -> vec3<f32> {
+    let geometry_index = candidate.instance_custom_data + candidate.geometry_index;
+    let geometry = rt_alpha_geometries[geometry_index];
+    let material = rt_alpha_materials[geometry.values.z];
+    let first_index = geometry.values.y + candidate.primitive_index * 3u;
+    let first_vertex = geometry.values.x;
+    let i0 = first_vertex + rt_alpha_indices[first_index];
+    let i1 = first_vertex + rt_alpha_indices[first_index + 1u];
+    let i2 = first_vertex + rt_alpha_indices[first_index + 2u];
+    let v0 = rt_alpha_vertices[i0];
+    let v1 = rt_alpha_vertices[i1];
+    let v2 = rt_alpha_vertices[i2];
+    let bary = vec3<f32>(
+        1.0 - candidate.barycentrics.x - candidate.barycentrics.y,
+        candidate.barycentrics.x,
+        candidate.barycentrics.y
     );
-    loop {
-        let has_candidate = rayQueryProceed(&query);
-        if (!has_candidate) {
-            break;
-        }
-        let candidate = rayQueryGetCandidateIntersection(&query);
-        if (candidate.kind == 1u && rt_alpha_candidate_blocks(candidate)) {
-            rayQueryConfirmIntersection(&query);
-            rayQueryTerminate(&query);
-        }
+    let object_position = v0.position_u.xyz * bary.x
+        + v1.position_u.xyz * bary.y
+        + v2.position_u.xyz * bary.z;
+    let object_normal = v0.normal_v.xyz * bary.x
+        + v1.normal_v.xyz * bary.y
+        + v2.normal_v.xyz * bary.z;
+    let base_uv = vec2<f32>(
+        v0.position_u.w * bary.x + v1.position_u.w * bary.y + v2.position_u.w * bary.z,
+        v0.normal_v.w * bary.x + v1.normal_v.w * bary.y + v2.normal_v.w * bary.z
+    );
+    let lightmap_uv = v0.lightmap_alpha.xy * bary.x
+        + v1.lightmap_alpha.xy * bary.y
+        + v2.lightmap_alpha.xy * bary.z;
+    let vertex_alpha = v0.lightmap_alpha.z * bary.x
+        + v1.lightmap_alpha.z * bary.y
+        + v2.lightmap_alpha.z * bary.z;
+    let world_position = candidate.object_to_world * vec4<f32>(object_position, 1.0);
+    let world_normal = candidate.object_to_world * vec4<f32>(object_normal, 0.0);
+    let uv = rt_alpha_generated_uv(material, base_uv, lightmap_uv, world_position, world_normal);
+    var alpha_multiplier = material.color.a;
+    // Match the existing BSP shader's alphaGen semantics exactly. RGB generation
+    // uses different bits; RT candidate rejection must only follow alphaGen.
+    if ((material.header.z & 1048576u) != 0u) {
+        alpha_multiplier *= vertex_alpha;
+    } else if ((material.header.z & 2097152u) != 0u) {
+        alpha_multiplier *= (1.0 - vertex_alpha);
     }
-    let hit = rayQueryGetCommittedIntersection(&query);
-    return select(1.0, 0.0, hit.kind != 0u);
+    let sampled = rt_sample_rgba(material.texture.x, uv);
+    let alpha = clamp(sampled.a * alpha_multiplier, 0.0, 1.0);
+    // Compile-time lightfilter can be authored on an opaque texture/stage.
+    // Treat this as a nominal thin glass sheet, not an opaque black wall.
+    let opacity = select(alpha, 0.25, alpha >= 0.98 || material.texture.z != 0u);
+    let srgb = clamp(sampled.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    let linear = select(srgb / 12.92, pow((srgb + 0.055) / 1.055, vec3<f32>(2.4)), srgb > vec3<f32>(0.04045));
+    return clamp(linear * material.color.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * (1.0 - opacity);
+}
+
+fn rt_trace_shadow_visibility(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32) -> f32 {
+    return rt_trace_shadow_query(origin, direction_to_light, max_distance, false).x;
 }
 
 fn ray_traced_local_shadow_visibility(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
@@ -315,6 +411,86 @@ fn rt_trace_local_visibility(light: PointLight, world_position: vec3<f32>, norma
     return rt_trace_shadow_visibility(origin, to_emitter / distance, distance - 0.25);
 }
 
+// One ray-query implementation for scalar visibility and RGB transmission.
+// Separate scalar/RGB query declarations triggered nvoglv64.dll+0x146B2FC
+// during Vulkan graphics-pipeline compilation on NVIDIA 581.80. Share the
+// traversal state; the scalar mode keeps the original first-hit flags and
+// alpha/glass classification. The RGB mode leaves panes unconfirmed and
+// multiplies their transmission, while every opaque/masked blocker wins.
+// Candidate order is unspecified: multiplying thin-pane RGB is commutative,
+// and a committed blocker returns zero regardless of when panes were visited.
+fn rt_trace_shadow_query(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32, colored: bool) -> vec3<f32> {
+    if (max_distance <= 0.25) { return vec3<f32>(1.0); }
+    var query: ray_query;
+    let ray_flags = select(0x204u, 0x200u, colored);
+    rayQueryInitialize(&query, rt_shadow_scene, RayDesc(ray_flags, 0xffu, 0.25, max_distance, origin, direction_to_light));
+    var throughput = vec3<f32>(1.0);
+    loop {
+        let has_candidate = rayQueryProceed(&query);
+        if (!has_candidate) { break; }
+        let candidate = rayQueryGetCandidateIntersection(&query);
+        if (candidate.kind == 1u) {
+            let geometry = rt_alpha_geometries[candidate.instance_custom_data + candidate.geometry_index];
+            let material = rt_alpha_materials[geometry.values.z];
+            if (colored && material.texture.y != 0u) {
+                throughput *= rt_candidate_glass_throughput(candidate);
+                if (all(throughput < vec3<f32>(0.001))) {
+                    throughput = vec3<f32>(0.0);
+                    rayQueryTerminate(&query);
+                    break;
+                }
+            } else if (rt_alpha_candidate_blocks(candidate)) {
+                rayQueryConfirmIntersection(&query);
+                rayQueryTerminate(&query);
+            }
+        }
+    }
+    let hit = rayQueryGetCommittedIntersection(&query);
+    return select(throughput, vec3<f32>(0.0), hit.kind != 0u);
+}
+
+fn rt_trace_shadow_throughput(origin: vec3<f32>, direction_to_light: vec3<f32>, max_distance: f32) -> vec3<f32> {
+    return rt_trace_shadow_query(origin, direction_to_light, max_distance, true);
+}
+
+fn rt_local_shadow_rgb(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    // Opt-in bit in the existing local-light control uniform; scalar OFF path
+    // remains the same hardware ray query and the same local-light gating.
+    if ((lighting_settings.feature_flags.z & 0x200u) == 0u) {
+        return vec3<f32>(ray_traced_local_shadow_visibility(light, world_position, normal));
+    }
+    if (!ENABLE_LOCAL_SHADOWS || camera.render_flags.x != 0u) { return vec3<f32>(1.0); }
+    let delta = light.position_radius.xyz - world_position;
+    let distance_sq = dot(delta, delta);
+    let radius = max(light.position_radius.w, 0.0);
+    if (distance_sq <= 1e-8 || distance_sq >= radius * radius) { return vec3<f32>(1.0); }
+    let distance = sqrt(distance_sq);
+    let direction = delta / distance;
+    let ndotl = max(dot(normal, direction), 0.0);
+    if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
+        let scalar = q3map_light_scalar(light, distance, q3map_surface_angle(light, ndotl));
+        if (!q3map_fast_contribution_visible(scalar)) { return vec3<f32>(1.0); }
+    } else if (ndotl <= 0.0 || light.color_intensity.a == 0.0) {
+        return vec3<f32>(1.0);
+    }
+    if (emitter_visibility(light, direction) <= 0.0) { return vec3<f32>(1.0); }
+    let surface_normal = normal * inverseSqrt(max(dot(normal, normal), 1e-12));
+    let oriented = select(-surface_normal, surface_normal, dot(surface_normal, direction) >= 0.0);
+    let origin = world_position + oriented * min(0.5, distance * 0.25);
+    let to_emitter = light.position_radius.xyz - origin;
+    let remaining = length(to_emitter);
+    if (remaining <= 0.5) { return vec3<f32>(1.0); }
+    let transmission = rt_trace_shadow_throughput(origin, to_emitter / remaining, remaining - 0.25);
+    if ((lighting_settings.feature_flags.z & 0x400u) != 0u) {
+        return select(vec3<f32>(1.0), vec3<f32>(1.0, 0.05, 0.8),
+            any(transmission < vec3<f32>(0.995)));
+    }
+    if ((lighting_settings.feature_flags.z & 0x800u) != 0u) {
+        return vec3<f32>(1.0) - transmission;
+    }
+    return transmission;
+}
+
 fn ray_traced_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
     if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u || shadow_settings.light_direction_enabled.w < 0.5) { return 1.0; }
     let cached = rt_cached_sun_visibility(input);
@@ -360,3 +536,43 @@ fn rt_uncached_sun_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {
     return visibility / f32(samples);
 }
 
+
+// Uncached directional RGB visibility while glass filtering is enabled. The
+// scalar screen-space cache remains used unchanged when tint is OFF; it cannot
+// represent three independent wavelength throughputs in its rg32float texel.
+// Using the actual traced direction preserves shaderSun's angular softening.
+fn rt_sun_shadow_rgb(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {
+    if ((lighting_settings.feature_flags.z & 0x200u) == 0u) {
+        return vec3<f32>(ray_traced_shadow_visibility(input, normal));
+    }
+    if (!ENABLE_RAY_TRACED_SUN || camera.render_flags.x != 0u
+        || shadow_settings.light_direction_enabled.w < 0.5) {
+        return vec3<f32>(1.0);
+    }
+    let toward_light = -shadow_settings.light_direction_enabled.xyz;
+    let length_sq = dot(toward_light, toward_light);
+    if (length_sq < 1.0e-8) { return vec3<f32>(1.0); }
+    let direction = toward_light * inverseSqrt(length_sq);
+    let n = normal * inverseSqrt(max(dot(normal, normal), 1e-12));
+    let oriented = select(-n, n, dot(n, direction) >= 0.0);
+    let origin = input.world_position + oriented * 0.5;
+    let px = u32(max(input.clip_position.x, 0.0));
+    let py = u32(max(input.clip_position.y, 0.0));
+    var rng = px + py * max(lighting_settings.values.z, 1u) + camera.render_flags.w;
+    let samples = rt_sample_count();
+    var transmission = vec3<f32>(0.0);
+    for (var sample_index = 0u; sample_index < samples; sample_index += 1u) {
+        let sampled_direction = rt_sample_directional_emitter(direction,
+            clamp(shadow_settings.bevy_params.x, 0.0, 1.0), &rng, sample_index, samples);
+        transmission += rt_trace_shadow_throughput(origin, sampled_direction, 1000000.0);
+    }
+    transmission /= f32(samples);
+    if ((lighting_settings.feature_flags.z & 0x400u) != 0u) {
+        return select(vec3<f32>(1.0), vec3<f32>(1.0, 0.05, 0.8),
+            any(transmission < vec3<f32>(0.995)));
+    }
+    if ((lighting_settings.feature_flags.z & 0x800u) != 0u) {
+        return vec3<f32>(1.0) - transmission;
+    }
+    return transmission;
+}

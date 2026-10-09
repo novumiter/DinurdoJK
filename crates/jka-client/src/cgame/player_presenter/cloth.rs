@@ -95,7 +95,7 @@ impl PlayerPresenter {
         entity_num: u16,
         model_label: &str,
         lod_index: usize,
-        frames: &[ClothSurfaceFrame],
+        frames: Vec<ClothSurfaceFrame>,
         glm: &GlmModel,
         surface_assets: &[PlayerSurfaceAsset],
         gla: &GlaAnimation,
@@ -123,7 +123,7 @@ impl PlayerPresenter {
                 model_label,
                 lod_index,
                 frames,
-                &capsules,
+                capsules,
                 ClothMotion { axis, origin },
                 self.stage_time_ms,
             )

@@ -5,3 +5,4 @@ pub(in crate::app) mod probe;
 pub(in crate::app) mod recording;
 pub(in crate::app) mod stream;
 pub(in crate::app) mod types;
+pub(in crate::app) mod video_export;

@@ -177,6 +177,33 @@ pub struct Ghoul2GpuBone {
     pub row2: [f32; 4],
 }
 
+/// A Source 1 `VertexLitGeneric` material's lighting extras: `$bumpmap` plus the
+/// `$phong`/`$rimlight`/`$halflambert` block. Present only on surfaces built from
+/// a VMT, which is what keeps every JKA model on the cheaper pipeline variant
+/// that has no normal-map sample compiled into it at all.
+///
+/// The scalars are Valve's, already in the form `skin_ps20b.fxc` consumes them;
+/// see `jka_client::cgame::player_presenter::source_vtf::VmtPhong`.
+#[derive(Clone, Debug)]
+pub struct SourceMaterialParams {
+    /// Tangent-space normal map, decoded linear. `None` when the VMT declares
+    /// phong but no `$bumpmap`: the surface then takes the same pipeline with a
+    /// flat normal bound, so the phong still applies to the geometric normal.
+    pub normal_map: Option<Arc<TextureData>>,
+    /// `$phongboost`; 0 when the material has no `$phong`.
+    pub phong_boost: f32,
+    /// `$phongexponent`.
+    pub phong_exponent: f32,
+    /// `$phongfresnelranges`, packed as `((mid-min)*2, mid, (max-mid)*2)`.
+    pub phong_fresnel: [f32; 3],
+    /// `$rimlightboost`; 0 when the material has no `$rimlight`.
+    pub rimlight_boost: f32,
+    /// `$rimlightexponent`.
+    pub rimlight_exponent: f32,
+    /// `$halflambert`: the diffuse term becomes `(N.L * 0.5 + 0.5)^2`.
+    pub half_lambert: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Ghoul2GpuSkinning {
     /// Stable geometry cache key, e.g. `models/players/kyle/model.glm#lod0#surface3`.
@@ -208,6 +235,9 @@ pub struct Ghoul2GpuSkinning {
     /// Up to four model-space post-skin region offsets. Ordinary Ghoul2 draws
     /// keep these zero; jiggle vertices select one through `jiggle_region`.
     pub jiggle_offsets: [[f32; 4]; 4],
+    /// Source 1 bump/phong material, if this surface came from a VMT. `None` for
+    /// every JKA surface, and the renderer keys its pipeline choice off that.
+    pub source_material: Option<SourceMaterialParams>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -487,6 +517,7 @@ pub(in crate::renderer) struct LegacyDlightPerfStats {
     pub(in crate::renderer) transient_count: usize,
     pub(in crate::renderer) saber_sources: usize,
     pub(in crate::renderer) authored_fx_sources: usize,
+    pub(in crate::renderer) promoted_fx_sources: usize,
     pub(in crate::renderer) saber_mark_sources: usize,
     pub(in crate::renderer) radius_sum: f64,
     pub(in crate::renderer) radius_max: f32,
@@ -496,6 +527,7 @@ pub(in crate::renderer) struct LegacyDlightPerfStats {
     pub(in crate::renderer) candidate_pairs: u64,
     pub(in crate::renderer) saber_pairs: u64,
     pub(in crate::renderer) authored_fx_pairs: u64,
+    pub(in crate::renderer) promoted_fx_pairs: u64,
     pub(in crate::renderer) saber_mark_pairs: u64,
     pub(in crate::renderer) max_candidates_per_surface: u32,
     pub(in crate::renderer) surface_buckets: [u32; 6],
@@ -510,7 +542,12 @@ pub struct TransientLight {
     pub position: [f32; 3],
     pub color: [f32; 3],
     pub radius: f32,
+    /// Physical emitter radius for stochastic hardware-RT soft shadows.
+    /// This does not change raster attenuation/range.
+    pub source_radius: f32,
     pub intensity: f32,
+    /// Local projected-light cone. Direction is in renderer space.
+    pub spot: Option<crate::fx::system::FxSpotLight>,
     pub segment: Option<[[f32; 3]; 2]>,
     pub blade_segments: Option<Arc<[crate::fx::system::FxLightSegment]>>,
 }
@@ -529,6 +566,21 @@ pub struct CloudForegroundBlade {
 /// the nearest ones win when a scene has more.
 pub(in crate::renderer) const MAX_CLOUD_FOREGROUND_BLADES: usize = 8;
 
+/// Team colour used by the spectator/demo through-wall outline pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpectatorHighlightTeam {
+    Red,
+    Blue,
+    Yellow,
+}
+
+/// One player entity to outline for spectator/demo viewing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpectatorHighlight {
+    pub entity_num: u16,
+    pub team: SpectatorHighlightTeam,
+}
+
 #[derive(Clone)]
 pub struct RenderSnapshot {
     pub model_frame_source: Option<crate::model_frame_log::FrameSource>,
@@ -542,10 +594,13 @@ pub struct RenderSnapshot {
     /// High-rate subframe updates mirror this into `LatestViewState`.
     pub dynamic_crosshair_world: Option<[f32; 3]>,
     pub player_position: Option<Vec3>,
+    pub ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
     /// Current server snapshot portal-area mask. Set bits are areas closed off
     /// by areaportals/doors. `None` for solo/offline scenes with no snapshot.
     pub area_mask: Option<[u8; 32]>,
     pub dynamic_models: Arc<Vec<DynamicModelSurface>>,
+    /// Players outlined through walls while spectating or watching demos.
+    pub spectator_highlights: Arc<Vec<SpectatorHighlight>>,
     /// Short-lived RE_AddLightToScene-style sources submitted by CGame/FX.
     /// These stay separate from map-static lights so moving flashes do not
     /// churn the cached local-shadow selection.
@@ -598,6 +653,7 @@ pub struct PostEffects {
     pub fxaa: bool,
     pub smaa: bool,
     pub taa: bool,
+    pub rt_taa: u32,
     pub contact_shadows: bool,
     pub fog_mode: FogMode,
     pub fog_strength: f32,
@@ -608,13 +664,15 @@ pub struct PostEffects {
     pub sun_color: [f32; 3],
     pub sun_visibility: SunVisibilityMode,
     pub entity_sun_lighting: bool,
+    pub sky_fractal_override: bool,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,
     pub cloud_coverage: f32,
     pub cloud_height: f32,
     pub cloud_thickness: f32,
-    pub weather_wind: crate::ocean::OceanWind,
+    pub weather_wind: crate::ocean::AtmosphericWind,
+    pub wind_visuals: f32,
     pub cloud_shadows: bool,
     pub cloud_render_resolution: CloudRenderResolution,
     pub cloud_temporal: bool,
@@ -633,6 +691,24 @@ pub struct PostEffects {
     pub cloud_size: f32,
     pub rain: bool,
     pub rain_intensity: RainIntensity,
+    /// Compatibility multiplier for stacked JKA `r_we` rain clouds.
+    pub rain_density_scale: f32,
+    /// RGB multiplier. Acid rain uses the stock green color; normal rain is 1.
+    pub rain_tint: [f32; 3],
+    /// `r_we freeze` freezes only renderer world-effect rain, not the saved user rain cvar.
+    pub rain_frozen: bool,
+    /// Retail renderer-world snow. One density unit corresponds to one 1,000-flake cloud.
+    pub snow: bool,
+    pub snow_density_scale: f32,
+    pub snow_frozen: bool,
+    /// Legacy `r_we sand` cloud layers. Zero keeps its renderer path dormant.
+    pub legacy_sand_layers: u32,
+    /// Sum of positive `r_we spacedust <count>` cloud requests.
+    pub legacy_space_dust_count: u32,
+    /// `r_we freeze` also freezes procedural sand/spacedust advection.
+    pub legacy_weather_frozen: bool,
+    /// 0..1 toxic atmospheric treatment for the selected legacy acid-rain cloud.
+    pub legacy_acid_rain: f32,
     pub rain_glass: bool,
     pub puddle_quality: PuddleQuality,
     pub puddle_scatter: f32,
@@ -765,6 +841,8 @@ pub enum ScreenshotFormat {
 }
 
 pub enum RenderCommand {
+    /// Arm a bounded, off-by-default per-frame command-encoding capture.
+    StartPerfCapture { stem: PathBuf, frames: usize },
     Resize(PhysicalSize<u32>),
     SetVsync(VsyncMode),
     SetMaxFrameLatency(u32),
@@ -794,6 +872,7 @@ pub enum RenderCommand {
     /// Draw a beam from the sun to the camera (player head) while sun angles are edited.
     SetSunRayPreview(bool),
     SetPvsMode(PvsMode),
+    SetWorldFlares(bool),
     SetFpsCap(u32),
     SetGamma(f32),
     SetGammaMethod(crate::gamma::GammaMethod),
@@ -808,6 +887,17 @@ pub enum RenderCommand {
     SetGrassPrecompute(bool),
     SetGrassMidLod(bool),
     SetGrassFrontToBack(bool),
+    /// Runtime-only rain performance A/B controls.
+    SetRainOptimizations {
+        fast_post: bool,
+        water_field: bool,
+        fast_vertex: bool,
+        lean_depth: bool,
+        static_depth: bool,
+        opaque_depth: bool,
+        lean_models: bool,
+        lean_post: bool,
+    },
     SetContactShadowDebug(u8),
     SetSsrDebug(u8),
     SetOceanEnabled(bool),
@@ -826,7 +916,9 @@ pub enum RenderCommand {
         hiz_occlusion: bool,
     },
     SetDynamicLighting(DynamicLightsMode),
+    SetDynamicLightDebug(bool),
     SetRtSamples(u32),
+    SetRtDenoiserMode(u32),
     SetDynamicLightFalloff(u32),
     SetRtHalfResolution(bool),
     SetMapLightSimulation(bool),
@@ -836,9 +928,12 @@ pub enum RenderCommand {
         lightmap_only: bool,
     },
     SetEmissiveAreaLights(bool),
+    SetShaderLightPromotion { enabled: bool, mask: u32 },
     SetEntityAmbientLighting(EntityAmbientLightingMode),
     SetVoxelProbeGi(bool),
     SetLocalLightShadows(bool),
+    SetTintedGlass(bool),
+    SetTintedGlassDebug(u32),
     SetEntityShadowLight(EntityShadowLight),
     SetPbrSettings {
         enabled: bool,
@@ -872,6 +967,7 @@ pub enum RenderCommand {
         format: ScreenshotFormat,
     },
     CopyFrameToClipboard,
+    CaptureVideoFrame { frame_index: u64, depth: bool },
     SetUi(UiSnapshot),
     SetTransientUi {
         chat_lines: Vec<ui::UiChatLine>,
@@ -944,6 +1040,25 @@ pub enum RenderCommand {
     Shutdown,
 }
 
+/// CPU-side calls recorded *at the instrumented call sites* of the main
+/// frame functions. These are not driver/API-internal or all-subrenderer totals.
+/// In particular each multi-draw call is counted once, not once per GPU draw.
+#[derive(Default, Clone, Copy)]
+pub(in crate::renderer) struct PerfEncodeCallCounts {
+    pub render_passes: u32,
+    pub compute_passes: u32,
+    pub set_pipeline: u32,
+    pub set_bind_group: u32,
+    pub set_vertex_buffer: u32,
+    pub set_index_buffer: u32,
+    pub draw: u32,
+    pub draw_indexed: u32,
+    pub world_helper_draw_indexed: u32,
+    pub draw_indexed_indirect: u32,
+    pub multi_draw_indexed_indirect: u32,
+    pub multi_draw_indexed_indirect_count: u32,
+}
+
 #[derive(Default)]
 pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) frame_ms: f64,
@@ -952,6 +1067,22 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) cpu_encode_ms: f64,
     pub(in crate::renderer) cpu_submit_ms: f64,
     pub(in crate::renderer) cpu_present_ms: f64,
+    /// Opt-in diagnostic. Mutually exclusive encoder intervals; they do not
+    /// measure GPU execution. `encode_pre_world` can include RT, shadows,
+    /// reflections, and environment work on the unified path.
+    pub(in crate::renderer) perf_encode_setup_ms: f64,
+    pub(in crate::renderer) perf_encode_pre_world_ms: f64,
+    pub(in crate::renderer) perf_encode_scene_ms: f64,
+    pub(in crate::renderer) perf_encode_post_ui_ms: f64,
+    pub(in crate::renderer) perf_encoder_finish_ms: f64,
+    pub(in crate::renderer) perf_profiler_readback_encode_ms: f64,
+    /// Isolated first `queue.submit()` API call, not the old `cpu_submit_ms`.
+    pub(in crate::renderer) perf_primary_submit_api_ms: f64,
+    /// Time AFTER the first queue submit until `cpu_submit_ms` stops. Includes
+    /// optional SMAA, CRT, menu, egui, screenshot and related CPU work.
+    pub(in crate::renderer) perf_followup_ms: f64,
+    pub(in crate::renderer) perf_primary_command_buffers: u32,
+    pub(in crate::renderer) perf_encode_calls: PerfEncodeCallCounts,
     /// Which world renderer produced this frame ("fast-baseline" / "unified").
     pub(in crate::renderer) world_path: &'static str,
     /// Advanced-path breakdown of `cpu_prepare_ms`. All zero on FastBaseline,
@@ -963,6 +1094,9 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) submit_call_at: Option<Instant>,
     pub(in crate::renderer) present_call_completed_at: Option<Instant>,
     pub(in crate::renderer) late_latch: Option<ViewSampleMeasurement>,
+    /// True when the late-latch sample was intentionally taken after surface
+    /// acquisition (fast baseline without camera-dependent early preparation).
+    pub(in crate::renderer) late_latch_after_acquire: bool,
     pub(in crate::renderer) dynamic_model_prepare_ms: f64,
     pub(in crate::renderer) dynamic_model_surfaces: u32,
     pub(in crate::renderer) dynamic_model_vertices: u64,
@@ -984,6 +1118,7 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) world_multidraw_groups: u32,
     pub(in crate::renderer) world_multidraw_batches: u32,
     pub(in crate::renderer) grass: GrassDrawStats,
+    pub(in crate::renderer) ocean: crate::ocean::OceanDrawStats,
 }
 
 #[derive(Debug)]

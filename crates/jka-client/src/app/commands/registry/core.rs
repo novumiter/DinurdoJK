@@ -3,6 +3,21 @@ use crate::app::{split_console_script, App, ChatMode, ConsoleCvarSetResult};
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_snd_restart ["snd_restart", ] ("snd_restart", "Restart the sound subsystem and apply current audio settings.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => {
+                self.restart_sound_subsystem();
+                CommandResult::Handled
+            }
+            [_verb, ..] => {
+                self.push_console_line("^3usage:^7 snd_restart".to_owned());
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
     cmd_clear ["clear", ] ("clear", "Clear the console output.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {

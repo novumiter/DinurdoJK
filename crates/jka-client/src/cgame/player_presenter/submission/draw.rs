@@ -204,7 +204,7 @@ impl PlayerPresenter {
                 entity_num,
                 model_label,
                 lod_index,
-                &cloth_frames,
+                cloth_frames,
                 glm,
                 surface_assets,
                 gla,
@@ -318,6 +318,12 @@ impl PlayerPresenter {
                         bulge_height: 0.0,
                         env_map: false,
                         jiggle_offsets: gpu_jiggle_offsets,
+                        // A customShader/tint stage replaces the material, so the
+                        // VMT's bump and phong only ride along with the base one.
+                        source_material: custom_material
+                            .is_none()
+                            .then(|| asset.source_material.clone())
+                            .flatten(),
                     }),
                     fx_gpu_sprites: None,
                     authored_glow,
@@ -389,7 +395,7 @@ impl PlayerPresenter {
             entity_num,
             model_label,
             lod_index,
-            &cloth_frames,
+            cloth_frames,
             glm,
             surface_assets,
             gla,
@@ -629,6 +635,9 @@ impl PlayerPresenter {
             bulge_height: bulge_height.unwrap_or(skin.bulge_height),
             env_map: env_map.unwrap_or(skin.env_map),
             jiggle_offsets: skin.jiggle_offsets,
+            // This clone is a different material (overlay, stage or
+            // customShader), so it keeps none of the base one's VMT lighting.
+            source_material: None,
         });
         let vertices = if ghoul2_gpu.is_some() {
             Arc::clone(&surface.vertices)

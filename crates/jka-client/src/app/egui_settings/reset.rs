@@ -7,10 +7,15 @@ use crate::app::egui_settings::{
     PHYS_CLOTH_BODY_COLLISION, PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_DEBRIS,
     PHYS_DEBRIS_LIFETIME, PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT,
     PHYS_DISMEMBER_LIFETIME, PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES,
-    PHYS_JIGGLE, PHYS_JIGGLE_BREAST, PHYS_JIGGLE_DAMPING, PHYS_JIGGLE_GLUTE,
-    PHYS_JIGGLE_GLUTE_LIFT, PHYS_JIGGLE_JP_AIR_DRAG, PHYS_JIGGLE_JP_DRAG,
+    PHYS_JIGGLE, PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z,
+    PHYS_JIGGLE_BREAST_REMESH_TOP_Z, PHYS_JIGGLE_DAMPING, PHYS_JIGGLE_GLUTE,
+    PHYS_JIGGLE_GLUTE_JIGGLE_BOTTOM_Z, PHYS_JIGGLE_GLUTE_JIGGLE_TOP_Z, PHYS_JIGGLE_GLUTE_LIFT,
+    PHYS_JIGGLE_GLUTE_REMESH_BOTTOM_Z, PHYS_JIGGLE_GLUTE_REMESH_TOP_Z, PHYS_JIGGLE_JP_AIR_DRAG, PHYS_JIGGLE_JP_DRAG,
     PHYS_JIGGLE_JP_GRAVITY, PHYS_JIGGLE_JP_SOFTEN, PHYS_JIGGLE_JP_STIFFNESS,
     PHYS_JIGGLE_JP_STRETCH, PHYS_JIGGLE_SOLVER, PHYS_JIGGLE_STIFFNESS, PHYS_JIGGLE_STRENGTH,
+    PHYS_JIGGLE_BREAST_SIZE, PHYS_JIGGLE_GLUTE_SIZE, PHYS_JIGGLE_LOCOMOTION, PHYS_JIGGLE_SWIRL,
+    PHYS_JIGGLE_BREAST_STIFFNESS, PHYS_JIGGLE_BREAST_DAMPING, PHYS_JIGGLE_GLUTE_STIFFNESS,
+    PHYS_JIGGLE_GLUTE_DAMPING,
     PHYS_MAX_SUBSTEPS,
     PHYS_PLAYER_PUSH, PHYS_PROPS, PHYS_PROP_MAX, PHYS_RAGDOLLS, PHYS_RAGDOLL_LIFETIME,
     PHYS_RAGDOLL_MAX, PHYS_RAGDOLL_SELF_COLLISION, PHYS_RATE, PHYS_SLEEPING, PHYS_STATS,
@@ -225,6 +230,39 @@ impl App {
                 self.sync_dynamic_lighting();
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_DYNAMIC_LIGHT_DEBUG => {
+                self.video.dynamic_light_debug = defaults.dynamic_light_debug;
+                self.render_command(RenderCommand::SetDynamicLightDebug(
+                    self.video.dynamic_light_debug,
+                ));
+            }
+            ui::VIDEO_ROW_PROMOTE_FX_LIGHTS => {
+                self.video.promote_fx_lights = defaults.promote_fx_lights;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.promote_fx_lights = self.video.promote_fx_lights;
+                }
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS => {
+                self.video.promote_shader_lights = defaults.promote_shader_lights;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_GLOW => {
+                self.video.promote_shader_glow = defaults.promote_shader_glow;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_ADDITIVE => {
+                self.video.promote_shader_additive = defaults.promote_shader_additive;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_EMISSIVE => {
+                self.video.promote_shader_emissive = defaults.promote_shader_emissive;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_MAP_LIGHT_SIMULATION => {
                 self.video.map_light_simulation = defaults.map_light_simulation;
                 self.sync_map_light_simulation();
@@ -276,6 +314,11 @@ impl App {
             }
             ui::VIDEO_ROW_FLARES => {
                 self.video.flares = defaults.flares;
+                self.sync_world_flares();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_SABER_FLARES => {
+                self.video.saber_flares = defaults.saber_flares;
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_SABER_IMPACT_FX => {
@@ -325,6 +368,10 @@ impl App {
             }
             ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS => {
                 self.video.local_light_shadows = defaults.local_light_shadows;
+                self.video.tinted_glass = defaults.tinted_glass;
+                self.video.tinted_glass_debug = defaults.tinted_glass_debug;
+                self.sync_tinted_glass_debug();
+                self.sync_tinted_glass();
                 self.sync_local_light_shadows();
                 self.mark_config_dirty();
             }
@@ -531,6 +578,40 @@ impl App {
             PHYS_JIGGLE_STIFFNESS => self.video.jiggle_stiffness = defaults.jiggle_stiffness,
             PHYS_JIGGLE_DAMPING => self.video.jiggle_damping = defaults.jiggle_damping,
             PHYS_JIGGLE_GLUTE_LIFT => self.video.jiggle_glute_lift = defaults.jiggle_glute_lift,
+            PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z => {
+                self.video.jiggle_breast_remesh_bottom_z = defaults.jiggle_breast_remesh_bottom_z
+            }
+            PHYS_JIGGLE_BREAST_REMESH_TOP_Z => {
+                self.video.jiggle_breast_remesh_top_z = defaults.jiggle_breast_remesh_top_z
+            }
+            PHYS_JIGGLE_GLUTE_REMESH_BOTTOM_Z => {
+                self.video.jiggle_glute_remesh_bottom_z = defaults.jiggle_glute_remesh_bottom_z
+            }
+            PHYS_JIGGLE_GLUTE_REMESH_TOP_Z => {
+                self.video.jiggle_glute_remesh_top_z = defaults.jiggle_glute_remesh_top_z
+            }
+            PHYS_JIGGLE_GLUTE_JIGGLE_BOTTOM_Z => {
+                self.video.jiggle_glute_jiggle_bottom_z = defaults.jiggle_glute_jiggle_bottom_z
+            }
+            PHYS_JIGGLE_GLUTE_JIGGLE_TOP_Z => {
+                self.video.jiggle_glute_jiggle_top_z = defaults.jiggle_glute_jiggle_top_z
+            }
+            PHYS_JIGGLE_BREAST_SIZE => self.video.jiggle_breast_size = defaults.jiggle_breast_size,
+            PHYS_JIGGLE_GLUTE_SIZE => self.video.jiggle_glute_size = defaults.jiggle_glute_size,
+            PHYS_JIGGLE_LOCOMOTION => self.video.jiggle_locomotion = defaults.jiggle_locomotion,
+            PHYS_JIGGLE_SWIRL => self.video.jiggle_swirl = defaults.jiggle_swirl,
+            PHYS_JIGGLE_BREAST_STIFFNESS => {
+                self.video.jiggle_breast_stiffness = defaults.jiggle_breast_stiffness
+            }
+            PHYS_JIGGLE_BREAST_DAMPING => {
+                self.video.jiggle_breast_damping = defaults.jiggle_breast_damping
+            }
+            PHYS_JIGGLE_GLUTE_STIFFNESS => {
+                self.video.jiggle_glute_stiffness = defaults.jiggle_glute_stiffness
+            }
+            PHYS_JIGGLE_GLUTE_DAMPING => {
+                self.video.jiggle_glute_damping = defaults.jiggle_glute_damping
+            }
             PHYS_JIGGLE_SOLVER => self.video.jiggle_solver = defaults.jiggle_solver,
             PHYS_JIGGLE_JP_STIFFNESS => self.video.jiggle_jp_stiffness = defaults.jiggle_jp_stiffness,
             PHYS_JIGGLE_JP_DRAG => self.video.jiggle_jp_drag = defaults.jiggle_jp_drag,
@@ -650,6 +731,7 @@ impl App {
             ui::ENV_ROW_WEATHER_DIRECTION_VARIATION => {
                 self.set_weather_direction_variation(defaults.weather_wind.shift)
             }
+            ui::ENV_ROW_WIND_VISUALS => self.set_wind_visuals(defaults.wind_visuals),
             ui::ENV_ROW_CLOUD_SHADOWS => {
                 self.video.cloud_shadows = defaults.cloud_shadows;
                 self.sync_post_effects();
@@ -666,9 +748,20 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::ENV_ROW_RAIN => {
-                self.video.rain = defaults.rain;
-                self.sync_post_effects();
-                self.mark_config_dirty();
+                let weather = if defaults.rain {
+                    match defaults.rain_intensity {
+                        crate::ui::RainIntensity::Light => {
+                            crate::world_effects::WeatherType::LightRain
+                        }
+                        crate::ui::RainIntensity::Rain => crate::world_effects::WeatherType::Rain,
+                        crate::ui::RainIntensity::Heavy => {
+                            crate::world_effects::WeatherType::HeavyRain
+                        }
+                    }
+                } else {
+                    crate::world_effects::WeatherType::Clear
+                };
+                self.set_weather_type(weather);
             }
             ui::ENV_ROW_RAIN_INTENSITY => {
                 self.video.rain_intensity = defaults.rain_intensity;
@@ -688,6 +781,38 @@ impl App {
             }
             ui::ENV_ROW_PUDDLE_SCATTER => self.set_puddle_scatter(defaults.puddle_scatter),
             ui::ENV_ROW_RAIN_GRADE => self.set_rain_grade(defaults.rain_grade),
+            ui::ENV_ROW_RAIN_FAST_POST => {
+                self.video.rain_fast_post = defaults.rain_fast_post;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_WATER_FIELD => {
+                self.video.rain_water_field = defaults.rain_water_field;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_FAST_VERTEX => {
+                self.video.rain_fast_vertex = defaults.rain_fast_vertex;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_LEAN_DEPTH => {
+                self.video.rain_lean_depth = defaults.rain_lean_depth;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_STATIC_DEPTH => {
+                self.video.rain_static_depth = defaults.rain_static_depth;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_OPAQUE_DEPTH => {
+                self.video.rain_opaque_depth = defaults.rain_opaque_depth;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_LEAN_MODELS => {
+                self.video.rain_lean_models = defaults.rain_lean_models;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_LEAN_POST => {
+                self.video.rain_lean_post = defaults.rain_lean_post;
+                self.sync_rain_optimizations();
+            }
             ui::ENV_ROW_FOOTPRINTS => {
                 self.video.footprints = defaults.footprints;
                 self.render_command(RenderCommand::SetFootprintMode(self.video.footprints));

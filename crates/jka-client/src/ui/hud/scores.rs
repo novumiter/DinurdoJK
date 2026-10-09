@@ -1,7 +1,8 @@
 //! Hud scores.
 use crate::ui::{
-    fixed_charset_text, player_icon_atlas_cell, rect, text, visible_jka_chars, ProportionalFont,
-    UiMiniScores, UiSnapshot, UiVertex,
+    duel_icon_atlas_offset, fixed_charset_text, player_icon_atlas_cell, rect,
+    shared_player_icon_count, text, visible_jka_chars, ProportionalFont, UiMiniScores, UiSnapshot,
+    UiVertex,
 };
 
 pub(in crate::ui) fn build_game_timer(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
@@ -141,10 +142,15 @@ pub(in crate::ui) fn build_mini_scores(
             draw_score(out, &red, red_x_v);
         }
         UiMiniScores::Duel {
-            icon_paths,
+            icon_paths: _,
             blue,
             red,
         } => {
+            let icon_count = shared_player_icon_count(ui);
+            let icon_offset = duel_icon_atlas_offset(ui);
+            let absolute_icon = |index: Option<u16>| {
+                index.and_then(|index| u16::try_from(icon_offset + usize::from(index)).ok())
+            };
             // CG_DrawDuelHUD: duelist1 is blue/left and duelist2 red/right,
             // including each clientInfo modelIcon beside the equal score boxes.
             const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 0.70];
@@ -188,8 +194,8 @@ pub(in crate::ui) fn build_mini_scores(
             let icon_h_v = box_h_v - 3.0;
             player_icon_atlas_cell(
                 out,
-                icon_paths.len(),
-                blue.model_icon,
+                icon_count,
+                absolute_icon(blue.model_icon),
                 (blue_x_v - icon_w_v + ratio) * sx,
                 (y_v + 1.0) * sy,
                 (icon_w_v - 3.0 * ratio) * sx,
@@ -199,8 +205,8 @@ pub(in crate::ui) fn build_mini_scores(
             );
             player_icon_atlas_cell(
                 out,
-                icon_paths.len(),
-                red.model_icon,
+                icon_count,
+                absolute_icon(red.model_icon),
                 (red_x_v + box_w_v + 2.0 * ratio) * sx,
                 (y_v + 1.0) * sy,
                 (icon_w_v - 3.0 * ratio) * sx,

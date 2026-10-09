@@ -60,6 +60,7 @@ use hud::movement::{
 pub use hud::movement::{ICON_CELL, ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
 use hud::notices::{build_center_print, build_follow_indicator, build_vote};
 use hud::scores::{build_game_timer, build_mini_scores};
+use hud::siege::build_siege_hud;
 use hud::team::{build_prediction_debug, build_team_overlay, player_icon_atlas_cell};
 use inspector::surface_inspector_frame;
 use loading::{build_background_progress, build_loading_screen, build_splash_background};
@@ -75,7 +76,11 @@ pub use settings::environment::{
     ENV_ROW_CLOUD_RENDER_RESOLUTION, ENV_ROW_CLOUD_SHADOWS, ENV_ROW_CLOUD_TEMPORAL,
     ENV_ROW_CLOUD_THICKNESS, ENV_ROW_CLOUD_TUNING, ENV_ROW_CLOUD_TYPE, ENV_ROW_FOG_MODE,
     ENV_ROW_FOG_STRENGTH, ENV_ROW_FOOTPRINTS, ENV_ROW_PUDDLE_SCATTER, ENV_ROW_PUDDLE_WATER,
-    ENV_ROW_RAIN, ENV_ROW_RAIN_GLASS, ENV_ROW_RAIN_GRADE, ENV_ROW_RAIN_INTENSITY,
+    ENV_ROW_RAIN, ENV_ROW_RAIN_FAST_POST, ENV_ROW_RAIN_FAST_VERTEX, ENV_ROW_RAIN_GLASS,
+    ENV_ROW_RAIN_GRADE, ENV_ROW_RAIN_INTENSITY, ENV_ROW_RAIN_LEAN_DEPTH,
+    ENV_ROW_RAIN_LEAN_MODELS, ENV_ROW_RAIN_LEAN_POST, ENV_ROW_RAIN_OPAQUE_DEPTH,
+    ENV_ROW_RAIN_STATIC_DEPTH, ENV_ROW_RAIN_WATER_FIELD,
+    ENV_ROW_WIND_VISUALS,
     MAX_FOG_STRENGTH,
     VIDEO_ROW_FILM_GRAIN,
 };
@@ -100,7 +105,10 @@ pub use settings::rendering::{
     VIDEO_ROW_DISTANCE_CULL, VIDEO_ROW_DLIGHT_BRIGHTNESS, VIDEO_ROW_DOF_AUTOFOCUS,
     VIDEO_ROW_DOF_QUALITY, VIDEO_ROW_DRAW_CLIP_BRUSHES, VIDEO_ROW_DRAW_ENTITIES,
     VIDEO_ROW_DRAW_FPS, VIDEO_ROW_DRAW_MAP_MODELS, VIDEO_ROW_DRAW_TRIGGERS,
-    VIDEO_ROW_DYNAMIC_LIGHTS, VIDEO_ROW_DYNAMIC_SHADOWS, VIDEO_ROW_EMISSIVE_AREA_LIGHTS,
+    VIDEO_ROW_DYNAMIC_LIGHTS, VIDEO_ROW_DYNAMIC_LIGHT_DEBUG, VIDEO_ROW_DYNAMIC_SHADOWS,
+    VIDEO_ROW_EMISSIVE_AREA_LIGHTS, VIDEO_ROW_PROMOTE_FX_LIGHTS,
+    VIDEO_ROW_PROMOTE_SHADER_ADDITIVE, VIDEO_ROW_PROMOTE_SHADER_EMISSIVE,
+    VIDEO_ROW_PROMOTE_SHADER_GLOW, VIDEO_ROW_PROMOTE_SHADER_LIGHTS,
     VIDEO_ROW_ENTITY_AMBIENT_LIGHTING, VIDEO_ROW_ENTITY_SHADOW_LIGHT, VIDEO_ROW_FLARES,
     VIDEO_ROW_FLOAT_LIGHTMAP, VIDEO_ROW_FPS_CAP, VIDEO_ROW_FULLSCREEN, VIDEO_ROW_FX_FPS,
     VIDEO_ROW_FX_FPS_SCOPE, VIDEO_ROW_FX_GEOMETRY, VIDEO_ROW_FX_LOD, VIDEO_ROW_FX_PHYSICS,
@@ -113,7 +121,7 @@ pub use settings::rendering::{
     VIDEO_ROW_PICMIP, VIDEO_ROW_PLANAR_REFLECTIONS,
     VIDEO_ROW_PLANAR_REFLECTION_DEBUG, VIDEO_ROW_PVS, VIDEO_ROW_QUALITY_PRESET,
     VIDEO_ROW_RENDERER_VERBOSE, VIDEO_ROW_RENDER_BACKEND, VIDEO_ROW_RESOLUTION,
-    VIDEO_ROW_SABER_IMPACT_FX, VIDEO_ROW_SABER_MARKS, VIDEO_ROW_SSR, VIDEO_ROW_TEXTURE_FILTER,
+    VIDEO_ROW_SABER_FLARES, VIDEO_ROW_SABER_IMPACT_FX, VIDEO_ROW_SABER_MARKS, VIDEO_ROW_SSR, VIDEO_ROW_TEXTURE_FILTER,
     VIDEO_ROW_TONE_MAPPING, VIDEO_ROW_VERTEX_LIGHTING, VIDEO_ROW_VID_RESTART, VIDEO_ROW_VIGNETTE,
     VIDEO_ROW_CRT_SCOPE, VIDEO_ROW_CRT_STYLE, VIDEO_ROW_CRT_QUALITY, VIDEO_ROW_CRT_REFERENCE, VIDEO_ROW_CRT_MASK,
     VIDEO_ROW_CRT_SCANLINE, VIDEO_ROW_CRT_SHARPNESS, VIDEO_ROW_CRT_MASK_INTENSITY,
@@ -172,6 +180,8 @@ pub enum ChatMode {
     #[default]
     Global,
     Team,
+    /// A recipient captured when `messagemode3` is opened (TaystJK chat_playerNum).
+    Direct(u8),
 }
 
 #[derive(Debug, Clone)]
@@ -200,22 +210,76 @@ pub struct UiScoreEntry {
     pub client: i32,
     pub name: String,
     pub score: i32,
+    /// `score_t.powerups`; CTF and Siege use the flag bits for the carrier marker.
+    pub powerups: i32,
+    pub captures: i32,
+    pub assists: i32,
+    pub defends: i32,
     pub deaths: Option<i32>,
     pub ping: i32,
     pub time: i32,
     pub team: i32,
+    /// Current CS_PLAYERS `siegeclass` for native Siege scoreboard presentation.
+    pub siege_class: String,
+    /// Local cell within `UiScoreboard::icon_paths`. In Siege this is
+    /// the carried flag icon first, otherwise the authored class_shader.
+    pub siege_icon: Option<u16>,
+    /// Client-side heuristic: this spectator has mirrored the local player's
+    /// changing ping for three consecutive distinct samples, which is how
+    /// legacy JKA follow spectators can reveal their likely target.
+    pub spectating_you: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiScoreboard {
     pub team_scores: [i32; 2],
+    /// TaystJK `cg.snap->ps.stats[STAT_CLIENTS_READY]`: low 16 bits are a
+    /// client-number bitmask used by the intermission scoreboard.
+    pub ready_clients: u16,
     pub team_game: bool,
+    /// TaystJK GT_CTF scoreboard layout (score/captures/assists/defends/ping/time).
+    pub ctf: bool,
+    pub siege: bool,
+    /// CS_SIEGE_WINTEAM; zero while no round winner is being displayed.
+    pub siege_win_team: i32,
     /// Duel and power duel keep a win/loss score for the spectators waiting in line;
     /// every other mode shows only ping and time for them, like jaPRO's scoreboard.
     pub spectator_scores: bool,
     /// Whether this scoreboard mode has a usable deaths value to display.
     pub show_deaths: bool,
+    /// Siege class/carrier cells following the team overlay and duel icons in the atlas.
+    pub icon_paths: Vec<String>,
     pub entries: Vec<UiScoreEntry>,
+}
+
+pub(in crate::ui) fn shared_player_icon_count(ui: &UiSnapshot) -> usize {
+    shared_player_icon_paths(ui).len()
+}
+
+pub(in crate) fn shared_player_icon_paths(ui: &UiSnapshot) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(overlay) = ui.team_overlay.as_ref() {
+        paths.extend(overlay.icon_paths.iter().cloned());
+    }
+    if let Some(UiMiniScores::Duel { icon_paths, .. }) = ui.mini_scores.as_ref() {
+        paths.extend(icon_paths.iter().cloned());
+    }
+    if let Some(board) = ui.scoreboard.as_ref() {
+        paths.extend(board.icon_paths.iter().cloned());
+    }
+    paths
+}
+
+pub(in crate::ui) fn duel_icon_atlas_offset(ui: &UiSnapshot) -> usize {
+    ui.team_overlay.as_ref().map_or(0, |overlay| overlay.icon_paths.len())
+}
+
+pub(in crate::ui) fn scoreboard_icon_atlas_offset(ui: &UiSnapshot) -> usize {
+    duel_icon_atlas_offset(ui)
+        + match ui.mini_scores.as_ref() {
+            Some(UiMiniScores::Duel { icon_paths, .. }) => icon_paths.len(),
+            _ => 0,
+        }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +296,13 @@ pub struct DemoKillMarkerUi {
 pub struct DemoTimelineUi {
     pub elapsed_ms: f64,
     pub duration_ms: i32,
+    pub export_in_ms: Option<i32>,
+    pub export_out_ms: Option<i32>,
+    pub export_available: bool,
+    pub export_preset_label: String,
+    pub export_fps: u32,
+    pub export_depth: bool,
+    pub hover_text: Option<String>,
     /// Selected playback speed. When paused this is the resume speed.
     pub playback_rate: f64,
     pub paused: bool,
@@ -246,23 +317,48 @@ pub struct DemoTimelineUi {
 pub struct DemoTimelineLayout {
     pub play: [f32; 4],
     pub track: [f32; 4],
+    pub mark_in: [f32; 4],
+    pub mark_out: [f32; 4],
+    pub export: [f32; 4],
+    pub export_preset: [f32; 4],
+    pub export_fps: [f32; 4],
+    pub export_depth: [f32; 4],
     pub speed: [f32; 4],
 }
 
 pub fn demo_timeline_layout(width: u32, height: u32) -> Option<DemoTimelineLayout> {
-    if width < 420 || height < 120 {
+    if width < 620 || height < 120 {
         return None;
     }
     let w = width as f32;
     let h = height as f32;
-    let panel_y = h - 46.0;
-    let play = [16.0, panel_y + 7.0, 30.0, 26.0];
-    let speed = [w - 82.0, panel_y + 7.0, 66.0, 26.0];
-    // Leave fixed text gutters for current and total time.
+    // Two rows: the entire first row belongs to the scrub track, while export
+    // controls live below it. This keeps the timeline readable even after adding
+    // quality/FPS controls instead of squeezing the useful track to nothing.
+    let panel_y = h - 72.0;
+    let controls_y = panel_y + 39.0;
+    let play = [16.0, controls_y, 30.0, 26.0];
+    let speed = [w - 82.0, controls_y, 66.0, 26.0];
+    let export = [w - 168.0, controls_y, 76.0, 26.0];
+    let export_preset = [w - 278.0, controls_y, 102.0, 26.0];
+    let export_depth = [w - 356.0, controls_y, 72.0, 26.0];
+    let export_fps = [w - 414.0, controls_y, 52.0, 26.0];
+    let mark_out = [w - 466.0, controls_y, 46.0, 26.0];
+    let mark_in = [w - 514.0, controls_y, 42.0, 26.0];
     let track_x = 116.0;
-    let track_w = (w - track_x - 176.0).max(80.0);
-    let track = [track_x, panel_y + 10.0, track_w, 20.0];
-    Some(DemoTimelineLayout { play, track, speed })
+    let track_w = (w - track_x - 92.0).max(120.0);
+    let track = [track_x, panel_y + 8.0, track_w, 20.0];
+    Some(DemoTimelineLayout {
+        play,
+        track,
+        mark_in,
+        mark_out,
+        export,
+        export_preset,
+        export_fps,
+        export_depth,
+        speed,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -333,6 +429,10 @@ pub struct HudState {
     pub weapon: i32,
     /// `fd.saberDrawAnimLevel` (`saber_styles_t`: 1 fast .. 7 staff), 0 when unknown.
     pub saber_style: i32,
+    /// `fd.saberAnimLevel`: the style that is actually active right now. When this
+    /// differs from `saber_style`, EternalJK has a style queued and the HUD can
+    /// present the requested style as pending instead of pretending it is active.
+    pub saber_active_style: i32,
     /// The force bar is in the red half of its "no force / out of ammo" flash.
     pub force_flash: bool,
 }
@@ -814,6 +914,24 @@ pub enum UiMiniScores {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiSiegeStatViewer {
+    pub name: String,
+    pub health: i32,
+    pub max_health: i32,
+    pub ammo: i32,
+    pub ammo_max: i32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UiSiegeHud {
+    pub banner: Option<String>,
+    pub timer: Option<String>,
+    pub timer_color: [f32; 4],
+    pub respawn: Option<String>,
+    pub stat_viewer: Option<UiSiegeStatViewer>,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiSnapshot {
     pub setup_selected: usize,
@@ -856,6 +974,8 @@ pub struct UiSnapshot {
     pub game_timer: Option<String>,
     /// TaystJK `cg_drawScores` compact score HUD.
     pub mini_scores: Option<UiMiniScores>,
+    /// TaystJK/OpenJK Siege round/timed/respawn/stat-viewer presentation.
+    pub siege_hud: Option<UiSiegeHud>,
     /// jaPRO `cg_raceTimer` / `cg_raceStart` readout (updates every frame of a run).
     pub race_timer: Option<crate::japro_cg::RaceTimerUi>,
     /// `CG_DrawVote`: the open vote's summary line (colour codes included).
@@ -928,6 +1048,7 @@ impl Default for UiSnapshot {
             follow_name: None,
             game_timer: None,
             mini_scores: None,
+            siege_hud: None,
             race_timer: None,
             vote_line: None,
             scoreboard: None,
@@ -963,3 +1084,7 @@ mod crosshair_tests;
 #[cfg(test)]
 #[path = "ui/tests/shadow_mode_tests.rs"]
 mod shadow_mode_tests;
+
+#[cfg(test)]
+#[path = "ui/tests/siege_tests.rs"]
+mod siege_tests;

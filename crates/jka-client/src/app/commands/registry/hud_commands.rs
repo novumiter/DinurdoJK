@@ -14,6 +14,23 @@ commands! {
         }
     }
 
+    cmd_ui_opensiegemenu ["ui_opensiegemenu", ] ("ui_opensiegemenu <menu>", "Open a stock in-game Siege UI surface (currently ingame_objectives).", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb, menu] if menu.eq_ignore_ascii_case("ingame_objectives") => {
+                self.open_siege_objectives_menu();
+                CommandResult::Handled
+            }
+            [_verb, ..] => {
+                // TaystJK's UI_OpenSiegeMenu_f simply fails to activate an unknown
+                // menu name. Keep unsupported legacy UI names as a handled no-op
+                // instead of forwarding a client UI command to the server.
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
     cmd_followfastest ["followFastest", ] ("followFastest", "Spectate whoever is moving fastest right now.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -261,6 +278,37 @@ commands! {
                 CommandResult::Handled
             }
             _ => return CommandResult::Unhandled,
+        }
+    }
+
+    // TaystJK Con_MessageMode3_f: PMF_FOLLOW selects the followed player;
+    // otherwise CGVM_CrosshairPlayer supplies a recent target. No valid target
+    // means the command does nothing, rather than opening global chat.
+    cmd_messagemode3 ["messagemode3", ] ("messagemode3", "Open a private message to the targeted or spectated player.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => {
+                if let Some(slot) = self.message_mode_target() {
+                    self.begin_chat(ChatMode::Direct(slot));
+                }
+                CommandResult::Handled
+            }
+            _ => CommandResult::Unhandled,
+        }
+    }
+
+    // TaystJK Con_MessageMode4_f calls CG_LastAttacker and does not open
+    // a chat box until CG_DamageFeedback has registered actual damage.
+    cmd_messagemode4 ["messagemode4", ] ("messagemode4", "Open a private message to your last attacker.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => {
+                if let Some(slot) = self.message_mode_attacker() {
+                    self.begin_chat(ChatMode::Direct(slot));
+                }
+                CommandResult::Handled
+            }
+            _ => CommandResult::Unhandled,
         }
     }
 

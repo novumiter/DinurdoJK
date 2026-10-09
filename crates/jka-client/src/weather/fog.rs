@@ -355,6 +355,22 @@ impl FogSystem {
         }
     }
 
+    /// Optional high-precision path for Legacy 2: float scene target plus a
+    /// dithered presentation pass. It costs ~20% FPS (16F bandwidth + an extra
+    /// fullscreen pass), so it is off by default; the fog pass dithers its blend
+    /// alpha in the shader instead (`legacy_fog_dither_alpha`). Flip to compare.
+    const LEGACY2_FLOAT_SCENE_TARGET: bool = false;
+
+    /// Whether Legacy 2 needs the float scene target and dithered presentation
+    /// pass, only while its fog is actually applied (the same condition as
+    /// `legacy_effective()`). The scene format depends on this, so map load and
+    /// unload request a scene rebuild when it flips.
+    pub(crate) fn legacy2_precision_active(&self) -> bool {
+        Self::LEGACY2_FLOAT_SCENE_TARGET
+            && self.mode == FogMode::LegacyDrawFog2
+            && self.legacy_effective()
+    }
+
     pub(crate) fn legacy_uses_separate_pass(
         &self,
         fog_is_global: bool,
@@ -747,5 +763,18 @@ mod tests {
         assert!((authored_fog_strength_scale(1.0) - 1.0).abs() < 1e-6);
         assert!((authored_fog_strength_scale(0.5) - 0.5).abs() < 1e-6);
         assert!((authored_fog_strength_scale(2.0) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn froxel_fog_wgsl_parses_and_validates() {
+        let source = include_str!("../froxel_fog.wgsl");
+        let module = wgpu::naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("froxel_fog: {}", error.emit_to_string(source)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("froxel_fog validates");
     }
 }

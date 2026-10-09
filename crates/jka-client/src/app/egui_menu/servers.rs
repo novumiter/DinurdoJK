@@ -473,6 +473,7 @@ impl App {
             egui::ComboBox::from_id_salt("jka_server_browser_filters")
                 .selected_text(filter_label)
                 .width(126.0)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                 .show_ui(ui, |ui| {
                     ui.set_min_width(230.0);
                     theme::label(ui, theme::plain("SERVER FILTERS", 10.5, theme::TEXT_FAINT));

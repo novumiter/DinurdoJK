@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 21;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 30;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -51,6 +51,28 @@ pub(in crate::renderer) enum GpuPass {
     // Independent interval between the world and post passes: volumetric cloud
     // march plus its temporal resolve.
     Clouds = 20,
+    // Sub-timing inside World: promoted/authored GodotOcean surface shading.
+    // This excludes the scene-capture/underwater OceanOptics interval above.
+    OceanSurface = 21,
+    // Weather sub-timings. RainSim is an independent pre-depth compute interval
+    // and belongs in the fallback frame sum. RainDraw is inside World and
+    // RainHaze/RainLens are inside Post, so those three stay diagnostic-only.
+    RainSim = 22,
+    RainDraw = 23,
+    RainHaze = 24,
+    RainLens = 25,
+    // Shared volumetric weather/fog froxel build. Independent pre-world compute.
+    WeatherFog = 26,
+    // GodotOcean FFT cascade generation plus the wind-foam streak transport.
+    // Independent pre-world compute, encoded before the depth prepass, so it
+    // belongs in the fallback frame sum. It was previously inside the Frame
+    // interval but attributed to no pass, which made the ocean look cheaper
+    // than it is: OceanSurface only covers the surface draw and OceanOptics
+    // only the scene capture/composite.
+    OceanSim = 27,
+    RtRadiance = 28,
+    // Independent finite-emitter HDR ray trace and denoise.
+    RtLocalRadiance = 29,
 }
 
 impl GpuPass {
@@ -97,8 +119,13 @@ impl GpuTiming {
             GpuPass::Cull,
             GpuPass::Cluster,
             GpuPass::GrassPrepare,
+            GpuPass::RainSim,
+            GpuPass::WeatherFog,
+            GpuPass::OceanSim,
             GpuPass::RtBuild,
             GpuPass::RtVisibility,
+            GpuPass::RtRadiance,
+            GpuPass::RtLocalRadiance,
             GpuPass::World,
             GpuPass::Clouds,
             GpuPass::Post,

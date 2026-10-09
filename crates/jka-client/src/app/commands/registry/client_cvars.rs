@@ -34,6 +34,34 @@ app_cvars! {
         ]
     }
 
+    APP_CG_CLEANCHATBOX {
+        runtime: CvarDef::new("cg_cleanChatbox", "", "0|1|2", "TaystJK: 0 off, 1 filter spam/duplicates and strip message-body colors, 2 filter spam/duplicates and recolor an initial message-body color green.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_cleanchatbox(app)), |app, value| App::cvar_set_cg_cleanchatbox(app, "cg_cleanChatbox", &value.to_string())).with_text_setter(App::cvar_set_cg_cleanchatbox, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    if mode <= 2 { settings.clean_chatbox = mode; }
+                }
+            }),
+            archive: Some((290, |state| state.presentation.clean_chatbox.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_cg_cleanchatbox(&self) -> String {
+                    self.clean_chatbox.to_string()
+                }
+                fn cvar_set_cg_cleanchatbox(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>().map_err(|_| "cg_cleanChatbox expects 0, 1, or 2".to_owned())?;
+                    if mode > 2 { return Err("cg_cleanChatbox expects 0, 1, or 2".to_owned()); }
+                    self.clean_chatbox = mode;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_DISMEMBER {
         runtime: CvarDef::new(
                 "cg_dismember",
@@ -585,6 +613,59 @@ app_cvars! {
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_SCORESPECTATORGUESS {
+        runtime: CvarDef::new(
+                "cg_scoreSpectatorGuess",
+                "",
+                "0..1",
+                "Heuristically label a spectator as SPECTATING YOU after they mirror three consecutive distinct changes of your scoreboard ping. Cosmetic guess only.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_cg_scorespectatorguess(app)),
+                |app, value| {
+                    App::cvar_set_cg_scorespectatorguess(app, APP_CG_SCORESPECTATORGUESS.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_cg_scorespectatorguess, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, _name, value| {
+                    settings.score_spectator_guess =
+                        parse_bool(value).unwrap_or(settings.score_spectator_guess);
+                }),
+                archive: Some((417, |state| {
+                    let presentation = state.presentation;
+                    format!("{}", u8::from(presentation.score_spectator_guess))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_cg_scorespectatorguess(&self) -> String {
+                    bool_value(self.score_spectator_guess)
+                }
+                fn cvar_set_cg_scorespectatorguess(
+                    &mut self,
+                    name: &str,
+                    value: &str,
+                ) -> Result<(), String> {
+                    self.score_spectator_guess = Self::parse_cvar_bool(name, value)?;
+                    for guess in &mut self.spectator_ping_guesses {
+                        guess.reset();
+                    }
+                    if let Some(board) = self.scoreboard.as_mut() {
+                        for entry in &mut board.entries {
+                            entry.spectating_you = false;
+                        }
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }
@@ -1337,7 +1418,7 @@ app_cvars! {
     }
 
     APP_CL_CHATLOG {
-        runtime: CvarDef::new("cl_chatLog", "", "0..1", "Save live server chat sessions as self-contained HTML under the active fs_game/chatlogs directory. File I/O runs on a dedicated worker thread.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_chatlog(app)), |app, value| App::cvar_set_cl_chatlog(app, APP_CL_CHATLOG.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_chatlog, None),
+        runtime: CvarDef::new("cl_chatLog", "", "0..1", "Save live chat as one HTML log per day per server in the active fs_game/chatlogs directory. File I/O runs on a dedicated worker thread.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_chatlog(app)), |app, value| App::cvar_set_cl_chatlog(app, APP_CL_CHATLOG.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_chatlog, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     settings.chat_log = parse_bool(value).unwrap_or(settings.chat_log)

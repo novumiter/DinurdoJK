@@ -94,6 +94,7 @@ impl Renderer {
                     if self.vignette_enabled { 1.0 } else { 0.0 },
                     self.color_grade.exposure_ev,
                 ],
+                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
             }),
         );
         self.rebuild_frame_plan();

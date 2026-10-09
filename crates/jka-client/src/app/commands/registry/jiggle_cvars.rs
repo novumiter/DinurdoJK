@@ -154,12 +154,69 @@ app_cvars! {
         ]
     }
 
+    APP_R_JIGGLEGLUTECOVERAGEHEIGHT {
+        runtime: CvarDef::new(
+                "r_jiggleGluteCoverageHeight",
+                "",
+                "0..1",
+                "Deprecated normalized remesh control retained for config compatibility; use the explicit breast/glute remesh Z bounds.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_jiggleglutecoverageheight(app)),
+                |app, value| {
+                    App::cvar_set_r_jiggleglutecoverageheight(
+                        app,
+                        APP_R_JIGGLEGLUTECOVERAGEHEIGHT.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_r_jiggleglutecoverageheight, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        settings.jiggle_glute_coverage_height = v.clamp(0.0, 1.0);
+                    }
+                }),
+                archive: Some((418, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.jiggle_glute_coverage_height)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_jiggleglutecoverageheight(&self) -> String {
+                    format!("{:.3}", self.video.jiggle_glute_coverage_height)
+                }
+                fn cvar_set_r_jiggleglutecoverageheight(
+                    &mut self,
+                    name: &str,
+                    value: &str,
+                ) -> Result<(), String> {
+                    let amount = value
+                        .trim()
+                        .parse::<f32>()
+                        .map_err(|_| format!("{name}: expected a finite number"))?;
+                    if !amount.is_finite() {
+                        return Err(format!("{name}: expected a finite number"));
+                    }
+                    self.video.jiggle_glute_coverage_height = amount.clamp(0.0, 1.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_JIGGLEGLUTELIFT {
         runtime: CvarDef::new(
                 "r_jiggleGluteLift",
                 "",
                 "-0.4..0.6",
-                "Lower-edge glute trim; positive keeps motion higher, negative includes more upper thigh.",
+                "Deprecated normalized glute trim retained for config compatibility; use r_jiggleGluteJiggleBottomZ/r_jiggleGluteJiggleTopZ.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -725,52 +782,27 @@ app_cvars! {
     }
 
     APP_R_JIGGLEPHYSICS {
-        runtime: CvarDef::new("r_jigglePhysics", "", "0..1", "Experimental: enable auto-detected _humanoid soft-tissue motion; model.jiggle overrides auto detection.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_jigglephysics(app)), |app, value| App::cvar_set_r_jigglephysics(app, APP_R_JIGGLEPHYSICS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_jigglephysics, None),
+        runtime: CvarDef::new("r_jigglePhysics", "", "0|1|2|3", "Soft-tissue targets by reported player sex: 0 Off, 1 Female, 2 Male, 3 Both.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_jigglephysics(app)), |app, value| App::cvar_set_r_jigglephysics(app, APP_R_JIGGLEPHYSICS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_jigglephysics, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
-                    settings.jiggle_physics = parse_bool(value).unwrap_or(settings.jiggle_physics);
+                    settings.jiggle_physics = VideoSettings::parse_jiggle_mode(value).unwrap_or(settings.jiggle_physics);
                 }),
                 archive: Some((213, |state| {
                     let settings = state.video;
-                    format!("{}", u8::from(settings.jiggle_physics))
+                    settings.jiggle_physics.to_string()
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_jigglephysics(&self) -> String {
-                    bool_value(self.video.jiggle_physics)
+                    self.video.jiggle_physics.to_string()
                 }
                 fn cvar_set_r_jigglephysics(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let lower = "r_jigglephysics".to_owned();
-                    {
-                        let enabled = Self::parse_cvar_bool(name, value)?;
-                        match lower.as_str() {
-                            "r_physics" => self.video.client_physics = enabled,
-                            "r_physicsccd" => self.video.client_physics_ccd = enabled,
-                            "r_physicssleeping" => self.video.client_physics_sleeping = enabled,
-                            "r_ragdolls" => self.video.ragdolls = enabled,
-                            "r_ragdollselfcollision" => self.video.ragdoll_self_collision = enabled,
-                            "r_jigglephysics" => self.video.jiggle_physics = enabled,
-                            "r_clothphysics" => self.video.cloth_physics = enabled,
-                            "r_clothbodycollision" => self.video.cloth_body_collision = enabled,
-                            "r_clothwind" => self.video.cloth_wind = enabled,
-                            "r_physicsprops" => self.video.physics_props = enabled,
-                            "r_physicsdebris" => self.video.physics_debris = enabled,
-                            "r_physicsplayerpush" => self.video.physics_player_push = enabled,
-                            "r_physicsweaponimpulses" => self.video.physics_weapon_impulses = enabled,
-                            "r_physicsexplosionimpulses" => self.video.physics_explosion_impulses = enabled,
-                            "r_physicsforceimpulses" => self.video.physics_force_impulses = enabled,
-                            "r_physicsdebug" => self.video.physics_debug_draw = enabled,
-                            "r_physicsstats" => self.video.physics_stats = enabled,
-                            _ => unreachable!(),
-                        }
-                        self.mark_config_dirty();
-                        if lower == "r_physics" {
-                            self.ensure_map_physics_mesh();
-                        }
-                        self.publish_ui();
-                    }
+                    self.video.jiggle_physics = VideoSettings::parse_jiggle_mode(value)
+                        .ok_or_else(|| format!("{name}: expected 0 Off, 1 Female, 2 Male, or 3 Both"))?;
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

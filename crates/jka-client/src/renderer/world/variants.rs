@@ -44,6 +44,9 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     pub(in crate::renderer) cascaded_shadows: bool,
     pub(in crate::renderer) ray_traced_shadows: bool,
     pub(in crate::renderer) ray_traced_sun: bool,
+    /// Shader source/interface identity, frozen for the lifetime of the process.
+    pub(in crate::renderer) rt_receiver_denoiser: bool,
+    pub(in crate::renderer) rt_receiver_glass: bool,
     pub(in crate::renderer) planar_reflections: bool,
     pub(in crate::renderer) legacy_fog: bool,
     pub(in crate::renderer) jump_shade: bool,

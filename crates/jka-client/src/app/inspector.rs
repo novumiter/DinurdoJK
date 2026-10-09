@@ -286,6 +286,18 @@ impl App {
     /// bodies, own client ignored. Static target/name scans retain the old ~30 Hz
     /// cadence; dynamic placement/autofocus additionally follow fresh subframe input.
     pub(in crate::app) fn update_crosshair_target(&mut self, now: Instant) {
+        self.update_crosshair_target_inner(now, false);
+    }
+
+    /// The message-mode key needs an up-to-date CG_CrosshairPlayer even when
+    /// crosshair names / identification / dynamic positioning are disabled.
+    /// Reuse the *same* TaystJK crosshair trace, with the normal scan throttle
+    /// and visual enablement bypassed for this one command.
+    pub(in crate::app) fn update_crosshair_target_for_chat(&mut self, now: Instant) {
+        self.update_crosshair_target_inner(now, true);
+    }
+
+    fn update_crosshair_target_inner(&mut self, now: Instant, force_chat_scan: bool) {
         use crate::cgame::crosshair::{self, CrosshairViewer};
         use jka_movement::TraceWorld;
         const SCAN_INTERVAL: Duration = Duration::from_millis(33);
@@ -323,15 +335,16 @@ impl App {
         });
         // A dynamic crosshair needs its trace even when target colouring/names are disabled.
         // DOF autofocus also consumes this endpoint when available.
-        let active = settings.style != 0
-            && (settings.dynamic != 0
-                || settings.identify_target
-                || settings.names != 0.0
-                || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus))
-            && matches!(
-                self.overlay,
-                OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs
-            )
+        let active = (force_chat_scan
+            || (settings.style != 0
+                && (settings.dynamic != 0
+                    || settings.identify_target
+                    || settings.names != 0.0
+                    || (self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus))
+                && matches!(
+                    self.overlay,
+                    OverlayMode::None | OverlayMode::Chat | OverlayMode::Vgs
+                )))
             && session_supports_crosshair;
         if !active {
             self.crosshair_seen = None;
@@ -343,7 +356,7 @@ impl App {
             return;
         }
         let dof_autofocus = self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus;
-        let scan_interval = if settings.dynamic != 0 || dof_autofocus {
+        let scan_interval = if force_chat_scan || settings.dynamic != 0 || dof_autofocus {
             Duration::ZERO
         } else {
             SCAN_INTERVAL

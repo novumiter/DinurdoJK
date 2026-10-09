@@ -5,10 +5,13 @@
 //! network source both feed the same decoded `Snapshot` values into this layer.
 
 mod player_animation;
+#[allow(dead_code)]
 pub(crate) mod player_state;
 pub(crate) mod footsteps;
 pub(crate) mod ragdoll;
 pub(crate) mod cloth;
+pub(crate) mod cloth_worker;
+pub(crate) mod jiggle_worker;
 pub(crate) mod cloth_body;
 pub(crate) mod jiggle;
 mod saber_throw;
@@ -27,6 +30,7 @@ pub mod player_presenter;
 pub(crate) mod player_gore;
 pub mod view;
 pub mod crosshair;
+pub mod siege;
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -91,6 +95,18 @@ pub fn snapshot_discontinuity(current: &Snapshot, next: &Snapshot) -> bool {
     ((current_eflags ^ next_eflags) & EF_TELEPORT_BIT) != 0
         || current_client != next_client
         || ((current.snap_flags ^ next.snap_flags) & SNAPFLAG_SERVERCOUNT) != 0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NpcModelRequest {
+    /// Ordinary client-style metadata still used by shared saber/sound/effect code.
+    pub(crate) client_info: ClientInfo,
+    /// Exact `CS_MODELS + modelindex` GLM after `CG_HandleAppendedSkin` strips `*skin`.
+    pub(crate) model_qpath: String,
+    /// Registered appended skin, if the model configstring actually supplied one.
+    /// A missing skin is deliberately `None`: TaystJK initializes the Ghoul2 model
+    /// with skin handle 0 rather than routing NPCs through player skin fallback.
+    pub(crate) skin_qpath: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +494,8 @@ pub struct ScoreEntry {
     pub deaths: Option<i32>,
     pub name: String,
     pub team: i32,
+    /// CS_PLAYERS `siegeclass`, used by the Siege scoreboard class slot.
+    pub siege_class: String,
 }
 
 /// Reliable Ghoul2 lifecycle commands emitted by the OpenJK server.
@@ -603,7 +621,7 @@ pub enum CgameServerAction {
     SiegeBriefing { team: i32 },
     SiegeClassSelect,
     SiegeProfile,
-    SiegeExtendedData(Vec<u8>),
+    SiegeExtendedData(Vec<siege::SiegeExtendedDataEntry>),
     ClientLevelShot,
 }
 
@@ -706,6 +724,11 @@ pub enum CgameNotice {
     Chat { team: bool, kind: ChatKind, text: Vec<u8> },
     /// `cp`: CG_CenterPrint.
     CenterPrint(Vec<u8>),
+    /// `CG_DrawSiegeMessageNonMenu`: a Siege-authored objective message. A
+    /// leading single `@` is a full StringEd reference, unlike server `@@@`.
+    SiegeCenterPrint(Vec<u8>),
+    /// `CG_DrawSiegeMessage(..., 0)`: the round-over Siege message surface.
+    SiegeRoundMessage(Vec<u8>),
     /// TaystJK/jaPRO `cg_killMessage`, generated from EV_OBITUARY for the
     /// viewer's own non-suicide kills. Localisation/presentation stays app-side.
     KillMessage {
@@ -795,6 +818,10 @@ pub struct ClientGameState {
     presentation_events: PresentationEventQueue,
     pending_event_traces: VecDeque<EventCheckTrace>,
     pending_ghoul2_commands: VecDeque<Ghoul2ServerCommand>,
+    /// TaystJK/OpenJK CG_ParseWeatherEffect payloads, with the leading `*`
+    /// already stripped. Kept separate from ordinary server actions so the
+    /// renderer compatibility path cannot consume Siege/UI events.
+    pending_world_effect_commands: VecDeque<String>,
     pending_server_actions: VecDeque<CgameServerAction>,
     pending_audio_actions: VecDeque<CgameServerAction>,
     team_info: Vec<TeamInfoEntry>,
@@ -825,6 +852,7 @@ impl Default for ClientGameState {
             presentation_events: PresentationEventQueue::default(),
             pending_event_traces: VecDeque::new(),
             pending_ghoul2_commands: VecDeque::new(),
+            pending_world_effect_commands: VecDeque::new(),
             pending_server_actions: VecDeque::new(),
             pending_audio_actions: VecDeque::new(),
             team_info: Vec::new(),
@@ -893,6 +921,7 @@ impl ClientGameState {
         self.presentation_events.clear();
         self.pending_event_traces.clear();
         self.pending_ghoul2_commands.clear();
+        self.pending_world_effect_commands.clear();
         self.pending_server_actions.clear();
         self.pending_audio_actions.clear();
         self.team_info.clear();
@@ -905,8 +934,32 @@ impl ClientGameState {
         self.pending_ghoul2_commands.drain(..).collect()
     }
 
+    /// Renderer world-effect commands produced by `CS_EFFECTS` entries whose
+    /// value begins with `*`, matching TaystJK `CG_ParseWeatherEffect`.
+    pub fn drain_world_effect_commands(&mut self) -> Vec<String> {
+        self.pending_world_effect_commands.drain(..).collect()
+    }
+
     pub fn drain_server_actions(&mut self) -> Vec<CgameServerAction> {
         self.pending_server_actions.drain(..).collect()
+    }
+
+    /// Drain only Siege UI/state actions. Shader remaps, force-rank changes and
+    /// other server actions remain queued for their normal consumers.
+    pub fn drain_siege_server_actions(&mut self) -> Vec<CgameServerAction> {
+        let mut siege = Vec::new();
+        let mut keep = VecDeque::with_capacity(self.pending_server_actions.len());
+        while let Some(action) = self.pending_server_actions.pop_front() {
+            match action {
+                CgameServerAction::SiegeBriefing { .. }
+                | CgameServerAction::SiegeClassSelect
+                | CgameServerAction::SiegeProfile
+                | CgameServerAction::SiegeExtendedData(_) => siege.push(action),
+                other => keep.push_back(other),
+            }
+        }
+        self.pending_server_actions = keep;
+        siege
     }
 
     /// Drain only renderer shader-remap actions without consuming unrelated
@@ -957,7 +1010,9 @@ impl ClientGameState {
     pub fn flag_status(&self) -> [i32; 2] { self.config_state.flag_status }
     pub fn intermission_started(&self) -> bool { self.config_state.intermission }
     pub fn siege_state(&self) -> &[u8] { &self.config_state.siege_state }
+    pub fn siege_round_state(&self, now: i32) -> siege::SiegeRoundState { siege::parse_round_state(&self.config_state.siege_state, now) }
     pub fn siege_objectives(&self) -> &[u8] { &self.config_state.siege_objectives }
+    pub fn siege_objective_status(&self) -> siege::SiegeObjectiveStatus { siege::parse_objective_status(&self.config_state.siege_objectives) }
     pub fn siege_time_override(&self) -> i32 { self.config_state.siege_time_override }
     pub fn siege_win_team(&self) -> i32 { self.config_state.siege_win_team }
 
@@ -1028,6 +1083,17 @@ impl ClientGameState {
                 source: ShaderRemapSource::ShaderState,
             });
         }
+
+        // R_InitWorldEffects/R_ShutdownWorldEffects brackets map changes in the
+        // native renderer. Our renderer persists across map loads, so explicitly
+        // reset its compatibility state, then replay the initial CS_EFFECTS table
+        // in protocol order exactly as CG_RegisterEffects does.
+        self.pending_world_effect_commands.push_back("die".to_owned());
+        for index in (CS_EFFECTS + 1)..(CS_EFFECTS + 64) {
+            if let Some(command) = self.weather_effect_configstring(index) {
+                self.pending_world_effect_commands.push_back(command);
+            }
+        }
     }
 
     fn apply_configstring_state(&mut self, index: u16, emit_actions: bool) {
@@ -1074,6 +1140,16 @@ impl ClientGameState {
             CS_SIEGE_OBJECTIVES => self.config_state.siege_objectives = value,
             CS_SIEGE_TIMEOVERRIDE => self.config_state.siege_time_override = integer,
             CS_SIEGE_WINTEAM => self.config_state.siege_win_team = integer,
+            index if (CS_EFFECTS + 1..CS_EFFECTS + 64).contains(&index) => {
+                // TaystJK CG_ConfigStringModified: only strings beginning with
+                // '*' are renderer world effects; normal .efx resources remain
+                // lazy assets in the existing effect path.
+                if emit_actions {
+                    if let Some(command) = self.weather_effect_configstring(index) {
+                        self.pending_world_effect_commands.push_back(command);
+                    }
+                }
+            }
             index if (CS_LIGHT_STYLES..CS_LIGHT_STYLES + MAX_LIGHT_STYLE_CONFIGSTRINGS).contains(&index) => {
                 if emit_actions {
                     self.pending_server_actions.push_back(CgameServerAction::LightStyleChanged {
@@ -1087,6 +1163,13 @@ impl ClientGameState {
             // registration side effects without duplicating cache ownership.
             _ => {}
         }
+    }
+
+    fn weather_effect_configstring(&self, index: u16) -> Option<String> {
+        let value = self.configstring(index)?;
+        let value = std::str::from_utf8(value).ok()?.trim();
+        let command = value.strip_prefix('*')?.trim();
+        (!command.is_empty()).then(|| command.to_owned())
     }
 
     pub fn model_qpath(&self, model_index: i32) -> Option<String> {
@@ -1459,6 +1542,12 @@ impl ClientGameState {
             .unwrap_or(0)
     }
 
+    pub fn serverinfo_value(&self, key: &[u8]) -> Option<String> {
+        self.configstring(CS_SERVERINFO)
+            .and_then(|info| info_value(info, key))
+            .map(bytes_to_lossless_ascii)
+    }
+
     /// TaystJK `cgs.jediVmerc`, parsed from CS_SERVERINFO. Team presentation forcing is disabled there.
     pub fn jedi_v_merc(&self) -> bool {
         self.configstring(CS_SERVERINFO)
@@ -1614,8 +1703,9 @@ impl ClientGameState {
             gametype: self.gametype(),
             jedi_v_merc: self.jedi_v_merc(),
             team_color_override: None,
-            female: info_value(configstring, b"ds")
-                .is_some_and(|value| value.first() == Some(&b'f')),
+            female: info_value(configstring, b"sex")
+                .or_else(|| info_value(configstring, b"ds"))
+                .is_some_and(|value| value.first().is_some_and(|byte| byte.eq_ignore_ascii_case(&b'f'))),
             model_name,
             skin_name,
             siege_class,
@@ -1631,30 +1721,67 @@ impl ClientGameState {
         })
     }
 
-    /// OpenJK `cent->npcClient` as filled by CG_G2AnimEntModelLoad and
-    /// CG_Player: the Ghoul2 model and appended skin come from
-    /// `CS_MODELS + modelindex` ("models/players/<model>/model.glm*<skin>"),
-    /// sabers from the `@name` configstrings at npcSaber1/npcSaber2, team is
-    /// TEAM_FREE. Vehicles and non-player-model NPCs are not humanoid clients.
+    /// TaystJK `cent->npcClient` metadata.  Rendering must use
+    /// [`Self::npc_model_request`] instead: unlike a multiplayer player, an NPC
+    /// is allowed to reference a non-humanoid GLA and must not fall back to Kyle.
     pub fn npc_client_info(&self, npc: &EntityState) -> Result<ClientInfo, &'static str> {
+        self.npc_model_request(npc).map(|request| request.client_info)
+    }
+
+    /// Port of TaystJK's `CG_G2AnimEntModelLoad` / `CG_HandleAppendedSkin` input
+    /// contract.  The model identity comes straight from `CS_MODELS + modelindex`;
+    /// it is intentionally not reconstructed as `models/players/<name>/model.glm`.
+    pub(crate) fn npc_model_request(
+        &self,
+        npc: &EntityState,
+    ) -> Result<NpcModelRequest, &'static str> {
         if field_i32(npc, "NPC_class") == CLASS_VEHICLE {
             return Err("npc-vehicle-uses-static-presenter");
         }
         let model_index = field_i32(npc, "modelindex");
-        let model = self.model_qpath(model_index).ok_or("npc-model-configstring-missing")?;
-        // CG_HandleAppendedSkin: the text after the last '*' is the skin.
-        let (glm, skin) = match model.rsplit_once('*') {
-            Some((glm, skin)) if !skin.is_empty() => (glm, skin),
-            Some((glm, _)) => (glm, "default"),
-            None => (model.as_str(), "default"),
+        let configured = self
+            .model_qpath(model_index)
+            .ok_or("npc-model-configstring-missing")?;
+        let (glm, appended_skin) = match configured.rsplit_once('*') {
+            Some((glm, skin)) if !skin.is_empty() => (glm, Some(skin)),
+            Some((glm, _)) => (glm, None),
+            None => (configured.as_str(), None),
         };
-        let folder = glm
-            .strip_prefix("models/players/")
-            .and_then(|rest| rest.strip_suffix("/model.glm"))
-            .filter(|folder| !folder.is_empty() && !folder.contains('/'))
-            .ok_or("npc-model-not-player-glm")?;
+        if glm.is_empty() || !glm.to_ascii_lowercase().ends_with(".glm") {
+            return Err("npc-model-configstring-not-glm");
+        }
+        let model_qpath = glm.replace('\\', "/");
+        let directory = model_qpath
+            .rsplit_once('/')
+            .map(|(directory, _)| directory)
+            .unwrap_or("");
+        // `clientInfo_t::modelName` is still useful to shared NPC sound/saber
+        // code.  For stock creature paths this yields e.g. `wampa`, but no
+        // presentation decision is made from it.
+        let model_name = directory
+            .rsplit('/')
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("npc")
+            .to_owned();
+        let skin_name = appended_skin.unwrap_or("default").to_owned();
+        let skin_qpath = appended_skin.map(|skin| {
+            // TaystJK CG_HandleAppendedSkin: multipart skins keep the leading
+            // `|` form; ordinary skins resolve as model_<skin>.skin beside GLM.
+            if skin.contains('|') {
+                if directory.is_empty() {
+                    format!("|{skin}")
+                } else {
+                    format!("{directory}/|{skin}")
+                }
+            } else if directory.is_empty() {
+                format!("model_{skin}.skin")
+            } else {
+                format!("{directory}/model_{skin}.skin")
+            }
+        });
+
         let saber = |field: &str| -> String {
-            // npcSaber* index CS_MODELS entries of the form "@saberName".
             let index = field_i32(npc, field);
             if index == 0 {
                 return "none".to_owned();
@@ -1665,24 +1792,28 @@ impl ClientGameState {
                 .unwrap_or_else(|| "none".to_owned())
         };
         let bolt_colors = field_i32(npc, "boltToPlayer");
-        Ok(ClientInfo {
-            client_num: usize::from(npc.number),
-            name: String::new(),
-            team: 0, // TEAM_FREE
-            gametype: self.gametype(),
-            jedi_v_merc: self.jedi_v_merc(),
-            team_color_override: None,
-            female: false,
-            model_name: folder.to_owned(),
-            skin_name: skin.to_owned(),
-            siege_class: String::new(),
-            saber_name: saber("npcSaber1"),
-            saber2_name: saber("npcSaber2"),
-            saber_color: (bolt_colors & 0x07) - 1,
-            saber2_color: ((bolt_colors & 0x38) >> 3) - 1,
-            plugin_disable: self.plugin_disable,
-            definition_saber_colors: bolt_colors == 0,
-            cosmetics: 0,
+        Ok(NpcModelRequest {
+            model_qpath,
+            skin_qpath,
+            client_info: ClientInfo {
+                client_num: usize::from(npc.number),
+                name: String::new(),
+                team: 0, // TEAM_FREE
+                gametype: self.gametype(),
+                jedi_v_merc: self.jedi_v_merc(),
+                team_color_override: None,
+                female: false,
+                model_name,
+                skin_name,
+                siege_class: String::new(),
+                saber_name: saber("npcSaber1"),
+                saber2_name: saber("npcSaber2"),
+                saber_color: (bolt_colors & 0x07) - 1,
+                saber2_color: ((bolt_colors & 0x38) >> 3) - 1,
+                plugin_disable: self.plugin_disable,
+                definition_saber_colors: bolt_colors == 0,
+                cosmetics: 0,
+            },
         })
     }
 
@@ -2057,6 +2188,10 @@ impl ClientGameState {
                     .and_then(|info| info_value(info, b"t"))
                     .and_then(parse_i32_ascii)
                     .unwrap_or(0);
+                let siege_class = player_info
+                    .and_then(|info| info_value(info, b"siegeclass"))
+                    .map(bytes_to_lossless_ascii)
+                    .unwrap_or_default();
                 entries.push(ScoreEntry {
                     client,
                     score: integer(base + 1),
@@ -2075,6 +2210,7 @@ impl ClientGameState {
                     deaths: (score_offset == SCORE_FIELDS_JAPRO).then(|| integer(base + 14)),
                     name,
                     team,
+                    siege_class,
                 });
             }
             self.notices.push_back(CgameNotice::Scores { team_scores, entries });
@@ -2158,9 +2294,8 @@ impl ClientGameState {
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"sxd") {
-            self.pending_server_actions.push_back(CgameServerAction::SiegeExtendedData(
-                parts.get(1..).unwrap_or_default().join(&b' '),
-            ));
+            let entries = parts.iter().skip(1).filter_map(|value| siege::parse_extended_data_entry(value)).collect();
+            self.pending_server_actions.push_back(CgameServerAction::SiegeExtendedData(entries));
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"map_restart") {
@@ -3357,6 +3492,35 @@ mod tests {
     }
 
     #[test]
+    fn siege_server_actions_parse_extended_rows_and_preserve_renderer_actions() {
+        let mut game = ClientGameState::new();
+        for (sequence, command) in [
+            "sb 2",
+            "remapShader textures/old textures/new 1250",
+            "sxd 7|83|100|12 8|90|100|45 malformed",
+            "scl",
+            "spc",
+        ].into_iter().enumerate() {
+            game.execute_server_command(&ServerCommand {
+                sequence: sequence as i32,
+                text: command.as_bytes().to_vec(),
+            }).unwrap();
+        }
+        assert_eq!(game.drain_siege_server_actions(), vec![
+            CgameServerAction::SiegeBriefing { team: 2 },
+            CgameServerAction::SiegeExtendedData(vec![
+                siege::SiegeExtendedDataEntry { client: 7, health: 83, max_health: 100, ammo: 12 },
+                siege::SiegeExtendedDataEntry { client: 8, health: 90, max_health: 100, ammo: 45 },
+            ]),
+            CgameServerAction::SiegeClassSelect,
+            CgameServerAction::SiegeProfile,
+        ]);
+        assert!(game.drain_siege_server_actions().is_empty());
+        assert!(matches!(game.drain_server_actions().as_slice(),
+            [CgameServerAction::ShaderRemap { .. }]));
+    }
+
+    #[test]
     fn configstring_modified_tracks_duel_siege_shader_and_music_state() {
         let mut game = ClientGameState::new();
         game.set_configstring(CS_CLIENT_JEDIMASTER, b"9".to_vec());
@@ -3757,6 +3921,34 @@ mod tests {
     }
 
     #[test]
+    fn initial_weather_effect_configstrings_queue_renderer_commands() {
+        let mut cg = ClientGameState::new();
+        let mut configstrings = BTreeMap::new();
+        configstrings.insert(CS_EFFECTS + 1, b"*rain".to_vec());
+        configstrings.insert(CS_EFFECTS + 2, b"effects/test.efx".to_vec());
+        configstrings.insert(CS_EFFECTS + 3, b"*constantwind ( 100 200 0 )".to_vec());
+        cg.reset_gamestate(&configstrings, 0);
+        assert_eq!(
+            cg.drain_world_effect_commands(),
+            vec![
+                "die".to_owned(),
+                "rain".to_owned(),
+                "constantwind ( 100 200 0 )".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_weather_effect_configstring_uses_same_renderer_command_path() {
+        let mut cg = ClientGameState::new();
+        cg.set_configstring(CS_EFFECTS + 4, b"*heavyrain".to_vec());
+        assert_eq!(cg.drain_world_effect_commands(), vec!["heavyrain".to_owned()]);
+
+        cg.set_configstring(CS_EFFECTS + 4, b"effects/not_weather.efx".to_vec());
+        assert!(cg.drain_world_effect_commands().is_empty());
+    }
+
+    #[test]
     fn entity_event_is_emitted_once_and_masks_sequence_bits() {
         let mut cent = CEntity::default();
         let state = entity(
@@ -3829,6 +4021,58 @@ mod tests {
 #[cfg(test)]
 mod client_info_tests {
     use super::*;
+    use jka_protocol::gamestate::ENTITY_FIELDS;
+
+    fn npc_entity(number: u16, modelindex: i32) -> EntityState {
+        let mut entity = EntityState {
+            number,
+            fields: [0; ENTITY_FIELDS.len()],
+        };
+        let model_index = ENTITY_FIELDS
+            .iter()
+            .position(|(name, _)| name == &"modelindex")
+            .expect("protocol-26 modelindex field");
+        entity.fields[model_index] = modelindex as u32;
+        entity
+    }
+
+    #[test]
+    fn npc_model_request_preserves_exact_configstring_glm_without_player_fallback() {
+        let mut game = ClientGameState::new();
+        game.configstrings.insert(
+            CS_MODELS + 17,
+            b"models/players/wampa/model.glm".to_vec(),
+        );
+        let request = game.npc_model_request(&npc_entity(80, 17)).unwrap();
+        assert_eq!(request.model_qpath, "models/players/wampa/model.glm");
+        assert_eq!(request.skin_qpath, None);
+        assert_eq!(request.client_info.model_name, "wampa");
+        assert_eq!(request.client_info.skin_name, "default");
+    }
+
+    #[test]
+    fn npc_model_request_matches_taystjk_appended_skin_rules() {
+        let mut game = ClientGameState::new();
+        game.configstrings.insert(
+            CS_MODELS + 18,
+            b"models/players/wampa/model.glm*red".to_vec(),
+        );
+        game.configstrings.insert(
+            CS_MODELS + 19,
+            b"models/players/jedi_hm/model.glm*head_a1|torso_a1|lower_a1".to_vec(),
+        );
+
+        let ordinary = game.npc_model_request(&npc_entity(81, 18)).unwrap();
+        assert_eq!(
+            ordinary.skin_qpath.as_deref(),
+            Some("models/players/wampa/model_red.skin")
+        );
+        let multipart = game.npc_model_request(&npc_entity(82, 19)).unwrap();
+        assert_eq!(
+            multipart.skin_qpath.as_deref(),
+            Some("models/players/jedi_hm/|head_a1|torso_a1|lower_a1")
+        );
+    }
 
     #[test]
     fn plugin_disable_black_saber_clamps_only_black_to_orange() {

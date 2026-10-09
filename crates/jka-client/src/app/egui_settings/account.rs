@@ -1,112 +1,23 @@
-//! Account.
+//! Saved per-server accounts.
 use crate::app::egui_settings::{theme, App};
+use crate::credential_store::AccountType;
 
 impl App {
-    /// jaPRO account login plus secure, exact-endpoint saved credentials.
-    ///
-    /// Saved credentials are keyed by the resolved UDP `IP:port`, never by a
-    /// hostname or friendly label. Nothing is sent automatically on connect;
-    /// the user explicitly presses LOG IN for the current server.
-    pub(in crate::app::egui_settings) fn egui_japro_account(&mut self, ui: &mut egui::Ui) {
+    /// Secure, exact-endpoint credentials for normal login, mod admin login and
+    /// RCON. Nothing is sent or applied automatically on connect: every row has
+    /// explicit LOG IN / LOG OUT actions and only the current server can use them.
+    pub(in crate::app) fn egui_account(&mut self, ui: &mut egui::Ui) {
         theme::section(
             ui,
             "ACCOUNT",
-            "Log in to your jaPRO account on the connected server. Register creates one if the server allows it.",
-        );
-        // jaPRO keeps both at 15 characters and takes them as single arguments.
-        const LIMIT: usize = 15;
-        let clean = |text: &mut String| {
-            text.retain(|c| !c.is_whitespace() && !matches!(c, ';' | '"' | '\\'));
-        };
-
-        let mut username_changed = false;
-        theme::row(
-            ui,
-            "Username",
-            "ui_username. Up to 15 characters, no spaces. Saved to the config.",
-            theme::Reset::None,
-            |ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.network.ui_username)
-                        .char_limit(LIMIT)
-                        .desired_width(220.0),
-                );
-                username_changed = response.changed();
-            },
-        );
-        let mut submit = false;
-        theme::row(
-            ui,
-            "Password",
-            "ui_password. Up to 15 characters, no spaces. Kept for this session only and never written to the config.",
-            theme::Reset::None,
-            |ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.network.ui_password)
-                        .password(true)
-                        .char_limit(LIMIT)
-                        .desired_width(220.0),
-                );
-                submit = response.lost_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            },
-        );
-        clean(&mut self.network.ui_username);
-        clean(&mut self.network.ui_password);
-        if username_changed {
-            self.mark_config_dirty();
-        }
-
-        let connected = self.live_connected();
-        let ready = !self.network.ui_username.is_empty() && !self.network.ui_password.is_empty();
-        let mut command = None;
-        theme::row(ui, "Account", "", theme::Reset::None, |ui| {
-            ui.add_enabled_ui(connected, |ui| {
-                ui.add_enabled_ui(ready, |ui| {
-                    if theme::primary_button(ui, "LOG IN").clicked()
-                        || (submit && ready && connected)
-                    {
-                        command = Some(format!(
-                            "login {} {}",
-                            self.network.ui_username, self.network.ui_password
-                        ));
-                    }
-                    ui.add_space(8.0);
-                    if theme::ghost_button(ui, "REGISTER").clicked() {
-                        command = Some(format!(
-                            "register {} {}",
-                            self.network.ui_username, self.network.ui_password
-                        ));
-                    }
-                });
-                ui.add_space(8.0);
-                if theme::ghost_button(ui, "LOG OUT").clicked() {
-                    command = Some("logout".to_owned());
-                }
-            });
-        });
-        if !connected {
-            theme::label(
-                ui,
-                theme::plain("Join a jaPRO server to log in.", 11.5, theme::TEXT_FAINT),
-            );
-        }
-        if let Some(command) = command {
-            self.forward_command_to_server(&command);
-        }
-
-        ui.add_space(16.0);
-        theme::section(
-            ui,
-            "SAVED LOGINS",
-            "Passwords are stored by the operating system, not in DinurdoJK.cfg. Saved credentials never log in automatically; LOG IN is always an explicit action for the exact current IP:port.",
+            "Saved credentials for the exact server endpoint. Login sends /login, Admin sends /amlogin, and RCON loads rconPassword.",
         );
 
         if !crate::credential_store::supported() {
             theme::label(
                 ui,
                 theme::plain(
-                    "Secure saved logins are unavailable on this platform.",
+                    "Secure saved accounts are unavailable on this platform.",
                     11.5,
                     theme::TEXT_FAINT,
                 ),
@@ -114,163 +25,223 @@ impl App {
             return;
         }
 
-        let current = self.current_japro_server_endpoint();
-        let current_saved = current.and_then(|server| {
-            self.japro_saved_logins
-                .iter()
-                .find(|entry| entry.server == server)
-                .cloned()
-        });
+        let current = self.current_account_server_endpoint();
+        let current_accounts: Vec<_> = self
+            .saved_accounts
+            .iter()
+            .filter(|entry| Some(entry.server) == current)
+            .cloned()
+            .collect();
+        let other_accounts: Vec<_> = self
+            .saved_accounts
+            .iter()
+            .filter(|entry| Some(entry.server) != current)
+            .cloned()
+            .collect();
 
         let mut login = None;
+        let mut logout = None;
         let mut edit = None;
         let mut forget = None;
-        let mut new_login = None;
+        let mut new_account = None;
 
         if let Some(server) = current {
             theme::row(
                 ui,
                 "Current server",
-                "The exact resolved UDP endpoint is the credential identity. A friendly server name is display-only and can never redirect a login.",
+                "The resolved UDP IP:port is the credential identity. The friendly name is display-only and never redirects a credential.",
                 theme::Reset::None,
                 |ui| {
-                    theme::glow_label(ui, &server.to_string(), 12.5, theme::TEXT);
+                    let name = self
+                        .current_server_hostname()
+                        .map(|name| crate::logging::strip_jka_colors(&name).trim().to_owned())
+                        .filter(|name| !name.is_empty());
+                    let display = name
+                        .map(|name| format!("{name}  ·  {server}"))
+                        .unwrap_or_else(|| server.to_string());
+                    theme::glow_label(ui, &display, 12.5, theme::TEXT);
                 },
             );
 
-            theme::row(
-                ui,
-                "Saved login",
-                "A saved credential is only sent when you press LOG IN while connected to this exact endpoint.",
-                theme::Reset::None,
-                |ui| {
-                    if let Some(saved) = &current_saved {
-                        let display = saved
-                            .server_name
-                            .as_deref()
-                            .filter(|name| !name.is_empty())
-                            .map(|name| format!("{name}  ·  {}", saved.username))
-                            .unwrap_or_else(|| saved.username.clone());
-                        theme::glow_label(ui, &display, 12.5, theme::TEXT);
-                        ui.add_space(10.0);
-                        if theme::primary_button(ui, "LOG IN").clicked() {
-                            login = Some(server);
-                        }
-                        ui.add_space(6.0);
-                        if theme::ghost_button(ui, "EDIT").clicked() {
-                            edit = Some(server);
-                        }
-                        ui.add_space(6.0);
-                        if theme::ghost_button(ui, "FORGET").clicked() {
-                            forget = Some(server);
-                        }
-                    } else if theme::primary_button(ui, "SAVE LOGIN").clicked() {
-                        new_login = Some(server);
+            if current_accounts.is_empty() {
+                theme::label(
+                    ui,
+                    theme::plain(
+                        "No saved accounts for this server yet.",
+                        11.5,
+                        theme::TEXT_FAINT,
+                    ),
+                );
+            } else {
+                for entry in &current_accounts {
+                    let account_type = entry.account_type;
+                    let detail = match account_type {
+                        AccountType::Login => format!("{}  ·  {}", entry.username, entry.server),
+                        AccountType::Admin => format!("Admin password  ·  {}", entry.server),
+                        AccountType::Rcon => format!("RCON password  ·  {}", entry.server),
+                    };
+                    theme::row(
+                        ui,
+                        account_type.label(),
+                        "Passwords stay in Windows Credential Manager and are never displayed here.",
+                        theme::Reset::None,
+                        |ui| {
+                            theme::glow_label(ui, &detail, 12.5, theme::TEXT);
+                            ui.add_space(10.0);
+                            if theme::primary_button(ui, "LOG IN").clicked() {
+                                login = Some((entry.server, account_type));
+                            }
+                            ui.add_space(6.0);
+                            if theme::ghost_button(ui, "LOG OUT").clicked() {
+                                logout = Some((entry.server, account_type));
+                            }
+                            ui.add_space(6.0);
+                            if theme::ghost_button(ui, "EDIT").clicked() {
+                                edit = Some((entry.server, account_type));
+                            }
+                            ui.add_space(6.0);
+                            if theme::ghost_button(ui, "FORGET").clicked() {
+                                forget = Some((entry.server, account_type));
+                            }
+                        },
+                    );
+                }
+            }
+
+            if current_accounts.len() < AccountType::ALL.len() {
+                theme::row(ui, "", "", theme::Reset::None, |ui| {
+                    if theme::primary_button(ui, "ADD ACCOUNT").clicked() {
+                        new_account = Some(server);
                     }
-                },
-            );
+                });
+            }
         } else {
             theme::label(
                 ui,
                 theme::plain(
-                    "Connect to a jaPRO server to save or use a login for its exact IP:port.",
+                    "Join a server to add or use accounts for its exact IP:port.",
                     11.5,
                     theme::TEXT_FAINT,
                 ),
             );
         }
 
-        let other_logins: Vec<_> = self
-            .japro_saved_logins
-            .iter()
-            .filter(|entry| Some(entry.server) != current)
-            .cloned()
-            .collect();
-        if !other_logins.is_empty() {
-            ui.add_space(10.0);
-            theme::section(
+        if !other_accounts.is_empty() {
+            ui.add_space(8.0);
+            theme::row(
                 ui,
-                "OTHER SAVED LOGINS",
-                "These credentials are stored locally. Connect to the matching endpoint before LOG IN becomes available.",
+                "Show other servers",
+                "Off by default. Other endpoints are shown below for management only and cannot log in until you join that exact server.",
+                theme::Reset::None,
+                |ui| {
+                    if let Some(show) = theme::switch(ui, self.show_other_accounts) {
+                        self.show_other_accounts = show;
+                    }
+                },
             );
-            for entry in other_logins {
-                let label = entry
-                    .server_name
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| entry.server.to_string());
-                theme::row(
-                    ui,
-                    &label,
-                    "Saved in Windows Credential Manager. The password is never displayed here.",
-                    theme::Reset::None,
-                    |ui| {
-                        theme::glow_label(
-                            ui,
-                            &format!("{}  ·  {}", entry.username, entry.server),
-                            12.5,
-                            theme::TEXT,
-                        );
-                        ui.add_space(10.0);
-                        if theme::ghost_button(ui, "EDIT").clicked() {
-                            edit = Some(entry.server);
+
+            if self.show_other_accounts {
+                for entry in &other_accounts {
+                    let account_type = entry.account_type;
+                    let server_label = entry
+                        .server_name
+                        .as_deref()
+                        .filter(|name| !name.is_empty())
+                        .map(|name| format!("{name}  ·  {}", entry.server))
+                        .unwrap_or_else(|| entry.server.to_string());
+                    let detail = match account_type {
+                        AccountType::Login => {
+                            format!("{}  ·  {}", account_type.label(), entry.username)
                         }
-                        ui.add_space(6.0);
-                        if theme::ghost_button(ui, "FORGET").clicked() {
-                            forget = Some(entry.server);
-                        }
-                    },
-                );
+                        AccountType::Admin | AccountType::Rcon => account_type.label().to_owned(),
+                    };
+                    theme::row(
+                        ui,
+                        &server_label,
+                        "Saved for another endpoint. Join that exact server before LOG IN / LOG OUT can be used.",
+                        theme::Reset::None,
+                        |ui| {
+                            theme::glow_label(ui, &detail, 12.0, theme::TEXT_FAINT);
+                            ui.add_space(10.0);
+                            ui.add_enabled_ui(false, |ui| {
+                                let _ = theme::ghost_button(ui, "LOG IN");
+                                ui.add_space(6.0);
+                                let _ = theme::ghost_button(ui, "LOG OUT");
+                            });
+                            ui.add_space(6.0);
+                            if theme::ghost_button(ui, "EDIT").clicked() {
+                                edit = Some((entry.server, account_type));
+                            }
+                            ui.add_space(6.0);
+                            if theme::ghost_button(ui, "FORGET").clicked() {
+                                forget = Some((entry.server, account_type));
+                            }
+                        },
+                    );
+                }
             }
         }
 
-        if let Some(server) = login {
-            if let Err(error) = self.login_with_saved_japro_credential(server) {
-                self.japro_credential_error = Some(error);
+        if let Some((server, account_type)) = login {
+            if let Err(error) = self.login_with_saved_account(server, account_type) {
+                self.account_credential_error = Some(error);
             } else {
-                self.japro_credential_error = None;
+                self.account_credential_error = None;
             }
         }
-        if let Some(server) = new_login {
-            self.begin_new_japro_login(server);
-        } else if let Some(server) = edit {
-            self.begin_edit_japro_login(server);
+        if let Some((server, account_type)) = logout {
+            if let Err(error) = self.logout_saved_account(server, account_type) {
+                self.account_credential_error = Some(error);
+            } else {
+                self.account_credential_error = None;
+            }
         }
-        if let Some(server) = forget {
-            match self.forget_japro_login(server) {
+        if let Some(server) = new_account {
+            self.begin_new_account(server);
+        } else if let Some((server, account_type)) = edit {
+            self.begin_edit_account(server, account_type);
+        }
+        if let Some((server, account_type)) = forget {
+            match self.forget_saved_account(server, account_type) {
                 Ok(()) => {
-                    self.japro_credential_error = None;
-                    self.console_status = format!("JAPRO SAVED LOGIN FORGOTTEN FOR {server}");
+                    self.account_credential_error = None;
+                    self.console_status = format!(
+                        "{} ACCOUNT FORGOTTEN FOR {server}",
+                        account_type.label().to_ascii_uppercase()
+                    );
                 }
-                Err(error) => self.japro_credential_error = Some(error),
+                Err(error) => self.account_credential_error = Some(error),
             }
         }
 
         // Work on a clone so rendering the editor never holds a mutable borrow
         // of an App field while a save/cancel action needs &mut self.
-        let mut editor = self.japro_login_editor.clone();
+        let mut editor = self.account_editor.clone();
         let mut save_editor = None;
         let mut cancel_editor = false;
         if let Some(state) = editor.as_mut() {
+            const USERNAME_LIMIT: usize = 64;
+            const PASSWORD_LIMIT: usize = 128;
+            let new_entry = state.original_type.is_none();
+
             ui.add_space(14.0);
             theme::section(
                 ui,
-                if state.new_entry {
-                    "SAVE LOGIN"
+                if new_entry {
+                    "ADD ACCOUNT"
                 } else {
-                    "EDIT SAVED LOGIN"
+                    "EDIT ACCOUNT"
                 },
-                if state.new_entry {
-                    "Give this exact endpoint an optional friendly name and save its jaPRO credentials securely."
+                if new_entry {
+                    "Choose how this credential is used, then save it for this exact endpoint."
                 } else {
-                    "Change the friendly name or username. Leave Password blank to keep the existing saved password."
+                    "Change the display name, type or username. Leave Password blank to keep the existing saved password."
                 },
             );
             theme::row(
                 ui,
                 "Endpoint",
-                "Security identity. This cannot be edited; save a separate login while connected to another endpoint.",
+                "Security identity. This cannot be edited; add an account while connected to another endpoint to save one there.",
                 theme::Reset::None,
                 |ui| {
                     theme::glow_label(ui, &state.server.to_string(), 12.5, theme::TEXT);
@@ -286,28 +257,72 @@ impl App {
                         egui::TextEdit::singleline(&mut state.server_name)
                             .char_limit(96)
                             .desired_width(260.0)
-                            .hint_text("e.g. My jaPRO server"),
+                            .hint_text("optional friendly name"),
                     );
                 },
             );
             theme::row(
                 ui,
-                "Username",
-                "jaPRO username stored with this endpoint.",
+                "Type",
+                "Login sends /login <user> <password>. Admin sends /amlogin <password>. RCON sets rconPassword locally for rcon commands.",
                 theme::Reset::None,
                 |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.username)
-                            .char_limit(LIMIT)
-                            .desired_width(220.0),
-                    );
+                    egui::ComboBox::from_id_salt(("saved_account_type", state.server))
+                        .selected_text(state.account_type.label())
+                        .show_ui(ui, |ui| {
+                            for account_type in AccountType::ALL.iter().copied() {
+                                let occupied = self.saved_accounts.iter().any(|entry| {
+                                    entry.server == state.server
+                                        && entry.account_type == account_type
+                                        && state.original_type != Some(account_type)
+                                });
+                                ui.add_enabled_ui(!occupied, |ui| {
+                                    ui.selectable_value(
+                                        &mut state.account_type,
+                                        account_type,
+                                        account_type.label(),
+                                    );
+                                });
+                            }
+                        });
                 },
             );
+
+            if state.account_type == AccountType::Login {
+                theme::row(
+                    ui,
+                    "Username",
+                    "Username passed to the server's /login command.",
+                    theme::Reset::None,
+                    |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.username)
+                                .char_limit(USERNAME_LIMIT)
+                                .desired_width(220.0),
+                        );
+                    },
+                );
+                state
+                    .username
+                    .retain(|c| !c.is_whitespace() && !matches!(c, ';' | '"' | '\\'));
+            }
+
+            let password_tip = match state.account_type {
+                AccountType::Login => {
+                    "Password passed to /login. Stored in Windows Credential Manager, never DinurdoJK.cfg."
+                }
+                AccountType::Admin => {
+                    "Admin password passed to /amlogin. Stored in Windows Credential Manager."
+                }
+                AccountType::Rcon => {
+                    "RCON password loaded into the temporary rconPassword cvar when LOG IN is pressed."
+                }
+            };
             theme::row(
                 ui,
                 "Password",
-                if state.new_entry {
-                    "jaPRO password. Stored in Windows Credential Manager, never DinurdoJK.cfg."
+                if new_entry {
+                    password_tip
                 } else {
                     "Enter a new password, or leave blank to keep the existing saved password."
                 },
@@ -316,9 +331,9 @@ impl App {
                     ui.add(
                         egui::TextEdit::singleline(&mut state.password)
                             .password(true)
-                            .char_limit(LIMIT)
+                            .char_limit(PASSWORD_LIMIT)
                             .desired_width(220.0)
-                            .hint_text(if state.new_entry {
+                            .hint_text(if new_entry {
                                 "password"
                             } else {
                                 "keep existing"
@@ -326,13 +341,18 @@ impl App {
                     );
                 },
             );
-            clean(&mut state.username);
-            clean(&mut state.password);
+            match state.account_type {
+                AccountType::Login | AccountType::Admin => state
+                    .password
+                    .retain(|c| !c.is_whitespace() && !matches!(c, ';' | '"' | '\\')),
+                AccountType::Rcon => state.password.retain(|c| !c.is_control()),
+            }
 
             theme::row(ui, "", "", theme::Reset::None, |ui| {
-                let ready = !state.username.is_empty()
-                    && (!state.new_entry || !state.password.is_empty());
-                ui.add_enabled_ui(ready, |ui| {
+                let username_ready = state.account_type != AccountType::Login
+                    || !state.username.is_empty();
+                let password_ready = !new_entry || !state.password.is_empty();
+                ui.add_enabled_ui(username_ready && password_ready, |ui| {
                     if theme::primary_button(ui, "SAVE").clicked() {
                         save_editor = Some(state.clone());
                     }
@@ -343,33 +363,42 @@ impl App {
                 }
             });
         }
-        self.japro_login_editor = editor;
+        self.account_editor = editor;
 
         if let Some(state) = save_editor {
-            match self.save_japro_login_edit(
+            match self.save_account_edit(
                 state.server,
                 &state.server_name,
+                state.account_type,
+                state.original_type,
                 &state.username,
                 &state.password,
-                state.new_entry,
             ) {
                 Ok(()) => {
-                    self.japro_login_editor = None;
-                    self.japro_credential_error = None;
-                    self.console_status = if state.new_entry {
-                        format!("JAPRO SAVED LOGIN SAVED FOR {}", state.server)
+                    self.account_editor = None;
+                    self.account_credential_error = None;
+                    self.console_status = if state.original_type.is_none() {
+                        format!(
+                            "{} ACCOUNT SAVED FOR {}",
+                            state.account_type.label().to_ascii_uppercase(),
+                            state.server
+                        )
                     } else {
-                        format!("JAPRO SAVED LOGIN UPDATED FOR {}", state.server)
+                        format!(
+                            "{} ACCOUNT UPDATED FOR {}",
+                            state.account_type.label().to_ascii_uppercase(),
+                            state.server
+                        )
                     };
                 }
-                Err(error) => self.japro_credential_error = Some(error),
+                Err(error) => self.account_credential_error = Some(error),
             }
         } else if cancel_editor {
-            self.japro_login_editor = None;
-            self.japro_credential_error = None;
+            self.account_editor = None;
+            self.account_credential_error = None;
         }
 
-        if let Some(error) = &self.japro_credential_error {
+        if let Some(error) = &self.account_credential_error {
             theme::label(
                 ui,
                 theme::plain(

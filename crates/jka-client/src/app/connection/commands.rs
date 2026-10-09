@@ -124,6 +124,20 @@ impl App {
         }
         let force_touched = self.profile_force_pending;
         if self.live_connected() {
+            // `cmd` (CL_ForwardToServer_f) only forwards once the connection is
+            // Active. Queuing forcechanged during the join window is the one
+            // path that never reached the server, so wait for Active and keep
+            // the touched bit set instead of clearing it.
+            let active = self.net.as_ref().is_some_and(|net| {
+                net.state() == jka_protocol::session::ConnectionState::Active
+            });
+            if force_touched && !active {
+                self.push_console_line(
+                    "^3Force loadout pending: still joining the server; press APPLY again once in game"
+                        .to_owned(),
+                );
+                return;
+            }
             // TaystJK UI_UpdateClientForcePowers writes forcepowers first, then
             // executes `cmd forcechanged [team]` only when force was touched.
             // Always put a fresh userinfo immediately before that notification:
@@ -146,9 +160,10 @@ impl App {
                     self.push_console_line(format!("^1Could not apply Force loadout: {error}"));
                     return;
                 }
+                let sequence = self.net.as_ref().map_or(-1, |net| net.session().reliable_sequence());
                 self.profile_force_pending = false;
                 self.push_console_line(format!(
-                    "^5Force loadout applied: sent userinfo + {command}"
+                    "^5Force loadout applied: sent userinfo + {command} (reliable seq {sequence})"
                 ));
             }
         } else {

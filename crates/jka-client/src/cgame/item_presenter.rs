@@ -67,6 +67,8 @@ pub struct ItemInput {
     /// `cg_weapons[giTag].weaponMidpoint` (R_ModelBounds of world_model[0];
     /// zero for Ghoul2 weapon models, whose bounds OpenJK reports as zero).
     pub weapon_midpoint: [f32; 3],
+    /// cgs.gametype. CTY uses world_model[1] for the team flags.
+    pub gametype: i32,
 }
 
 /// One `R_AddRefEntityToScene` from CG_Item.
@@ -84,9 +86,19 @@ pub struct ItemDraw {
 /// CG_RegisterItemVisuals `models[0]`. The renderer dispatches on that
 /// model's type, so for thermal/trip mine/det pack the `_pu.md3` pickup model
 /// is drawn and the Ghoul2 world model (oriented for the hand bolt) is not.
-pub fn registered_item_model(item: &ItemInfo) -> &str {
-    let pickup_md3 = item.item_type == IT_WEAPON && matches!(item.tag, WP_THERMAL | WP_TRIP_MINE | WP_DET_PACK);
-    if pickup_md3 && !item.world_model2.is_empty() { &item.world_model2 } else { &item.world_model }
+pub fn registered_item_model(item: &ItemInfo, gametype: i32) -> &str {
+    // TaystJK/OpenJK CG_RegisterItemVisuals: CTY promotes the red/blue flag's
+    // second world model (r_flag_ysal/b_flag_ysal) instead of the CTF model.
+    let cty_flag = gametype == 9
+        && item.item_type == IT_TEAM
+        && matches!(item.tag, PW_REDFLAG | PW_BLUEFLAG);
+    let pickup_md3 = item.item_type == IT_WEAPON
+        && matches!(item.tag, WP_THERMAL | WP_TRIP_MINE | WP_DET_PACK);
+    if (cty_flag || pickup_md3) && !item.world_model2.is_empty() {
+        &item.world_model2
+    } else {
+        &item.world_model
+    }
 }
 
 /// CG_GreyItem: enlightenment of the opposing side is shown disabled.
@@ -192,7 +204,7 @@ pub fn cg_item(item: &ItemInfo, input: &ItemInput, angles_to_axis: fn([f32; 3]) 
     }
 
     let mut draw = ItemDraw {
-        model: registered_item_model(item).to_owned(),
+        model: registered_item_model(item, input.gametype).to_owned(),
         origin,
         axis,
         rgba: [1.0; 4],
@@ -273,6 +285,7 @@ mod tests {
             misc_time: -100_000,
             force_side: FORCE_LIGHTSIDE,
             weapon_midpoint: [0.0; 3],
+            gametype: 0,
         }
     }
 

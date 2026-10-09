@@ -323,3 +323,74 @@ pub(crate) fn apply_shader_remaps(
     apply_shader_remaps_in_place(&mut map, root, game, options, state)?;
     Ok(map)
 }
+
+/// Apply an opt-in OpenJK reverse-lightmap fold to a *derived* PreparedMap.
+/// The restart cache must keep the pristine authored two-pass representation.
+/// No texture parsing, BSP work or gameplay state is changed here.
+pub(in crate::scene) fn fold_reverse_lightmap_batches(source: &[DrawBatch]) -> (Vec<DrawBatch>, usize) {
+    let mut out = Vec::with_capacity(source.len());
+    let mut folds = 0;
+    let mut index = 0;
+    while index < source.len() {
+        let first = &source[index];
+        let mut end = index + 1;
+        while end < source.len() && same_material_geometry(first, &source[end]) {
+            end += 1;
+        }
+        let group = &source[index..end];
+        if group.len() >= 2
+            && group[0].reverse_lightmap_fold_role == 1
+            && group[1].reverse_lightmap_fold_role == 2
+            && group[0].texture_is_lightmap
+            && group[1].texture.is_some()
+            && group[0].lightmap.is_some()
+        {
+            // Equivalent to stage_batch(material, second-without-blend,
+            // first=true) in the existing folded forward-modulation path.
+            let mut fused = group[1].clone();
+            fused.pipeline.class = super::DrawClass::Opaque;
+            fused.pipeline.blend = super::BlendMode::Opaque;
+            fused.pipeline.depth_write = true;
+            fused.modulate_lightmap = true;
+            fused.detail_texture_eligible = fused.reverse_lightmap_fold_detail;
+            fused.dlight_in_lightmap_stage = false;
+            fused.fog_color_override = super::FogColorOverride::None;
+            fused.reverse_lightmap_fold_role = 0;
+            fused.reverse_lightmap_fold_detail = false;
+            out.push(fused);
+            for stage in &group[2..] {
+                let mut stage = stage.clone();
+                // The folded $lightmap pass no longer exists. As in the
+                // ordinary append_material_batches wrapper, local dynamic
+                // lighting must be evaluated by the first surviving stage.
+                stage.dlight_in_lightmap_stage = false;
+                stage.reverse_lightmap_fold_role = 0;
+                out.push(stage);
+            }
+            folds += 1;
+        } else {
+            out.extend_from_slice(group);
+        }
+        index = end;
+    }
+    (out, folds)
+}
+
+pub(crate) fn apply_reverse_lightmap_collapse_in_place(map: &mut PreparedMap) -> usize {
+    let (coarse, count) = fold_reverse_lightmap_batches(&map.batches);
+    let (full, full_count) = fold_reverse_lightmap_batches(&map.pvs_batches);
+    let (inline, inline_count) = fold_reverse_lightmap_batches(&map.inline_batches);
+    map.batches = coarse;
+    map.pvs_batches = full;
+    map.inline_batches = inline;
+    // AUTO 4 plans refer to FULL indices. A recipe count change invalidates
+    // their indices, so reconstruct the plan, not just its representative.
+    if let Some(visibility) = &map.visibility {
+        map.portal_draw_plan = super::build_prepared_portal_draw_plan(
+            &map.batches, &map.pvs_batches, visibility, &map.vertices, |_| {},
+        );
+    } else {
+        map.portal_draw_plan = Default::default();
+    }
+    count + full_count + inline_count
+}

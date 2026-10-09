@@ -23,7 +23,7 @@ impl App {
                 let result =
                     App::build_cgame_cpu_assets(&base, game.as_deref(), pbr, allow_asset_overrides)
                         .map(
-                            |(siege_classes, player_presenter, entity_presenter, fx_assets)| {
+                            |(siege_catalog, siege_classes, player_presenter, entity_presenter, fx_assets)| {
                                 let stringed = if load_stringed {
                                     jka_assets::pk3::AssetSearchPath::open_game(
                                         &base,
@@ -37,6 +37,7 @@ impl App {
                                     None
                                 };
                                 LiveCgamePrepared {
+                                    siege_catalog,
                                     siege_classes,
                                     player_presenter,
                                     entity_presenter,

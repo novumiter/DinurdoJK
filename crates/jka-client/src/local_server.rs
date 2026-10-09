@@ -10,7 +10,7 @@ mod game;
 mod movers;
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     ops::{Deref, DerefMut},
     time::Duration,
 };
@@ -23,7 +23,7 @@ use crate::{
     camera::Camera,
     cgame::{ambient_sets::CS_AMBIENT_SET, ClientInfo, CS_EFFECTS, CS_MODELS, CS_PLAYERS, CS_SERVERINFO, ET_FX},
     player::{LocalPlayer, MouseInputSettings},
-    scene::{MapBrushEntity, MapFxRunner, SpawnPoint},
+    scene::{MapBrushEntity, MapFxRunner, MapWorldEffectRegistration, SpawnPoint},
     surface_deformation::SurfaceDeformationStamp,
 };
 use jka_movement::{
@@ -32,7 +32,7 @@ use jka_movement::{
 };
 use jka_protocol::{
     gamestate::{EntityState, ENTITY_FIELDS},
-    server::{PlayerState as ProtocolPlayerState, Snapshot},
+    server::{PlayerState as ProtocolPlayerState, ServerCommand, Snapshot},
     session::CS_SYSTEMINFO,
 };
 
@@ -44,6 +44,20 @@ const MAX_LOCAL_EFFECTS: usize = 63;
 const LOCAL_MAP_ENTITY_BASE: u16 = 64;
 const MAX_GENTITIES: u16 = 1024;
 
+// bg_public.h team_t / gametype_t values used by TaystJK's SetTeam and
+// BroadcastTeamChange. The local authority is GT_FFA today, but keeping the
+// whole branch table here avoids changing the announcement semantics when
+// local team gametypes are added.
+const TEAM_FREE: i32 = 0;
+const TEAM_RED: i32 = 1;
+const TEAM_BLUE: i32 = 2;
+const TEAM_SPECTATOR: i32 = 3;
+const GT_FFA: i32 = 0;
+const GT_DUEL: i32 = 3;
+const GT_POWERDUEL: i32 = 4;
+const GT_TEAM: i32 = 6;
+const GT_SIEGE: i32 = 7;
+
 /// A one-client authoritative local host.  There is deliberately no fake UDP
 /// socket or protocol-26 re-encoding here: this sits immediately after the
 /// network decoder and feeds the exact semantic objects consumed by CGame.
@@ -51,7 +65,13 @@ pub struct LocalServer {
     diagnostic_epoch: std::time::Instant,
     player: LocalPlayer,
     map_name: String,
+    client_name: String,
     configstrings: BTreeMap<u16, Vec<u8>>,
+    /// Reliable server commands emitted by the in-process game authority.
+    /// They are fed through CGame's ordinary `CG_ServerCommand` queue rather
+    /// than turned into solo-only UI events.
+    pending_server_commands: VecDeque<ServerCommand>,
+    server_command_sequence: i32,
     map_effects: Vec<String>,
     /// The fx_runner entities.
     fx_entities: Vec<EntityState>,
@@ -82,13 +102,15 @@ impl LocalServer {
         client_info: &ClientInfo,
         saber_movement: [SaberMovementInfo; 2],
         fx_runners: &[MapFxRunner],
+        world_effect_registrations: &[MapWorldEffectRegistration],
         brush_entities: &[MapBrushEntity],
         areas: Option<jka_assets::bsp::AreaLocator>,
     ) -> Result<Self, String> {
         let mut player = LocalPlayer::new(movement, world, spawn)?;
         player.set_saber_movement_info(saber_movement)?;
         let map_name = normalize_map_name(map_name);
-        let (map_effects, fx_entities) = build_map_fx_entities(fx_runners);
+        let (map_effects, fx_entities) =
+            build_map_fx_entities(fx_runners, world_effect_registrations);
         let movers = movers::build_brush_mover_entities(
             brush_entities,
             LOCAL_MAP_ENTITY_BASE.saturating_add(fx_entities.len() as u16),
@@ -110,7 +132,10 @@ impl LocalServer {
             diagnostic_epoch: std::time::Instant::now(),
             player,
             map_name,
+            client_name: clean_info_value(&client_info.name),
             configstrings: BTreeMap::new(),
+            pending_server_commands: VecDeque::new(),
+            server_command_sequence: 0,
             map_effects,
             fx_entities,
             game,
@@ -137,7 +162,10 @@ impl LocalServer {
     /// authority. Client commands must not be swallowed unless the local game
     /// side can actually execute them.
     pub fn supports_generic_command(&self, command: u8) -> bool {
-        matches!(command, jka_movement::GENCMD_SABERATTACKCYCLE)
+        matches!(
+            command,
+            jka_movement::GENCMD_SABERSWITCH | jka_movement::GENCMD_SABERATTACKCYCLE
+        )
     }
 
     pub fn configstrings(&self) -> &BTreeMap<u16, Vec<u8>> {
@@ -154,8 +182,24 @@ impl LocalServer {
     }
 
     pub fn set_client_info(&mut self, info: &ClientInfo) {
+        self.client_name = clean_info_value(&info.name);
         self.configstrings
             .insert(CS_PLAYERS, client_info_string(info).into_bytes());
+    }
+
+    /// Local equivalent of `SV_SendServerCommand`'s reliable command stream.
+    /// `push_local_snapshot` drains this into CGame before the snapshot whose
+    /// `server_command_num` acknowledges the sequence.
+    pub fn drain_server_commands(&mut self) -> Vec<ServerCommand> {
+        self.pending_server_commands.drain(..).collect()
+    }
+
+    fn send_server_command(&mut self, text: Vec<u8>) {
+        self.server_command_sequence = self.server_command_sequence.saturating_add(1).max(1);
+        self.pending_server_commands.push_back(ServerCommand {
+            sequence: self.server_command_sequence,
+            text,
+        });
     }
 
     pub fn set_saber_movement_info(
@@ -247,7 +291,7 @@ impl LocalServer {
             delta_num,
             snap_flags: 0,
             ping: 0,
-            server_command_num: 0,
+            server_command_num: self.server_command_sequence,
             area_mask: self.area_mask(),
             player_state,
             vehicle_player_state: None,
@@ -310,6 +354,18 @@ impl LocalServer {
             .map_or(0, |bits| *bits as i32)
     }
 
+    /// `fd.saberAnimLevel` (playerState field 23 in the protocol-26 schema):
+    /// the saber style which is actually active, as opposed to the HUD-facing
+    /// queued style returned by `saber_style()`.
+    pub fn saber_active_style(&self) -> i32 {
+        const SABER_ANIM_LEVEL_FIELD: usize = 23;
+        self.player
+            .network_state()
+            .fields
+            .get(SABER_ANIM_LEVEL_FIELD)
+            .map_or(0, |bits| *bits as i32)
+    }
+
     pub fn entity_view(&self) -> PlayerEntityView {
         let mut view = self.player.entity_view();
         view.custom_rgba = self.custom_rgba;
@@ -340,6 +396,11 @@ impl LocalServer {
         self.player.can_join()
     }
 
+    /// OpenJK Cmd_Team_f with no argument: print the current session team.
+    pub fn report_current_team(&mut self) {
+        self.send_server_command(current_team_command(local_team(self.player.mode)));
+    }
+
     /// Install freshly rebuilt source-map collision while preserving the
     /// authoritative local player and snapshot timeline.
     pub fn replace_collision_world(&mut self, world: CollisionWorld) {
@@ -347,10 +408,40 @@ impl LocalServer {
     }
 
     pub fn join(&mut self, mode: JoinMode, spawn: SpawnPoint) -> Result<(), String> {
+        let old_team = local_team(self.player.mode);
+        let new_team = local_team(mode);
         let previous_server_time = self.authoritative_time();
         self.player.join(mode, spawn)?;
         self.rebase_after_player_time_reset(previous_server_time);
+
+        // TaystJK SetTeam returns before BroadcastTeamChange for an unchanged
+        // non-spectator team. Spectator->spectator is allowed through SetTeam,
+        // but BroadcastTeamChange itself intentionally prints nothing for it.
+        if new_team != old_team || new_team == TEAM_SPECTATOR {
+            self.broadcast_team_change(old_team, new_team);
+        }
         Ok(())
+    }
+
+    /// Direct port of TaystJK `BroadcastTeamChange`'s announcement branches.
+    ///
+    /// The real game module resolves `G_GetStringEdString("MP_SVGAME", key)`
+    /// before sending the command. The in-process server intentionally leaves
+    /// that one transport detail as an `@@@key` reference so the existing
+    /// client-side `CG_CheckSVStringEdRef` path resolves the same StringEd text;
+    /// the resulting presentation and command type (`cp` vs `print`) are the
+    /// same.
+    fn broadcast_team_change(&mut self, old_team: i32, new_team: i32) {
+        let Some(text) = broadcast_team_change_command(
+            &self.client_name,
+            old_team,
+            new_team,
+            GT_FFA,
+            false,
+        ) else {
+            return;
+        };
+        self.send_server_command(text);
     }
 
     pub fn respawn(&mut self, spawn: SpawnPoint) -> Result<(), String> {
@@ -487,36 +578,67 @@ fn set_entity_vec3(entity: &mut EntityState, prefix: &str, value: [f32; 3]) {
     }
 }
 
-fn build_map_fx_entities(runners: &[MapFxRunner]) -> (Vec<String>, Vec<EntityState>) {
+fn build_map_fx_entities(
+    runners: &[MapFxRunner],
+    registrations: &[MapWorldEffectRegistration],
+) -> (Vec<String>, Vec<EntityState>) {
     let mut effects = Vec::<String>::new();
     let mut effect_indices = BTreeMap::<String, i32>::new();
     let mut entities = Vec::new();
 
-    for runner in runners {
-        if LOCAL_MAP_ENTITY_BASE.saturating_add(entities.len() as u16) >= MAX_GENTITIES {
-            eprintln!(
-                "LOCAL SERVER FX: entity limit reached; skipped {} remaining fx_runner(s)",
-                runners.len().saturating_sub(entities.len())
-            );
-            break;
-        }
+    // G_SpawnEntitiesFromString invokes each entity spawn function in map order.
+    // Both dedicated weather entities and fx_runner call G_EffectIndex, so merge
+    // them by their source BSP entity index before filling CS_EFFECTS. This is
+    // observable for commands such as *clear/*die and therefore is not merely
+    // bookkeeping.
+    enum Registration<'a> {
+        Weather(&'a MapWorldEffectRegistration),
+        Runner(&'a MapFxRunner),
+    }
+    let mut ordered = Vec::<(usize, usize, Registration<'_>)>::with_capacity(
+        registrations.len() + runners.len(),
+    );
+    for (sequence, registration) in registrations.iter().enumerate() {
+        ordered.push((registration.source_entity_index, sequence, Registration::Weather(registration)));
+    }
+    let weather_count = registrations.len();
+    for (sequence, runner) in runners.iter().enumerate() {
+        ordered.push((runner.source_entity_index, weather_count + sequence, Registration::Runner(runner)));
+    }
+    ordered.sort_by_key(|(entity_index, sequence, _)| (*entity_index, *sequence));
 
-        let key = runner.effect.replace('\\', "/").to_ascii_lowercase();
+    for (_, _, registration) in ordered {
+        let (raw_effect, runner) = match registration {
+            Registration::Weather(registration) => (registration.effect.as_str(), None),
+            Registration::Runner(runner) => (runner.effect.as_str(), Some(runner)),
+        };
+        let normalized = raw_effect.replace('\\', "/");
+        let key = normalized.to_ascii_lowercase();
         let effect_index = if let Some(&index) = effect_indices.get(&key) {
             index
         } else {
             if effects.len() >= MAX_LOCAL_EFFECTS {
-                eprintln!(
-                    "LOCAL SERVER FX: CS_EFFECTS limit reached; skipping fx_runner '{}'",
-                    runner.effect
-                );
+                eprintln!("LOCAL SERVER FX: CS_EFFECTS limit reached; skipping '{raw_effect}'");
                 continue;
             }
             let index = (effects.len() + 1) as i32;
-            effects.push(runner.effect.replace('\\', "/"));
+            effects.push(normalized.clone());
             effect_indices.insert(key, index);
             index
         };
+
+        let Some(runner) = runner else { continue };
+
+        // Native CGame leaves gameEffects[slot] == 0 when the registered
+        // string starts with '*'. The ET_FX therefore has no ordinary .efx to
+        // play; the visible result came from CG_ParseWeatherEffect already.
+        if normalized.trim_start().starts_with('*') {
+            continue;
+        }
+        if LOCAL_MAP_ENTITY_BASE.saturating_add(entities.len() as u16) >= MAX_GENTITIES {
+            eprintln!("LOCAL SERVER FX: entity limit reached; skipping fx_runner '{}'", runner.effect);
+            continue;
+        }
 
         let number = LOCAL_MAP_ENTITY_BASE + entities.len() as u16;
         let mut state = EntityState {
@@ -545,10 +667,10 @@ fn build_map_fx_entities(runners: &[MapFxRunner]) -> (Vec<String>, Vec<EntitySta
         entities.push(state);
     }
 
-    if !entities.is_empty() {
+    if !effects.is_empty() {
         devprintln!(
             1,
-            "LOCAL SERVER FX: {} fx_runner entity(s), {} unique effect(s)",
+            "LOCAL SERVER FX: {} fx_runner entity(s), {} unique CS_EFFECTS registration(s)",
             entities.len(),
             effects.len()
         );
@@ -572,11 +694,64 @@ fn clean_info_value(value: &str) -> String {
         .collect()
 }
 
+fn local_team(mode: JoinMode) -> i32 {
+    match mode {
+        JoinMode::Player => TEAM_FREE,
+        JoinMode::Spectator => TEAM_SPECTATOR,
+    }
+}
+
+fn current_team_command(team: i32) -> Vec<u8> {
+    let key = match team {
+        TEAM_BLUE => "PRINTBLUETEAM",
+        TEAM_RED => "PRINTREDTEAM",
+        TEAM_SPECTATOR => "PRINTSPECTEAM",
+        _ => "PRINTFREETEAM",
+    };
+    format!("print \"@@@{key}\n\"").into_bytes()
+}
+
+/// TaystJK `BroadcastTeamChange` reduced to the reliable command it emits.
+/// Keeping all four team branches here makes the local authority's behavior
+/// explicit even though today's one-client solo host only exposes FREE/SPEC.
+fn broadcast_team_change_command(
+    client_name: &str,
+    old_team: i32,
+    new_team: i32,
+    gametype: i32,
+    race_mode: bool,
+) -> Option<Vec<u8>> {
+    if gametype == GT_SIEGE {
+        return None;
+    }
+
+    let stringed_key = if new_team == TEAM_RED {
+        "JOINEDTHEREDTEAM"
+    } else if new_team == TEAM_BLUE {
+        "JOINEDTHEBLUETEAM"
+    } else if new_team == TEAM_SPECTATOR && old_team != TEAM_SPECTATOR {
+        "JOINEDTHESPECTATORS"
+    } else if new_team == TEAM_FREE {
+        if gametype == GT_DUEL || gametype == GT_POWERDUEL {
+            return None;
+        }
+        "JOINEDTHEBATTLE"
+    } else {
+        return None;
+    };
+
+    // jaPRO/Tayst race mode deliberately demotes these announcements from
+    // centreprint to ordinary console print.
+    let command = if race_mode { "print" } else { "cp" };
+    Some(format!("{command} \"{client_name}^7 @@@{stringed_key}\n\"").into_bytes())
+}
+
 fn client_info_string(info: &ClientInfo) -> String {
     format!(
-        "\\n\\{}\\t\\{}\\model\\{}\\c1\\{}\\c2\\{}\\st\\{}\\st2\\{}",
+        "\\n\\{}\\t\\{}\\ds\\{}\\model\\{}\\c1\\{}\\c2\\{}\\st\\{}\\st2\\{}",
         clean_info_value(&info.name),
         info.team,
+        if info.female { "f" } else { "m" },
         clean_info_value(&info.model_cvar()),
         info.saber_color,
         info.saber2_color,
@@ -604,8 +779,64 @@ mod tests {
     }
 
     #[test]
+    fn tayst_broadcast_team_change_uses_cp_and_stringed_keys() {
+        assert_eq!(
+            broadcast_team_change_command("Padawan", TEAM_SPECTATOR, TEAM_FREE, GT_FFA, false),
+            Some(b"cp \"Padawan^7 @@@JOINEDTHEBATTLE\n\"".to_vec())
+        );
+        assert_eq!(
+            broadcast_team_change_command("Padawan", TEAM_FREE, TEAM_SPECTATOR, GT_FFA, false),
+            Some(b"cp \"Padawan^7 @@@JOINEDTHESPECTATORS\n\"".to_vec())
+        );
+        assert_eq!(
+            broadcast_team_change_command("Padawan", TEAM_SPECTATOR, TEAM_RED, GT_TEAM, false),
+            Some(b"cp \"Padawan^7 @@@JOINEDTHEREDTEAM\n\"".to_vec())
+        );
+        assert_eq!(
+            broadcast_team_change_command("Padawan", TEAM_RED, TEAM_BLUE, GT_TEAM, false),
+            Some(b"cp \"Padawan^7 @@@JOINEDTHEBLUETEAM\n\"".to_vec())
+        );
+    }
+
+    #[test]
+    fn tayst_broadcast_team_change_preserves_suppression_and_race_prints() {
+        assert_eq!(
+            broadcast_team_change_command(
+                "Padawan",
+                TEAM_SPECTATOR,
+                TEAM_SPECTATOR,
+                GT_FFA,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            broadcast_team_change_command("Padawan", TEAM_SPECTATOR, TEAM_FREE, GT_DUEL, false),
+            None
+        );
+        assert_eq!(
+            broadcast_team_change_command("Padawan", TEAM_FREE, TEAM_RED, GT_SIEGE, false),
+            None
+        );
+        assert_eq!(
+            broadcast_team_change_command("Padawan", TEAM_FREE, TEAM_SPECTATOR, GT_FFA, true),
+            Some(b"print \"Padawan^7 @@@JOINEDTHESPECTATORS\n\"".to_vec())
+        );
+    }
+
+    #[test]
+    fn openjk_bare_team_reports_current_free_or_spectator_team() {
+        assert_eq!(current_team_command(TEAM_FREE), b"print \"@@@PRINTFREETEAM\n\"".to_vec());
+        assert_eq!(
+            current_team_command(TEAM_SPECTATOR),
+            b"print \"@@@PRINTSPECTEAM\n\"".to_vec()
+        );
+    }
+
+    #[test]
     fn local_fx_runner_uses_effect_configstring_and_et_fx() {
         let runner = MapFxRunner {
+            source_entity_index: 0,
             effect: "effects/test.efx".into(),
             origin: [1.0, 2.0, 3.0],
             angles: [-90.0, 0.0, 0.0],
@@ -613,7 +844,7 @@ mod tests {
             random_ms: 25,
             spawnflags: 0,
         };
-        let (effects, entities) = build_map_fx_entities(&[runner]);
+        let (effects, entities) = build_map_fx_entities(&[runner], &[]);
         assert_eq!(effects, vec!["effects/test.efx".to_owned()]);
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].field_i32("eType"), Some(ET_FX));
@@ -623,9 +854,57 @@ mod tests {
     }
 
     #[test]
+    fn map_world_effect_registration_uses_cs_effects_without_et_fx() {
+        let registrations = vec![
+            MapWorldEffectRegistration { source_entity_index: 0, effect: "*rain".to_owned() },
+            MapWorldEffectRegistration { source_entity_index: 0, effect: "*fog".to_owned() },
+        ];
+        let (effects, entities) = build_map_fx_entities(&[], &registrations);
+        assert_eq!(effects, vec!["*rain".to_owned(), "*fog".to_owned()]);
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn map_weather_and_star_fx_runner_preserve_source_entity_order() {
+        let registrations = vec![MapWorldEffectRegistration {
+            source_entity_index: 2,
+            effect: "*rain".to_owned(),
+        }];
+        let runner = MapFxRunner {
+            source_entity_index: 1,
+            effect: "*clear".into(),
+            origin: [0.0; 3],
+            angles: [0.0; 3],
+            delay_ms: 200,
+            random_ms: 0,
+            spawnflags: 0,
+        };
+        let (effects, entities) = build_map_fx_entities(&[runner], &registrations);
+        assert_eq!(effects, vec!["*clear".to_owned(), "*rain".to_owned()]);
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn star_fx_runner_registers_weather_but_does_not_spawn_et_fx() {
+        let runner = MapFxRunner {
+            source_entity_index: 0,
+            effect: "*heavyrain".into(),
+            origin: [1.0, 2.0, 3.0],
+            angles: [0.0; 3],
+            delay_ms: 200,
+            random_ms: 0,
+            spawnflags: 0,
+        };
+        let (effects, entities) = build_map_fx_entities(&[runner], &[]);
+        assert_eq!(effects, vec!["*heavyrain".to_owned()]);
+        assert!(entities.is_empty());
+    }
+
+    #[test]
     fn startoff_and_oneshot_fx_runners_begin_off() {
         for spawnflags in [FX_RUNNER_STARTOFF, FX_RUNNER_ONESHOT] {
             let runner = MapFxRunner {
+                source_entity_index: 0,
                 effect: "test".into(),
                 origin: [0.0; 3],
                 angles: [-90.0, 0.0, 0.0],
@@ -633,7 +912,7 @@ mod tests {
                 random_ms: 0,
                 spawnflags,
             };
-            let (_, entities) = build_map_fx_entities(&[runner]);
+            let (_, entities) = build_map_fx_entities(&[runner], &[]);
             assert_eq!(entities[0].field_i32("modelindex2"), Some(FX_STATE_OFF));
         }
     }

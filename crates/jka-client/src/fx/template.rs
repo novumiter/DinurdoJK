@@ -401,13 +401,53 @@ pub struct EffectTemplate {
     #[allow(dead_code)]
     pub repeat_delay: i32,
     pub primitives: Vec<PrimitiveTemplate>,
+    /// DinurdoJK inference profile for legacy EFX that have no authored Light{}
+    /// primitive. This is metadata only; the renderer still decides whether the
+    /// chosen shader/material is actually emissive enough to promote.
+    pub auto_light: Option<AutoLightProfile>,
+}
+
+/// Load-time heuristic result for an effect that plausibly emits light despite
+/// not containing an authored `Light {}` primitive.  We intentionally select a
+/// single visual primitive as the driver so particle counts never turn into
+/// one dynamic light per sprite.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoLightProfile {
+    pub driver_primitive: usize,
+    /// Semantic confidence before material/shader inspection.
+    pub score: i16,
+    /// Directional emission inferred from the authored primitive.  Line and
+    /// electricity primitives deliberately remain segment emitters; this is
+    /// only for point-like visuals whose authored motion forms a coherent cone.
+    pub spot: Option<AutoLightSpotProfile>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoLightSpotProfile {
+    /// Mean authored emission direction in the effect's local axis basis.
+    pub local_direction: [f32; 3],
+    /// Cosines are stored so the runtime/shader path never needs trig.
+    pub inner_cone_cos: f32,
+    pub outer_cone_cos: f32,
 }
 
 /// FX_MAX_EFFECT_COMPONENTS.
 const MAX_EFFECT_COMPONENTS: usize = 24;
 
-/// CFxScheduler::ParseEffect.
+/// CFxScheduler::ParseEffect. Tooling/map-load callers use this form so the
+/// promotion heuristic is evaluated while assets are already being prepared.
 pub fn parse_effect(name: &str, root: &Group) -> EffectTemplate {
+    parse_effect_impl(name, root, true)
+}
+
+/// Runtime FX registration keeps OpenJK's normal lazy EFX parse but deliberately
+/// skips promotion inference: map loading already built that metadata on a
+/// worker, and `FxSystem` installs the catalog result after parsing.
+pub fn parse_effect_without_auto_light(name: &str, root: &Group) -> EffectTemplate {
+    parse_effect_impl(name, root, false)
+}
+
+fn parse_effect_impl(name: &str, root: &Group, infer_auto_light: bool) -> EffectTemplate {
     // Only the first root pair is examined, exactly as OpenJK does.
     let repeat_delay = root
         .pairs
@@ -415,13 +455,211 @@ pub fn parse_effect(name: &str, root: &Group) -> EffectTemplate {
         .filter(|pair| pair.name.eq_ignore_ascii_case("repeatDelay"))
         .and_then(|pair| pair.top().trim().parse::<i32>().ok())
         .unwrap_or(0);
-    let primitives = root
+    let primitives: Vec<_> = root
         .groups
         .iter()
         .filter_map(|group| PrimType::from_name(&group.name).map(|kind| PrimitiveTemplate::parse(kind, group)))
         .take(MAX_EFFECT_COMPONENTS)
         .collect();
-    EffectTemplate { name: name.to_owned(), repeat_delay, primitives }
+    let auto_light = infer_auto_light
+        .then(|| infer_auto_light_profile(name, &primitives))
+        .flatten();
+    EffectTemplate { name: name.to_owned(), repeat_delay, primitives, auto_light }
+}
+
+const AUTO_LIGHT_SEMANTIC_THRESHOLD: i16 = 0;
+
+fn infer_auto_light_profile(name: &str, primitives: &[PrimitiveTemplate]) -> Option<AutoLightProfile> {
+    // Authored JKA/Raven light stages always win. Never augment an effect that
+    // already made an explicit lighting decision.
+    if primitives.iter().any(|primitive| primitive.kind == PrimType::Light) {
+        return None;
+    }
+
+    let effect_score = token_score(name, true);
+    let flash_bonus = if primitives.iter().any(|primitive| primitive.kind == PrimType::ScreenFlash) { 2 } else { 0 };
+    let mut best: Option<AutoLightProfile> = None;
+
+    for (index, primitive) in primitives.iter().enumerate() {
+        if !matches!(
+            primitive.kind,
+            PrimType::Particle
+                | PrimType::OrientedParticle
+                | PrimType::Line
+                | PrimType::Tail
+                | PrimType::Cylinder
+                | PrimType::Electricity
+        ) {
+            continue;
+        }
+
+        let mut score = effect_score + flash_bonus;
+        if primitive.kind == PrimType::Electricity {
+            score += 6;
+        }
+        for medium in &primitive.media {
+            score += token_score(medium, false);
+        }
+
+        // Authored component colour is only supporting evidence. White is very
+        // common in FX because the texture itself carries the hue.
+        let rgb = primitive.rgb_start.map(|range| 0.5 * (range.min + range.max));
+        let max = rgb[0].max(rgb[1]).max(rgb[2]);
+        let min = rgb[0].min(rgb[1]).min(rgb[2]);
+        if max >= 0.70 {
+            score += 1;
+        }
+        if max >= 0.45 && max - min >= 0.25 {
+            score += 1;
+        }
+
+        let spot = infer_auto_light_spot(name, primitive);
+        if spot.is_some() {
+            score += 2;
+        }
+        let candidate = AutoLightProfile {
+            driver_primitive: index,
+            score,
+            spot,
+        };
+        if best.map_or(true, |current| candidate.score > current.score) {
+            best = Some(candidate);
+        }
+    }
+
+    best.filter(|profile| profile.score >= AUTO_LIGHT_SEMANTIC_THRESHOLD)
+}
+
+fn infer_auto_light_spot(effect_name: &str, primitive: &PrimitiveTemplate) -> Option<AutoLightSpotProfile> {
+    // A Line/Electricity/Tail source is luminous along its length, not a
+    // projector. Keep those on the segment/capsule path even if the name says
+    // "beam" or "jet".
+    if matches!(primitive.kind, PrimType::Line | PrimType::Electricity | PrimType::Tail) {
+        return None;
+    }
+
+    // Some Raven effects author the projector itself as a tapered Cylinder.
+    // Example: rockettrooper/light_cone.efx has a tiny size2 ring at the source,
+    // a much wider size ring at the far end, and an explicit length. That is a
+    // stronger spot-light signal than any string heuristic.
+    if primitive.kind == PrimType::Cylinder {
+        let max_abs = |range: Range| range.min.abs().max(range.max.abs());
+        let near_radius = max_abs(primitive.size2_start).max(max_abs(primitive.size2_end));
+        let far_radius = max_abs(primitive.size_start).max(max_abs(primitive.size_end));
+        let length_value = if max_abs(primitive.length_start) >= max_abs(primitive.length_end) {
+            0.5 * (primitive.length_start.min + primitive.length_start.max)
+        } else {
+            0.5 * (primitive.length_end.min + primitive.length_end.max)
+        };
+        let length = length_value.abs();
+        if length >= 8.0 && far_radius >= near_radius.max(0.5) * 1.35 {
+            let mut outer = far_radius.atan2(length);
+            outer = outer.clamp(6.0_f32.to_radians(), 60.0_f32.to_radians());
+            let inner = (outer * 0.72).clamp(3.0_f32.to_radians(), outer * 0.92);
+            return Some(AutoLightSpotProfile {
+                local_direction: [length_value.signum().max(-1.0), 0.0, 0.0],
+                inner_cone_cos: inner.cos(),
+                outer_cone_cos: outer.cos(),
+            });
+        }
+        return None;
+    }
+
+    if !matches!(primitive.kind, PrimType::Particle | PrimType::OrientedParticle) {
+        return None;
+    }
+
+    let mean = primitive.velocity.map(|range| 0.5 * (range.min + range.max));
+    let mean_len_sq = mean.iter().map(|v| v * v).sum::<f32>();
+    let mean_len = mean_len_sq.sqrt();
+    if !mean_len.is_finite() || mean_len < 8.0 {
+        return None;
+    }
+    let local_direction = mean.map(|value| value / mean_len);
+
+    // Velocity ranges are independent uniform distributions. Only variance
+    // perpendicular to the mean direction widens the light cone; speed spread
+    // along the axis does not.
+    let mut perpendicular_variance = 0.0_f32;
+    let mut total_variance = 0.0_f32;
+    for axis in 0..3 {
+        let span = (primitive.velocity[axis].max - primitive.velocity[axis].min).abs();
+        let variance = span * span / 12.0;
+        total_variance += variance;
+        perpendicular_variance += variance * (1.0 - local_direction[axis] * local_direction[axis]);
+    }
+    let rms_perpendicular = perpendicular_variance.max(0.0).sqrt();
+    let coherence = mean_len / (mean_len_sq + total_variance).sqrt().max(1.0e-4);
+
+    // Strong authored motion is the primary signal. Directional naming can
+    // relax the threshold slightly, but never creates a cone on its own.
+    let lower = effect_name.to_ascii_lowercase();
+    let directional_name = [
+        "jet", "flamethrow", "fthrw", "thrower", "muzzle", "exhaust", "thruster",
+        "searchlight", "spotlight", "light_cone",
+    ]
+    .iter()
+    .any(|token| lower.contains(token));
+
+    // Derive angular spread from authored velocity dispersion and from how wide
+    // the visual becomes over its lifetime. The latter matters for flame jets:
+    // their velocity cone is often narrow while the sprite billboards grow.
+    let velocity_half_angle = rms_perpendicular.atan2(mean_len);
+    let life_seconds = (0.5 * (primitive.life.min + primitive.life.max)).abs() * 0.001;
+    let visual_radius = primitive
+        .size_start
+        .min
+        .abs()
+        .max(primitive.size_start.max.abs())
+        .max(primitive.size_end.min.abs())
+        .max(primitive.size_end.max.abs());
+    let travel = (mean_len * life_seconds).max(1.0);
+    let jet_aspect = travel / visual_radius.max(1.0);
+    let required_coherence = if directional_name { 0.72 } else { 0.92 };
+    let required_aspect = if directional_name { 1.25 } else { 4.0 };
+    if coherence < required_coherence || jet_aspect < required_aspect {
+        return None;
+    }
+
+    let visual_half_angle = visual_radius.atan2(travel);
+    let mut outer = velocity_half_angle.max(visual_half_angle) * 1.35;
+    outer = outer.clamp(10.0_f32.to_radians(), 55.0_f32.to_radians());
+    let inner = (outer * 0.62).clamp(5.0_f32.to_radians(), outer * 0.90);
+
+    Some(AutoLightSpotProfile {
+        local_direction,
+        inner_cone_cos: inner.cos(),
+        outer_cone_cos: outer.cos(),
+    })
+}
+
+fn token_score(value: &str, effect_name: bool) -> i16 {
+    let value = value.to_ascii_lowercase();
+    let contains_any = |tokens: &[&str]| tokens.iter().any(|token| value.contains(token));
+
+    // Negative classes are deliberately strong. A smoke sprite may share an
+    // explosion EFX with a flash, but it must never become the selected driver.
+    if contains_any(&[
+        "smoke", "steam", "dust", "dirt", "blood", "gore", "debris", "chunk",
+        "water", "splash", "bubble", "mist", "fog", "snow", "rain", "decal", "mark",
+    ]) {
+        return -7;
+    }
+
+    let mut score = 0;
+    if contains_any(&[
+        "fire", "flame", "glow", "flare", "lightning", "electric", "plasma", "energy",
+        "laser", "spark", "hot", "core",
+    ]) {
+        score += if effect_name { 2 } else { 4 };
+    }
+    if contains_any(&[
+        "explosion", "explode", "muzzle", "shot", "bolt", "beam", "jet", "flash", "burn",
+        "exhaust", "thruster", "light_cone", "spotlight",
+    ]) {
+        score += if effect_name { 2 } else { 3 };
+    }
+    score
 }
 
 fn list(pair: &Pair) -> impl Iterator<Item = String> + '_ {
@@ -570,6 +808,96 @@ mod tests {
         let particle = &effect.primitives[2];
         assert_eq!(particle.kind, PrimType::Particle);
         assert_eq!(particle.spawn_flags, FX_ORG_ON_SPHERE | FX_EVEN_DISTRIBUTION);
+        let auto = effect.auto_light.expect("glowing blaster visuals should be a promotion candidate");
+        assert_eq!(auto.driver_primitive, 1, "whiteGlow line should beat the weaker blob line");
+    }
+
+    #[test]
+    fn authored_light_disables_inference() {
+        let bytes = b"particle\n{\n shader\n [\n  gfx/effects/fire\n ]\n}\nLight\n{\n size\n {\n  start 160\n }\n rgb\n {\n  start 1 .4 .1\n }\n}\n";
+        let effect = parse_effect("env/fire", &gp2::parse(bytes));
+        assert!(effect.auto_light.is_none());
+    }
+
+    #[test]
+    fn smoke_is_not_selected_over_fire() {
+        let bytes = b"particle\n{\n shader\n [\n  gfx/effects/smoke\n ]\n}\nparticle\n{\n shader\n [\n  gfx/effects/fire2\n ]\n}\n";
+        let effect = parse_effect("env/flamejet", &gp2::parse(bytes));
+        let auto = effect.auto_light.expect("fire primitive should be inferred");
+        assert_eq!(auto.driver_primitive, 1);
+    }
+
+    #[test]
+    fn coherent_flame_velocity_infers_spot_cone_but_lines_remain_segments() {
+        let bytes = b"Particle
+{
+ life 400
+ velocity 160 -10 -10 280 10 10
+ size
+ {
+  start 3 4
+  end 12 30
+ }
+ shader
+ [
+  gfx/effects/fire2
+ ]
+}
+";
+        let effect = parse_effect("bespin/flamejet", &gp2::parse(bytes));
+        let auto = effect.auto_light.expect("flame jet should be promotable");
+        let spot = auto.spot.expect("coherent authored velocity should infer a spot light");
+        assert!(spot.local_direction[0] > 0.99);
+        assert!(spot.inner_cone_cos > spot.outer_cone_cos);
+        assert!(spot.outer_cone_cos > 55.0_f32.to_radians().cos());
+
+        let line = parse_effect(
+            "weapon/beamjet",
+            &gp2::parse(b"Line
+{
+ origin 0 0 0
+ origin2 128 0 0
+ shader
+ [
+  gfx/effects/whiteGlow
+ ]
+}
+"),
+        );
+        assert!(line.auto_light.expect("glowing line should promote").spot.is_none());
+
+        let cone = parse_effect(
+            "rockettrooper/light_cone",
+            &gp2::parse(b"Cylinder
+{
+ size
+ {
+  start 30
+ }
+ size2
+ {
+  start 2
+ }
+ length
+ {
+  start 150
+ }
+ shaders
+ [
+  gfx/effects/light_cone
+ ]
+}
+"),
+        );
+        let cone_spot = cone
+            .auto_light
+            .expect("tapered emissive cylinder should promote")
+            .spot
+            .expect("tapered cylinder should infer a spot light");
+        assert!(cone_spot.local_direction[0] > 0.99);
+        assert!(cone_spot.inner_cone_cos > cone_spot.outer_cone_cos);
+        let expected_outer = (30.0_f32 / 150.0).atan().cos();
+        assert!((cone_spot.outer_cone_cos - expected_outer).abs() < 0.02);
     }
 
     #[test]

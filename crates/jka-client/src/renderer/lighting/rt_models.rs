@@ -107,6 +107,7 @@ impl Renderer {
                     immediate_size: 0,
                 });
                 let source = model_shader_source(key.3).expect("RT model shader anchors");
+                crate::renderer::lighting::rt_diagnostics::dump_shader("model-rt", &source);
                 let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("RT model receivers"),
                     source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -234,10 +235,15 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
         "rt_local_sample_count",
         "rt_sample_local_emitter",
         "rt_alpha_repeat_coord",
-        "rt_alpha_texel",
+        "rt_rgba_texel",
+        "rt_sample_rgba",
         "rt_sample_alpha",
         "rt_alpha_generated_uv",
         "rt_alpha_candidate_blocks",
+        "rt_candidate_glass_throughput",
+        "rt_trace_shadow_throughput",
+        "rt_trace_shadow_query",
+        "rt_local_shadow_rgb",
         "rt_trace_shadow_visibility",
         "ray_traced_local_shadow_visibility",
         "rt_trace_local_visibility",
@@ -250,6 +256,10 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
         "emitter_visibility",
         "cluster_for_fragment",
     ] {
+        if !crate::renderer::lighting::rt_diagnostics::config().receiver.glass
+            && matches!(name, "rt_candidate_glass_throughput" | "rt_trace_shadow_throughput") {
+            continue;
+        }
         source.push_str(declaration(&donor, &format!("fn {name}("))?);
         source.push('\n');
     }
@@ -360,7 +370,7 @@ mod tests {
         let donor = ray_traced_world_shader_source(include_str!("../../bsp.wgsl")).unwrap();
         let mut source = String::from(
             r#"
-struct VertexOut { clip_position: vec4<f32> };
+struct VertexOut { clip_position: vec4<f32>, world_position: vec3<f32> };
 struct Camera { render_flags: vec4<u32> };
 const camera = Camera(vec4<u32>(0u));
 struct Settings { values: vec4<u32>, map_ambient: vec4<f32> };
@@ -385,9 +395,9 @@ var<private> lighting_settings: Settings;
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let count = 1u << (id.x / 256u);
     lighting_settings = Settings(vec4<u32>(1u, 1u, 256u, 1u), vec4<f32>(0.0, 0.0, 0.0, f32(count)));
-    let input = VertexOut(vec4<f32>(f32(id.x % 256u), 0.0, 0.0, 1.0));
+    let input = VertexOut(vec4<f32>(f32(id.x % 256u), 0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -10.0));
     var light = PointLight(vec4<f32>(0.0, 0.0, 0.0, 10.0), vec4<f32>(3.0, 2.0, 1.0, 2.0),
-        vec4<f32>(1.0, 0.0, 0.0, -1.0), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        vec4<f32>(1.0, 0.0, 0.0, -1.0), vec4<f32>(0.0), vec4<f32>(0.0, 0.0, 0.0, 1.0));
     var sum = vec3<f32>(0.0);
     var failures = select(1.0, 0.0, rt_local_sample_count(light) == count);
     for (var i = 0u; i < count; i += 1u) {
@@ -396,7 +406,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if (t < f32(i) / f32(count) || t > f32(i + 1u) / f32(count)) { failures += 1.0; }
         sum += sample.color_intensity.rgb * sample.color_intensity.a;
     }
+    // A finite point emitter should use the same quality count, preserve total
+    // radiance, move within its projected source disk, and resolve to a point.
+    light.emitter = vec4<f32>(0.0);
+    light.shadow.z = 2.0;
+    var sphere_sum = vec3<f32>(0.0);
+    if (rt_local_sample_count(light) != count) { failures += 1.0; }
+    for (var i = 0u; i < count; i += 1u) {
+        let sample = rt_sample_local_emitter(light, input, 0u, i, count);
+        let offset = sample.position_radius.xyz - light.position_radius.xyz;
+        if (length(offset) > 2.0001 || sample.shadow.z != 0.0 || sample.emitter.w != 0.0) { failures += 1.0; }
+        sphere_sum += sample.color_intensity.rgb * sample.color_intensity.a;
+    }
+    if (any(abs(sphere_sum - vec3<f32>(6.0, 4.0, 2.0)) > vec3<f32>(0.0001))) { failures += 1.0; }
+
     // Negative q3map angle metadata must remain untouched at every quality level.
+    light.shadow.z = 0.0;
     light.shadow.w = 0.0;
     light.emitter.w = -2.5;
     let point = rt_sample_local_emitter(light, input, 0u, 0u, rt_local_sample_count(light));

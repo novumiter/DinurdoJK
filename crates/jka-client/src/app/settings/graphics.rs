@@ -150,6 +150,20 @@ impl App {
         self.publish_ui();
     }
 
+    pub(in crate::app) fn sync_rain_optimizations(&mut self) {
+        self.render_command(RenderCommand::SetRainOptimizations {
+            fast_post: self.video.rain_fast_post,
+            water_field: self.video.rain_water_field,
+            fast_vertex: self.video.rain_fast_vertex,
+            lean_depth: self.video.rain_lean_depth,
+            static_depth: self.video.rain_static_depth,
+            opaque_depth: self.video.rain_opaque_depth,
+            lean_models: self.video.rain_lean_models,
+            lean_post: self.video.rain_lean_post,
+        });
+        self.publish_ui();
+    }
+
     pub(in crate::app) fn set_motion_blur_strength(&mut self, strength: f32) {
         self.video.motion_blur_strength = strength.clamp(0.0, 1.0);
         self.sync_post_effects();
@@ -492,7 +506,7 @@ impl App {
         self.publish_ui();
     }
 
-    pub(in crate::app) fn set_weather_wind(&mut self, wind: crate::ocean::OceanWind) {
+    pub(in crate::app) fn set_weather_wind(&mut self, wind: crate::ocean::AtmosphericWind) {
         let wind = wind.sanitize();
         self.video.weather_wind = wind;
         // OceanSettings retains the simulation-facing copy, but Weather is the
@@ -529,7 +543,21 @@ impl App {
         self.set_weather_wind(wind);
     }
 
+    pub(in crate::app) fn set_wind_visuals(&mut self, strength: f32) {
+        self.video.wind_visuals = if strength.is_finite() { strength.clamp(0.0, 1.0) } else { 0.0 };
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
     pub(in crate::app) fn sync_post_effects(&self) {
+        let legacy_rain = self.world_effects.rain_override();
+        let legacy_snow = self.world_effects.snow_override();
+        let legacy_atmosphere = self.world_effects.atmosphere_override();
+        let weather_wind = self
+            .world_effects
+            .wind_override()
+            .unwrap_or(self.video.weather_wind);
         self.render_command(RenderCommand::SetPostEffects(PostEffects {
             hdr: self.video.hdr,
             auto_exposure: self.video.auto_exposure,
@@ -547,6 +575,7 @@ impl App {
             fxaa: self.video.fxaa,
             smaa: self.video.smaa,
             taa: self.video.taa,
+            rt_taa: self.video.rt_taa,
             contact_shadows: self.video.contact_shadows,
             fog_mode: self.video.fog_mode,
             fog_strength: self.video.fog_strength,
@@ -557,13 +586,15 @@ impl App {
             sun_color: self.video.sun_color,
             sun_visibility: self.video.sun_visibility,
             entity_sun_lighting: self.video.entity_sun_lighting,
+            sky_fractal_override: self.video.sky_fractal_override,
             clouds: self.video.clouds,
             cloud_type: self.video.cloud_type,
             cloud_quality: self.video.cloud_quality,
             cloud_coverage: self.video.cloud_coverage,
             cloud_height: self.video.cloud_height,
             cloud_thickness: self.video.cloud_thickness,
-            weather_wind: self.video.weather_wind,
+            weather_wind,
+            wind_visuals: self.video.wind_visuals,
             cloud_shadows: self.video.cloud_shadows,
             cloud_render_resolution: self.video.cloud_render_resolution,
             cloud_temporal: self.video.cloud_temporal,
@@ -580,8 +611,18 @@ impl App {
             cloud_history_depth_reject: self.video.cloud_history_depth_reject,
             cloud_thickness_variation: self.video.cloud_thickness_variation,
             cloud_size: self.video.cloud_size,
-            rain: self.video.rain,
-            rain_intensity: self.video.rain_intensity,
+            rain: legacy_rain.is_some(),
+            rain_intensity: legacy_rain.map_or(self.video.rain_intensity, |rain| rain.intensity),
+            rain_density_scale: legacy_rain.map_or(1.0, |rain| rain.density_scale),
+            rain_tint: legacy_rain.map_or([1.0; 3], |rain| rain.tint),
+            rain_frozen: legacy_rain.is_some_and(|rain| rain.frozen),
+            snow: legacy_snow.is_some(),
+            snow_density_scale: legacy_snow.map_or(1.0, |snow| snow.density_scale),
+            snow_frozen: legacy_snow.is_some_and(|snow| snow.frozen),
+            legacy_sand_layers: legacy_atmosphere.sand_layers,
+            legacy_space_dust_count: legacy_atmosphere.space_dust_count,
+            legacy_weather_frozen: legacy_atmosphere.frozen,
+            legacy_acid_rain: self.world_effects.acid_rain_strength(),
             rain_glass: self.video.rain_glass,
             puddle_quality: self.video.puddle_quality,
             puddle_scatter: self.video.puddle_scatter,
@@ -613,6 +654,12 @@ impl App {
         }));
     }
 
+    /// Synchronize the effective world-flare enable to the render thread.
+    /// No saber overlay is affected by either world-flare cvar.
+    pub(in crate::app) fn sync_world_flares(&self) {
+        self.render_command(RenderCommand::SetWorldFlares(self.video.world_flares_active()));
+    }
+
     pub(in crate::app) fn sync_gpu_visibility(&self) {
         self.render_command(RenderCommand::SetGpuVisibility {
             gpu_driven: self.video.gpu_driven,
@@ -622,7 +669,11 @@ impl App {
 
     pub(in crate::app) fn sync_dynamic_lighting(&self) {
         self.render_command(RenderCommand::SetDynamicLighting(self.video.dynamic_lights));
+        self.render_command(RenderCommand::SetDynamicLightDebug(
+            self.video.dynamic_light_debug,
+        ));
         self.render_command(RenderCommand::SetRtSamples(self.video.rt_samples));
+        self.render_command(RenderCommand::SetRtDenoiserMode(self.video.rt_denoiser_mode));
         self.render_command(RenderCommand::SetDynamicLightFalloff(
             self.video.dynamic_light_falloff,
         ));
@@ -657,8 +708,33 @@ impl App {
         ));
     }
 
+    pub(in crate::app) fn sync_shader_light_promotion(&self) {
+        let mut mask = 0_u32;
+        if self.video.promote_shader_glow {
+            mask |= crate::materials::SHADER_LIGHT_GLOW;
+        }
+        if self.video.promote_shader_additive {
+            mask |= crate::materials::SHADER_LIGHT_ADDITIVE;
+        }
+        if self.video.promote_shader_emissive {
+            mask |= crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION;
+        }
+        self.render_command(RenderCommand::SetShaderLightPromotion {
+            enabled: self.video.promote_shader_lights,
+            mask,
+        });
+    }
+
     pub(in crate::app) fn sync_voxel_probe_gi(&self) {
         self.render_command(RenderCommand::SetVoxelProbeGi(self.video.voxel_probe_gi));
+    }
+
+    pub(in crate::app) fn sync_tinted_glass_debug(&self) {
+        self.render_command(RenderCommand::SetTintedGlassDebug(self.video.tinted_glass_debug));
+    }
+
+    pub(in crate::app) fn sync_tinted_glass(&self) {
+        self.render_command(RenderCommand::SetTintedGlass(self.video.tinted_glass));
     }
 
     pub(in crate::app) fn sync_local_light_shadows(&self) {
@@ -875,6 +951,51 @@ impl App {
                     self.console_status = "DYNAMIC LIGHTS: HARDWARE RT DIRECT LIGHTING (FORWARD+ FALLBACK IF UNAVAILABLE)".into();
                 }
             }
+            ui::VIDEO_ROW_DYNAMIC_LIGHT_DEBUG => {
+                self.video.dynamic_light_debug = !self.video.dynamic_light_debug;
+                self.render_command(RenderCommand::SetDynamicLightDebug(
+                    self.video.dynamic_light_debug,
+                ));
+                self.console_status = format!(
+                    "DYNAMIC LIGHT DEBUG VIEW: {}",
+                    if self.video.dynamic_light_debug { "ON" } else { "OFF" }
+                );
+            }
+            ui::VIDEO_ROW_PROMOTE_FX_LIGHTS => {
+                self.video.promote_fx_lights = !self.video.promote_fx_lights;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.promote_fx_lights = self.video.promote_fx_lights;
+                }
+                self.mark_config_dirty();
+                self.console_status = format!(
+                    "FX LIGHT PROMOTION: {}",
+                    if self.video.promote_fx_lights { "ON" } else { "OFF" }
+                );
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS => {
+                self.video.promote_shader_lights = !self.video.promote_shader_lights;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+                self.console_status = format!(
+                    "SHADER LIGHT PROMOTION: {}",
+                    if self.video.promote_shader_lights { "ON" } else { "OFF" }
+                );
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_GLOW => {
+                self.video.promote_shader_glow = !self.video.promote_shader_glow;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_ADDITIVE => {
+                self.video.promote_shader_additive = !self.video.promote_shader_additive;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_PROMOTE_SHADER_EMISSIVE => {
+                self.video.promote_shader_emissive = !self.video.promote_shader_emissive;
+                self.sync_shader_light_promotion();
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_MAP_LIGHT_SIMULATION => {
                 self.video.map_light_simulation = !self.video.map_light_simulation;
                 self.sync_map_light_simulation();
@@ -907,9 +1028,16 @@ impl App {
             }
             ui::VIDEO_ROW_FLARES => {
                 self.video.flares = !self.video.flares;
+                self.sync_world_flares();
                 self.mark_config_dirty();
                 self.console_status =
-                    format!("FLARES: {}", if self.video.flares { "ON" } else { "OFF" });
+                    format!("WORLD FLARES: {}", if self.video.world_flares_active() { "ON" } else { "OFF" });
+            }
+            ui::VIDEO_ROW_SABER_FLARES => {
+                self.video.saber_flares = !self.video.saber_flares;
+                self.mark_config_dirty();
+                self.console_status =
+                    format!("SABER FLARES: {}", if self.video.saber_flares { "ON" } else { "OFF" });
             }
             ui::VIDEO_ROW_SABER_IMPACT_FX => {
                 self.video.saber_impact_fx = !self.video.saber_impact_fx;
@@ -1471,6 +1599,9 @@ impl App {
     }
 
     pub(in crate::app) fn commit_ocean_settings(&mut self) {
+        if let Some(session) = self.game_session.as_mut() {
+            session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+        }
         self.video.ocean_settings.wind = self.video.weather_wind;
         self.video.ocean_settings = self.video.ocean_settings.sanitize();
         self.render_command(RenderCommand::SetOceanSettings(self.video.ocean_settings));
@@ -1595,6 +1726,9 @@ impl App {
             ui::ENV_ROW_WEATHER_DIRECTION_VARIATION => self.set_weather_direction_variation(
                 self.video.weather_wind.shift + direction as f32 * 5.0,
             ),
+            ui::ENV_ROW_WIND_VISUALS => {
+                self.set_wind_visuals(self.video.wind_visuals + direction as f32 * 0.1)
+            }
             ui::ENV_ROW_CLOUD_SHADOWS => {
                 self.video.cloud_shadows = !self.video.cloud_shadows;
                 self.sync_post_effects();
@@ -1617,9 +1751,15 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::ENV_ROW_RAIN => {
-                self.video.rain = !self.video.rain;
-                self.sync_post_effects();
-                self.mark_config_dirty();
+                let current = self.effective_weather_type();
+                let current = crate::world_effects::WeatherType::ALL
+                    .iter()
+                    .position(|weather| *weather == current)
+                    .unwrap_or(0) as i32;
+                let next = (current + direction)
+                    .rem_euclid(crate::world_effects::WeatherType::ALL.len() as i32)
+                    as usize;
+                self.set_weather_type(crate::world_effects::WeatherType::ALL[next]);
             }
             ui::ENV_ROW_RAIN_GLASS => {
                 self.video.rain_glass = !self.video.rain_glass;
@@ -1654,6 +1794,38 @@ impl App {
             ui::ENV_ROW_RAIN_GRADE => {
                 self.set_rain_grade(self.video.rain_grade + direction as f32 * 0.05)
             }
+            ui::ENV_ROW_RAIN_FAST_POST => {
+                self.video.rain_fast_post = !self.video.rain_fast_post;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_WATER_FIELD => {
+                self.video.rain_water_field = !self.video.rain_water_field;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_FAST_VERTEX => {
+                self.video.rain_fast_vertex = !self.video.rain_fast_vertex;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_LEAN_DEPTH => {
+                self.video.rain_lean_depth = !self.video.rain_lean_depth;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_STATIC_DEPTH => {
+                self.video.rain_static_depth = !self.video.rain_static_depth;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_OPAQUE_DEPTH => {
+                self.video.rain_opaque_depth = !self.video.rain_opaque_depth;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_LEAN_MODELS => {
+                self.video.rain_lean_models = !self.video.rain_lean_models;
+                self.sync_rain_optimizations();
+            }
+            ui::ENV_ROW_RAIN_LEAN_POST => {
+                self.video.rain_lean_post = !self.video.rain_lean_post;
+                self.sync_rain_optimizations();
+            }
             ui::ENV_ROW_FOOTPRINTS => {
                 let current = FootprintMode::ALL
                     .iter()
@@ -1686,6 +1858,9 @@ impl App {
             }
             ui::ENV_ROW_OCEAN => {
                 self.video.ocean = !self.video.ocean;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+                }
                 // OFF releases the FFT resources immediately. If the current
                 // world already carries its promoted ocean clipmap, ON can also
                 // be restored live without rebuilding the renderer.

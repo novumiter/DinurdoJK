@@ -7,6 +7,7 @@ use jka_protocol::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     io::Cursor,
     path::Path,
 };
@@ -169,6 +170,9 @@ pub(super) struct ProfileModelEntry {
     pub value: String,
     pub model_name: String,
     pub skin_name: String,
+    /// Listed from a `source_model.json` descriptor rather than from a
+    /// `.skin`/`icon_*` pair, because Source 1 characters ship neither.
+    pub source_model: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,12 +222,16 @@ const PROFILE_ICON_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "tga"];
 fn profile_model_entries<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ProfileModelEntry> {
     let mut skins = BTreeMap::<&str, BTreeSet<&str>>::new();
     let mut icons = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut source_models = BTreeSet::<&str>::new();
     for name in names {
         let Some(rest) = name.strip_prefix("models/players/") else { continue };
         let Some((folder, leaf)) = rest.split_once('/') else { continue };
         // Only direct children of models/players/<model>/, like FS_GetFileList.
         if folder.is_empty() || leaf.contains('/') {
             continue;
+        }
+        if leaf == "source_model.json" {
+            source_models.insert(folder);
         }
         if let Some(stem) = leaf.strip_suffix(".skin") {
             // Everything after the first underscore: model_/head_/torso_/lower_<skin>.
@@ -252,10 +260,23 @@ fn profile_model_entries<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Profil
                 value,
                 model_name: model.to_owned(),
                 skin_name: (*skin).to_owned(),
+                source_model: false,
             });
         }
     }
-    // BTreeMap/BTreeSet iteration is already sorted by (model, skin).
+    // Source 1 characters have no .skin/.glm pair, so they are listed from
+    // their descriptor instead of from the skin/icon intersection above.
+    for model in source_models {
+        if !models.iter().any(|entry| entry.model_name == model) {
+            models.push(ProfileModelEntry {
+                value: model.to_owned(),
+                model_name: model.to_owned(),
+                skin_name: "default".to_owned(),
+                source_model: true,
+            });
+        }
+    }
+    models.sort_by(|a, b| a.model_name.cmp(&b.model_name).then(a.skin_name.cmp(&b.skin_name)));
     models
 }
 
@@ -774,11 +795,62 @@ pub(super) fn inspect_asset(
     }
 }
 
+/// Game-directory choices for the demo browser. Only expose physical game/mod
+/// directories that actually contain at least one loose `demos/*.dm_26` file.
+/// Demo contents are still enumerated through `AssetSearchPath` once a source is
+/// selected, so the browser keeps the normal JKA asset semantics.
+pub(super) fn scan_demo_game_directories(base: &Path) -> Result<Vec<String>, String> {
+    fn has_loose_dm26(game_dir: &Path) -> bool {
+        let demos_dir = game_dir.join("demos");
+        if !demos_dir.is_dir() {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(demos_dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("dm_26"))
+        })
+    }
+
+    let root = base.parent().unwrap_or(base);
+    let entries = fs::read_dir(root)
+        .map_err(|error| format!("could not scan {}: {error}", root.display()))?;
+    let mut games = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        if !has_loose_dm26(&path) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.is_empty() {
+            games.push(name);
+        }
+    }
+    games.sort_by_key(|game| (!game.eq_ignore_ascii_case("base"), game.to_ascii_lowercase()));
+    games.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    Ok(games)
+}
+
+/// Scan demos physically owned by one selected game directory. A mod selection
+/// must not inherit base/demos into its browser list, even though normal JKA
+/// gameplay mounts `fs_game` over base after the demo has been opened.
 pub(super) fn scan_demos(
     base: &Path,
     game: Option<&Path>,
 ) -> Result<Vec<DemoEntry>, String> {
-    let assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
+    let assets = match game {
+        Some(game) => AssetSearchPath::open_search_dirs([game]),
+        None => AssetSearchPath::open(base),
+    }
+    .map_err(|error| error.to_string())?;
     let mut demos: Vec<DemoEntry> = assets
         .names()
         .filter_map(|name| {
@@ -898,10 +970,15 @@ pub(super) struct DemoScoreEntry {
     pub client: i32,
     pub name: String,
     pub score: i32,
+    pub powerups: i32,
+    pub captures: i32,
+    pub assists: i32,
+    pub defends: i32,
     pub deaths: Option<i32>,
     pub ping: i32,
     pub time: i32,
     pub team: i32,
+    pub siege_class: String,
 }
 
 /// Timeline-addressable scoreboard payload extracted while the demo index is
@@ -1191,10 +1268,19 @@ fn parse_scoreboard(
             client,
             name: scoreboard_client_name(configstrings, client),
             score: atoi(&args[base + 1]),
+            powerups: atoi(&args[base + 5]),
+            captures: atoi(&args[base + 13]),
+            assists: atoi(&args[base + 11]),
+            defends: atoi(&args[base + 10]),
             deaths: (stride == 15).then(|| atoi(&args[base + 14])),
             ping: atoi(&args[base + 2]),
             time: atoi(&args[base + 3]),
             team: client_team(configstrings, client),
+            siege_class: configstrings
+                .get(&(CS_PLAYERS + client as u16))
+                .and_then(|info| info_value(info, b"siegeclass"))
+                .map(|value| String::from_utf8_lossy(value).into_owned())
+                .unwrap_or_default(),
         });
     }
     Some((team_scores, entries))
@@ -1213,7 +1299,11 @@ pub(super) fn index_demo_metadata(
 ) -> Result<DemoMetadata, String> {
     const MAX_DEMO_FILE_BYTES: usize = 512 * 1024 * 1024;
     let qpath = format!("demos/{demo_name}.dm_26");
-    let mut assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
+    let mut assets = match game {
+        Some(game) => AssetSearchPath::open_search_dirs([game]),
+        None => AssetSearchPath::open(base),
+    }
+    .map_err(|error| error.to_string())?;
     let asset = assets
         .read(&qpath, MAX_DEMO_FILE_BYTES)
         .map_err(|error| format!("{qpath}: {error}"))?
@@ -1720,6 +1810,14 @@ mod profile_catalog_tests {
         assert_eq!(entries[0].value, "foo");
         assert_eq!(entries[0].model_name, "foo");
         assert_eq!(entries[0].skin_name, "default");
+    }
+
+    #[test]
+    fn source_descriptor_shows_unavailable_entry() {
+        let entries = profile_model_entries(["models/players/hev_mk2/source_model.json"].into_iter());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model_name, "hev_mk2");
+        assert!(entries[0].source_model);
     }
 
     #[test]

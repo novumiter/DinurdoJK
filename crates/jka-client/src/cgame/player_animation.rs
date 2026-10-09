@@ -100,17 +100,19 @@ impl PlayerAnimationState {
     /// speed 1.0 before cgame starts applying network animation IDs.
     pub fn new(gla: &GlaAnimation, current_time: i32) -> Result<Self, String> {
         let mut animator = Ghoul2Animator::new(gla);
-        animator.set_bone_anim(
-            gla,
-            "model_root",
-            0,
-            12,
-            BONE_ANIM_OVERRIDE_LOOP,
-            1.0,
-            current_time,
-            None,
-            -1,
-        )?;
+        if Ghoul2Animator::bone_index(gla, "model_root").is_some() {
+            animator.set_bone_anim(
+                gla,
+                "model_root",
+                0,
+                12,
+                BONE_ANIM_OVERRIDE_LOOP,
+                1.0,
+                current_time,
+                None,
+                -1,
+            )?;
+        }
         Ok(Self {
             animator,
             legs: LerpFrameState::default(),
@@ -140,6 +142,7 @@ impl PlayerAnimationState {
         saber_scales: &SaberAnimationScales,
         current_time: i32,
         anim_blend: bool,
+        humanoid: bool,
     ) -> Result<(), String> {
         let legs_anim = field_i32(entity, "legsAnim");
         let torso_anim = field_i32(entity, "torsoAnim");
@@ -162,6 +165,7 @@ impl PlayerAnimationState {
             &mut self.ci_torso_anim,
             &mut self.ci_broken_limbs,
             self.no_lumbar,
+            humanoid,
             entity,
             animations,
             gla,
@@ -188,6 +192,7 @@ impl PlayerAnimationState {
                 &mut self.ci_torso_anim,
                 &mut self.ci_broken_limbs,
                 self.no_lumbar,
+                humanoid,
                 entity,
                 animations,
                 gla,
@@ -256,6 +261,7 @@ fn run_lerp_frame(
     ci_torso_anim: &mut i32,
     ci_broken_limbs: &mut i32,
     no_lumbar: bool,
+    humanoid: bool,
     entity: &EntityState,
     animations: &AnimationSet,
     gla: &GlaAnimation,
@@ -273,6 +279,9 @@ fn run_lerp_frame(
         if lf.last_forced_frame != force_frame {
             let flags = BONE_ANIM_OVERRIDE_FREEZE | BONE_ANIM_BLEND;
             for bone in ["lower_lumbar", "model_root", "Motion"] {
+                if Ghoul2Animator::bone_index(gla, bone).is_none() {
+                    continue;
+                }
                 animator.set_bone_anim(
                     gla,
                     bone,
@@ -308,6 +317,7 @@ fn run_lerp_frame(
                 ci_torso_anim,
                 ci_broken_limbs,
                 no_lumbar,
+                humanoid,
                 entity,
                 animations,
                 gla,
@@ -350,6 +360,7 @@ fn set_lerp_frame_animation(
     ci_torso_anim: &mut i32,
     ci_broken_limbs: &mut i32,
     no_lumbar: bool,
+    humanoid: bool,
     entity: &EntityState,
     animations: &AnimationSet,
     gla: &GlaAnimation,
@@ -371,8 +382,13 @@ fn set_lerp_frame_animation(
     lf.has_animation = true;
     lf.animation_time = lf.frame_time + i32::from(anim.frame_lerp).abs();
 
-    // The currently-supported player model path is humanoid (localAnimIndex 0),
-    // so OpenJK's non-humanoid broken-limb bookkeeping does not run here.
+    // TaystJK CG_SetLerpFrameAnimation allows undefined (0-frame) entries for
+    // non-humanoid animation sets. They are valid no-ops, not registration errors.
+    if !humanoid && anim.first_frame == 0 && anim.num_frames == 0 {
+        return Ok(());
+    }
+
+    // Broken-limb pose overrides are humanoid-only in the original path.
     let _ = ci_broken_limbs;
 
     if anim.frame_lerp == 0 {
@@ -494,7 +510,8 @@ fn set_lerp_frame_animation(
             begin_frame = None;
         }
 
-        if field_i32(entity, "torsoAnim") == field_i32(entity, "legsAnim")
+        if !no_lumbar
+            && field_i32(entity, "torsoAnim") == field_i32(entity, "legsAnim")
             && (*ci_legs_anim != new_animation || old_speed != anim_speed)
         {
             let old_begin = begin_frame;
@@ -524,8 +541,8 @@ fn set_lerp_frame_animation(
         *ci_legs_anim = new_animation;
     }
 
-    // localAnimIndex <= 1 for supported humanoid player models.
-    if field_i32(entity, "torsoAnim") == new_animation && !no_lumbar {
+    // Non-humanoid NPC skeletons do not require the humanoid Motion chain.
+    if humanoid && field_i32(entity, "torsoAnim") == new_animation && !no_lumbar {
         animator.set_bone_anim(
             gla,
             "Motion",
@@ -597,10 +614,14 @@ fn refresh_lerp_frames_from_ghoul2(
     gla: &GlaAnimation,
     current_time: i32,
 ) -> Result<(), String> {
-    if let Some(frame) = animator.bone_frame(gla, require_bone(gla, "model_root")?, current_time)? {
-        let current = frame.floor() as i32;
-        legs.old_frame = legs.frame;
-        legs.frame = current;
+    // G2API_GetBoneFrame simply returns false when a creature lacks a queried
+    // bone. Mirror that instead of turning optional NPC bones into fatal errors.
+    if let Some(root) = Ghoul2Animator::bone_index(gla, "model_root") {
+        if let Some(frame) = animator.bone_frame(gla, root, current_time)? {
+            let current = frame.floor() as i32;
+            legs.old_frame = legs.frame;
+            legs.frame = current;
+        }
     }
     if no_lumbar {
         torso.old_frame = legs.old_frame;

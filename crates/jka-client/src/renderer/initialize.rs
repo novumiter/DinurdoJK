@@ -4,6 +4,7 @@ use crate::renderer::{
     create_bloom_bind_groups, create_cloud_fallback_resources,
     create_cloud_pass_pipeline, create_cloud_resolve_bind_group, create_color_lut_texture,
     create_depth_prepass_mask_pipeline, create_depth_prepass_pipeline, create_dof_bind_group,
+    create_rain_depth_prepass_pipeline,
     create_dof_pipeline, create_fast_post_bind_group, create_gamma_post_bind_group,
     create_gamma_post_pipeline, create_hiz_build_bind_group, create_hiz_prepass_pipeline,
     create_hiz_reduce_bind_groups, create_planar_debug_pipeline,
@@ -24,6 +25,7 @@ use crate::renderer::{
     AutoExposureState, AutoExposureUniform, BTreeMap, CameraUniform, CloudLayerSettings,
     CloudRenderResolution, CloudRenderSettings, CloudSunSettings, CloudType, ColorLutPreset,
     CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DetailTextureMode, DofQuality,
+    OceanVisibility,
     DofUniform, DynamicLightsMode, DynamicModelRenderer, DynamicShadowsMode, EntityShadowLight,
     EntityShadowState, FramePlan, GammaPostUniform, GpuCullSettings, GpuProfiler, GrassRenderer,
     HashMap, InlineDrawScratch, Instant, JumpShadeState, LightingSettings, Mat4, Path, PbrSettings,
@@ -32,7 +34,7 @@ use crate::renderer::{
     PostCloudSkyAmbientSettings, PostCloudTemporalSettings, PostCloudTemporalTuningSettings,
     PostCloudVariationSettings, PostCloudWindSettings, PostColorSettings, PostFilmSettings,
     PostGrainSettings, PostSceneSettings, PostUniform, PvsMode, RainIntensity, ReflectionQuality,
-    Renderer, ScreenshotEncodeJob, ScreenshotOutput, SsaoTemporalUniform, SsrTemporalUniform,
+    Renderer, ScreenshotEncodeJob, ScreenshotOutput, SpectatorHighlightResources, SsaoTemporalUniform, SsrTemporalUniform,
     SunVisibilityMode, SurfaceDeformationGpu, SurfaceSpriteEffectRenderer, TextureData,
     TextureFilter, UiSnapshot, Vec3, VsyncMode, WeatherSystem, Window, FALLBACK_SUN_COLOR,
     FALLBACK_SUN_DIRECTION, FALLBACK_SUN_INTENSITY, LOCAL_SHADOW_MAP_SIZE,
@@ -295,6 +297,7 @@ impl Renderer {
         if let Some(error) = error_scope.pop().await {
             return Err(format!("Surface configuration failed: {error}"));
         }
+        let surface_configured_at = Instant::now();
         rverbose!(
             1,
             "Present mode: {:?}; surface: {:?}",
@@ -690,6 +693,7 @@ impl Renderer {
                         true,
                         wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ),
+                    storage_buffer_entry(17, true, wgpu::ShaderStages::FRAGMENT),
                 ],
             });
         let lighting_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -725,6 +729,7 @@ impl Renderer {
                     true,
                     wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ),
+                storage_buffer_entry(17, true, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let shadow_receiver_layout =
@@ -829,6 +834,13 @@ impl Renderer {
         init_mark!("grass renderer");
         let surface_sprite_effect_renderer =
             SurfaceSpriteEffectRenderer::new(&device, &camera_layout, config.format, msaa_samples);
+        let weather_assets = match jka_assets::pk3::AssetSearchPath::open_game(base, game) {
+            Ok(assets) => Some(assets),
+            Err(error) => {
+                eprintln!("[JKA WEATHER] RainyGlass disabled: asset VFS unavailable: {error}");
+                None
+            }
+        };
         let mut weather = WeatherSystem::new(
             &device,
             &queue,
@@ -922,9 +934,10 @@ impl Renderer {
                 label: Some("JKA BSP shader (known-fast baseline)"),
                 source: wgpu::ShaderSource::Wgsl(
                     format!(
-                        "{}\n{}",
+                        "{}\n{}\n{}",
                         include_str!("../bsp_fast.wgsl"),
-                        include_str!("../surface_deformation.wgsl")
+                        include_str!("../surface_deformation.wgsl"),
+                        include_str!("../sky_fractal.wgsl")
                     )
                     .into(),
                 ),
@@ -932,6 +945,7 @@ impl Renderer {
         );
         init_mark!("buffers+shader modules");
         let ocean_layout = crate::ocean::OceanGpu::create_render_layout(&device);
+        let ocean_interaction = crate::ocean::interaction::InteractionGpu::new(&device);
         let ocean_optics = crate::ocean::optics::Resources::new(
             &device,
             &cloud_shadow_layout,
@@ -1271,8 +1285,22 @@ impl Renderer {
         let missing = upload_texture(&device, &queue, &missing_texture_data);
         init_mark!("samplers+white/missing textures");
         let dynamic_model_renderer =
-            DynamicModelRenderer::new(&device, &camera_layout, config.format, msaa_samples, &white);
+        DynamicModelRenderer::new(
+            &device,
+            &queue,
+            &camera_layout,
+            config.format,
+            msaa_samples,
+            &white,
+        );
         dynamic_model_renderer.prewarm_core_model_pipelines(&mut pipeline_jobs, &device);
+        let spectator_highlight = SpectatorHighlightResources::new(
+            &device,
+            &dynamic_model_renderer,
+            config.format,
+            config.width,
+            config.height,
+        );
         init_mark!("dynamic model renderer");
         let flat_normal = upload_texture(
             &device,
@@ -1705,6 +1733,7 @@ impl Renderer {
                 ],
                 weather_occlusion: [0.0; 4],
                 weather_look: [0.0; 4],
+                legacy_weather: [0.0; 4],
                 underwater: [NO_WATER_SURFACE, 1.0, 0.0, 0.0],
                 cloud_foreground: [0.0; 4],
                 cloud_blades: [[0.0; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2],
@@ -1880,6 +1909,7 @@ impl Renderer {
             label: Some("JKA gamma-only post uniform"),
             contents: bytemuck::bytes_of(&GammaPostUniform {
                 values: [gamma, 0.0, 0.0, 0.0],
+                flags: [0.0; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1959,6 +1989,18 @@ impl Renderer {
             &device,
             &depth_prepass_mask_layout,
             &depth_prepass_shader,
+        );
+        let rain_depth_prepass_pipeline = create_rain_depth_prepass_pipeline(
+            &device,
+            &depth_prepass_layout,
+            &depth_prepass_shader,
+            false,
+        );
+        let rain_depth_prepass_mask_pipeline = create_rain_depth_prepass_pipeline(
+            &device,
+            &depth_prepass_mask_layout,
+            &depth_prepass_shader,
+            true,
         );
 
         let hiz_prepass_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2161,6 +2203,7 @@ impl Renderer {
         // Diagnostic-only: compiled by ensure_lazy_scene_pipelines on first use.
         let cull_debug_pipeline = None;
         let cull_diagnostics_readback = CullDiagnosticsReadback::new(&device);
+        let ocean_visibility = OceanVisibility::new(&device);
 
         // Weather owns persistent precipitation GPU state. The haze binding is
         // attached here because it depends on post-process targets created later
@@ -2211,6 +2254,9 @@ impl Renderer {
             queue,
             pipeline_jobs,
             config,
+            surface_config_generation: 1,
+            surface_config_reason: "initial",
+            surface_configured_at,
             ray_tracing_supported,
             ray_traced_shadows: None,
             size,
@@ -2240,9 +2286,15 @@ impl Renderer {
             planar_reflection_layout,
             planar_reflection,
             weather,
+            weather_assets,
             grass_renderer,
             surface_sprite_effect_renderer,
+            world_flares: Default::default(),
+            world_flares_sky: Default::default(),
+            world_flares_planar: std::array::from_fn(|_| Default::default()),
+            world_flares_enabled: false,
             ocean_layout,
+            ocean_interaction,
             ocean_optics_layout: cloud_shadow_layout,
             ocean_optics,
             ocean_inert_bind_group,
@@ -2258,6 +2310,8 @@ impl Renderer {
             water_boxes: Vec::new(),
             camera_water_surface: NO_WATER_SURFACE,
             ocean_enabled: false,
+            ocean_visibility,
+            ocean_hidden_time: 0.0,
             ocean_settings: crate::ocean::OceanSettings::default(),
             promoted_ocean_overrides: Vec::new(),
             world_pipeline_layout,
@@ -2335,6 +2389,7 @@ impl Renderer {
             world: None,
             world_videos: Vec::new(),
             dynamic_model_renderer,
+            spectator_highlight,
             white,
             missing,
             flat_normal,
@@ -2371,6 +2426,7 @@ impl Renderer {
             fxaa_enabled: false,
             smaa_enabled: false,
             taa_enabled: false,
+            rt_taa_mode: 0,
             contact_shadows_enabled: false,
             sun_override: false,
             sun_yaw: 314.25595,
@@ -2379,13 +2435,14 @@ impl Renderer {
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
+            sky_fractal_override: false,
             clouds_enabled: true,
             cloud_type: CloudType::Storm,
             cloud_quality: 1.0,
             cloud_coverage: 0.6,
             cloud_height: 4600.0,
             cloud_thickness: 1200.0,
-            weather_wind: crate::ocean::OceanWind {
+            weather_wind: crate::ocean::AtmosphericWind {
                 speed: 167.0,
                 direction: 220.0,
                 gust: 0.2,
@@ -2468,7 +2525,11 @@ impl Renderer {
             gpu_driven_enabled: false,
             hiz_occlusion_enabled: false,
             dynamic_lights_mode: DynamicLightsMode::Off,
+            dynamic_light_debug: false,
+            tinted_glass_enabled: false,
+            tinted_glass_debug: 0,
             rt_samples: 1,
+            rt_denoiser_mode: 0,
             dynamic_light_falloff: 0,
             rt_reduced_shadows: false,
             clustered_lighting_enabled: false,
@@ -2480,6 +2541,8 @@ impl Renderer {
             cloud_foreground: Vec::new(),
             dynamic_light_brightness: 1.0,
             emissive_area_lights_enabled: false,
+            shader_light_promotion_enabled: false,
+            shader_light_promotion_mask: crate::materials::SHADER_LIGHT_ALL,
             irradiance_volume_enabled: false,
             voxel_probe_gi_enabled: false,
             local_light_shadows_enabled: false,
@@ -2515,6 +2578,8 @@ impl Renderer {
             ssr_frame_index: 0,
             depth_prepass_pipeline,
             depth_prepass_mask_pipeline,
+            rain_depth_prepass_pipeline,
+            rain_depth_prepass_mask_pipeline,
             hiz_prepass_pipeline,
             hiz_prepass_mask_pipeline,
             hiz_build_layout,
@@ -2549,7 +2614,9 @@ impl Renderer {
             post_shader,
             post_pipeline_layout,
             post_pipeline: None,
+            rain_post_pipeline: None,
             taa_post_pipeline,
+            rt_taa_resources: None,
             cloud_march_pipeline,
             cloud_resolve_pipeline,
             cloud_resolve_layout,
@@ -2597,6 +2664,7 @@ impl Renderer {
             screenshot_requested: None,
             screenshot_result: None,
             screenshot_readback_buffer: None,
+            video_depth_readback_buffer: None,
             screenshot_worker_tx,
             screenshot_worker_rx,
             started: Instant::now(),

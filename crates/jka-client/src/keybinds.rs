@@ -72,6 +72,8 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
 
     ControlAction { label: "CHAT", command: "messagemode", group: "Other" },
     ControlAction { label: "TEAM CHAT", command: "messagemode2", group: "Other" },
+    ControlAction { label: "TARGET CHAT", command: "messagemode3", group: "Other" },
+    ControlAction { label: "ATTACKER CHAT", command: "messagemode4", group: "Other" },
     ControlAction { label: "SCORES", command: "+scores", group: "Other" },
     ControlAction { label: "BINOCULAR ZOOM", command: "zoom", group: "Other" },
     ControlAction { label: "ZOOM", command: "+zoom", group: "Other" },
@@ -151,7 +153,7 @@ impl Default for Bindings {
         // Mirrors the stock MP mpdefault.cfg, which jaPRO also runs on (it ships no
         // default binds of its own). Commands this client does not implement yet
         // (+strafe, +lookup/+lookdown, +left/+right, centerview, +mlook,
-        // messagemode3/4, scoresUp/Down, automap_toggle, the siege menu) are left
+        // scoresUp/Down, automap_toggle) are left
         // out so a keypress never lands on "unknown command". N is DinurdoJK's own
         // noclip key; the stock keys it would otherwise collide with stay stock.
         for (key, command) in [
@@ -211,7 +213,9 @@ impl Default for Bindings {
             // Communication, scoreboard and misc.
             (BindKey::Keyboard(KeyCode::KeyY), "messagemode"),
             (BindKey::Keyboard(KeyCode::KeyT), "messagemode2"),
+            (BindKey::Keyboard(KeyCode::KeyU), "messagemode3"),
             (BindKey::Keyboard(KeyCode::KeyV), "voicechat"),
+            (BindKey::Keyboard(KeyCode::KeyO), "ui_opensiegemenu ingame_objectives"),
             (BindKey::Keyboard(KeyCode::Tab), "+scores"),
             (BindKey::Keyboard(KeyCode::KeyP), "toggle cg_thirdPerson 0 1"),
             (BindKey::Keyboard(KeyCode::KeyK), "engage_duel"),
@@ -675,6 +679,7 @@ mod tests {
         assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::Digit0)), Some("weapon 9"));
         assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::F4)), Some("force_seeing"));
         assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyQ)), Some("forceprev"));
+        assert_eq!(bindings.get(BindKey::Keyboard(KeyCode::KeyO)), Some("ui_opensiegemenu ingame_objectives"));
         assert_eq!(bindings.get(BindKey::WheelUp), Some("weapprev"));
     }
 

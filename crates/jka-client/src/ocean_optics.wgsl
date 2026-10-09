@@ -36,6 +36,178 @@ fn interval(a: vec3<f32>, delta: vec3<f32>, lo: vec3<f32>, hi: vec3<f32>) -> vec
     }
     return vec2<f32>(near, far);
 }
+
+// The surface outline (see OceanMasks): a box is only the bounding rectangle of
+// its water, so an island ring's hollow must not count as water. A volume's
+// `minimum.w` carries its mask slot + 1, 0 meaning "the box is the water".
+fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
+    if (slot < 0 || slot >= 8) {
+        return true;
+    }
+    let range = ocean.mask_ranges[slot];
+    let count = u32(range.y);
+    if (count == 0u) {
+        return true;
+    }
+    let first = u32(range.x);
+    let tolerance = 0.75;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let t0 = ocean.mask_triangles[(first + i) * 2u];
+        let t1 = ocean.mask_triangles[(first + i) * 2u + 1u];
+        let a = t0.xy;
+        let b = t0.zw;
+        let c = t1.xy;
+        let lo = min(a, min(b, c)) - vec2<f32>(tolerance);
+        let hi = max(a, max(b, c)) + vec2<f32>(tolerance);
+        if (any(p < lo) || any(p > hi)) {
+            continue;
+        }
+        let ab = b - a;
+        let bc = c - b;
+        let ca = a - c;
+        let e0 = (ab.x * (p.y - a.y) - ab.y * (p.x - a.x)) / max(length(ab), 1.0e-4);
+        let e1 = (bc.x * (p.y - b.y) - bc.y * (p.x - b.x)) / max(length(bc), 1.0e-4);
+        let e2 = (ca.x * (p.y - c.y) - ca.y * (p.x - c.x)) / max(length(ca), 1.0e-4);
+        if ((e0 >= -tolerance && e1 >= -tolerance && e2 >= -tolerance)
+            || (e0 <= tolerance && e1 <= tolerance && e2 <= tolerance)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Water spans along the current ray, as fractions of its eye->surface delta,
+// sorted by entry. Private state so masked volumes can add several spans.
+// The capacity is deliberately small. This is a `var<private>` array indexed by
+// a runtime value, so it cannot live in registers: every invocation reserves
+// scratch memory for the whole array, which costs occupancy for the entire
+// shader whether or not the spans are used. Measured on hothchallenges looking
+// across water, capacity 16 vs 8 was 1.85ms vs 1.33ms in this pass, and 4 was
+// no better than 8, so 8 is the knee. Eight also covers reality comfortably: an
+// unmasked volume contributes one span, a ray crossing a ring-shaped outline two.
+const OCEAN_MAX_SPANS: u32 = 8u;
+var<private> g_spans: array<vec2<f32>, OCEAN_MAX_SPANS>;
+var<private> g_span_count: u32;
+var<private> g_eye_depth: f32;
+
+fn add_span(span: vec2<f32>, top: f32, delta_y: f32) {
+    if (span.y <= span.x) {
+        return;
+    }
+    if (g_span_count >= OCEAN_MAX_SPANS) {
+        // Overflow widens the last span rather than discarding this one, so a
+        // ray crossing more than eight water pieces over-estimates absorption
+        // slightly instead of silently losing a layer. `add_masked_spans`
+        // already folds its own runs the same way.
+        g_spans[OCEAN_MAX_SPANS - 1u] = vec2<f32>(
+            min(g_spans[OCEAN_MAX_SPANS - 1u].x, span.x),
+            max(g_spans[OCEAN_MAX_SPANS - 1u].y, span.y),
+        );
+        g_eye_depth = max(g_eye_depth, max(top - (optics.eye.y + delta_y * span.x), 0.0));
+        return;
+    }
+    // Insertion sort allows exact union of overlapping bounds (no double fog).
+    var j = g_span_count;
+    loop {
+        if (j == 0u) { break; }
+        if (g_spans[j - 1u].x <= span.x) { break; }
+        g_spans[j] = g_spans[j - 1u];
+        j -= 1u;
+    }
+    g_spans[j] = span;
+    g_span_count += 1u;
+    g_eye_depth = max(g_eye_depth, max(top - (optics.eye.y + delta_y * span.x), 0.0));
+}
+
+// Part of `span` where the ray's xz line is inside one outline triangle (grown
+// by the surface mask's 0.75 unit tolerance). x >= y means the ray misses it.
+fn mask_triangle_interval(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, origin: vec2<f32>, direction: vec2<f32>, span: vec2<f32>) -> vec2<f32> {
+    let miss = vec2<f32>(1.0, 0.0);
+    let tolerance = 0.75;
+    let p0 = origin + direction * span.x;
+    let p1 = origin + direction * span.y;
+    let lo = min(a, min(b, c)) - vec2<f32>(tolerance);
+    let hi = max(a, max(b, c)) + vec2<f32>(tolerance);
+    if (any(max(p0, p1) < lo) || any(min(p0, p1) > hi)) {
+        return miss;
+    }
+    let area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (abs(area) < 1.0e-4) {
+        return miss;
+    }
+    let winding = select(-1.0, 1.0, area > 0.0);
+    var t = span;
+    for (var edge_index = 0u; edge_index < 3u; edge_index += 1u) {
+        var start = a;
+        var finish = b;
+        if (edge_index == 1u) {
+            start = b;
+            finish = c;
+        } else if (edge_index == 2u) {
+            start = c;
+            finish = a;
+        }
+        let edge = finish - start;
+        let inv_length = 1.0 / max(length(edge), 1.0e-4);
+        // Signed distance to the edge (positive inside) is linear in t.
+        let at_origin = winding * (edge.x * (origin.y - start.y) - edge.y * (origin.x - start.x)) * inv_length + tolerance;
+        let slope = winding * (edge.x * direction.y - edge.y * direction.x) * inv_length;
+        if (abs(slope) < 1.0e-9) {
+            if (at_origin < 0.0) {
+                return miss;
+            }
+        } else {
+            let bound = -at_origin / slope;
+            if (slope > 0.0) {
+                t.x = max(t.x, bound);
+            } else {
+                t.y = min(t.y, bound);
+            }
+        }
+    }
+    return t;
+}
+
+// Adds the runs of `span` that lie inside the volume's real outline.
+fn add_masked_spans(slot: i32, span: vec2<f32>, top: f32, delta: vec3<f32>) {
+    let range = ocean.mask_ranges[slot];
+    let count = u32(range.y);
+    let first = u32(range.x);
+    var runs: array<vec2<f32>, 8>;
+    var run_count = 0u;
+    for (var i = 0u; i < count; i = i + 1u) {
+        let t0 = ocean.mask_triangles[(first + i) * 2u];
+        let t1 = ocean.mask_triangles[(first + i) * 2u + 1u];
+        let piece = mask_triangle_interval(t0.xy, t0.zw, t1.xy, optics.eye.xz, delta.xz, span);
+        if (piece.y <= piece.x) {
+            continue;
+        }
+        // Neighbouring triangles abut, so fold every run this piece touches
+        // into one. Overflow past eight runs widens the last one.
+        var merged = piece;
+        var kept = 0u;
+        for (var k = 0u; k < run_count; k = k + 1u) {
+            let run = runs[k];
+            if (run.y >= merged.x - 1.0e-4 && run.x <= merged.y + 1.0e-4) {
+                merged = vec2<f32>(min(merged.x, run.x), max(merged.y, run.y));
+            } else {
+                runs[kept] = run;
+                kept += 1u;
+            }
+        }
+        if (kept < 8u) {
+            runs[kept] = merged;
+            kept += 1u;
+        } else {
+            runs[7u] = vec2<f32>(min(runs[7u].x, merged.x), max(runs[7u].y, merged.y));
+        }
+        run_count = kept;
+    }
+    for (var k = 0u; k < run_count; k = k + 1u) {
+        add_span(runs[k], top, delta.y);
+    }
+}
+
 fn slopes(p: vec2<f32>) -> vec2<f32> {
     let scale = ocean.map_scales[1];
     let uv = p / ocean.ocean_info.z * vec2<f32>(1.0, -1.0) * scale.xy;
@@ -70,32 +242,31 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
     var scene_normal = vec3<f32>(0.0, 1.0, 0.0);
     if (normal_length > 0.000001) { scene_normal = normal_cross / normal_length; }
     var color = sample_color;
-    var spans: array<vec2<f32>, 8>;
-    var count = 0u;
-    var eye_depth = 0.0;
+    g_span_count = 0u;
+    g_eye_depth = 0.0;
     var bottom_depth = 0.0;
     for (var i = 0u; i < min(u32(optics.params.w), 8u); i += 1u) {
         let lo = optics.minimum[i].xyz;
         let hi = optics.maximum[i].xyz;
+        let slot = i32(round(optics.minimum[i].w)) - 1;
         let span = interval(optics.eye.xyz, delta, lo, hi);
         if (span.y > span.x) {
-            // Insertion sort allows exact union of overlapping bounds (no double fog).
-            var j = count;
-            loop {
-                if (j == 0u) { break; }
-                if (spans[j-1u].x <= span.x) { break; }
-                spans[j] = spans[j-1u]; j -= 1u;
+            if (slot >= 0 && slot < 8) {
+                add_masked_spans(slot, span, hi.y, delta);
+            } else {
+                add_span(span, hi.y, delta.y);
             }
-            spans[j] = span; count += 1u;
-            eye_depth = max(eye_depth, max(hi.y - (optics.eye.y + delta.y * span.x), 0.0));
         }
-        if (all(world >= lo) && all(world <= hi)) { bottom_depth = max(bottom_depth, hi.y - world.y); }
+        if (all(world >= lo) && all(world <= hi) && ocean_mask_contains(slot, world.xz)) {
+            bottom_depth = max(bottom_depth, hi.y - world.y);
+        }
     }
+    let eye_depth = g_eye_depth;
     var water_fraction = 0.0;
     var end = 0.0;
-    for (var i = 0u; i < count; i += 1u) {
-        water_fraction += max(spans[i].y - max(spans[i].x, end), 0.0);
-        end = max(end, spans[i].y);
+    for (var i = 0u; i < g_span_count; i += 1u) {
+        water_fraction += max(g_spans[i].y - max(g_spans[i].x, end), 0.0);
+        end = max(end, g_spans[i].y);
     }
     // Optional low-cost wave-curvature caustics. Approximation, not photon tracing.
     // Scope to the bound simulation; distinct authored oceans never borrow its waves.

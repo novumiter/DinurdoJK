@@ -2,8 +2,8 @@
 use crate::cgame::player_presenter::{
     footsteps, load_humanoid_animations, load_saber_animation_scales, load_saber_definitions,
     load_vehicle_definitions, materials, AnimationSet, Arc, AssetRegistry, AssetSearchPath,
-    AssetSource, ClothSystem, CosmeticDraw, DynamicModelAlphaMode, FootstepImpact, FootstepStages,
-    Ghoul2Animator, Ghoul2PerfStats, Ghoul2SkinningMode, HashMap, HashSet, JiggleSystem,
+    AssetSource, CosmeticDraw, DynamicModelAlphaMode, FootstepImpact, FootstepStages,
+    Ghoul2Animator, Ghoul2PerfStats, Ghoul2SkinningMode, HashMap, HashSet, JiggleRemeshTuning,
     ModelLoadShared, PlayerFxRequest, PlayerPresenter, RagdollWorld, Textures, VehicleDefinition,
     VehicleDefinitions,
 };
@@ -214,8 +214,10 @@ impl PlayerPresenter {
             vehicle_snaps: HashMap::new(),
             entities: HashMap::new(),
             external_live_entities: HashSet::new(),
-            jiggle: JiggleSystem::default(),
-            cloth: ClothSystem::default(),
+            jiggle: super::AsyncJiggleSystem::default(),
+            jiggle_sex_filter: 0,
+            jiggle_remesh: JiggleRemeshTuning::default(),
+            cloth: super::AsyncClothSystem::default(),
             cloth_weather_wind: None,
             cloth_body_templates: HashMap::new(),
             ragdolls: RagdollWorld::new(),

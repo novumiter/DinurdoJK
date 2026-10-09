@@ -6,12 +6,30 @@ use crate::app::{
     Duration, ElementState, FrontendCinematic, FrontendPage, FullscreenMode, InputLatencySample,
     Instant, KeyCode, LiveJoinTiming, LocalServer, MapEditor, ModifiersState, MouseButton,
     MouseScrollDelta, OverlayMode, PerfStats, PhysicalKey, PhysicalPosition, PhysicalSize,
-    PreparedMapCache, RenderCommand, RenderThread, RendererBackend, ScreenshotOutput,
+    PreparedMapCache, StartCause, RenderCommand, RenderThread, RendererBackend, ScreenshotOutput,
     ThreadPerfStats, UserEvent, Window, WindowEvent, WindowId, FRONTEND_CAMERA_EYE_HEIGHT,
     MAX_SPECTATOR_ORBIT_RANGE, MIN_SPECTATOR_ORBIT_RANGE,
 };
 
 impl ApplicationHandler<UserEvent> for App {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        let cause = match cause {
+            StartCause::Init => "init",
+            StartCause::Poll => "poll",
+            StartCause::ResumeTimeReached { .. } => "resume_time_reached",
+            StartCause::WaitCancelled { .. } => "wait_cancelled",
+        };
+        if let Some(render) = &self.render {
+            render.record_input_diagnostic_event_loop_turn(
+                Instant::now(),
+                cause,
+                self.window_focused,
+                self.captured,
+                self.mouse_grab_mode,
+            );
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -123,9 +141,22 @@ impl ApplicationHandler<UserEvent> for App {
                         self.console_status = "COPIED SCREENSHOT TO CLIPBOARD".into();
                         self.push_console_line(format!("^2{}", self.console_status));
                     }
+                    Ok(ScreenshotOutput::VideoFrame {
+                        frame_index,
+                        width,
+                        height,
+                        bgra,
+                        depth_f32le,
+                    }) => {
+                        self.on_demo_video_frame(frame_index, width, height, bgra, depth_f32le);
+                    }
                     Err(error) => {
-                        self.console_status = format!("SCREENSHOT CAPTURE FAILED: {error}");
-                        self.push_console_line(format!("^1{}", self.console_status));
+                        if self.demo_video_export.is_some() {
+                            self.fail_demo_video_export(format!("frame capture failed: {error}"));
+                        } else {
+                            self.console_status = format!("SCREENSHOT CAPTURE FAILED: {error}");
+                            self.push_console_line(format!("^1{}", self.console_status));
+                        }
                     }
                 }
                 self.publish_ui();
@@ -388,6 +419,68 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.publish_ui();
             }
+            UserEvent::SteamAudioScenePrepared {
+                request_id,
+                map_name,
+                result,
+            } => {
+                if request_id != self.latest_request_id || !self.audio.steam_audio {
+                    return;
+                }
+                match result {
+                    Ok(prepared) => {
+                        let has_background_bake = prepared.bake_request.is_some();
+                        self.steam_audio_acoustic_mesh =
+                            Some(Arc::clone(&prepared.acoustic_mesh));
+                        self.steam_audio_bake = prepared.bake.clone();
+                        self.steam_audio_bake_error = None;
+                        if !has_background_bake {
+                            self.steam_audio_bake_progress = None;
+                        }
+                        self.latest_prepare_options.steam_audio = true;
+                        if let Some(cache) = &mut self.prepared_map_cache {
+                            cache.prepare_options.steam_audio = true;
+                            let cached = Arc::make_mut(&mut cache.map);
+                            cached.steam_audio_acoustic_mesh =
+                                Some(Arc::clone(&prepared.acoustic_mesh));
+                            cached.steam_audio_bake = prepared.bake.clone();
+                            // The targeted worker owns any live bake request.
+                            cached.steam_audio_bake_request = None;
+                        }
+                        if let Some(sound) = self
+                            .game_session
+                            .as_mut()
+                            .and_then(|session| session.sound_presenter.as_mut())
+                        {
+                            sound.set_steam_audio_map(
+                                Some(Arc::clone(&prepared.acoustic_mesh)),
+                                prepared.bake.clone(),
+                            );
+                        }
+                        println!(
+                            "{map_name}: Steam Audio current-map acoustic scene attached{}",
+                            if prepared.bake.is_some() {
+                                " (cached bake loaded)"
+                            } else if has_background_bake {
+                                " (background bake queued)"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                    Err(error) => {
+                        self.steam_audio_bake_progress = None;
+                        self.steam_audio_bake_error = Some(error.clone());
+                        eprintln!(
+                            "{map_name}: Steam Audio current-map acoustic preparation failed: {error}"
+                        );
+                        self.push_console_error(format!(
+                            "^1Steam Audio:^7 current-map acoustic preparation failed: {error}"
+                        ));
+                    }
+                }
+                self.publish_ui();
+            }
             UserEvent::SteamAudioBakeProgress {
                 request_id,
                 map_name,
@@ -405,7 +498,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.steam_audio_bake_error = None;
                 if progress <= f32::EPSILON {
                     println!(
-                        "{map_name}: Steam Audio background bake started; the legacy mixer remains authoritative until baked assets are ready"
+                        "{map_name}: Steam Audio background bake started; direct current-map acoustics remain active while cached probe data is prepared"
                     );
                 }
                 self.publish_ui();
@@ -469,12 +562,31 @@ impl ApplicationHandler<UserEvent> for App {
                 started,
                 name,
                 mut map,
+                fx_light_promotion,
             } => {
                 if request_id != self.latest_request_id {
                     return;
                 }
                 let frontend_background =
                     self.front_end && self.frontend_background_request_id == Some(request_id);
+                let map_edit_preview = self.map_edit_preview_request_id == Some(request_id);
+                if !frontend_background && !map_edit_preview {
+                    self.fx_light_promotion_catalog = Arc::clone(&fx_light_promotion);
+                    // Live-map preparation can overlap the previous CGame. Only
+                    // patch a session that already belongs to this prepared map;
+                    // a later GameSession construction reads the app catalog.
+                    let session_matches_map = self.game_session.as_ref().is_some_and(|session| {
+                        session.map_name.as_deref().is_some_and(|map_name| {
+                            Self::normalized_bsp_name(map_name)
+                                == Self::normalized_bsp_name(&name)
+                        })
+                    });
+                    if session_matches_map {
+                        if let Some(session) = self.game_session.as_mut() {
+                            session.set_fx_light_promotion_catalog(Arc::clone(&fx_light_promotion));
+                        }
+                    }
+                }
                 if let Some(net) = &self.net {
                     use crate::ocean::authoring::{AuthoredOcean, CS_OCEANS, CS_WEATHER};
                     let strings = &net.session().decoder().configstrings;
@@ -502,7 +614,7 @@ impl ApplicationHandler<UserEvent> for App {
                         map.authored_oceans = oceans;
                     }
                 }
-                if self.map_edit_preview_request_id == Some(request_id) {
+                if map_edit_preview {
                     // Source-map preparation rebuilt movement collision from the
                     // same text revision as this render world. Hold it until the
                     // renderer reports WorldUploaded so the player never collides
@@ -619,6 +731,12 @@ impl ApplicationHandler<UserEvent> for App {
                     ) {
                         self.push_console_line(format!("^1shader remap: {error}"));
                     }
+                }
+                // The unmodified cache was captured above. Only transform the
+                // derived render copy; toggling the cvar later recovers the
+                // authored two-pass recipe without BSP/asset re-preparation.
+                if self.video.stage_collapse_extra {
+                    scene::apply_reverse_lightmap_collapse_in_place(map.as_mut());
                 }
                 if shader_remap_map_matches_session {
                     // This upload now represents the complete remap/reset state
@@ -876,6 +994,7 @@ impl ApplicationHandler<UserEvent> for App {
                             &self.solo_client_info,
                             saber_movement,
                             &map.fx_runners,
+                            &map.world_effect_registrations,
                             &map.brush_entities,
                             map.visibility
                                 .as_ref()
@@ -960,6 +1079,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // A deferred enable (grass/ocean staged while this map lacked the
                 // data) was never sent to the renderer; deliver the current
                 // choice before the upload so the new world is built with it.
+                self.sync_world_flares();
                 self.render_command(RenderCommand::SetGrassEnabled(self.video.grass));
                 self.render_command(RenderCommand::SetOceanEnabled(self.video.ocean));
                 self.render_command(RenderCommand::LoadMap {
@@ -1802,6 +1922,16 @@ impl ApplicationHandler<UserEvent> for App {
                 match self.demo_timeline_hit(self.cursor_position.0, self.cursor_position.1) {
                     Some(DemoTimelineHit::PlayPause) => self.toggle_demo_pause_ui(),
                     Some(DemoTimelineHit::Track(fraction)) => self.begin_demo_scrub(fraction),
+                    Some(DemoTimelineHit::MarkIn) => self.mark_demo_export_in(),
+                    Some(DemoTimelineHit::MarkOut) => self.mark_demo_export_out(),
+                    Some(DemoTimelineHit::Export) => {
+                        if self.demo_export_available() {
+                            self.start_demo_video_export();
+                        }
+                    }
+                    Some(DemoTimelineHit::ExportPreset) => self.cycle_demo_export_preset(),
+                    Some(DemoTimelineHit::ExportFps) => self.cycle_demo_export_fps(),
+                    Some(DemoTimelineHit::ExportDepth) => self.toggle_demo_export_depth(),
                     Some(DemoTimelineHit::Speed) => self.cycle_demo_speed_ui(),
                     None => {}
                 }
@@ -2033,6 +2163,16 @@ impl ApplicationHandler<UserEvent> for App {
                     OverlayMode::None => {}
                 }
 
+                if self.demo_video_export.is_some()
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                {
+                    if code == KeyCode::Escape {
+                        self.cancel_demo_video_export();
+                    }
+                    return;
+                }
+
                 if self.demo_playback_active()
                     && event.state == ElementState::Pressed
                     && !event.repeat
@@ -2104,13 +2244,29 @@ impl ApplicationHandler<UserEvent> for App {
     fn device_event(
         &mut self,
         _event_loop: &ActiveEventLoop,
-        _device_id: winit::event::DeviceId,
+        device_id: winit::event::DeviceId,
         event: DeviceEvent,
     ) {
+        if self.demo_video_export.is_some() {
+            return;
+        }
         if !self.captured || self.overlay != OverlayMode::None {
             return;
         }
         if let DeviceEvent::MouseMotion { delta } = event {
+            let event_at = Instant::now();
+            let device_id_hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                device_id.hash(&mut hasher);
+                hasher.finish()
+            };
+            let diag_window_focused = self.window_focused;
+            let diag_captured = self.captured;
+            let diag_grab_mode = self.mouse_grab_mode;
+            if let Some(render) = &self.render {
+                render.begin_input_diagnostic_mouse(event_at);
+            }
             if self.spectator_orbit_follow_active() {
                 let yaw_degrees =
                     delta.0 as f32 * self.mouse_input.sensitivity * self.mouse_input.yaw;
@@ -2133,6 +2289,20 @@ impl ApplicationHandler<UserEvent> for App {
                 .unwrap_or([0.0; 3]);
                 self.spectator_camera_state
                     .apply_orbit_mouse(yaw_degrees, pitch_degrees, fallback);
+                if let Some(render) = &self.render {
+                    render.finish_input_diagnostic_mouse(
+                        event_at,
+                        None,
+                        Instant::now(),
+                        delta.0,
+                        delta.1,
+                        None,
+                        device_id_hash,
+                        diag_window_focused,
+                        diag_captured,
+                        diag_grab_mode,
+                    );
+                }
                 return;
             }
             if self.demo_playback_active() && self.demo_view_mode == DemoViewMode::Free {
@@ -2144,9 +2314,22 @@ impl ApplicationHandler<UserEvent> for App {
                 self.camera.pitch = (self.camera.pitch - pitch_degrees.to_radians())
                     .clamp((-89.0_f32).to_radians(), 89.0_f32.to_radians());
                 self.publish_snapshot();
+                if let Some(render) = &self.render {
+                    render.finish_input_diagnostic_mouse(
+                        event_at,
+                        None,
+                        Instant::now(),
+                        delta.0,
+                        delta.1,
+                        None,
+                        device_id_hash,
+                        diag_window_focused,
+                        diag_captured,
+                        diag_grab_mode,
+                    );
+                }
                 return;
             }
-            let event_at = Instant::now();
             self.mouse_input_sequence = self.mouse_input_sequence.wrapping_add(1);
             if self.mouse_input_sequence == 0 {
                 self.mouse_input_sequence = 1;
@@ -2185,6 +2368,20 @@ impl ApplicationHandler<UserEvent> for App {
                     self.update_crosshair_target(event_at);
                 }
                 self.publish_live_subframe_view(sample);
+                if let Some(render) = &self.render {
+                    render.finish_input_diagnostic_mouse(
+                        event_at,
+                        Some(sample.simulation_at),
+                        Instant::now(),
+                        delta.0,
+                        delta.1,
+                        Some(sample.sequence),
+                        device_id_hash,
+                        diag_window_focused,
+                        diag_captured,
+                        diag_grab_mode,
+                    );
+                }
             } else {
                 let mut applied = false;
                 let mut applied_sample = None;
@@ -2232,6 +2429,20 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         self.publish_snapshot();
                     }
+                }
+                if let Some(render) = &self.render {
+                    render.finish_input_diagnostic_mouse(
+                        event_at,
+                        applied_sample.map(|sample| sample.simulation_at),
+                        Instant::now(),
+                        delta.0,
+                        delta.1,
+                        applied_sample.map(|sample| sample.sequence),
+                        device_id_hash,
+                        diag_window_focused,
+                        diag_captured,
+                        diag_grab_mode,
+                    );
                 }
             }
         }

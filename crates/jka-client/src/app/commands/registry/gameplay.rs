@@ -150,19 +150,36 @@ commands! {
         }
     }
 
-    cmd_team ["team", ] ("team <team>", "Join a team: team <free|red|blue|spectator|follow1|follow2|scoreboard>.", CommandScope::Connected) |self, command| {
+    cmd_team ["team", ] ("team [team]", "Show or change team: team [free|f|red|r|blue|b|spectator|spectate|spec|s|follow1|follow2|scoreboard].", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         if self.execute_game_command(command) {
             return CommandResult::Handled;
         }
         match words.as_slice() {
+            [_verb] if self.local_server.is_some() => {
+                // OpenJK Cmd_Team_f with no argv(1) prints the current team.
+                self.local_server
+                    .as_mut()
+                    .expect("checked above")
+                    .report_current_team();
+                self.push_local_snapshot(true);
+                CommandResult::Handled
+            }
             [_verb, requested_team] if self.local_server.is_some() => {
                 // OpenJK SetTeam in GT_FFA: scoreboard/follow/spectator forms become
-                // TEAM_SPECTATOR; every other token becomes TEAM_FREE. That is why
-                // stock `team f` joins the game even though `f` has no explicit case.
+                // TEAM_SPECTATOR; every other token becomes TEAM_FREE. Keep that
+                // fallback, while also accepting the common `spectate`/`spec` spellings
+                // requested by the local shim.
                 let mode = if matches!(
                     requested_team.to_ascii_lowercase().as_str(),
-                    "scoreboard" | "score" | "follow1" | "follow2" | "spectator" | "s"
+                    "scoreboard"
+                        | "score"
+                        | "follow1"
+                        | "follow2"
+                        | "spectator"
+                        | "spectate"
+                        | "spec"
+                        | "s"
                 ) {
                     JoinMode::Spectator
                 } else {

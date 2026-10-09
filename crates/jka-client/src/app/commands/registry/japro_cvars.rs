@@ -116,6 +116,60 @@ settings_cvars! { JaproCgame;
         ]
     }
 
+    APP_CG_THIRDPERSONFLAGALPHA {
+        runtime: CvarDef::new("cg_thirdPersonFlagAlpha", "", "0..1", "Opacity of your carried flag in third person, including the followed player in demos.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_thirdpersonflagalpha(app)), |app, value| App::cvar_set_cg_thirdpersonflagalpha(app, APP_CG_THIRDPERSONFLAGALPHA.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_thirdpersonflagalpha, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, name, value| {
+                    let _ = settings.japro.set_cvar(name, value);
+                }),
+                archive: Some((1000, |state| {
+                    let presentation = state.presentation;
+                    format!("{}", presentation.japro.third_person_flag_alpha)
+                })),
+                ..CvarBinding::NONE
+            },
+        settings: SETTINGS_CG_THIRDPERSONFLAGALPHA = APP_CG_THIRDPERSONFLAGALPHA
+                .bind(
+                    |state: &JaproCgame| CvarValue::String(state.third_person_flag_alpha.to_string()),
+                    |state, value| {
+                        JaproCgame::cvar_set_cg_thirdpersonflagalpha(
+                            state,
+                            APP_CG_THIRDPERSONFLAGALPHA.entry.name,
+                            &value.to_string(),
+                        )
+                    },
+                )
+                .with_text_setter(JaproCgame::cvar_set_cg_thirdpersonflagalpha, None),
+        implementations: [
+            impl JaproCgame {
+                fn cvar_set_cg_thirdpersonflagalpha(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    japro_float(name, value).map(|v| self.third_person_flag_alpha = v.clamp(0.0, 1.0))
+                }
+            }
+            impl App {
+                fn cvar_get_cg_thirdpersonflagalpha(&self) -> String {
+                    (SETTINGS_CG_THIRDPERSONFLAGALPHA.get)(&self.japro_cg).to_string()
+                }
+                fn cvar_set_cg_thirdpersonflagalpha(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_THIRDPERSONFLAGALPHA.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.apply_client_options(
+                            self.screen_shake,
+                            self.audio.game,
+                            self.video.footprints,
+                            self.japro_cg,
+                            self.network.plugin_disable,
+                        );
+                    }
+                    self.mark_config_dirty();
+                    self.publish_snapshot();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_JUMPGOAL {
         runtime: CvarDef::new(
                 "cg_jumpGoal",
@@ -803,6 +857,79 @@ settings_cvars! { JaproCgame;
                 }
                 fn cvar_set_cg_racetimery(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_CG_RACETIMERY.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.apply_client_options(
+                            self.screen_shake,
+                            self.audio.game,
+                            self.video.footprints,
+                            self.japro_cg,
+                            self.network.plugin_disable,
+                        );
+                    }
+                    self.mark_config_dirty();
+                    self.publish_snapshot();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_SPECHUD {
+        runtime: CvarDef::new(
+                "cg_specHud",
+                "",
+                "0|1",
+                "While spectating or watching a demo, outline other living players through walls.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_cg_spechud(app)),
+                |app, value| {
+                    App::cvar_set_cg_spechud(
+                        app,
+                        APP_CG_SPECHUD.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_cg_spechud, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, name, value| {
+                    let _ = settings.japro.set_cvar(name, value);
+                }),
+                archive: Some((419, |state| {
+                    let presentation = state.presentation;
+                    format!("{}", u8::from(presentation.japro.spec_hud))
+                })),
+                ..CvarBinding::NONE
+            },
+        settings: SETTINGS_CG_SPECHUD = APP_CG_SPECHUD
+                .bind(
+                    |state: &JaproCgame| CvarValue::String(u8::from(state.spec_hud).to_string()),
+                    |state, value| {
+                        JaproCgame::cvar_set_cg_spechud(
+                            state,
+                            APP_CG_SPECHUD.entry.name,
+                            &value.to_string(),
+                        )
+                    },
+                )
+                .with_text_setter(JaproCgame::cvar_set_cg_spechud, None),
+        implementations: [
+            impl JaproCgame {
+                fn cvar_set_cg_spechud(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    japro_integer(name, value)
+                        .map(|number| number != 0)
+                        .map(|v| self.spec_hud = v)
+                }
+            }
+            impl App {
+                fn cvar_get_cg_spechud(&self) -> String {
+                    (SETTINGS_CG_SPECHUD.get)(&self.japro_cg).to_string()
+                }
+                fn cvar_set_cg_spechud(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_SPECHUD.set_text.unwrap())(&mut self.japro_cg, name, value)?;
                     if let Some(session) = self.game_session.as_mut() {
                         session.apply_client_options(
                             self.screen_shake,

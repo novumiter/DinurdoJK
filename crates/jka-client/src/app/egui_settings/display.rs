@@ -180,25 +180,6 @@ impl App {
             theme::hint(ui, "Display mode changed: needs Apply", theme::WARNING);
         }
 
-        theme::row(
-            ui,
-            "Companion window",
-            "Opens a native second-monitor workspace for persistent Console, Scoreboard and Server info. The auxiliary surface has its own sleeping render worker and only submits when its contents change. This is also the presentation-surface foundation for a later spectator Scene View.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(enabled) = theme::switch(ui, self.companion_enabled()) {
-                    self.set_companion_enabled(enabled);
-                }
-            },
-        );
-        if self.companion_enabled() && self.applied_fullscreen == FullscreenMode::Exclusive {
-            theme::hint(
-                ui,
-                "Exclusive fullscreen can lose focus when you click the companion; passive display remains safe.",
-                theme::TEXT_DIM,
-            );
-        }
-
         let resolutions =
             Self::available_resolutions(self.window.as_deref(), self.video.resolution);
         theme::row(

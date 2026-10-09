@@ -1,8 +1,10 @@
 //! Thread.
+use crate::renderer::diagnostics::perf_capture::PerfCapture;
 use crate::renderer::{
     block_on, mpsc, sample_view_rotation, scene, thread, Arc, CompanionId, CompanionRenderThread,
     Duration, DynamicLightsMode, EventLoopProxy, FrameInfo, GpuPass, HashMap, InputLatencySample,
-    Instant, JoinHandle, LatestViewState, Mutex, PathBuf, PostEffects, PreparedMap, Receiver,
+    InputDiagFrameSample, InputDiagLatchPhase, InputDiagRendererMetadata, InputDiagnostic, Instant,
+    JoinHandle, LatestViewState, Mutex, PathBuf, PostEffects, PreparedMap, Receiver,
     RenderBatchTiming, RenderCommand, RenderError, RenderSnapshot, RenderStats, Renderer,
     RendererBackend, Sender, TryRecvError, UiSnapshot, UserEvent, Window, WorldRenderPath,
     WorldUploadTimings, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
@@ -53,6 +55,7 @@ pub struct RenderThread {
     pub(in crate::renderer) instance: wgpu::Instance,
     pub(in crate::renderer) latest_snapshot: Arc<Mutex<RenderSnapshot>>,
     pub(in crate::renderer) latest_view: Arc<LatestViewState>,
+    pub(in crate::renderer) input_diagnostic: Arc<InputDiagnostic>,
     pub(in crate::renderer) join: Option<JoinHandle<()>>,
 }
 
@@ -79,8 +82,10 @@ impl RenderThread {
             initial_view_camera.pitch = pitch;
         }
         let latest_view = Arc::new(LatestViewState::new(initial_view_camera));
+        let input_diagnostic = Arc::new(InputDiagnostic::new());
         let render_snapshot = Arc::clone(&latest_snapshot);
         let render_latest_view = Arc::clone(&latest_view);
+        let render_input_diagnostic = Arc::clone(&input_diagnostic);
         let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
         // Release builds run with the backend validation layers off. A GPU fault
         // ("[GPU DEVICE LOST] reason=Unknown: Device is lost") cannot be traced to
@@ -125,6 +130,7 @@ impl RenderThread {
                         command_rx,
                         render_snapshot,
                         render_latest_view,
+                        render_input_diagnostic,
                         initial,
                         initial_ui,
                         base,
@@ -145,6 +151,7 @@ impl RenderThread {
             instance: surface_instance,
             latest_snapshot,
             latest_view,
+            input_diagnostic,
             join: Some(join),
         })
     }
@@ -202,6 +209,72 @@ impl RenderThread {
             .publish_rotation(yaw, pitch, crosshair_world, Some(input));
     }
 
+    /// Request a bounded renderer CPU recording after map/shader warmup.
+    pub fn start_render_perf_capture(&self, stem: PathBuf, frames: usize) -> Result<(), &'static str> {
+        self.command_tx.send(RenderCommand::StartPerfCapture { stem, frames })
+            .map_err(|_| "renderer command channel closed")
+    }
+
+    /// Arm the short input/presentation capture. Recording begins on the first
+    /// captured mouse event so opening/closing the console is excluded.
+    pub fn arm_input_diagnostic(&self, stem: PathBuf) -> Result<(), &'static str> {
+        self.input_diagnostic.arm(stem)
+    }
+
+    #[inline]
+    pub fn begin_input_diagnostic_mouse(&self, event_at: Instant) {
+        self.input_diagnostic.begin_mouse_event(event_at);
+    }
+
+    #[inline]
+    pub fn finish_input_diagnostic_mouse(
+        &self,
+        event_at: Instant,
+        simulation_at: Option<Instant>,
+        completed_at: Instant,
+        dx: f64,
+        dy: f64,
+        input_sequence: Option<u64>,
+        device_id_hash: u64,
+        window_focused: bool,
+        captured: bool,
+        grab_mode: &'static str,
+    ) {
+        self.input_diagnostic.finish_mouse_event(
+            event_at,
+            simulation_at,
+            completed_at,
+            dx,
+            dy,
+            input_sequence,
+            device_id_hash,
+            window_focused,
+            captured,
+            grab_mode,
+        );
+    }
+
+    pub fn record_input_diagnostic_event_loop_turn(
+        &self,
+        at: Instant,
+        cause: &'static str,
+        window_focused: bool,
+        captured: bool,
+        grab_mode: &'static str,
+    ) {
+        self.input_diagnostic.record_event_loop_turn(
+            at,
+            cause,
+            window_focused,
+            captured,
+            grab_mode,
+        );
+    }
+
+    pub fn take_input_diagnostic_notices(&self) -> Vec<String> {
+        self.input_diagnostic.take_notices()
+    }
+
     pub fn shutdown(&mut self) {
         let _ = self.command_tx.send(RenderCommand::Shutdown);
         if let Some(join) = self.join.take() {
@@ -244,6 +317,7 @@ pub(in crate::renderer) fn render_thread_main(
     command_rx: Receiver<RenderCommand>,
     latest_snapshot: Arc<Mutex<RenderSnapshot>>,
     latest_view: Arc<LatestViewState>,
+    input_diagnostic: Arc<InputDiagnostic>,
     mut snapshot: RenderSnapshot,
     initial_ui: UiSnapshot,
     base: PathBuf,
@@ -272,6 +346,22 @@ pub(in crate::renderer) fn render_thread_main(
         renderer_init_started.elapsed().as_secs_f64() * 1000.0
     );
     renderer.set_vsync(initial_ui.video.vsync);
+    {
+        let info = renderer.adapter.get_info();
+        input_diagnostic.set_renderer_metadata(InputDiagRendererMetadata {
+            adapter_name: info.name,
+            backend: format!("{:?}", info.backend),
+            device_type: format!("{:?}", info.device_type),
+            driver: info.driver,
+            driver_info: info.driver_info,
+            vendor: info.vendor,
+            device: info.device,
+            surface_format: format!("{:?}", renderer.config.format),
+            alpha_mode: format!("{:?}", renderer.config.alpha_mode),
+            surface_usage: format!("{:?}", renderer.config.usage),
+            supported_present_modes: format!("{:?}", renderer.present_modes),
+        });
+    }
     renderer
         .dynamic_model_renderer
         .set_fx_zero_alpha_discard(initial_ui.video.fx_zero_alpha_discard);
@@ -319,6 +409,7 @@ pub(in crate::renderer) fn render_thread_main(
         fxaa: initial_ui.video.fxaa,
         smaa: initial_ui.video.smaa,
         taa: initial_ui.video.taa,
+        rt_taa: initial_ui.video.rt_taa,
         contact_shadows: initial_ui.video.contact_shadows,
         fog_mode: initial_ui.video.fog_mode,
         fog_strength: initial_ui.video.fog_strength,
@@ -329,6 +420,7 @@ pub(in crate::renderer) fn render_thread_main(
         sun_color: initial_ui.video.sun_color,
         sun_visibility: initial_ui.video.sun_visibility,
         entity_sun_lighting: initial_ui.video.entity_sun_lighting,
+        sky_fractal_override: initial_ui.video.sky_fractal_override,
         clouds: initial_ui.video.clouds,
         cloud_type: initial_ui.video.cloud_type,
         cloud_quality: initial_ui.video.cloud_quality,
@@ -336,6 +428,7 @@ pub(in crate::renderer) fn render_thread_main(
         cloud_height: initial_ui.video.cloud_height,
         cloud_thickness: initial_ui.video.cloud_thickness,
         weather_wind: initial_ui.video.weather_wind,
+        wind_visuals: initial_ui.video.wind_visuals,
         cloud_shadows: initial_ui.video.cloud_shadows,
         cloud_render_resolution: initial_ui.video.cloud_render_resolution,
         cloud_temporal: initial_ui.video.cloud_temporal,
@@ -354,6 +447,16 @@ pub(in crate::renderer) fn render_thread_main(
         cloud_size: initial_ui.video.cloud_size,
         rain: initial_ui.video.rain,
         rain_intensity: initial_ui.video.rain_intensity,
+        rain_density_scale: 1.0,
+        rain_tint: [1.0; 3],
+        rain_frozen: false,
+        snow: false,
+        snow_density_scale: 1.0,
+        snow_frozen: false,
+        legacy_sand_layers: 0,
+        legacy_space_dust_count: 0,
+        legacy_weather_frozen: false,
+        legacy_acid_rain: 0.0,
         rain_glass: initial_ui.video.rain_glass,
         puddle_quality: initial_ui.video.puddle_quality,
         puddle_scatter: initial_ui.video.puddle_scatter,
@@ -385,6 +488,16 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.set_grass_precompute(initial_ui.video.grass_precompute);
     renderer.set_grass_mid_lod(initial_ui.video.grass_mid_lod);
     renderer.set_grass_front_to_back(initial_ui.video.grass_front_to_back);
+    renderer.set_rain_optimizations(
+        initial_ui.video.rain_fast_post,
+        initial_ui.video.rain_water_field,
+        initial_ui.video.rain_fast_vertex,
+        initial_ui.video.rain_lean_depth,
+        initial_ui.video.rain_static_depth,
+        initial_ui.video.rain_opaque_depth,
+        initial_ui.video.rain_lean_models,
+        initial_ui.video.rain_lean_post,
+    );
     let mut initial_ocean_settings = initial_ui.video.ocean_settings;
     initial_ocean_settings.wind = initial_ui.video.weather_wind;
     renderer.set_ocean_settings(initial_ocean_settings);
@@ -394,13 +507,30 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
     renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
     renderer.set_rt_samples(initial_ui.video.rt_samples);
+    renderer.set_rt_denoiser_mode(initial_ui.video.rt_denoiser_mode);
     renderer.set_dynamic_light_falloff(initial_ui.video.dynamic_light_falloff);
     renderer.set_rt_half_resolution(initial_ui.video.rt_half_resolution);
     renderer.set_map_light_simulation(initial_ui.video.map_light_simulation);
     renderer.set_emissive_area_lights(initial_ui.video.emissive_area_lights);
+    let mut shader_light_mask = 0_u32;
+    if initial_ui.video.promote_shader_glow {
+        shader_light_mask |= crate::materials::SHADER_LIGHT_GLOW;
+    }
+    if initial_ui.video.promote_shader_additive {
+        shader_light_mask |= crate::materials::SHADER_LIGHT_ADDITIVE;
+    }
+    if initial_ui.video.promote_shader_emissive {
+        shader_light_mask |= crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION;
+    }
+    renderer.set_shader_light_promotion(
+        initial_ui.video.promote_shader_lights,
+        shader_light_mask,
+    );
     renderer.set_entity_ambient_lighting(initial_ui.video.entity_ambient_lighting);
     renderer.set_voxel_probe_gi(initial_ui.video.voxel_probe_gi);
     renderer.set_local_light_shadows(initial_ui.video.local_light_shadows);
+    renderer.set_tinted_glass(initial_ui.video.tinted_glass);
+    renderer.set_tinted_glass_debug(initial_ui.video.tinted_glass_debug);
     renderer.set_entity_shadow_light(initial_ui.video.entity_shadow_light);
     renderer.set_pbr_settings(
         initial_ui.video.pbr,
@@ -467,6 +597,10 @@ pub(in crate::renderer) fn render_thread_main(
     let mut motion_camera_sample_dt = 1.0 / 120.0;
     let mut motion_camera_changed_at = Instant::now();
 
+    // Owned exclusively by this thread. There is no shared collection state,
+    // and each successful frame adds one small, allocation-free PerfRow.
+    let mut perf_capture: Option<PerfCapture> = None;
+
     // Opt-in console diagnostics. Keep the normal maximum-FPS path free of
     // per-frame formatting/printing, and only aggregate when explicitly asked.
     let mut trace_started = Instant::now();
@@ -479,6 +613,22 @@ pub(in crate::renderer) fn render_thread_main(
     let mut trace_present_ms = 0.0_f64;
     let mut trace_dynamic_model_ms = 0.0_f64;
     let mut trace_grass_cpu_ms = 0.0_f64;
+    // The per-pass GPU numbers printed below come from `gpu_profiler.latest`,
+    // which is ONE frame. That is misleading for deliberately amortized work:
+    // the ocean FFT encodes one cascade on roughly one frame in N, so a single
+    // sample cannot tell a ~3ms cascade frame from a ~0.04ms idle frame, and
+    // either one read alone gives the wrong answer about what the ocean costs.
+    // Accumulate min/avg/max across the trace window for those passes instead.
+    const TRACE_GPU_PASSES: [GpuPass; 4] = [
+        GpuPass::Frame,
+        GpuPass::OceanSim,
+        GpuPass::OceanSurface,
+        GpuPass::OceanOptics,
+    ];
+    let mut trace_gpu_sum = [0.0_f64; TRACE_GPU_PASSES.len()];
+    let mut trace_gpu_min = [f64::INFINITY; TRACE_GPU_PASSES.len()];
+    let mut trace_gpu_max = [0.0_f64; TRACE_GPU_PASSES.len()];
+    let mut trace_gpu_n = [0_u64; TRACE_GPU_PASSES.len()];
     // Advanced-path prepare breakdown: camera, shadow, world, reflection.
     let mut trace_prep_stage_ms = [0.0_f64; 4];
     if perf_trace {
@@ -492,6 +642,8 @@ pub(in crate::renderer) fn render_thread_main(
     let mut deferred_load_map = None;
 
     loop {
+        let mut diag_command_drain_count = 0_u32;
+        let diag_command_drain_ms: f64;
         // Checked before the command batch as well as before the frame: map and
         // texture uploads run from here, and on a dead device those fail the same
         // silent way, panicking somewhere inside wgpu instead of reporting.
@@ -525,10 +677,22 @@ pub(in crate::renderer) fn render_thread_main(
                     bsp_stats,
                 ));
             }
+            let diag_command_drain_started = input_diagnostic.is_recording().then(Instant::now);
             loop {
                 let received = command_rx.try_recv();
+                if diag_command_drain_started.is_some() && received.is_ok() {
+                    diag_command_drain_count = diag_command_drain_count.saturating_add(1);
+                }
                 let command_started = Instant::now();
                 match received {
+                    Ok(RenderCommand::StartPerfCapture { stem, frames }) => {
+                        // Re-arming discards an incomplete run. Drop clears the
+                        // global hook flag before the new capture enables it.
+                        perf_capture = None;
+                        eprintln!("[RENDER PERF] armed {} samples -> {} (2s delay + 120 warmup frames)",
+                            frames.clamp(30, 6_000), stem.display());
+                        perf_capture = Some(PerfCapture::arm(stem, frames, &renderer));
+                    }
                     Ok(RenderCommand::BatchBegin(title)) => {
                         renderer.begin_settings_batch();
                         batch_timing = Some(RenderBatchTiming::new(title));
@@ -581,6 +745,16 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.debug_volumes.sun_ray_enabled = enabled;
                     }
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
+                    Ok(RenderCommand::SetWorldFlares(enabled)) => {
+                        if renderer.world_flares_enabled != enabled {
+                            renderer.world_flares.invalidate_history();
+                            renderer.world_flares_sky.invalidate_history();
+                            for flare_view in &mut renderer.world_flares_planar {
+                                flare_view.invalidate_history();
+                            }
+                        }
+                        renderer.world_flares_enabled = enabled;
+                    }
                     Ok(RenderCommand::SetFpsCap(cap)) => fps_cap = cap,
                     Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
                     Ok(RenderCommand::SetGammaMethod(method)) => {
@@ -615,6 +789,25 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetGrassFrontToBack(enabled)) => {
                         renderer.set_grass_front_to_back(enabled)
                     }
+                    Ok(RenderCommand::SetRainOptimizations {
+                        fast_post,
+                        water_field,
+                        fast_vertex,
+                        lean_depth,
+                        static_depth,
+                        opaque_depth,
+                        lean_models,
+                        lean_post,
+                    }) => renderer.set_rain_optimizations(
+                        fast_post,
+                        water_field,
+                        fast_vertex,
+                        lean_depth,
+                        static_depth,
+                        opaque_depth,
+                        lean_models,
+                        lean_post,
+                    ),
                     Ok(RenderCommand::SetContactShadowDebug(enabled)) => {
                         renderer.contact_shadow_debug = enabled
                     }
@@ -674,7 +867,11 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetDynamicLighting(mode)) => {
                         renderer.set_dynamic_lighting(mode);
                     }
+                    Ok(RenderCommand::SetDynamicLightDebug(enabled)) => {
+                        renderer.set_dynamic_light_debug(enabled);
+                    }
                     Ok(RenderCommand::SetRtSamples(samples)) => renderer.set_rt_samples(samples),
+                    Ok(RenderCommand::SetRtDenoiserMode(mode)) => renderer.set_rt_denoiser_mode(mode),
                     Ok(RenderCommand::SetDynamicLightFalloff(mode)) => {
                         renderer.set_dynamic_light_falloff(mode)
                     }
@@ -698,6 +895,9 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetEmissiveAreaLights(enabled)) => {
                         renderer.set_emissive_area_lights(enabled);
                     }
+                    Ok(RenderCommand::SetShaderLightPromotion { enabled, mask }) => {
+                        renderer.set_shader_light_promotion(enabled, mask);
+                    }
                     Ok(RenderCommand::SetEntityAmbientLighting(mode)) => {
                         renderer.set_entity_ambient_lighting(mode);
                     }
@@ -706,6 +906,12 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetLocalLightShadows(enabled)) => {
                         renderer.set_local_light_shadows(enabled);
+                    }
+                    Ok(RenderCommand::SetTintedGlass(enabled)) => {
+                        renderer.set_tinted_glass(enabled);
+                    }
+                    Ok(RenderCommand::SetTintedGlassDebug(mode)) => {
+                        renderer.set_tinted_glass_debug(mode);
                     }
                     Ok(RenderCommand::SetEntityShadowLight(source)) => {
                         renderer.set_entity_shadow_light(source);
@@ -824,6 +1030,7 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.request_screenshot(directory, metadata, format)
                     }
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
+                    Ok(RenderCommand::CaptureVideoFrame { frame_index, depth }) => renderer.request_video_frame_capture(frame_index, depth),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
                     Ok(RenderCommand::SetTransientUi {
                         chat_lines,
@@ -984,6 +1191,9 @@ pub(in crate::renderer) fn render_thread_main(
                     batch.record(command_started.elapsed());
                 }
             }
+            diag_command_drain_ms = diag_command_drain_started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
             if let Some((completed, total)) = renderer.poll_static_ao_progress() {
                 let _ = proxy.send_event(UserEvent::StaticAoProgress { completed, total });
             }
@@ -1029,7 +1239,6 @@ pub(in crate::renderer) fn render_thread_main(
             renderer.set_cloud_foreground(&next.cloud_foreground);
             snapshot = next;
         }
-
         if renderer.size.width == 0 || renderer.size.height == 0 {
             thread::sleep(Duration::from_millis(8));
             continue;
@@ -1054,6 +1263,12 @@ pub(in crate::renderer) fn render_thread_main(
         }
 
         let frame_loop_started = Instant::now();
+        let diag_frame_start_input = input_diagnostic
+            .is_recording()
+            .then(|| latest_view.load().input)
+            .flatten();
+        let mut diag_present_latest_input = None;
+        let mut diag_rendered = false;
         // Permanent subframe input samples the same lock-free latest-view mailbox
         // at frame start. `cl_input_latelatch 1` defers that exact sample until
         // the renderer's last coherent camera point, making the A/B comparison
@@ -1088,6 +1303,7 @@ pub(in crate::renderer) fn render_thread_main(
                     .count();
             }
             renderer.model_frame_log.set_source(model_source);
+            renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
             let _activity = crate::thread_activity::activity(
                 crate::thread_activity::ThreadSlot::Render,
                 crate::thread_activity::Task::RenderFrame,
@@ -1106,6 +1322,7 @@ pub(in crate::renderer) fn render_thread_main(
                     snapshot.player_position,
                     snapshot.area_mask.as_ref(),
                     snapshot.dynamic_models.as_slice(),
+                    snapshot.spectator_highlights.as_slice(),
                     snapshot.transient_lights.as_slice(),
                     snapshot.companion_scene.as_ref(),
                     snapshot.dof_focus_target,
@@ -1135,6 +1352,11 @@ pub(in crate::renderer) fn render_thread_main(
         }
         match render_result {
             Ok(info) => {
+                if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer)) {
+                    if let Some(completed) = perf_capture.take() {
+                        completed.finish();
+                    }
+                }
                 for scene_frame in renderer.take_companion_scene_ready() {
                     if let Some(worker) = companion_renderers.get(&scene_frame.id) {
                         worker.publish_scene(scene_frame);
@@ -1158,12 +1380,26 @@ pub(in crate::renderer) fn render_thread_main(
                     trace_present_ms += info.cpu_present_ms;
                     trace_dynamic_model_ms += info.dynamic_model_prepare_ms;
                     trace_grass_cpu_ms += info.grass.cpu_ms;
+                    if let Some(timing) = renderer.gpu_profiler.latest {
+                        for (slot, pass) in TRACE_GPU_PASSES.iter().enumerate() {
+                            if let Some(ms) = timing.milliseconds[pass.index()] {
+                                trace_gpu_sum[slot] += ms;
+                                trace_gpu_min[slot] = trace_gpu_min[slot].min(ms);
+                                trace_gpu_max[slot] = trace_gpu_max[slot].max(ms);
+                                trace_gpu_n[slot] += 1;
+                            }
+                        }
+                    }
                     trace_prep_stage_ms[0] += info.prep_camera_ms;
                     trace_prep_stage_ms[1] += info.prep_shadow_ms;
                     trace_prep_stage_ms[2] += info.prep_world_ms;
                     trace_prep_stage_ms[3] += info.prep_reflection_ms;
                 }
                 last_info = info;
+                if input_diagnostic.is_recording() {
+                    diag_rendered = true;
+                    diag_present_latest_input = latest_view.load().input;
+                }
                 let late_measurement = input_latelatch
                     .then_some(last_info.late_latch)
                     .flatten()
@@ -1257,7 +1493,9 @@ pub(in crate::renderer) fn render_thread_main(
                 stop_for_device_loss(&proxy, renderer, companion_renderers);
                 return;
             }
-            Err(RenderError::Lost | RenderError::Outdated) => renderer.reconfigure(),
+            Err(RenderError::Lost | RenderError::Outdated) => {
+                renderer.reconfigure("surface_lost_or_outdated")
+            }
             Err(RenderError::Timeout) => {}
             Err(RenderError::Occluded) => {
                 // An occluded/minimized/hidden surface cannot make forward progress
@@ -1525,10 +1763,11 @@ pub(in crate::renderer) fn render_thread_main(
                     dlight.total_surfaces_per_light as f64 / dlight.transient_count as f64
                 };
                 println!(
-                    "[JKA DLIGHT PERF] transient={} sources[saber={} fx={} saber_mark={}] radius[avg={:.2} max={:.2}] surfaces[total={} eligible={} touched={}] pairs={} mask_density={:.2}% candidates_per_touched[avg={:.2} max={}] buckets[0={} 1={} 2-4={} 5-8={} 9-16={} 17+={}] pairs_by_source[saber={} fx={} saber_mark={}] surfaces_per_light[avg={:.2} max={}]",
+                    "[JKA DLIGHT PERF] transient={} sources[saber={} fx={} promoted_fx={} saber_mark={}] radius[avg={:.2} max={:.2}] surfaces[total={} eligible={} touched={}] pairs={} mask_density={:.2}% candidates_per_touched[avg={:.2} max={}] buckets[0={} 1={} 2-4={} 5-8={} 9-16={} 17+={}] pairs_by_source[saber={} fx={} promoted_fx={} saber_mark={}] surfaces_per_light[avg={:.2} max={}]",
                     dlight.transient_count,
                     dlight.saber_sources,
                     dlight.authored_fx_sources,
+                    dlight.promoted_fx_sources,
                     dlight.saber_mark_sources,
                     avg_radius,
                     dlight.radius_max,
@@ -1547,23 +1786,31 @@ pub(in crate::renderer) fn render_thread_main(
                     dlight.surface_buckets[5],
                     dlight.saber_pairs,
                     dlight.authored_fx_pairs,
+                    dlight.promoted_fx_pairs,
                     dlight.saber_mark_pairs,
                     avg_surfaces_per_light,
                     dlight.max_surfaces_per_light,
                 );
             }
             println!(
-                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms",
+                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_sim={}ms ocean_surface={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms rain_sim={}ms rain_draw={}ms rain_haze={}ms rain_froxel={}ms rain_lens={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms",
                 gpu_ms(GpuPass::Frame),
                 gpu_ms(GpuPass::RtBuild),
                 gpu_ms(GpuPass::World),
                 gpu_ms(GpuPass::LegacyDlights),
                 dynamic_model_ms,
                 fx_sprite_ms,
+                gpu_ms(GpuPass::OceanSim),
+                gpu_ms(GpuPass::OceanSurface),
                 gpu_ms(GpuPass::OceanOptics),
                 grass_total_ms,
                 gpu_ms(GpuPass::GrassPrepare),
                 gpu_ms(GpuPass::Grass),
+                gpu_ms(GpuPass::RainSim),
+                gpu_ms(GpuPass::RainDraw),
+                gpu_ms(GpuPass::RainHaze),
+                gpu_ms(GpuPass::WeatherFog),
+                gpu_ms(GpuPass::RainLens),
                 gpu_ms(GpuPass::Post),
                 gpu_ms(GpuPass::Depth),
                 gpu_ms(GpuPass::HiZ),
@@ -1572,14 +1819,39 @@ pub(in crate::renderer) fn render_thread_main(
                 gpu_ms(GpuPass::Ui),
                 gpu_ms(GpuPass::Clouds),
             );
+            println!(
+                "[JKA WEATHER PERF] ab[fast_post={} water_field={} fast_vertex={} lean_depth={} static_depth={} opaque_depth={} lean_models={} lean_post={} haze_2d={}] rain_only_depth={} rain_only_post={} rain[sim={}ms draw={}ms haze={}ms froxel={}ms lens={}ms] frame={}ms depth={}ms post={}ms",
+                u8::from(renderer.weather.rain.fast_post),
+                u8::from(renderer.weather.rain.water_field_enabled),
+                u8::from(renderer.weather.rain.fast_vertex),
+                u8::from(renderer.weather.rain.lean_depth),
+                u8::from(renderer.weather.rain.static_depth),
+                u8::from(renderer.weather.rain.opaque_depth),
+                u8::from(renderer.weather.rain.lean_models),
+                u8::from(renderer.weather.rain.lean_post),
+                u8::from(renderer.rain_uses_2d_haze()),
+                u8::from(renderer.frame_plan.rain_only_linear_depth),
+                u8::from(renderer.frame_plan.rain_only_post),
+                gpu_ms(GpuPass::RainSim),
+                gpu_ms(GpuPass::RainDraw),
+                gpu_ms(GpuPass::RainHaze),
+                gpu_ms(GpuPass::WeatherFog),
+                gpu_ms(GpuPass::RainLens),
+                gpu_ms(GpuPass::Frame),
+                gpu_ms(GpuPass::Depth),
+                gpu_ms(GpuPass::Post),
+            );
             if renderer.hardware_rt_active() {
                 if let Some(rt) = renderer.ray_traced_shadows.as_ref() {
                     println!(
-                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms sun_shadow_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
+                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms sun_radiance={}ms local_radiance={}ms rt_denoiser={} sun_shadow_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
                     gpu_ms(GpuPass::RtBuild),
                     gpu_ms(GpuPass::RtSkin),
                     gpu_ms(GpuPass::RtAcceleration),
                     gpu_ms(GpuPass::RtVisibility),
+                    gpu_ms(GpuPass::RtRadiance),
+                    gpu_ms(GpuPass::RtLocalRadiance),
+                    renderer.rt_denoiser_mode,
                     if renderer.rt_reduced_shadows { "quarter" } else { "full" },
                     rt.geometry_count,
                     rt.triangle_count,
@@ -1596,9 +1868,83 @@ pub(in crate::renderer) fn render_thread_main(
                     rt.alpha_texels.len(),
                         rt.alpha_buffers_generation,
                         if renderer.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun) { renderer.rt_samples } else { 0 },
-                        if renderer.ray_traced_local_shadows_active() { format!("up_to_{}_per_segment_1_per_point", renderer.rt_samples) } else { "0".into() },
+                        if renderer.ray_traced_local_shadows_active() { format!("up_to_{}_per_finite_emitter_1_per_hard_point", renderer.rt_samples) } else { "0".into() },
                     );
                 }
+            }
+            let ocean = last_info.ocean;
+            // `promoted` counts what the loaded map CARRIES, which says nothing
+            // about whether the ocean is rendering: water is clustered and
+            // promoted at upload regardless. The `gates` group is the authority.
+            // `resources` is the renderer's OceanGpu (created by
+            // SetOceanEnabled), `variant` is the active world PSO's ocean
+            // support, and `active` is the `render_ocean` both must agree on
+            // (draw.rs). cvar=1 with resources=0 means the setting was changed
+            // on a world prepared without ocean: apply video settings or
+            // vid_restart.
+            let ocean_variant = renderer
+                .world
+                .as_ref()
+                .is_some_and(|world| world.active_pipeline_variant.ocean);
+            let ocean_resources = renderer.ocean.is_some();
+            // avg/min/max over the trace window, not one frame: see TRACE_GPU_PASSES.
+            // `avg` is what the ocean actually costs per frame; a large max/avg
+            // ratio means the work is spiky rather than expensive.
+            let gpu_window: [String; TRACE_GPU_PASSES.len()] =
+                std::array::from_fn(|slot| {
+                    if trace_gpu_n[slot] == 0 {
+                        return "--/--/--".to_string();
+                    }
+                    format!(
+                        "{:.4}/{:.4}/{:.4}",
+                        trace_gpu_sum[slot] / trace_gpu_n[slot] as f64,
+                        trace_gpu_min[slot],
+                        trace_gpu_max[slot],
+                    )
+                });
+            if ocean.promoted_surfaces > 0 || ocean.authored_oceans > 0 || renderer.ocean_enabled {
+                println!(
+                    "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] samples={} avg/min/max_ms sim={} surface={} optics={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",
+                    u8::from(renderer.ocean_enabled),
+                    u8::from(ocean_resources),
+                    u8::from(ocean_variant),
+                    u8::from(renderer.ocean_enabled && ocean_variant),
+                    trace_gpu_n[1],
+                    gpu_window[1].as_str(),
+                    gpu_window[2].as_str(),
+                    gpu_window[3].as_str(),
+                    gpu_window[0].as_str(),
+                    ocean.promoted_surfaces,
+                    ocean.authored_oceans,
+                    ocean.clipmap_batches,
+                    ocean.clipmaps_drawn,
+                    ocean.rejected_duplicate,
+                    ocean.rejected_area,
+                    ocean.rejected_frustum,
+                    ocean.visible_samples,
+                    u8::from(ocean.visibility_primed),
+                    ocean.triangles,
+                    ocean.minimum_level,
+                    ocean.half_cells,
+                    u8::from(ocean.optics_active),
+                    u8::from(ocean.submerged),
+                    ocean.optics_pixels,
+                    u64::from(renderer.config.width) * u64::from(renderer.config.height),
+                    ocean.optics_rect[2],
+                    ocean.optics_rect[3],
+                    ocean.optics_rect[0],
+                    ocean.optics_rect[1],
+                    u8::from(ocean.optics_unbounded),
+                    u8::from(ocean.sim_hidden),
+                    renderer.ocean_settings.mesh_quality,
+                    renderer.ocean_settings.map_size,
+                    renderer.ocean_settings.updates_per_second,
+                    u8::from(renderer.ocean_settings.wind_foam_streaks),
+                    u8::from(renderer.ocean_settings.sea_spray),
+                    u8::from(renderer.ocean_settings.optics.cull),
+                    u8::from(renderer.ocean_settings.optics.scissor),
+                    u8::from(renderer.ocean_settings.simulate_when_hidden),
+                );
             }
             let grass = last_info.grass;
             println!(
@@ -1624,7 +1970,7 @@ pub(in crate::renderer) fn render_thread_main(
                 u8::from(renderer.grass_front_to_back_enabled),
             );
             println!(
-                "[JKA PERF PLAN] post={} gamma_fast={} linear_depth={} hiz={} gpu_cull={} compact={} clustered={} gamma={:.3} grain={:.3} lut={} lut_strength={:.2} fog={:?} hdr={} tonemap={} bloom={} ssao={} static_ao={} fxaa={} smaa={} taa={} contact={} ssr={} motion={:.2} motion_scale={:.2} dof={:.2} dof_quality={} dof_focus={:.0} ca={:.2} vignette={} local_shadows={} pbr={} pom={} cascaded={}",
+                "[JKA PERF PLAN] post={} post_compact={} linear_depth={} hiz={} gpu_cull={} compact={} clustered={} gamma={:.3} grain={:.3} lut={} lut_strength={:.2} fog={:?} hdr={} tonemap={} bloom={} ssao={} static_ao={} fxaa={} smaa={} taa={} contact={} ssr={} motion={:.2} motion_scale={:.2} dof={:.2} dof_quality={} dof_focus={:.0} ca={:.2} vignette={} local_shadows={} pbr={} pom={} cascaded={}",
                 u8::from(renderer.frame_plan.use_post),
                 u8::from(renderer.frame_plan.gamma_only_post),
                 u8::from(renderer.frame_plan.needs_linear_depth),
@@ -1706,7 +2052,7 @@ pub(in crate::renderer) fn render_thread_main(
                 snapshot.camera.pitch,
                 renderer.dynamic_lights_mode.config_value(),
                 u8::from(renderer.point_lighting_enabled()),
-                u8::from(renderer.emissive_area_lights_enabled),
+                u8::from(renderer.any_area_lights_enabled()),
                 u8::from(renderer.voxel_probe_gi_enabled),
                 match renderer.frame_plan.world_path {
                     WorldRenderPath::FastBaseline => "fast-baseline",
@@ -1728,6 +2074,10 @@ pub(in crate::renderer) fn render_thread_main(
                 renderer.active_light_count(),
             );
             trace_started = Instant::now();
+            trace_gpu_sum = [0.0; TRACE_GPU_PASSES.len()];
+            trace_gpu_min = [f64::INFINITY; TRACE_GPU_PASSES.len()];
+            trace_gpu_max = [0.0; TRACE_GPU_PASSES.len()];
+            trace_gpu_n = [0; TRACE_GPU_PASSES.len()];
             trace_frames = 0;
             trace_frame_ms = 0.0;
             trace_prepare_ms = 0.0;
@@ -1740,22 +2090,115 @@ pub(in crate::renderer) fn render_thread_main(
             trace_prep_stage_ms = [0.0; 4];
         }
 
+        let diag_pacer_active = input_diagnostic.is_recording();
+        let mut diag_pace_target_ms = 0.0_f64;
+        let mut diag_pace_wait_ms = 0.0_f64;
+        let mut diag_pace_wake_error_ms = 0.0_f64;
+        let mut diag_pace_late_before_wait_ms = 0.0_f64;
+        let mut diag_pace_anchor_reset = false;
         if fps_cap > 0 {
             let target = Duration::from_secs_f64(1.0 / fps_cap as f64);
             let deadline = frame_pace_anchor + target;
+            let before_wait = Instant::now();
+            let missed_deadline = before_wait > deadline;
+            if diag_pacer_active {
+                diag_pace_target_ms = target.as_secs_f64() * 1000.0;
+                diag_pace_late_before_wait_ms = signed_instant_delta_ms(before_wait, deadline);
+            }
             precise_frame_wait(deadline);
             // On time: keep the exact cadence. Late (frame slower than the cap,
             // cap changed, menu/pause transition): restart it rather than
-            // bursting to catch up.
+            // shortening the next frame to catch up. The old code only reset
+            // after being a *full additional frame* late, which created
+            // long/short motion cadence after smaller misses.
             let now = Instant::now();
-            frame_pace_anchor = if now.saturating_duration_since(deadline) > target {
-                now
-            } else {
-                deadline
-            };
+            if diag_pacer_active {
+                diag_pace_wait_ms = now.saturating_duration_since(before_wait).as_secs_f64() * 1000.0;
+                diag_pace_wake_error_ms = signed_instant_delta_ms(now, deadline);
+            }
+            diag_pace_anchor_reset = missed_deadline;
+            frame_pace_anchor = if diag_pace_anchor_reset { now } else { deadline };
         } else {
             frame_pace_anchor = Instant::now();
         }
+
+        if input_diagnostic.is_recording() {
+            let diag_frame_completed = Instant::now();
+            if diag_rendered {
+                let latch = if input_latelatch {
+                    last_info.late_latch
+                } else {
+                    frame_start_view_sample
+                };
+                let latch_phase = if latch.is_none() {
+                    InputDiagLatchPhase::None
+                } else if !input_latelatch {
+                    InputDiagLatchPhase::FrameStart
+                } else if last_info.late_latch_after_acquire {
+                    InputDiagLatchPhase::PostAcquire
+                } else {
+                    InputDiagLatchPhase::PreAcquire
+                };
+                input_diagnostic.record_frame(InputDiagFrameSample {
+                    frame_started: frame_loop_started,
+                    frame_completed: diag_frame_completed,
+                    frame_start_input_sequence: diag_frame_start_input.map(|sample| sample.sequence),
+                    present_latest_input_sequence: diag_present_latest_input.map(|sample| sample.sequence),
+                    latch,
+                    latch_phase,
+                    frame_ms: last_info.frame_ms,
+                    cpu_prepare_ms: last_info.cpu_prepare_ms,
+                    cpu_acquire_ms: last_info.cpu_acquire_ms,
+                    cpu_encode_ms: last_info.cpu_encode_ms,
+                    cpu_submit_ms: last_info.cpu_submit_ms,
+                    cpu_present_ms: last_info.cpu_present_ms,
+                    submit_call_at: last_info.submit_call_at,
+                    present_call_completed_at: last_info.present_call_completed_at,
+                    command_drain_count: diag_command_drain_count,
+                    command_drain_ms: diag_command_drain_ms,
+                    world_path: last_info.world_path,
+                    fps_cap,
+                    vsync: renderer.vsync.label(),
+                    present_mode: present_mode_label(renderer.config.present_mode),
+                    max_frame_latency: renderer.config.desired_maximum_frame_latency,
+                    surface_width: renderer.config.width,
+                    surface_height: renderer.config.height,
+                    surface_config_generation: renderer.surface_config_generation,
+                    surface_config_reason: renderer.surface_config_reason,
+                    surface_config_age_ms: diag_frame_completed
+                        .saturating_duration_since(renderer.surface_configured_at)
+                        .as_secs_f64()
+                        * 1000.0,
+                    input_latelatch,
+                    pace_target_ms: diag_pace_target_ms,
+                    pace_wait_ms: diag_pace_wait_ms,
+                    pace_wake_error_ms: diag_pace_wake_error_ms,
+                    pace_late_before_wait_ms: diag_pace_late_before_wait_ms,
+                    pace_anchor_reset: diag_pace_anchor_reset,
+                    client_perf: snapshot.client_perf,
+                });
+            }
+            input_diagnostic.maybe_finish(diag_frame_completed);
+        }
+    }
+}
+
+fn signed_instant_delta_ms(actual: Instant, target: Instant) -> f64 {
+    if actual >= target {
+        actual.duration_since(target).as_secs_f64() * 1000.0
+    } else {
+        -target.duration_since(actual).as_secs_f64() * 1000.0
+    }
+}
+
+fn present_mode_label(mode: wgpu::PresentMode) -> &'static str {
+    match mode {
+        wgpu::PresentMode::Fifo => "FIFO",
+        wgpu::PresentMode::FifoRelaxed => "FIFO_RELAXED",
+        wgpu::PresentMode::Immediate => "IMMEDIATE",
+        wgpu::PresentMode::Mailbox => "MAILBOX",
+        wgpu::PresentMode::AutoNoVsync => "AUTO_NO_VSYNC",
+        _ => "OTHER",
     }
 }
 

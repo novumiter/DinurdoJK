@@ -1,8 +1,8 @@
 //! Hud team.
 use crate::ui::{
     fixed_charset_text, proportional_text, proportional_text_width, rect, text,
-    textured_rect_with_source, truncate_jka_text, visible_jka_chars, ProportionalFont,
-    TeamOverlayUi, UiSnapshot, UiVertex, TEAM_ICON_CELL, TEAM_ICON_COLUMNS,
+    shared_player_icon_count, textured_rect_with_source, truncate_jka_text, visible_jka_chars,
+    ProportionalFont, UiSnapshot, UiVertex, TEAM_ICON_CELL, TEAM_ICON_COLUMNS,
     TEAM_ICON_TEXTURE_SOURCE,
 };
 
@@ -52,7 +52,7 @@ pub(in crate::ui) fn player_icon_atlas_cell(
 
 pub(in crate::ui) fn team_overlay_icon(
     out: &mut Vec<UiVertex>,
-    overlay: &TeamOverlayUi,
+    icon_count: usize,
     index: Option<u16>,
     x: f32,
     y: f32,
@@ -63,7 +63,7 @@ pub(in crate::ui) fn team_overlay_icon(
 ) {
     player_icon_atlas_cell(
         out,
-        overlay.icon_paths.len(),
+        icon_count,
         index,
         x,
         y,
@@ -130,6 +130,7 @@ pub(in crate::ui) fn build_team_overlay(
     let Some(overlay) = &ui.team_overlay else {
         return;
     };
+    let shared_icon_count = shared_player_icon_count(ui);
     if overlay.settings.mode == 0 || overlay.entries.is_empty() {
         return;
     }
@@ -254,7 +255,7 @@ pub(in crate::ui) fn build_team_overlay(
                 if overlay.settings.weapons {
                     team_overlay_icon(
                         out,
-                        overlay,
+                        shared_icon_count,
                         entry.weapon_icon,
                         icon_x_v * sx,
                         y,
@@ -268,7 +269,7 @@ pub(in crate::ui) fn build_team_overlay(
                 for &icon in &entry.powerup_icons {
                     team_overlay_icon(
                         out,
-                        overlay,
+                        shared_icon_count,
                         Some(icon),
                         pw_x_v * sx,
                         y,
@@ -448,7 +449,7 @@ pub(in crate::ui) fn build_team_overlay(
                 if overlay.settings.weapons {
                     team_overlay_icon(
                         out,
-                        overlay,
+                        shared_icon_count,
                         entry.weapon_icon,
                         ix_v * sx,
                         iy_v,
@@ -462,7 +463,7 @@ pub(in crate::ui) fn build_team_overlay(
                 for &icon in &entry.powerup_icons {
                     team_overlay_icon(
                         out,
-                        overlay,
+                        shared_icon_count,
                         Some(icon),
                         ix_v * sx,
                         iy_v,
@@ -533,7 +534,7 @@ pub(in crate::ui) fn build_team_overlay(
                 );
                 team_overlay_icon(
                     out,
-                    overlay,
+                    shared_icon_count,
                     entry.model_icon,
                     icon_x_v * sx,
                     (y_v + pad_v) * sy,
@@ -595,7 +596,7 @@ pub(in crate::ui) fn build_team_overlay(
                     pw_x_v -= pw_icon_w_v;
                     team_overlay_icon(
                         out,
-                        overlay,
+                        shared_icon_count,
                         Some(icon),
                         pw_x_v * sx,
                         (y_v + pad_v) * sy,
@@ -609,7 +610,7 @@ pub(in crate::ui) fn build_team_overlay(
                     pw_x_v -= pw_icon_w_v;
                     team_overlay_icon(
                         out,
-                        overlay,
+                        shared_icon_count,
                         entry.weapon_icon,
                         pw_x_v * sx,
                         (y_v + pad_v) * sy,

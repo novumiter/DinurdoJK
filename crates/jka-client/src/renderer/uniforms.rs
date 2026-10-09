@@ -203,7 +203,7 @@ pub(in crate::renderer) struct CloudHistoryKey {
     pub(in crate::renderer) coverage: f32,
     pub(in crate::renderer) height: f32,
     pub(in crate::renderer) thickness: f32,
-    pub(in crate::renderer) weather_wind: crate::ocean::OceanWind,
+    pub(in crate::renderer) weather_wind: crate::ocean::AtmosphericWind,
     pub(in crate::renderer) resolution: CloudRenderResolution,
     pub(in crate::renderer) temporal: bool,
     pub(in crate::renderer) temporal_depth_fix: bool,
@@ -361,7 +361,8 @@ pub(in crate::renderer) struct PostUniform {
     pub(in crate::renderer) cloud_wind: PostCloudWindSettings,
     pub(in crate::renderer) rain: [f32; 4], // enabled, intensity, distant haze strength, puddle accumulation
     pub(in crate::renderer) weather_occlusion: [f32; 4], // min render X/Z, inverse heightfield extent X/Z
-    pub(in crate::renderer) weather_look: [f32; 4], // scattered puddle amount, wet grade amount, high-quality water, reserved
+    pub(in crate::renderer) weather_look: [f32; 4], // scattered puddle amount, wet grade amount, high-quality water, rain reaching camera
+    pub(in crate::renderer) legacy_weather: [f32; 4], // sand haze, spacedust haze, acid-rain haze, 2D-rain-haze flag
     pub(in crate::renderer) underwater: [f32; 4], // surface Y over a submerged camera (NO_WATER_SURFACE if dry), absorption distance, reserved
     pub(in crate::renderer) cloud_foreground: [f32; 4], // blade count, reserved x3
     // Two vec4 per blade: [ax, ay, bx, by] pixels, then [glow radius px, nearest distance].
@@ -404,6 +405,9 @@ pub(in crate::renderer) struct SsrTemporalUniform {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(in crate::renderer) struct GammaPostUniform {
     pub(in crate::renderer) values: [f32; 4],
+    // x: HDR scene. HDR already removes the fog quantization that motivated the
+    // legacy output dither, so the compact presentation shader skips it.
+    pub(in crate::renderer) flags: [f32; 4],
 }
 
 #[repr(C)]
@@ -455,11 +459,23 @@ pub(in crate::renderer) struct DrawIndexedIndirectArgs {
 pub(in crate::renderer) struct GpuPointLight {
     pub(in crate::renderer) position_radius: [f32; 4],
     pub(in crate::renderer) color_intensity: [f32; 4],
-    // xyz: area normal, or RT segment half-vector when w=-1.
-    // w: -1=segment, 0=point, 1=one-sided area, 2=two-sided area.
+    // xyz: area/spot direction, or RT segment half-vector when w=-1.
+    // w: -1=segment, 0=point, 1=one-sided area, 2=two-sided area, 3=spot.
     pub(in crate::renderer) emitter: [f32; 4],
-    pub(in crate::renderer) shadow: [f32; 4], // x: cubemap slot + 1, 0 means unshadowed
+    // x/y: spot inner/outer cone cosine for emitter.w=3.
+    // z: static shader-promotion evidence mask (0 for authored/runtime lights).
+    // w: reserved.
+    pub(in crate::renderer) shape: [f32; 4],
+    // x: cubemap slot + 1; y: q3map falloff metadata;
+    // z: q3map extra_distance for static map lights OR source radius for
+    // runtime transients (shadow.w=1); w: runtime-transient marker.
+    pub(in crate::renderer) shadow: [f32; 4],
 }
+
+const _: () = assert!(
+    std::mem::size_of::<GpuPointLight>() == 5 * std::mem::size_of::<[f32; 4]>(),
+    "GpuPointLight must stay byte-for-byte aligned with the WGSL PointLight structs",
+);
 
 pub(in crate::renderer) fn transient_light_gpu(
     light: &TransientLight,
@@ -480,8 +496,23 @@ pub(in crate::renderer) fn transient_light_gpu(
             light.intensity.max(0.0) * intensity_scale,
         ],
         emitter: [0.0; 4],
-        shadow: [0.0, 0.0, 0.0, 1.0],
+        shape: [0.0; 4],
+        shadow: [0.0, 0.0, light.source_radius.max(0.0), 1.0],
     };
+    if let Some(spot) = light.spot {
+        let spot_is_finite = spot.direction.iter().all(|value| value.is_finite())
+            && spot.inner_cone_cos.is_finite()
+            && spot.outer_cone_cos.is_finite();
+        if spot_is_finite {
+            let direction = Vec3::from_array(spot.direction).normalize_or_zero();
+            if direction.length_squared() > 1.0e-8 {
+                let inner = spot.inner_cone_cos.clamp(-1.0, 1.0);
+                let outer = spot.outer_cone_cos.clamp(-1.0, inner);
+                result.emitter = [direction.x, direction.y, direction.z, 3.0];
+                result.shape = [inner, outer, 0.0, 0.0];
+            }
+        }
+    }
     if segment_enabled {
         if let Some([start, end]) = light
             .segment
@@ -492,6 +523,7 @@ pub(in crate::renderer) fn transient_light_gpu(
             if half.is_finite() && midpoint.is_finite() && half.length_squared() > 1e-8 {
                 result.position_radius[..3].copy_from_slice(&midpoint.to_array());
                 result.emitter = [half.x, half.y, half.z, -1.0];
+                result.shape = [0.0; 4];
             }
         }
     }

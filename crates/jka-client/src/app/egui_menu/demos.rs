@@ -1,7 +1,7 @@
 //! Demos.
 use crate::app::egui_menu::{
     frontend, rail_item, theme, thread, App, BTreeMap, DemoConsoleFilter, DemoMetadata,
-    DemoMetadataResult, Path,
+    DemoMetadataResult, Path, PathBuf,
 };
 
 impl App {
@@ -36,7 +36,7 @@ impl App {
         let demo_name = demo_name.to_owned();
         self.demo_metadata_inflight.insert(demo_name.clone());
         let base = self.base.clone();
-        let game = self.game.clone();
+        let game = self.demo_browser_game_path();
         let tx = self.demo_metadata_tx.clone();
         let generation = self.demo_metadata_generation;
         let worker_demo_name = demo_name.clone();
@@ -66,7 +66,42 @@ impl App {
         self.demo_catalog_loaded = true;
         self.demo_entries.clear();
         self.demo_catalog_error = None;
-        match frontend::scan_demos(&self.base, self.game.as_deref()) {
+        match frontend::scan_demo_game_directories(&self.base) {
+            Ok(games) => self.demo_game_choices = games,
+            Err(error) => {
+                eprintln!("Could not scan demo game directories: {error}");
+                self.demo_catalog_error = Some(error);
+                return;
+            }
+        }
+        let selected_game = if self.demo_game_filter.is_empty() {
+            "base"
+        } else {
+            self.demo_game_filter.as_str()
+        };
+        if !self
+            .demo_game_choices
+            .iter()
+            .any(|game| game.eq_ignore_ascii_case(selected_game))
+        {
+            self.demo_game_filter = self
+                .demo_game_choices
+                .first()
+                .map(|game| {
+                    if game.eq_ignore_ascii_case("base") {
+                        String::new()
+                    } else {
+                        game.clone()
+                    }
+                })
+                .unwrap_or_default();
+        }
+        if self.demo_game_choices.is_empty() {
+            return;
+        }
+
+        let game = self.demo_browser_game_path();
+        match frontend::scan_demos(&self.base, game.as_deref()) {
             Ok(demos) => self.demo_entries = demos,
             Err(error) => {
                 eprintln!("Could not build Play Demo catalog: {error}");
@@ -76,6 +111,26 @@ impl App {
         self.demo_selected = self
             .demo_selected
             .min(self.demo_entries.len().saturating_sub(1));
+    }
+
+    pub(in crate::app) fn demo_browser_game_path(&self) -> Option<PathBuf> {
+        let game = self.demo_game_filter.trim();
+        if game.is_empty() || game.eq_ignore_ascii_case("base") {
+            None
+        } else {
+            Some(self.base.parent().unwrap_or(&self.base).join(game))
+        }
+    }
+
+    fn reset_demo_browser_catalog(&mut self) {
+        self.demo_catalog_loaded = false;
+        self.demo_catalog_error = None;
+        self.demo_entries.clear();
+        self.demo_selected = 0;
+        self.demo_metadata_generation = self.demo_metadata_generation.wrapping_add(1);
+        self.demo_metadata_cache.clear();
+        self.demo_metadata_errors.clear();
+        self.demo_metadata_inflight.clear();
     }
 
     pub(in crate::app::egui_menu) fn format_demo_time(ms: i32) -> String {
@@ -441,10 +496,53 @@ impl App {
         theme::page_title(
             ui,
             "PLAY DEMO",
-            "Jedi Academy .dm_26 demos discovered from loose base/demos files and mounted PK3s.",
+            "Browse .dm_26 demos by game/mod directory. Only folders with loose demos/*.dm_26 files are shown.",
         );
 
         self.ensure_demo_catalog();
+
+        if let Some(error) = &self.demo_catalog_error {
+            theme::banner(ui, &format!("Demo scan failed: {error}"), theme::WARNING);
+            return;
+        }
+
+        let mut game_changed = false;
+        let games = self.demo_game_choices.clone();
+        ui.horizontal(|ui| {
+            theme::label(ui, theme::plain("MOD", 10.0, theme::TEXT_DISABLED));
+            let selected_text = if games.is_empty() {
+                "No demo folders".to_owned()
+            } else if self.demo_game_filter.is_empty() {
+                "base".to_owned()
+            } else {
+                self.demo_game_filter.clone()
+            };
+            ui.add_enabled_ui(!games.is_empty(), |ui| {
+                egui::ComboBox::from_id_salt("demo_game_filter")
+                    .selected_text(selected_text)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for game in games {
+                            let value = if game.eq_ignore_ascii_case("base") {
+                                String::new()
+                            } else {
+                                game.clone()
+                            };
+                            if ui
+                                .selectable_value(&mut self.demo_game_filter, value, game)
+                                .changed()
+                            {
+                                game_changed = true;
+                            }
+                        }
+                    });
+            });
+        });
+        ui.add_space(8.0);
+        if game_changed {
+            self.reset_demo_browser_catalog();
+            self.ensure_demo_catalog();
+        }
 
         if let Some(error) = &self.demo_catalog_error {
             theme::banner(ui, &format!("Demo scan failed: {error}"), theme::WARNING);

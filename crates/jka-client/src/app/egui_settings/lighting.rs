@@ -167,6 +167,51 @@ impl App {
 
         self.egui_toggle_row(
             ui,
+            "Dynamic light debug view",
+            "Diagnostic BSP receiver view for active direct-local lights. World surfaces become neutral dark gray and normal BSP textures, baked lightmaps/static vertex light, sun, reflections, GI, emissive shading and in-surface weather/fog are bypassed so RGB/intensity footprints are easy to inspect. Runtime FX, enabled map point lights, authored q3map_surfacelight emitters and shader-promoted emitters are shown according to their normal source toggles. Session-only; does not alter light data.",
+            ui::VIDEO_ROW_DYNAMIC_LIGHT_DEBUG,
+            self.video.dynamic_light_debug,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Promote emissive FX to lights",
+            "Guess dynamic light sources for legacy .efx files that have no authored Light{} stage. The classifier uses EFX structure, directional emitter motion, resolved shader/material, and source texture colour to choose point, spot, or segment-shaped sources; explicit Light{} effects are never augmented.",
+            ui::VIDEO_ROW_PROMOTE_FX_LIGHTS,
+            self.video.promote_fx_lights,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Promote emissive shaders to lights",
+            "Master switch for runtime area-light promotion from visible BSP shader semantics. Glow/additive/emissive evidence is still classified on materials that also have q3map_surfacelight, so you can A/B test either interpretation live. If authored area lights are also enabled, the authored emitter takes priority to prevent double lighting.",
+            ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS,
+            self.video.promote_shader_lights,
+        );
+        self.egui_toggle_row(
+            ui,
+            "  Shader source: glow stages",
+            "Promote surfaces with the authored JKA shader-stage `glow` marker. Texture colour/energy and actual BSP surface geometry determine the emitted light.",
+            ui::VIDEO_ROW_PROMOTE_SHADER_GLOW,
+            self.video.promote_shader_glow,
+        );
+        self.egui_toggle_row(
+            ui,
+            "  Shader source: additive stages",
+            "Promote visible additive emission stages (GL_ONE GL_ONE or SRC_ALPHA ONE). This is broader than `glow` and is useful for finding legacy emissive materials that were never tagged for Dynamic Glow.",
+            ui::VIDEO_ROW_PROMOTE_SHADER_ADDITIVE,
+            self.video.promote_shader_additive,
+        );
+        self.egui_toggle_row(
+            ui,
+            "  Shader source: emissive maps",
+            "Promote modern _emissive/_emission/_emit/_glow companion textures. Mostly-black masks are energy/coverage weighted so the entire surface does not behave like a full-white emitter.",
+            ui::VIDEO_ROW_PROMOTE_SHADER_EMISSIVE,
+            self.video.promote_shader_emissive,
+        );
+
+        self.egui_toggle_row(
+            ui,
             ".map light simulation",
             "Source .map preview only. Approximates a compiled light stage from authored light/lightJunior entities, including color, strength and q3map-style falloff. It uses the modern clustered renderer and leaves compiled BSP lighting unchanged.",
             ui::VIDEO_ROW_MAP_LIGHT_SIMULATION,
@@ -175,9 +220,8 @@ impl App {
 
         self.egui_toggle_row(
             ui,
-            "Emissive / area lights",
-            "Lets glowing surfaces act as light sources with a shape, instead of \
-             only looking bright themselves.",
+            "Authored surface / area lights",
+            "Runtime area emitters from mapper-authored q3map_surfacelight metadata. Shader-driven glow/additive/emissive promotion is controlled separately above, so the same surface is never emitted twice.",
             ui::VIDEO_ROW_EMISSIVE_AREA_LIGHTS,
             self.video.emissive_area_lights,
         );

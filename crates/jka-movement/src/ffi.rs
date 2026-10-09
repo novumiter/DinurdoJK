@@ -19,7 +19,6 @@ pub(crate) type ContentsFn = unsafe extern "C" fn(*mut c_void, *const f32, i32) 
 unsafe extern "C" {
     fn jka_lock();
     fn jka_unlock();
-    pub fn jka_set_snap_mode(mode: i32);
     #[cfg(test)]
     fn jka_contract(index: i32) -> i32;
     #[cfg(test)]

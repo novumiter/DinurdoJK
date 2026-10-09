@@ -95,6 +95,73 @@ app_cvars! {
         ]
     }
 
+    APP_R_STAGECOLLAPSEEXTRA {
+        runtime: CvarDef::new(
+            "r_stageCollapseExtra", "", "0..1",
+            "Experimental OpenJK reverse lightmap modulation fold. Live cvar: rebuilds GPU world batches from the cached source (no BSP/asset reparse); may briefly stall during upload.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_stagecollapseextra(app)),
+            |app, value| App::cvar_set_r_stagecollapseextra(app, APP_R_STAGECOLLAPSEEXTRA.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_stagecollapseextra, Some(|name, value| {
+            App::parse_cvar_bool(name, value).map(|enabled| u8::from(enabled).to_string())
+        })),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.stage_collapse_extra = parse_bool(value).unwrap_or(settings.stage_collapse_extra);
+            }),
+            archive: Some((422, |state| {
+                format!("{}", u8::from(state.video.stage_collapse_extra))
+            })),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_stagecollapseextra(&self) -> String {
+                    bool_value(self.video.stage_collapse_extra)
+                }
+                fn cvar_set_r_stagecollapseextra(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if enabled == self.video.stage_collapse_extra {
+                        return Ok(());
+                    }
+                    self.video.stage_collapse_extra = enabled;
+                    let has_candidates = self.prepared_map_cache.as_ref().is_some_and(|cache| {
+                        cache.map.batches.iter()
+                            .chain(cache.map.pvs_batches.iter())
+                            .chain(cache.map.inline_batches.iter())
+                            .any(|batch| batch.reverse_lightmap_fold_role == 1)
+                    });
+                    // Avoid tearing down any GPU state when this map cannot
+                    // possibly benefit. Remapped materials need the normal
+                    // rebuild because their candidates are derived separately.
+                    if !has_candidates && self.shader_remaps.is_empty() && self.loading.is_none() {
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                        self.console_status = format!(
+                            "EXTRA SHADER STAGE COLLAPSE: {} (no eligible authored pairs in cache)",
+                            if enabled { "ON" } else { "OFF" },
+                        );
+                        return Ok(());
+                    }
+                    // Use the established R_RemapShader presentation-only
+                    // swap. If a map upload is in flight, coalesce changes and
+                    // rebuild once it completes. Never restart gameplay.
+                    if let Err(error) = self.rebuild_shader_remapped_world() {
+                        self.video.stage_collapse_extra = !enabled;
+                        return Err(format!("{name}: {error}"));
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    self.console_status = format!(
+                        "EXTRA SHADER STAGE COLLAPSE: {} (cached render-world swap)",
+                        if enabled { "ON" } else { "OFF" },
+                    );
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_BACKEND {
         runtime: CvarDef::new(
                 "r_backend",
@@ -777,6 +844,220 @@ app_cvars! {
         ]
     }
 
+    APP_R_DYNAMICLIGHTDEBUG {
+        runtime: CvarDef::new(
+                "r_dynamicLightDebug",
+                "",
+                "0..1",
+                "Debug runtime dynamic-light contribution on neutral dark BSP receivers. Suppresses normal world shading so point/spot/segment RGB, falloff and current shadowing are easy to inspect.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_dynamiclightdebug(app)),
+                |app, value| App::cvar_set_r_dynamiclightdebug(app, APP_R_DYNAMICLIGHTDEBUG.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_dynamiclightdebug, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.dynamic_light_debug)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_dynamiclightdebug(&self) -> String {
+                    bool_value(self.video.dynamic_light_debug)
+                }
+                fn cvar_set_r_dynamiclightdebug(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.dynamic_light_debug = Self::parse_cvar_bool(name, value)?;
+                    self.render_command(RenderCommand::SetDynamicLightDebug(
+                        self.video.dynamic_light_debug,
+                    ));
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PROMOTEFXLIGHTS {
+        runtime: CvarDef::new(
+                "r_promoteFxLights",
+                "",
+                "0..1",
+                "Infer point/spot/segment transient lights from emissive legacy EFX that omit authored Light{} stages.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_promotefxlights(app)),
+                |app, value| {
+                    App::cvar_set_r_promotefxlights(app, APP_R_PROMOTEFXLIGHTS.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_r_promotefxlights, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.promote_fx_lights =
+                        parse_bool(value).unwrap_or(settings.promote_fx_lights);
+                }),
+                archive: Some((417, |state| {
+                    let settings = state.video;
+                    format!("{}", u8::from(settings.promote_fx_lights))
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_promotefxlights(&self) -> String {
+                    bool_value(self.video.promote_fx_lights)
+                }
+                fn cvar_set_r_promotefxlights(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.promote_fx_lights = Self::parse_cvar_bool(name, value)?;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.promote_fx_lights = self.video.promote_fx_lights;
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PROMOTESHADERLIGHTS {
+        runtime: CvarDef::new(
+                "r_promoteShaderLights",
+                "",
+                "0..1",
+                "Promote visible BSP shader emission into runtime area lights. Glow/additive/emissive evidence is classified even on q3map_surfacelight materials so it can be A/B tested; when authored area lights are enabled, the authored emitter wins to avoid double lighting.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_promoteshaderlights(app)),
+                |app, value| App::cvar_set_r_promoteshaderlights(app, APP_R_PROMOTESHADERLIGHTS.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_promoteshaderlights, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.promote_shader_lights = parse_bool(value).unwrap_or(settings.promote_shader_lights);
+                }),
+                archive: Some((10420, |state| format!("{}", u8::from(state.video.promote_shader_lights)))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_promoteshaderlights(&self) -> String { bool_value(self.video.promote_shader_lights) }
+                fn cvar_set_r_promoteshaderlights(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.promote_shader_lights = Self::parse_cvar_bool(name, value)?;
+                    self.sync_shader_light_promotion();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PROMOTESHADERGLOW {
+        runtime: CvarDef::new(
+                "r_promoteShaderGlow",
+                "",
+                "0..1",
+                "Allow shader-light promotion from authored shader-stage glow markers.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_promoteshaderglow(app)),
+                |app, value| App::cvar_set_r_promoteshaderglow(app, APP_R_PROMOTESHADERGLOW.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_promoteshaderglow, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.promote_shader_glow = parse_bool(value).unwrap_or(settings.promote_shader_glow);
+                }),
+                archive: Some((10421, |state| format!("{}", u8::from(state.video.promote_shader_glow)))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_promoteshaderglow(&self) -> String { bool_value(self.video.promote_shader_glow) }
+                fn cvar_set_r_promoteshaderglow(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.promote_shader_glow = Self::parse_cvar_bool(name, value)?;
+                    self.sync_shader_light_promotion();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PROMOTESHADERADDITIVE {
+        runtime: CvarDef::new(
+                "r_promoteShaderAdditive",
+                "",
+                "0..1",
+                "Allow shader-light promotion from visible additive GL_ONE GL_ONE or SRC_ALPHA ONE stages.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_promoteshaderadditive(app)),
+                |app, value| App::cvar_set_r_promoteshaderadditive(app, APP_R_PROMOTESHADERADDITIVE.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_promoteshaderadditive, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.promote_shader_additive = parse_bool(value).unwrap_or(settings.promote_shader_additive);
+                }),
+                archive: Some((10422, |state| format!("{}", u8::from(state.video.promote_shader_additive)))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_promoteshaderadditive(&self) -> String { bool_value(self.video.promote_shader_additive) }
+                fn cvar_set_r_promoteshaderadditive(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.promote_shader_additive = Self::parse_cvar_bool(name, value)?;
+                    self.sync_shader_light_promotion();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PROMOTESHADEREMISSIVE {
+        runtime: CvarDef::new(
+                "r_promoteShaderEmissive",
+                "",
+                "0..1",
+                "Allow shader-light promotion from modern _emissive/_emission/_emit/_glow companion textures.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_promoteshaderemissive(app)),
+                |app, value| App::cvar_set_r_promoteshaderemissive(app, APP_R_PROMOTESHADEREMISSIVE.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_promoteshaderemissive, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    settings.promote_shader_emissive = parse_bool(value).unwrap_or(settings.promote_shader_emissive);
+                }),
+                archive: Some((10423, |state| format!("{}", u8::from(state.video.promote_shader_emissive)))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_promoteshaderemissive(&self) -> String { bool_value(self.video.promote_shader_emissive) }
+                fn cvar_set_r_promoteshaderemissive(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.promote_shader_emissive = Self::parse_cvar_bool(name, value)?;
+                    self.sync_shader_light_promotion();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_DYNAMICSHADOWS {
         runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm|ray_traced", "Dynamic-shadow mode; entity = entity-only shadow map aimed by the baked lightgrid; csm = Bevy-style cascaded shadow maps.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
         config: CvarBinding {
@@ -818,7 +1099,7 @@ app_cvars! {
                 "r_emissiveAreaLights",
                 "",
                 "0..1",
-                "Extract emissive surfaces as area lights.",
+                "Enable mapper-authored q3map_surfacelight surfaces as runtime area lights. Shader promotion is controlled separately by r_promoteShaderLights.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1171,7 +1452,7 @@ app_cvars! {
                 "r_flares",
                 "",
                 "0..1",
-                "Screen-space saber flare overlay; does not disable authored saber impact FX.",
+                "OpenJK/TaystJK world flares (RBSP MST_FLARE); r_worldFlares can independently enable the same GPU renderer.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1197,11 +1478,69 @@ app_cvars! {
                 fn cvar_set_r_flares(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.flares = Self::parse_cvar_bool(name, value)?;
+                        self.sync_world_flares();
                         self.mark_config_dirty();
                         self.publish_ui();
                         self.console_status =
-                            format!("FLARES: {}", if self.video.flares { "ON" } else { "OFF" });
+                            format!("WORLD FLARES: {}", if self.video.world_flares_active() { "ON" } else { "OFF" });
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SABERFLARES {
+        runtime: CvarDef::new(
+                "r_saberFlares", "1", "0..1",
+                "Screen-space saber clash flare; leaves authored saber hit FX, sound and marks unchanged.",
+                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+                |app: &App| CvarValue::String(bool_value(app.video.saber_flares)),
+                |app: &mut App, value: CvarValue| App::cvar_set_r_saberflares(app, APP_R_SABERFLARES.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_r_saberflares, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.saber_flares = parse_bool(value).unwrap_or(settings.saber_flares);
+            }),
+            archive: Some((423, |state| format!("{}", u8::from(state.video.saber_flares)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_saberflares(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.saber_flares = Self::parse_cvar_bool(name, value)?;
+                    self.mark_config_dirty();
+                    self.console_status = format!("SABER FLARES: {}", if self.video.saber_flares { "ON" } else { "OFF" });
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WORLDFLARES {
+        runtime: CvarDef::new(
+                "r_worldFlares", "", "0..1",
+                "Optional world-flare override (same GPU renderer as r_flares); does not control saber overlays.",
+                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+                |app: &App| CvarValue::String(bool_value(app.video.world_flares)),
+                |app: &mut App, value: CvarValue| App::cvar_set_r_worldflares(app, APP_R_WORLDFLARES.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_r_worldflares, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.world_flares = parse_bool(value).unwrap_or(settings.world_flares);
+            }),
+            archive: Some((420, |state| format!("{}", u8::from(state.video.world_flares)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_worldflares(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.world_flares = Self::parse_cvar_bool(name, value)?;
+                    self.sync_world_flares();
+                    self.mark_config_dirty();
+                    self.console_status = format!("WORLD FLARES: {}", if self.video.world_flares_active() { "ON" } else { "OFF" });
+                    self.publish_ui();
                     Ok(())
                 }
             }
@@ -1870,6 +2209,64 @@ app_cvars! {
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_TINTEDGLASS {
+        runtime: CvarDef::new(
+            "r_tintedGlass", "", "0..1",
+            "RGB transmission for hardware RT and raster shadowed local lights. Preserves opaque blockers and stacks panes. Overrides: tinted_glass_overrides.txt",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.tinted_glass)),
+            |app, value| App::cvar_set_r_tintedglass(app, APP_R_TINTEDGLASS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_tintedglass, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.tinted_glass = parse_bool(value).unwrap_or(settings.tinted_glass);
+            }),
+            archive: Some((420, |state| format!("{}", u8::from(state.video.tinted_glass)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_tintedglass(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.tinted_glass = Self::parse_cvar_bool(name, value)?;
+                    self.sync_tinted_glass();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_TINTEDGLASSDEBUG {
+        runtime: CvarDef::new(
+            "r_tintedGlassDebug", "", "0..2",
+            "0=off, 1=highlight receivers reached through glass, 2=RGB absorption diagnostic.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.tinted_glass_debug.to_string()),
+            |app, value| App::cvar_set_r_tintedglass_debug(app, APP_R_TINTEDGLASSDEBUG.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_tintedglass_debug, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.tinted_glass_debug = value.trim().parse::<u32>().unwrap_or(settings.tinted_glass_debug).min(2);
+            }),
+            archive: Some((421, |state| state.video.tinted_glass_debug.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_tintedglass_debug(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.parse::<u32>().map_err(|_| format!("{} expects 0, 1, or 2", name))?;
+                    if mode > 2 { return Err(format!("{} expects 0, 1, or 2", name)); }
+                    self.video.tinted_glass_debug = mode;
+                    self.sync_tinted_glass_debug();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

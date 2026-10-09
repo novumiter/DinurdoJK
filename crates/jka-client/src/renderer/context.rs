@@ -5,6 +5,13 @@ use crate::renderer::{
 };
 
 impl Renderer {
+    #[inline]
+    fn note_surface_configured(&mut self, reason: &'static str) {
+        self.surface_config_generation = self.surface_config_generation.saturating_add(1);
+        self.surface_config_reason = reason;
+        self.surface_configured_at = std::time::Instant::now();
+    }
+
     pub(in crate::renderer) fn resize(&mut self, size: PhysicalSize<u32>) {
         self.invalidate_rt_sun_shadow_depth();
         self.size = size;
@@ -14,6 +21,7 @@ impl Renderer {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
+        self.note_surface_configured("resize");
         self.targets = create_targets(
             &self.device,
             size.width,
@@ -27,6 +35,8 @@ impl Renderer {
             self.ssr_enabled,
             self.cloud_render_resolution,
         );
+        self.world_flares.invalidate_depth_binding();
+        self.world_flares_sky.invalidate_depth_binding();
         self.rebuild_planar_reflection_resources();
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
@@ -55,12 +65,13 @@ impl Renderer {
         self.rebuild_ui();
     }
 
-    pub(in crate::renderer) fn reconfigure(&mut self) {
+    pub(in crate::renderer) fn reconfigure(&mut self, reason: &'static str) {
         self.invalidate_rt_sun_shadow_depth();
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }
         self.surface.configure(&self.device, &self.config);
+        self.note_surface_configured(reason);
         self.targets = create_targets(
             &self.device,
             self.config.width,
@@ -74,6 +85,8 @@ impl Renderer {
             self.ssr_enabled,
             self.cloud_render_resolution,
         );
+        self.world_flares.invalidate_depth_binding();
+        self.world_flares_sky.invalidate_depth_binding();
         self.rebuild_planar_reflection_resources();
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
@@ -108,11 +121,12 @@ impl Renderer {
     /// Reconfigure only the presentation surface. Present mode and frame-queue
     /// changes do not alter render-target formats, sample counts, shaders, or
     /// pipelines, so keep this cold path deliberately smaller than `reconfigure`.
-    pub(in crate::renderer) fn reconfigure_presentation_surface(&mut self) {
+    pub(in crate::renderer) fn reconfigure_presentation_surface(&mut self, reason: &'static str) {
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }
         self.surface.configure(&self.device, &self.config);
+        self.note_surface_configured(reason);
     }
 
     pub(in crate::renderer) fn set_vsync(&mut self, vsync: VsyncMode) {
@@ -121,7 +135,7 @@ impl Renderer {
         }
         self.vsync = vsync;
         self.config.present_mode = present_mode_for_vsync(vsync, &self.present_modes);
-        self.reconfigure_presentation_surface();
+        self.reconfigure_presentation_surface("vsync");
         rverbose!(
             1,
             "VSync: {} -> present mode {:?}",
@@ -136,7 +150,7 @@ impl Renderer {
             return;
         }
         self.config.desired_maximum_frame_latency = latency;
-        self.reconfigure_presentation_surface();
+        self.reconfigure_presentation_surface("max_frame_latency");
         rverbose!(1, "Maximum frame latency: {latency}");
     }
 

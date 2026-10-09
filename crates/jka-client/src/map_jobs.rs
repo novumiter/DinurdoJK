@@ -6,7 +6,7 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 
-const TASK_COUNT: usize = 25;
+const TASK_COUNT: usize = 26;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MapJobProgress {

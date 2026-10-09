@@ -7,9 +7,6 @@ typedef struct mod_player_s {
     jka_predict_settings settings;
 } mod_player;
 static int last_backend;
-/* See host_snap_vector in movement.c. One global shared by both backends. */
-int jka_snap_mode = 0;
-void jka_set_snap_mode(int mode) { jka_snap_mode = mode; }
 extern int japro_set_entities(void *, const jka_prediction_entity *, int);
 extern int japro_clip_entity(const void *, const jka_prediction_entity *);
 int jka_player_set_entities(void *player, const jka_prediction_entity *entities, int count) {

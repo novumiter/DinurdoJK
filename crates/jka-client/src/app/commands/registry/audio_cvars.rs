@@ -981,7 +981,7 @@ app_cvars! {
                             "Steam Audio: {} ({})",
                             if enabled { "enabled" } else { "disabled" },
                             if enabled {
-                                "acoustic geometry/cache lookup will run on the next map load; first-time bakes continue in the background"
+                                "signal DSP applies live; run snd_restart to prepare/attach current-map acoustics immediately, otherwise they will be prepared on the next map load"
                             } else {
                                 "runtime use and future acoustic BSP/bake preparation gated off"
                             }
@@ -1046,6 +1046,81 @@ app_cvars! {
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_S_STEAMAUDIOHRTFINTERPOLATION {
+        runtime: CvarDef::new(
+                "s_steamAudioHrtfInterpolation",
+                "",
+                "nearest|bilinear",
+                "Steam Audio HRTF direction interpolation: nearest (fast default) or bilinear (smoother, more audio-thread CPU).",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_s_steamaudiohrtfinterpolation(app)),
+                |app, value| {
+                    App::cvar_set_s_steamaudiohrtfinterpolation(
+                        app,
+                        APP_S_STEAMAUDIOHRTFINTERPOLATION.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_s_steamaudiohrtfinterpolation, None),
+        config: CvarBinding {
+                load_audio: Some(|settings, _name, value| {
+                    settings.steam_audio_hrtf_interpolation =
+                        match value.trim().to_ascii_lowercase().as_str() {
+                            "1" | "bilinear" => 1,
+                            "0" | "nearest" => 0,
+                            _ => settings.steam_audio_hrtf_interpolation,
+                        };
+                }),
+                archive: Some((394, |state| {
+                    let audio = state.audio;
+                    match audio.steam_audio_hrtf_interpolation {
+                        1 => "bilinear".to_owned(),
+                        _ => "nearest".to_owned(),
+                    }
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_s_steamaudiohrtfinterpolation(&self) -> String {
+                    match self.audio.steam_audio_hrtf_interpolation {
+                        1 => "bilinear",
+                        _ => "nearest",
+                    }.to_owned()
+                }
+                fn cvar_set_s_steamaudiohrtfinterpolation(
+                    &mut self,
+                    name: &str,
+                    value: &str,
+                ) -> Result<(), String> {
+                    let interpolation = match value.trim().to_ascii_lowercase().as_str() {
+                        "0" | "nearest" => 0,
+                        "1" | "bilinear" => 1,
+                        _ => return Err(format!("{name}: expected nearest|bilinear (or 0|1)")),
+                    };
+                    self.audio.steam_audio_hrtf_interpolation = interpolation;
+                    if let Some(sound) = self
+                        .game_session
+                        .as_mut()
+                        .and_then(|session| session.sound_presenter.as_mut())
+                    {
+                        sound.set_steam_audio_hrtf_interpolation(interpolation);
+                    }
+                    println!(
+                        "Steam Audio HRTF interpolation: {} (live)",
+                        if interpolation == 1 { "bilinear" } else { "nearest" },
+                    );
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

@@ -25,7 +25,20 @@ fn cvar_runtime_setters_and_latches_match_baseline() {
         .map(|row| row.split_whitespace().next().unwrap())
         .collect();
     let mut snapshot = String::new();
+    // The frozen runtime baseline includes two removed prediction cvars in its
+    // vector of current values. Reconstruct only their historical entries to
+    // compare the remaining cvar behavior without rebaselining every hash.
+    let mut old_predict_backend = -1i32;
+    let mut old_snap_mode = -1i32;
     for name in &names {
+        if *name == "cg_predictbackend" {
+            for value in INPUTS { old_predict_backend = jka_protocol::commands::atoi(value.as_bytes()).clamp(-1, 1); }
+            continue;
+        }
+        if *name == "cg_snapmode" {
+            for value in INPUTS { old_snap_mode = jka_protocol::commands::atoi(value.as_bytes()).clamp(-1, 4); }
+            continue;
+        }
         snapshot.push_str(name);
         for value in INPUTS {
             app.config_dirty = false;
@@ -35,7 +48,11 @@ fn cvar_runtime_setters_and_latches_match_baseline() {
             let result = app.set_console_cvar(name, value);
             let values: Vec<_> = names
                 .iter()
-                .map(|name| app.console_cvar_value(name))
+                .map(|name| match *name {
+                    "cg_predictbackend" => Some(old_predict_backend.to_string()),
+                    "cg_snapmode" => Some(old_snap_mode.to_string()),
+                    _ => app.console_cvar_value(name),
+                })
                 .collect();
             snapshot.push(' ');
             snapshot.push_str(&digest(&format!(
@@ -74,4 +91,22 @@ fn cvar_runtime_setters_and_latches_match_baseline() {
     assert_snapshot("latches.txt", &snapshot);
     drop(app);
     drop(event_loop);
+}
+
+#[test]
+fn removed_prediction_controls_are_not_registered() {
+    for name in ["cg_predictBackend", "cg_snapMode"] {
+        assert!(crate::app::cvar_registry().find(name).is_none(), "{name} must not select physics");
+        assert!(crate::net::NetworkSettings::default().cvar_value(name).is_none());
+    }
+}
+
+#[test]
+fn stage_collapse_extra_is_live_and_archived() {
+    use crate::console::LatchScope;
+    let definition = crate::app::cvar_registry()
+        .find("r_stageCollapseExtra")
+        .expect("renderer stage-collapse cvar registered");
+    assert_eq!(definition.entry.latch, LatchScope::None);
+    assert!(!crate::ui::VideoSettings::default().stage_collapse_extra);
 }

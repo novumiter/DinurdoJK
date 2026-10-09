@@ -1,20 +1,70 @@
-//! Secure per-server jaPRO login storage.
+//! Secure per-server account credential storage.
 //!
 //! Passwords are never written to DinurdoJK.cfg. On Windows they live in the
 //! current user's Windows Credential Manager as generic credentials, keyed by
-//! the exact resolved server `SocketAddr` (`IP:port`). That exact endpoint is
-//! the trust boundary: a credential saved for one server is never offered to
-//! another resolved address. A friendly server name is optional metadata only.
+//! the exact resolved server `SocketAddr` (`IP:port`) and account type. That
+//! endpoint is the trust boundary: a credential saved for one server is never
+//! offered to another resolved address. A friendly server name is optional
+//! display metadata only.
 
 use std::net::SocketAddr;
 
 #[cfg(any(windows, test))]
-const TARGET_PREFIX: &str = "DinurdoJK/jaPRO/";
+const TARGET_PREFIX: &str = "DinurdoJK/account/";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccountType {
+    Login,
+    Admin,
+    Rcon,
+}
+
+impl AccountType {
+    pub const ALL: [Self; 3] = [Self::Login, Self::Admin, Self::Rcon];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Login => "Login",
+            Self::Admin => "Admin",
+            Self::Rcon => "RCON",
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Admin => "admin",
+            Self::Rcon => "rcon",
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "login" => Some(Self::Login),
+            "admin" => Some(Self::Admin),
+            "rcon" => Some(Self::Rcon),
+            _ => None,
+        }
+    }
+
+    const fn sort_key(self) -> u8 {
+        match self {
+            Self::Login => 0,
+            Self::Admin => 1,
+            Self::Rcon => 2,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SavedLogin {
+pub struct SavedAccount {
     pub server: SocketAddr,
+    pub account_type: AccountType,
     pub server_name: Option<String>,
+    /// Only `Login` accounts require a username. Admin and RCON entries leave
+    /// this empty and use the credential blob as their password/secret.
     pub username: String,
 }
 
@@ -25,18 +75,20 @@ pub struct Credential {
 }
 
 #[cfg(any(windows, test))]
-fn target(server: SocketAddr) -> String {
-    format!("{TARGET_PREFIX}{server}")
+fn target(server: SocketAddr, account_type: AccountType) -> String {
+    format!("{TARGET_PREFIX}{}/{server}", account_type.key())
 }
 
 #[cfg(any(windows, test))]
-fn parse_target(value: &str) -> Option<SocketAddr> {
-    value.strip_prefix(TARGET_PREFIX)?.parse().ok()
+fn parse_target(value: &str) -> Option<(SocketAddr, AccountType)> {
+    let value = value.strip_prefix(TARGET_PREFIX)?;
+    let (kind, server) = value.split_once('/')?;
+    Some((server.parse().ok()?, AccountType::from_key(kind)?))
 }
 
 #[cfg(windows)]
 mod platform {
-    use super::{parse_target, target, Credential, SavedLogin, TARGET_PREFIX};
+    use super::{parse_target, target, AccountType, Credential, SavedAccount, TARGET_PREFIX};
     use std::{
         ffi::{c_void, OsStr},
         net::SocketAddr,
@@ -128,18 +180,20 @@ mod platform {
 
     pub fn save(
         server: SocketAddr,
+        account_type: AccountType,
         server_name: Option<&str>,
         username: &str,
         password: &str,
     ) -> Result<(), String> {
-        let mut target = wide(&target(server));
+        let mut target = wide(&target(server, account_type));
         let mut comment = server_name
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(wide);
         let mut username = wide(username);
         let mut password = password.as_bytes().to_vec();
-        let blob_size = u32::try_from(password.len()).map_err(|_| "jaPRO password is too long".to_owned())?;
+        let blob_size = u32::try_from(password.len())
+            .map_err(|_| "Account password is too long".to_owned())?;
         let credential = CredentialW {
             Flags: 0,
             Type: CRED_TYPE_GENERIC,
@@ -147,7 +201,10 @@ mod platform {
             Comment: comment
                 .as_mut()
                 .map_or(ptr::null_mut(), |value| value.as_mut_ptr()),
-            LastWritten: FileTime { dwLowDateTime: 0, dwHighDateTime: 0 },
+            LastWritten: FileTime {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
             CredentialBlobSize: blob_size,
             CredentialBlob: password.as_mut_ptr(),
             Persist: CRED_PERSIST_LOCAL_MACHINE,
@@ -166,8 +223,11 @@ mod platform {
         }
     }
 
-    pub fn read(server: SocketAddr) -> Result<Option<Credential>, String> {
-        let target = wide(&target(server));
+    pub fn read(
+        server: SocketAddr,
+        account_type: AccountType,
+    ) -> Result<Option<Credential>, String> {
+        let target = wide(&target(server, account_type));
         let mut raw: *mut CredentialW = ptr::null_mut();
         let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut raw) };
         if ok == 0 {
@@ -183,7 +243,9 @@ mod platform {
         let value = unsafe {
             let credential = &*raw;
             let username = wide_ptr_string(credential.UserName);
-            let bytes = if credential.CredentialBlob.is_null() || credential.CredentialBlobSize == 0 {
+            let bytes = if credential.CredentialBlob.is_null()
+                || credential.CredentialBlobSize == 0
+            {
                 &[][..]
             } else {
                 slice::from_raw_parts(
@@ -192,7 +254,7 @@ mod platform {
                 )
             };
             let password = String::from_utf8(bytes.to_vec())
-                .map_err(|_| "Saved jaPRO password is not valid UTF-8".to_owned());
+                .map_err(|_| "Saved account password is not valid UTF-8".to_owned());
             (username, password)
         };
         unsafe { CredFree(raw.cast()) };
@@ -203,8 +265,8 @@ mod platform {
         }))
     }
 
-    pub fn delete(server: SocketAddr) -> Result<(), String> {
-        let target = wide(&target(server));
+    pub fn delete(server: SocketAddr, account_type: AccountType) -> Result<(), String> {
+        let target = wide(&target(server, account_type));
         let ok = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
         if ok == 0 {
             let code = unsafe { GetLastError() } as i32;
@@ -217,7 +279,7 @@ mod platform {
         }
     }
 
-    pub fn list() -> Result<Vec<SavedLogin>, String> {
+    pub fn list() -> Result<Vec<SavedAccount>, String> {
         let filter = wide(&format!("{TARGET_PREFIX}*"));
         let mut count = 0u32;
         let mut raw: *mut *mut CredentialW = ptr::null_mut();
@@ -239,50 +301,62 @@ mod platform {
                     continue;
                 }
                 let credential = &*entry;
-                let target = wide_ptr_string(credential.TargetName);
-                let Some(server) = parse_target(&target) else { continue };
+                let target_name = wide_ptr_string(credential.TargetName);
+                let Some((server, account_type)) = parse_target(&target_name) else {
+                    continue;
+                };
                 let server_name = wide_ptr_string(credential.Comment);
                 let username = wide_ptr_string(credential.UserName);
-                result.push(SavedLogin {
+                result.push(SavedAccount {
                     server,
+                    account_type,
                     server_name: (!server_name.is_empty()).then_some(server_name),
                     username,
                 });
             }
             CredFree(raw.cast());
         }
-        result.sort_by_key(|entry| entry.server);
+        result.sort_by_key(|entry| (entry.server.to_string(), entry.account_type.sort_key()));
         Ok(result)
     }
 
-    pub const fn supported() -> bool { true }
+    pub const fn supported() -> bool {
+        true
+    }
 }
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{Credential, SavedLogin};
+    use super::{AccountType, Credential, SavedAccount};
     use std::net::SocketAddr;
 
-    const UNSUPPORTED: &str = "secure saved jaPRO logins currently require Windows Credential Manager";
+    const UNSUPPORTED: &str =
+        "secure saved accounts currently require Windows Credential Manager";
 
     pub fn save(
         _server: SocketAddr,
+        _account_type: AccountType,
         _server_name: Option<&str>,
         _username: &str,
         _password: &str,
     ) -> Result<(), String> {
         Err(UNSUPPORTED.to_owned())
     }
-    pub fn read(_server: SocketAddr) -> Result<Option<Credential>, String> {
+    pub fn read(
+        _server: SocketAddr,
+        _account_type: AccountType,
+    ) -> Result<Option<Credential>, String> {
         Err(UNSUPPORTED.to_owned())
     }
-    pub fn delete(_server: SocketAddr) -> Result<(), String> {
+    pub fn delete(_server: SocketAddr, _account_type: AccountType) -> Result<(), String> {
         Err(UNSUPPORTED.to_owned())
     }
-    pub fn list() -> Result<Vec<SavedLogin>, String> {
+    pub fn list() -> Result<Vec<SavedAccount>, String> {
         Ok(Vec::new())
     }
-    pub const fn supported() -> bool { false }
+    pub const fn supported() -> bool {
+        false
+    }
 }
 
 pub use platform::{delete, list, read, save, supported};
@@ -292,10 +366,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn target_round_trips_exact_endpoint() {
+    fn target_round_trips_exact_endpoint_and_type() {
         let server: SocketAddr = "203.0.113.7:29070".parse().unwrap();
-        assert_eq!(parse_target(&target(server)), Some(server));
-        assert!(parse_target("DinurdoJK/jaPRO/203.0.113.7").is_none());
-        assert!(parse_target("OtherClient/jaPRO/203.0.113.7:29070").is_none());
+        for account_type in AccountType::ALL.iter().copied() {
+            assert_eq!(
+                parse_target(&target(server, account_type)),
+                Some((server, account_type))
+            );
+        }
+        assert!(parse_target("DinurdoJK/account/unknown/203.0.113.7:29070").is_none());
     }
 }

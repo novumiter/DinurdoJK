@@ -43,6 +43,10 @@ const WP_SABER: i32 = 3;
 const G2_MODEL_PART: i32 = 50;
 const INVULNERABILITY_MODEL: &str = "models/weaphits/testboom.md3";
 const INVULNERABILITY_SHADER: &str = "powerups/invulnerabilityshell";
+/// `cgs.media.halfShieldShader` (same `testboom.md3` model as the sphere above).
+const SHIELD_HIT_SHADER: &str = "halfShieldShell";
+/// cg_players.c MAX_SHIELD_TIME / MIN_SHIELD_TIME.
+const SHIELD_MAX_TIME_MS: i32 = 2000;
 
 #[derive(Clone)]
 struct Md3SurfaceAsset {
@@ -100,6 +104,16 @@ pub struct EntityPresenter {
     /// Whether `static_props` carry RT caster sources (they must be rebuilt when
     /// hardware RT shadows are toggled).
     static_props_rt: bool,
+    /// `cent->damageTime` / `damageAngles` set by `CG_PlayerShieldHit`
+    /// (EV_SHIELD_HIT: armor absorbed part of a hit), keyed by client number.
+    shield_hits: HashMap<u16, ShieldHit>,
+}
+
+/// `centity_t::damageTime` and `damageAngles` for the armor hit shell.
+#[derive(Clone, Copy)]
+struct ShieldHit {
+    until: i32,
+    angles: [f32; 3],
 }
 
 /// One placed `misc_model_static` with its world-space surfaces already built.
@@ -144,7 +158,106 @@ impl EntityPresenter {
             static_model_source: Arc::default(),
             static_props: None,
             static_props_rt: false,
+            shield_hits: HashMap::new(),
         })
+    }
+
+    /// `CG_PlayerShieldHit`: EV_SHIELD_HIT carries the hit client in
+    /// `otherEntityNum`, the damage direction in `eventParm` (DirToByte) and the
+    /// absorbed amount in `time2`. The shell only extends an active flash.
+    pub fn note_shield_hit(&mut self, event: &super::PresentationEvent) {
+        if event.event != jka_protocol::entity_event::EntityEvent::EV_SHIELD_HIT {
+            return;
+        }
+        let Ok(client) = u16::try_from(event.state.field_i32("otherEntityNum").unwrap_or(-1))
+        else {
+            return;
+        };
+        let amount = event.state.field_i32("time2").unwrap_or(0);
+        let duration = if amount > SHIELD_MAX_TIME_MS {
+            SHIELD_MAX_TIME_MS
+        } else {
+            500 + amount.saturating_mul(15)
+        };
+        let until = event.server_time.saturating_add(duration);
+        if self.shield_hits.get(&client).is_some_and(|hit| hit.until >= until) {
+            return;
+        }
+        let dir = jka_movement::byte_to_dir(event.parm);
+        self.shield_hits.insert(
+            client,
+            ShieldHit {
+                until,
+                angles: openjk_vectoangles([-dir[0], -dir[1], -dir[2]]),
+            },
+        );
+    }
+
+    /// `CG_DrawPlayerShield` via `CG_PlayerHitFX`: a fading half-shield facing
+    /// the hit direction. Stock skips the local player in first person (and the
+    /// dead), so `hide_entity` is the viewer's own client when first person.
+    pub fn present_shield_hits(
+        &mut self,
+        entities: &[PresentedEntity],
+        followed: Option<&PresentedEntity>,
+        time: i32,
+        hide_entity: Option<u16>,
+    ) -> Vec<DynamicModelSurface> {
+        self.shield_hits
+            .retain(|_, hit| hit.until > time && hit.until - time <= SHIELD_MAX_TIME_MS + 500);
+        if self.shield_hits.is_empty() {
+            return Vec::new();
+        }
+        let mut seen = HashSet::new();
+        let mut draws = Vec::new();
+        for entity in followed.into_iter().chain(entities.iter()) {
+            if entity.entity_type != super::ET_PLAYER
+                || Some(entity.number) == hide_entity
+                || !seen.insert(entity.number)
+            {
+                continue;
+            }
+            let Some(hit) = self.shield_hits.get(&entity.number).copied() else {
+                continue;
+            };
+            if entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0 {
+                continue;
+            }
+            // Q_flrand(0, 1) * 16 flicker on top of the fade.
+            let flicker = (time as u32)
+                .wrapping_mul(0x9E37_79B1)
+                .wrapping_add(u32::from(entity.number).wrapping_mul(0x85EB_CA6B))
+                >> 28;
+            let alpha = (255.0 * ((hit.until - time) as f32 / SHIELD_MAX_TIME_MS as f32)
+                + flicker as f32)
+                .min(255.0);
+            // Bigger but tighter when more solid: 1.4 down to 1.0.
+            let scale = 1.4 - alpha * (0.4 / 255.0);
+            let mut axis = angles_to_axis(hit.angles);
+            for row in &mut axis {
+                for value in row.iter_mut() {
+                    *value *= scale;
+                }
+            }
+            let origin = [entity.origin[0], entity.origin[1], entity.origin[2] + 10.0];
+            let level = alpha / 255.0;
+            match self.present_custom_md3_stages(
+                entity.number,
+                INVULNERABILITY_MODEL,
+                origin,
+                axis,
+                [level, level, level, 1.0],
+                SHIELD_HIT_SHADER,
+            ) {
+                Ok(mut shell) => draws.append(&mut shell),
+                Err(error) => {
+                    if self.logged_unsupported.insert("shield-hit".to_string()) {
+                        rverbose!(1, "SHIELD HIT SHELL: {error}");
+                    }
+                }
+            }
+        }
+        draws
     }
 
     pub fn set_draw_map_models(&mut self, enabled: bool) {
@@ -666,6 +779,7 @@ impl EntityPresenter {
                 .and_then(|snapshot| snapshot.player_state.field_i32("fd.forceSide"))
                 .unwrap_or(0),
             weapon_midpoint,
+            gametype: game.gametype(),
         };
         if let Some(origin) = item_cone_origin(&item, &input) {
             weapon_fx.item_cone(entity.number, origin);
@@ -691,7 +805,7 @@ impl EntityPresenter {
         }
     }
 
-    /// jaPRO cosmetics: the hat/cape MD3s `PlayerPresenter` bolted to players.
+    /// Player attachments: jaPRO cosmetics and carried powerup flag MD3s.
     /// They resolve through this presenter's own VFS like any other model, so
     /// they only appear when the asset search path provides them (`japro-assets.pk3` in base).
     pub fn present_cosmetics(

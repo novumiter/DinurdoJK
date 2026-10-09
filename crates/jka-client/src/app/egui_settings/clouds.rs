@@ -6,6 +6,14 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_clouds(&mut self, ui: &mut egui::Ui) {
+        if ui.checkbox(&mut self.video.sky_fractal_override, "Experimental Star Nest sky override")
+            .on_hover_text("Replaces BSP skybox and sky cloud stages with a procedural fractal nebula. Optional A/B test; real-world parallax, 12 x 10 shader loops. Does not replace volumetric clouds. Off by default.")
+            .changed()
+        {
+            self.sync_post_effects();
+            self.mark_config_dirty();
+            self.publish_ui();
+        }
         self.egui_environment_toggle(
             ui,
             "Volumetric clouds",

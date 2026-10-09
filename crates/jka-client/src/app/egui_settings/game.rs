@@ -25,6 +25,23 @@ impl App {
                     let _ = self.set_console_cvar("cg_autoSwitch", &value.to_string());
                 }
 
+                theme::section(
+                    ui,
+                    "SPECTATING & DEMOS",
+                    "Presentation options shared by every server/mod and demo playback.",
+                );
+                theme::row(
+                    ui,
+                    "Player outlines",
+                    "cg_specHud. Outline other living players through walls while spectating or watching demos. Team players are red/blue; neutral/FFA players are yellow.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(on) = theme::switch(ui, self.japro_cg.spec_hud) {
+                            let _ = self.set_console_cvar("cg_specHud", if on { "1" } else { "0" });
+                        }
+                    },
+                );
+
                 theme::section(ui, "VIEW EFFECTS", "Camera effects driven by the game.");
                 theme::row(
                     ui,

@@ -298,6 +298,32 @@ impl<'a> IndexedGeometryBuilder<'a> {
         start..end
     }
 
+    /// Appends a promoted-water clipmap with spare index capacity so its live
+    /// amplitude/3D-distance LOD topology can be rewritten in-place later.
+    /// Returns (active range, reserved range, absolute vertex base).
+    pub(in crate::renderer) fn append_runtime_clipmap(
+        &mut self,
+        vertices: &[GpuVertex],
+        indices: &[u32],
+        index_capacity: usize,
+    ) -> (std::ops::Range<u32>, std::ops::Range<u32>, u32) {
+        let vertex_base = u32::try_from(self.vertices.len()).unwrap_or(u32::MAX);
+        self.vertices.extend_from_slice(vertices);
+        self.legacy_dlight_surface_ids
+            .extend(std::iter::repeat(u32::MAX).take(vertices.len()));
+        let start = u32::try_from(self.indices.len()).unwrap_or(u32::MAX);
+        self.indices.extend(
+            indices
+                .iter()
+                .map(|index| vertex_base.saturating_add(*index)),
+        );
+        let active_end = u32::try_from(self.indices.len()).unwrap_or(u32::MAX);
+        let capacity = index_capacity.max(indices.len());
+        let reserved_end = start.saturating_add(u32::try_from(capacity).unwrap_or(u32::MAX));
+        self.indices.resize(reserved_end as usize, vertex_base);
+        (start..active_end, start..reserved_end, vertex_base)
+    }
+
     pub(in crate::renderer) fn batch_range(&mut self, batch: &DrawBatch) -> std::ops::Range<u32> {
         let key = (batch.vertices.start, batch.vertices.end, 0u32);
         if let Some(range) = self.cache.get(&key) {

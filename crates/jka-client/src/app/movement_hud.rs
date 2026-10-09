@@ -148,6 +148,10 @@ impl App {
             .game_session
             .as_ref()
             .filter(|session| session.phase == SessionPhase::Playing)
+            // TaystJK CG_Draw2D handles PM_INTERMISSION with CG_DrawIntermission and
+            // returns before CG_DrawLagometer. Preserve that control-flow boundary
+            // instead of teaching CG_DrawDisconnect about intermission.
+            .filter(|session| !session.client_game.rendering_intermission())
             .map(|session| {
                 let local_server = session.local;
                 // CG_DrawDisconnect: not for the local server or a demo.

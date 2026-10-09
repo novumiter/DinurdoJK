@@ -24,6 +24,26 @@ fn taystjk_chat_wire_text(message: &str) -> String {
     out
 }
 
+/// TaystJK `Message_Key`: the intended recipient is a stable client slot, not
+/// a player name, and `tell` is sent as a reliable client command.
+fn taystjk_chat_command(mode: ChatMode, message: &str) -> String {
+    let message = taystjk_chat_wire_text(message);
+    match mode {
+        ChatMode::Global => format!("say \"{message}\""),
+        ChatMode::Team => format!("say_team \"{message}\""),
+        ChatMode::Direct(client) => format!("tell {client} \"{message}\""),
+    }
+}
+
+/// CG_LastAttacker/Con_MessageMode4_f. The attacker index comes from the
+/// server, not an inferred hit direction or entity event.
+fn taystjk_last_attacker_slot(had_damage_feedback: bool, attacker: i32) -> Option<u8> {
+    if !had_damage_feedback {
+        return None;
+    }
+    u8::try_from(attacker).ok().filter(|&slot| slot < 32)
+}
+
 impl App {
     pub(in crate::app) fn paste_into(
         target: &mut String,
@@ -51,18 +71,65 @@ impl App {
         self.set_overlay(OverlayMode::Chat);
     }
 
+    /// TaystJK Con_MessageMode3_f / CG_CrosshairPlayer: capture the recipient
+    /// when the key is pressed, not on Enter. Return None for an invalid slot.
+    pub(in crate::app) fn message_mode_target(&mut self) -> Option<u8> {
+        const PMF_FOLLOW: i32 = 4096;
+        const MAX_CLIENTS: i32 = 32;
+        if !self.live_connected() {
+            return None;
+        }
+        let snapshot = self.game_session.as_ref()?.client_game.current_snapshot()?;
+        let ps = &snapshot.player_state;
+        if ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0 {
+            return u8::try_from(ps.field_i32("clientNum")?)
+                .ok()
+                .filter(|&client| i32::from(client) < MAX_CLIENTS);
+        }
+
+        let now = Instant::now();
+        self.update_crosshair_target_for_chat(now);
+        let seen = self.crosshair_seen?;
+        // CG_CrosshairPlayer accepts a last-seen client for one second.
+        if now.saturating_duration_since(seen.at).as_millis() > 1000 {
+            return None;
+        }
+        u8::try_from(seen.entity)
+            .ok()
+            .filter(|&client| i32::from(client) < MAX_CLIENTS)
+    }
+
+    /// TaystJK `CG_LastAttacker` reads the server-authored
+    /// `playerState.persistant[PERS_ATTACKER]` (index 6). Like `cg.attackerTime`,
+    /// the session flag must first be set by a real damage-event transition.
+    /// This also avoids accidentally sending to slot zero before any damage.
+    pub(in crate::app) fn message_mode_attacker(&self) -> Option<u8> {
+        const PERS_ATTACKER: usize = 6;
+        if !self.live_connected() {
+            return None;
+        }
+        let session = self.game_session.as_ref()?;
+        let snapshot = session.client_game.current_snapshot()?;
+        taystjk_last_attacker_slot(
+            session.attacker_damage_seen,
+            snapshot.player_state.persistant[PERS_ATTACKER],
+        )
+    }
+
     pub(in crate::app) fn push_chat_line(&mut self, mode: ChatMode, message: &str) {
         let rendered = match mode {
             // Match JKA/OpenJK chat coloring: the name/punctuation finish in
             // white, then the server inserts the chat-mode color before text.
             ChatMode::Global => format!("^7YOU:^2 {message}"),
             ChatMode::Team => format!("^5(TEAM) ^7YOU:^5 {message}"),
+            ChatMode::Direct(client) => format!("^6(TO #{client}) ^7YOU:^6 {message}"),
         };
         // A solo `say` never round-trips through a server `chat`/`tchat`
         // command, so the CG_ServerCommand beep has to be played here.
         let kind = match mode {
             ChatMode::Global => crate::cgame::ChatKind::Say,
             ChatMode::Team => crate::cgame::ChatKind::Team,
+            ChatMode::Direct(_) => crate::cgame::ChatKind::Say,
         };
         self.play_chat_sound(kind, &rendered);
         self.push_console_line(rendered.clone());
@@ -167,19 +234,12 @@ impl App {
             // generic unquoted command path. Do not trim the field: the stock
             // edit field preserves leading/trailing spaces inside the quoted
             // say argument.
-            let message = taystjk_chat_wire_text(&message);
             if self.live_connected() {
-                // The server echoes chat back as a `chat`/`tchat` command.
-                let verb = if self.chat_mode == ChatMode::Team {
-                    "say_team"
-                } else {
-                    "say"
-                };
-                self.forward_command_to_server(&format!("{verb} \"{message}\""));
+                // As with TaystJK, only the server echoes the `tell` (or say).
+                self.forward_command_to_server(&taystjk_chat_command(self.chat_mode, &message));
             } else {
-                // The solo shim has no server command round-trip, so mirror the
-                // text that TaystJK would have put on the wire before displaying it.
-                self.push_chat_line(self.chat_mode, &message);
+                // The solo shim has no server command round-trip.
+                self.push_chat_line(self.chat_mode, &taystjk_chat_wire_text(&message));
             }
         }
         // set_overlay publishes the retained UI once; the new chat line is
@@ -200,7 +260,25 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::taystjk_chat_wire_text;
+    use super::{taystjk_chat_command, taystjk_chat_wire_text, taystjk_last_attacker_slot};
+    use crate::ui::ChatMode;
+
+    #[test]
+    fn messagemode3_sends_tell_to_captured_slot() {
+        assert_eq!(taystjk_chat_command(ChatMode::Global, "hello"), "say \"hello\"");
+        assert_eq!(taystjk_chat_command(ChatMode::Team, "hello"), "say_team \"hello\"");
+        assert_eq!(taystjk_chat_command(ChatMode::Direct(5), "hello"), "tell 5 \"hello\"");
+        assert_eq!(taystjk_chat_command(ChatMode::Direct(31), "hi \"X\""), "tell 31 \"hi ''X''\"");
+    }
+
+    #[test]
+    fn last_attacker_is_unset_until_damage_and_validates_server_slot() {
+        assert_eq!(taystjk_last_attacker_slot(false, 0), None);
+        assert_eq!(taystjk_last_attacker_slot(true, 0), Some(0));
+        assert_eq!(taystjk_last_attacker_slot(true, 31), Some(31));
+        assert_eq!(taystjk_last_attacker_slot(true, -1), None);
+        assert_eq!(taystjk_last_attacker_slot(true, 32), None);
+    }
 
     #[test]
     fn taystjk_chat_wire_substitutions_match_message_key() {

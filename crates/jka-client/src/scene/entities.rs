@@ -198,6 +198,7 @@ pub(in crate::scene) fn dynamic_light_from_values(
         angle_attenuation: true,
         angle_scale: 0.0,
         extra_distance: 0.0,
+        shader_promotion_mask: 0,
     })
 }
 
@@ -483,7 +484,8 @@ pub(in crate::scene) fn bsp_fx_runners(bsp: &Bsp, warnings: &mut Vec<String>) ->
 
     bsp.entities
         .iter()
-        .filter_map(|entity| {
+        .enumerate()
+        .filter_map(|(source_entity_index, entity)| {
             let classname = bsp_entity_value(entity, b"classname")?;
             if !classname.eq_ignore_ascii_case(b"fx_runner") {
                 return None;
@@ -529,6 +531,7 @@ pub(in crate::scene) fn bsp_fx_runners(bsp: &Bsp, warnings: &mut Vec<String>) ->
             }
 
             Some(MapFxRunner {
+                source_entity_index,
                 effect: effect.replace('\\', "/"),
                 origin,
                 angles,
@@ -674,6 +677,7 @@ pub(in crate::scene) fn map_dynamic_light(
         angle_attenuation,
         angle_scale,
         extra_distance,
+        shader_promotion_mask: 0,
     })
 }
 
@@ -705,4 +709,152 @@ pub(in crate::scene) fn load_movement(
             None
         }
     }
+}
+
+/// Server-side JKA weather entities do not remain as snapshot entities. Their
+/// spawn functions only register `CS_EFFECTS` strings (some beginning with `*`),
+/// which CGame forwards to the renderer world-effect parser. Recreate exactly
+/// those registrations for DinurdoJK's in-process local server.
+pub(in crate::scene) fn bsp_world_effect_registrations(bsp: &Bsp) -> Vec<super::MapWorldEffectRegistration> {
+    let mut registrations = Vec::new();
+    for (source_entity_index, entity) in bsp.entities.iter().enumerate() {
+        let Some(classname) = bsp_entity_value(entity, b"classname") else { continue };
+        let spawnflags = parse_bsp_entity_i32(bsp_entity_value(entity, b"spawnflags"), 0);
+        let mut effects = Vec::new();
+        if classname.eq_ignore_ascii_case(b"fx_rain") {
+            append_rain_registrations(spawnflags, &mut effects);
+        } else if classname.eq_ignore_ascii_case(b"fx_snow") {
+            effects.extend([
+                "*snow".to_owned(),
+                "*fog".to_owned(),
+                "*constantwind ( 100 100 -100 )".to_owned(),
+            ]);
+        } else if classname.eq_ignore_ascii_case(b"fx_spacedust") {
+            let count = parse_bsp_entity_i32(bsp_entity_value(entity, b"count"), 0);
+            effects.push(format!("*spacedust {count}"));
+        } else if classname.eq_ignore_ascii_case(b"fx_wind") {
+            let angles = bsp_entity_angles(entity);
+            let speed = parse_bsp_entity_f32(bsp_entity_value(entity, b"speed"), 500.0);
+            append_wind_registrations(spawnflags, angles, speed, &mut effects);
+        }
+        registrations.extend(effects.into_iter().map(|effect| super::MapWorldEffectRegistration {
+            source_entity_index,
+            effect,
+        }));
+    }
+    registrations
+}
+
+pub(in crate::scene) fn map_world_effect_registrations(
+    entities: &[jka_assets::map::MapEntity],
+) -> Vec<super::MapWorldEffectRegistration> {
+    let mut registrations = Vec::new();
+    for (source_entity_index, entity) in entities.iter().enumerate() {
+        let Some(classname) = entity.classname() else { continue };
+        let spawnflags = entity
+            .properties
+            .get("spawnflags")
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(0);
+        let mut effects = Vec::new();
+        if classname.eq_ignore_ascii_case("fx_rain") {
+            append_rain_registrations(spawnflags, &mut effects);
+        } else if classname.eq_ignore_ascii_case("fx_snow") {
+            effects.extend([
+                "*snow".to_owned(),
+                "*fog".to_owned(),
+                "*constantwind ( 100 100 -100 )".to_owned(),
+            ]);
+        } else if classname.eq_ignore_ascii_case("fx_spacedust") {
+            let count = entity
+                .properties
+                .get("count")
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            effects.push(format!("*spacedust {count}"));
+        } else if classname.eq_ignore_ascii_case("fx_wind") {
+            let angles = map_entity_angles(entity);
+            let speed = entity
+                .properties
+                .get("speed")
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|value| value.is_finite())
+                .unwrap_or(500.0);
+            append_wind_registrations(spawnflags, angles, speed, &mut effects);
+        }
+        registrations.extend(effects.into_iter().map(|effect| super::MapWorldEffectRegistration {
+            source_entity_index,
+            effect,
+        }));
+    }
+    registrations
+}
+
+fn append_rain_registrations(spawnflags: i32, output: &mut Vec<String>) {
+    if spawnflags == 0 {
+        output.push("*rain".to_owned());
+        return;
+    }
+    // TaystJK SP_CreateRain deliberately uses if/else-if precedence here.
+    if spawnflags & 1 != 0 {
+        output.push("*lightrain".to_owned());
+    } else if spawnflags & 2 != 0 {
+        output.push("*rain".to_owned());
+    } else if spawnflags & 4 != 0 {
+        output.push("*heavyrain".to_owned());
+        output.push("*heavyrainfog".to_owned());
+    } else if spawnflags & 8 != 0 {
+        // The normal effect registration occupies a CS_EFFECTS slot in JKA too.
+        output.push("world/acid_fizz".to_owned());
+        output.push("*acidrain".to_owned());
+    }
+    if spawnflags & 32 != 0 {
+        output.push("*fog".to_owned());
+    }
+}
+
+fn append_wind_registrations(
+    spawnflags: i32,
+    angles: [f32; 3],
+    speed: f32,
+    output: &mut Vec<String>,
+) {
+    if spawnflags & 1 != 0 {
+        output.push("*wind".to_owned());
+    }
+    if spawnflags & 2 != 0 {
+        let (forward, _, _) = crate::camera::angle_vectors(angles);
+        let wind = forward.map(|component| component * speed);
+        output.push(format!(
+            "*constantwind ( {:.6} {:.6} {:.6} )",
+            wind[0], wind[1], wind[2]
+        ));
+    }
+    if spawnflags & 4 != 0 {
+        output.push("*gustingwind".to_owned());
+    }
+    // Spawnflag 8 / swirlingwind is commented out in TaystJK/OpenJK.
+    if spawnflags & 32 != 0 {
+        output.push("*fog".to_owned());
+    }
+    if spawnflags & 64 != 0 {
+        output.push("*light_fog".to_owned());
+    }
+}
+
+fn map_entity_angles(entity: &jka_assets::map::MapEntity) -> [f32; 3] {
+    if let Some(angles) = entity
+        .properties
+        .get("angles")
+        .and_then(|value| parse_light_triplet(value))
+    {
+        return angles;
+    }
+    let yaw = entity
+        .properties
+        .get("angle")
+        .and_then(|value| value.parse::<f32>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    [0.0, yaw, 0.0]
 }

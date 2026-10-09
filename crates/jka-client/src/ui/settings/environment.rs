@@ -305,6 +305,24 @@ pub const ENV_ROW_RAIN_GRADE: usize = 31;
 
 pub const ENV_ROW_RAIN_GLASS: usize = 33;
 
+pub const ENV_ROW_WIND_VISUALS: usize = 34;
+
+pub const ENV_ROW_RAIN_FAST_POST: usize = 35;
+
+pub const ENV_ROW_RAIN_WATER_FIELD: usize = 36;
+
+pub const ENV_ROW_RAIN_FAST_VERTEX: usize = 37;
+
+pub const ENV_ROW_RAIN_LEAN_DEPTH: usize = 38;
+
+pub const ENV_ROW_RAIN_STATIC_DEPTH: usize = 39;
+
+pub const ENV_ROW_RAIN_OPAQUE_DEPTH: usize = 40;
+
+pub const ENV_ROW_RAIN_LEAN_MODELS: usize = 41;
+
+pub const ENV_ROW_RAIN_LEAN_POST: usize = 42;
+
 pub const CLOUD_ROW_TEMPORAL_DEPTH_FIX: usize = 0;
 
 pub const CLOUD_ROW_SHEAR: usize = 1;

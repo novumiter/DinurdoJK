@@ -42,6 +42,43 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_water(&mut self, ui: &mut egui::Ui) {
+        let mut interaction = self.video.ocean_settings.interaction;
+        let mut strength = self.video.ocean_settings.interaction_strength;
+        let mut splash_mode = self.video.ocean_settings.interaction_splash_mode;
+        let toggled = ui.checkbox(&mut interaction, "Player water deformation").on_hover_text(
+            "Nearby ripples from moving players. Uses the ocean update rate and fades after contact stops.").changed();
+        let adjusted = interaction && ui.horizontal(|ui| {
+            ui.label("Deformation strength");
+            ui.add(egui::DragValue::new(&mut strength).speed(0.5).range(0.0..=f32::MAX)).changed()
+        }).inner;
+        let mut splash_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Interaction FX A/B");
+            egui::ComboBox::from_id_salt("ocean_interaction_splash_mode")
+                .selected_text(match splash_mode {
+                    0 => "Off",
+                    1 => "A: Entry droplets",
+                    2 => "B: Wake spray",
+                    3 => "A + B",
+                    4 => "Entry jets",
+                    _ => "All FX",
+                })
+                .show_ui(ui, |ui| {
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 0, "Off").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 1, "A: Entry droplets").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 2, "B: Wake spray").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 3, "A + B").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 4, "Entry jets").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 5, "All FX").changed();
+                });
+        }).response.on_hover_text(
+            "Compare entry droplets with spray emitted along the moving wake. Count and size follow speed and deformation strength; Entry jets and All FX add upward jets.");
+        if toggled || adjusted || splash_changed {
+            self.video.ocean_settings.interaction = interaction;
+            self.video.ocean_settings.interaction_strength = strength;
+            self.video.ocean_settings.interaction_splash_mode = splash_mode;
+            self.commit_ocean_settings();
+        }
         self.egui_environment_toggle(
             ui,
             "Simulated ocean",

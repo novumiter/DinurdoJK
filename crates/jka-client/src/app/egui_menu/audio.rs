@@ -220,7 +220,7 @@ impl App {
         theme::row(
             ui,
             "Steam Audio",
-            "s_steamAudio. Master gate for Steam Audio HRTF/occlusion/reflections/pathing. Turning this off prevents the Steam Audio runtime from being used and prevents acoustic geometry/bake work on subsequent map loads. Enabling it while a map is already loaded takes full environmental acoustics on the next map load.",
+            "s_steamAudio. Master gate for Steam Audio HRTF/occlusion/reflections/pathing. Turning this off prevents the Steam Audio runtime from being used and prevents acoustic geometry/bake work on subsequent map loads. If you enable it on an already-loaded map, run snd_restart to prepare and attach that map's acoustics immediately (otherwise the next map load will do it).",
             theme::Reset::None,
             |ui| {
                 if let Some(enabled) = theme::switch(ui, self.audio.steam_audio) {
@@ -228,31 +228,47 @@ impl App {
                 }
             },
         );
-        theme::row(
-            ui,
-            "Binaural HRTF",
-            "s_steamAudioBinaural. Uses Steam Audio HRTF rendering for positional sounds. This is a live setting and does not require a map reload.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(enabled) = theme::switch(ui, self.audio.steam_audio_binaural) {
-                    let _ = self.set_console_cvar("s_steamAudioBinaural", if enabled { "1" } else { "0" });
-                }
-            },
-        );
-        theme::row(
-            ui,
-            "Environmental Acoustics",
-            "s_steamAudioEnvironmental. Live Steam Audio direct-path acoustics for positional world sounds: wall occlusion plus frequency-dependent material transmission. Simulation runs on a dedicated worker at a bounded rate; the audio callback only applies the latest result. No map reload or rebake is required once the map's Steam Audio scene is ready.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(enabled) = theme::switch(ui, self.audio.steam_audio_environmental) {
-                    let _ = self.set_console_cvar(
-                        "s_steamAudioEnvironmental",
-                        if enabled { "1" } else { "0" },
-                    );
-                }
-            },
-        );
+        let steam_audio_enabled = self.audio.steam_audio;
+        let binaural_enabled = steam_audio_enabled && self.audio.steam_audio_binaural;
+        ui.add_enabled_ui(steam_audio_enabled, |ui| {
+            theme::row(
+                ui,
+                "Binaural HRTF",
+                "s_steamAudioBinaural. Uses Steam Audio HRTF rendering for positional sounds. This is a live setting and does not require a map reload.",
+                theme::Reset::None,
+                |ui| {
+                    if let Some(enabled) = theme::switch(ui, self.audio.steam_audio_binaural) {
+                        let _ = self.set_console_cvar("s_steamAudioBinaural", if enabled { "1" } else { "0" });
+                    }
+                },
+            );
+        });
+        ui.add_enabled_ui(binaural_enabled, |ui| {
+            self.audio_choice_row(
+                ui,
+                "HRTF interpolation",
+                "s_steamAudioHrtfInterpolation. Nearest is the fast default. Bilinear smooths HRTF direction changes and can reduce audible stepping/crackle on moving binaural sources, at higher audio-thread CPU cost. This is live and does not rebuild the Steam Audio scene.",
+                "s_steamAudioHrtfInterpolation",
+                self.audio.steam_audio_hrtf_interpolation,
+                &[(0, "Nearest"), (1, "Bilinear")],
+            );
+        });
+        ui.add_enabled_ui(steam_audio_enabled, |ui| {
+            theme::row(
+                ui,
+                "Environmental Acoustics",
+                "s_steamAudioEnvironmental. Live Steam Audio direct-path acoustics for positional world sounds: wall occlusion plus frequency-dependent material transmission. Simulation runs on a dedicated worker at a bounded rate; the audio callback only applies the latest result. No map reload or rebake is required once the map's Steam Audio scene is ready.",
+                theme::Reset::None,
+                |ui| {
+                    if let Some(enabled) = theme::switch(ui, self.audio.steam_audio_environmental) {
+                        let _ = self.set_console_cvar(
+                            "s_steamAudioEnvironmental",
+                            if enabled { "1" } else { "0" },
+                        );
+                    }
+                },
+            );
+        });
 
         theme::section(
             ui,

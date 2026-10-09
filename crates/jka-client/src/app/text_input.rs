@@ -79,6 +79,50 @@ impl App {
         self.console_input.len() != before
     }
 
+    /// Paste text into the console. A normal one-line paste remains editable;
+    /// once the clipboard contains a line ending, every pasted line is submitted
+    /// exactly like pressing Enter after it.
+    pub(in crate::app) fn paste_console_text(&mut self, value: &str) -> bool {
+        if !value.contains('\r') && !value.contains('\n') {
+            return self.insert_console_text(value);
+        }
+
+        let mut changed = false;
+        let mut segment_start = 0;
+        let mut chars = value.char_indices().peekable();
+
+        while let Some((index, ch)) = chars.next() {
+            if !matches!(ch, '\r' | '\n') {
+                continue;
+            }
+
+            changed |= self.insert_console_text(&value[segment_start..index]);
+            self.execute_console();
+            changed = true;
+
+            // Windows clipboard text normally uses CRLF. Treat that pair as one
+            // Enter instead of submitting a second empty command for the LF.
+            if ch == '\r'
+                && chars.peek().is_some_and(|(_, next)| *next == '\n')
+            {
+                let (lf_index, _) = chars.next().expect("peeked CRLF continuation");
+                segment_start = lf_index + '\n'.len_utf8();
+            } else {
+                segment_start = index + ch.len_utf8();
+            }
+        }
+
+        // A copied block usually has no newline after its last command. Since a
+        // multiline paste is command-oriented, submit that final line as well.
+        if segment_start < value.len() {
+            changed |= self.insert_console_text(&value[segment_start..]);
+            self.execute_console();
+            changed = true;
+        }
+
+        changed
+    }
+
     pub(in crate::app) fn handle_console_key(&mut self, event: &KeyEvent, code: KeyCode) {
         if event.state != ElementState::Pressed {
             return;
@@ -162,7 +206,7 @@ impl App {
                 KeyCode::KeyV => {
                     match crate::clipboard::get_text() {
                         Ok(value) => {
-                            if self.insert_console_text(&value) {
+                            if self.paste_console_text(&value) {
                                 self.console_history_index = None;
                                 self.console_scroll = 0;
                                 self.console_suggest_reset();

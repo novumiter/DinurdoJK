@@ -55,6 +55,8 @@ pub(in crate::renderer) struct LocalShadowResources {
     pub(in crate::renderer) selection_cluster: Option<Option<usize>>,
     pub(in crate::renderer) selection_position: Option<Vec3>,
     pub(in crate::renderer) selection_serial: u64,
+    /// Receiver-side RGB glass-caster cache, indexed by the same cubemap slot.
+    pub(in crate::renderer) glass_buffer: wgpu::Buffer,
 }
 
 pub(in crate::renderer) fn create_shadow_pipeline(

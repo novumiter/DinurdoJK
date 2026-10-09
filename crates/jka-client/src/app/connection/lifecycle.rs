@@ -3,6 +3,9 @@ use crate::app::{App, Arc, FrontendPage, OverlayMode, PhysicsMapMesh, RenderComm
 
 impl App {
     pub(in crate::app) fn request_quit(&mut self) {
+        if self.demo_video_export.is_some() {
+            self.cancel_demo_video_export();
+        }
         if self.demo_recording.is_some() {
             self.stop_demo_recording();
         }
@@ -21,6 +24,9 @@ impl App {
     }
 
     pub(in crate::app) fn disconnect_to_main_menu(&mut self) {
+        if self.demo_video_export.is_some() {
+            self.cancel_demo_video_export();
+        }
         if self.chat_log_enabled {
             self.chat_log.end("Disconnected");
         }
@@ -45,6 +51,7 @@ impl App {
         self.static_ao_progress = None;
         self.prepared_map_cache = None;
         self.game_session = None;
+        self.reset_world_effects();
         self.live_without_world = false;
         self.demo_without_world = false;
         self.server_password_prompt = None;
@@ -67,6 +74,9 @@ impl App {
         self.predictor.reset();
         self.live_input = crate::net::LiveInput::default();
         self.scoreboard = None;
+        for guess in &mut self.spectator_ping_guesses {
+            guess.reset();
+        }
         self.scores_showing = false;
         self.last_scores_request = None;
         self.mark_companion_dirty();
@@ -132,6 +142,7 @@ impl App {
         self.static_ao_progress = None;
         self.prepared_map_cache = None;
         self.game_session = None;
+        self.reset_world_effects();
         self.live_without_world = false;
         self.demo_without_world = false;
         self.server_password_prompt = None;
@@ -153,6 +164,9 @@ impl App {
         self.predictor.reset();
         self.live_input = crate::net::LiveInput::default();
         self.scoreboard = None;
+        for guess in &mut self.spectator_ping_guesses {
+            guess.reset();
+        }
         self.scores_showing = false;
         self.last_scores_request = None;
         self.mark_companion_dirty();

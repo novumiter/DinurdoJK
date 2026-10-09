@@ -2,7 +2,7 @@
 use crate::renderer::{
     scene, Arc, DynamicModelAlphaMode, DynamicModelVertex, DynamicWireframeClass,
     EntityAmbientLightingMode, FxGpuSpriteInstance, Ghoul2BatchMode, Ghoul2GpuBone, GpuImage, Hash,
-    HashMap, Pod, TextureData, Vec3, Zeroable,
+    HashMap, Pod, SourceMaterialParams, TextureData, Vec3, Zeroable,
 };
 
 #[repr(C)]
@@ -31,6 +31,40 @@ pub(in crate::renderer) struct Ghoul2GpuDrawUniform {
     pub(in crate::renderer) jiggle1: [f32; 4],
     pub(in crate::renderer) jiggle2: [f32; 4],
     pub(in crate::renderer) jiggle3: [f32; 4],
+    /// Source 1 `$phong`: boost, exponent, `$rimlightboost`, `$rimlightexponent`.
+    /// A zero boost switches that term off. Read only by the
+    /// `ENABLE_SOURCE_MATERIAL` fragment variants.
+    pub(in crate::renderer) source_phong: [f32; 4],
+    /// xyz: `$phongfresnelranges`, packed `((mid-min)*2, mid, (max-mid)*2)`.
+    /// w: bit 0 = `$halflambert`.
+    pub(in crate::renderer) source_fresnel: [f32; 4],
+}
+
+/// `SkinDraw::source_phong` for one surface: `$phongboost`, `$phongexponent`,
+/// `$rimlightboost`, `$rimlightexponent`. All zero without a Source material,
+/// which is also what a zero boost means to the shader: term off.
+pub(in crate::renderer) fn source_phong(material: Option<&SourceMaterialParams>) -> [f32; 4] {
+    material.map_or([0.0; 4], |material| {
+        [
+            material.phong_boost,
+            material.phong_exponent,
+            material.rimlight_boost,
+            material.rimlight_exponent,
+        ]
+    })
+}
+
+/// `SkinDraw::source_fresnel`: packed `$phongfresnelranges` plus the
+/// `$halflambert` flag in w.
+pub(in crate::renderer) fn source_fresnel(material: Option<&SourceMaterialParams>) -> [f32; 4] {
+    material.map_or([0.0; 4], |material| {
+        [
+            material.phong_fresnel[0],
+            material.phong_fresnel[1],
+            material.phong_fresnel[2],
+            f32::from(u8::from(material.half_lambert)),
+        ]
+    })
 }
 
 /// Everything needed to swap the baked map sun in a lightgrid sample for the
@@ -55,6 +89,93 @@ pub(in crate::renderer) fn sample_entity_classic_light(
         light.relight_sun(relight.map_toward_sun, relight.toward_sun, relight.gain);
     }
     Some(light)
+}
+
+/// One runtime dynamic light as classic entity lighting consumes it: the
+/// `dlight_t` that R_SetupEntityLighting walks.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::renderer) struct EntityDlight {
+    /// Renderer coordinates.
+    pub(in crate::renderer) position: Vec3,
+    /// `dl->color`, already scaled by the light's intensity and the Dynamic
+    /// Light Brightness setting.
+    pub(in crate::renderer) color: Vec3,
+    pub(in crate::renderer) radius: f32,
+}
+
+/// MAX_DLIGHTS (tr_types.h); the Legacy BSP dlight masks share the cap.
+pub(in crate::renderer) const MAX_ENTITY_DLIGHTS: usize = 32;
+// tr_light.cpp: light added at the edge of a dlight's influence, and the
+// shortest range ever used, so a light inside the model cannot blow up.
+const DLIGHT_AT_RADIUS: f32 = 16.0;
+const DLIGHT_MINIMUM_RADIUS: f32 = 16.0;
+
+/// The dlight loop of TaystJK's R_SetupEntityLighting: each dlight adds
+/// `16 r^2 / d^2` of its colour to the directed light and pulls the light
+/// direction toward itself by the same weight. There is no radius cutoff.
+/// `origin` is the lighting origin in renderer coordinates.
+pub(in crate::renderer) fn add_entity_dlights(
+    light: &mut scene::ClassicEntityLight,
+    origin: Vec3,
+    dlights: &[EntityDlight],
+) {
+    if dlights.is_empty() {
+        return;
+    }
+    let mut directed = Vec3::from_array(light.directed);
+    let mut direction = Vec3::from_array(light.direction) * directed.length();
+    for dlight in dlights {
+        let delta = dlight.position - origin;
+        let distance = delta.length();
+        let toward = if distance > 0.0 {
+            delta / distance
+        } else {
+            Vec3::ZERO
+        };
+        let distance = distance.max(DLIGHT_MINIMUM_RADIUS);
+        let weight = DLIGHT_AT_RADIUS * dlight.radius * dlight.radius / (distance * distance);
+        directed += dlight.color * weight;
+        direction += toward * weight;
+    }
+    light.directed = directed.to_array();
+    light.direction = direction.normalize_or_zero().to_array();
+}
+
+/// Classic entity lighting for one prepare pass, memoized on the lighting
+/// origin. Every surface of a multi-part model shares that origin
+/// (RF_LIGHTING_ORIGIN), so a player's head, torso, legs and weapon cost one
+/// lightgrid sample and one dlight loop instead of one per surface.
+#[derive(Default)]
+pub(in crate::renderer) struct EntityLightMemo {
+    last: Option<([u32; 3], Option<scene::ClassicEntityLight>)>,
+}
+
+impl EntityLightMemo {
+    /// `origin` is the JKA-space lighting origin, as `sample_entity_classic_light` takes it.
+    pub(in crate::renderer) fn light(
+        &mut self,
+        grid: &scene::ClassicEntityLightGrid,
+        origin: [f32; 3],
+        relight: Option<EntitySunRelight>,
+        dlights: &[EntityDlight],
+    ) -> Option<scene::ClassicEntityLight> {
+        let key = origin.map(f32::to_bits);
+        if let Some((last_key, light)) = self.last {
+            if last_key == key {
+                return light;
+            }
+        }
+        let mut light = sample_entity_classic_light(grid, origin, relight);
+        if let Some(light) = light.as_mut() {
+            add_entity_dlights(
+                light,
+                Vec3::from_array(scene::render_position(origin)),
+                dlights,
+            );
+        }
+        self.last = Some((key, light));
+        light
+    }
 }
 
 /// Classic vertex lighting for one normal: ambient + the (remaining) baked
@@ -132,6 +253,9 @@ pub(in crate::renderer) struct Ghoul2PreparedDraw {
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
     pub(in crate::renderer) authored_glow: bool,
+    /// This surface came from a Source 1 VMT, so it needs the pipeline variant
+    /// that samples the normal map and runs Valve's phong.
+    pub(in crate::renderer) source_material: bool,
     pub(in crate::renderer) first_instance: u32,
     pub(in crate::renderer) instance_count: u32,
 }
@@ -143,6 +267,7 @@ pub(in crate::renderer) struct Ghoul2PendingDraw {
     pub(in crate::renderer) alpha_mode: DynamicModelAlphaMode,
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
     pub(in crate::renderer) authored_glow: bool,
+    pub(in crate::renderer) source_material: bool,
     pub(in crate::renderer) uniform: Ghoul2GpuDrawUniform,
     pub(in crate::renderer) sequence: u32,
     // Adaptive batching starts by hashing a bounded distributed sample.  If
@@ -228,6 +353,9 @@ pub(in crate::renderer) const BLOB_MARK_SURFACE_LIFT: f32 = 0.25;
 
 pub(in crate::renderer) struct DynamicGpuTexture {
     pub(in crate::renderer) _image: GpuImage,
+    /// The surface's `$bumpmap`, kept alive for as long as its bind group. Not
+    /// registered with baked brightness: it is linear, which `register` skips.
+    pub(in crate::renderer) _normal_image: Option<GpuImage>,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
 }
 
@@ -267,6 +395,12 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Set by the renderer each frame before `prepare`; None keeps the stock
     /// lightgrid sample untouched.
     pub(in crate::renderer) entity_sun_relight: Option<EntitySunRelight>,
+    /// Runtime dynamic lights folded into classic entity lighting, set by the
+    /// renderer each frame before `prepare`. Empty while dynamic lights are off.
+    pub(in crate::renderer) entity_dlights: Vec<EntityDlight>,
+    /// The RT model receivers light this frame's RT-prepared models per pixel,
+    /// so `prepare_rt_skinned` leaves `entity_dlights` out rather than add them twice.
+    pub(in crate::renderer) entity_dlights_rt_per_pixel: bool,
     pub(in crate::renderer) model_brightness: f32,
     pub(in crate::renderer) entity_legacy_fog: EntityLegacyFog,
     pub(in crate::renderer) entity_weather: EntityWeather,
@@ -312,14 +446,27 @@ pub(in crate::renderer) struct DynamicModelRenderer {
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     pub(in crate::renderer) skin_glow_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// `ENABLE_SOURCE_MATERIAL` variants of the two lit colour pipelines; see
+    /// `ghoul2_skin.wgsl`. Only Opaque/Mask are ever compiled, and only once a
+    /// Source 1 character is actually on screen, so a stock session never pays
+    /// for them.
+    pub(in crate::renderer) skin_source_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     /// Bit per `DynamicModelAlphaMode::index` with a prepared Ghoul2 draw this frame.
     pub(in crate::renderer) skin_alpha_mask: u16,
+    /// Subset of `skin_alpha_mask` whose draws carry a Source 1 VMT material.
+    /// Zero in a stock session, which keeps the draw loop byte-identical.
+    pub(in crate::renderer) skin_source_mask: u16,
     // Depth-writing entities in the single-sample scene depth prepass. These
     // target the fixed prepass formats, so they never depend on MSAA/HDR.
     pub(in crate::renderer) prepass_pipeline: wgpu::RenderPipeline,
     pub(in crate::renderer) prepass_mask_pipeline: wgpu::RenderPipeline,
     pub(in crate::renderer) skin_prepass_pipeline: wgpu::RenderPipeline,
     pub(in crate::renderer) skin_prepass_mask_pipeline: wgpu::RenderPipeline,
+    pub(in crate::renderer) rain_prepass_pipeline: wgpu::RenderPipeline,
+    pub(in crate::renderer) rain_prepass_mask_pipeline: wgpu::RenderPipeline,
+    pub(in crate::renderer) skin_rain_prepass_pipeline: wgpu::RenderPipeline,
+    pub(in crate::renderer) skin_rain_prepass_mask_pipeline: wgpu::RenderPipeline,
     /// Depth-only light-space variants for entity shadow casters, in the order
     /// [md3 opaque, md3 mask, skin opaque, skin mask]. Index 0 is forward-Z (Entity
     /// map and legacy CSM), 1 is reverse-Z (Bevy CSM). Each is built lazily the
@@ -327,6 +474,10 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) entity_shadow_pipelines: [Option<[wgpu::RenderPipeline; 4]>; 2],
     pub(in crate::renderer) repeat_sampler: wgpu::Sampler,
     pub(in crate::renderer) clamp_sampler: wgpu::Sampler,
+    /// 1x1 linear (128, 128, 255): tangent space's own +Z. Bound as the normal
+    /// map wherever a surface has none, so the bind group always satisfies the
+    /// layout and the perturbed normal collapses to the geometric one.
+    pub(in crate::renderer) flat_normal: GpuImage,
     pub(in crate::renderer) fallback_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) textures: HashMap<Arc<str>, DynamicGpuTexture>,
     pub(in crate::renderer) vertex_buffer: wgpu::Buffer,
@@ -349,6 +500,9 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) skin_draw_capacity: u64,
     pub(in crate::renderer) skin_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) skin_draws: Vec<Ghoul2PreparedDraw>,
+    /// Entity number for each entry in `skin_draw_buffer`, preserving identity even
+    /// when Ghoul2 surfaces are instanced across multiple players.
+    pub(in crate::renderer) skin_instance_entities: Vec<u16>,
     pub(in crate::renderer) ghoul2_batch_draws: Ghoul2BatchMode,
     /// Entity hidden only when drawing the secondary first-person spectator view.
     /// `prepare` keeps this entity out of cross-entity Ghoul2 instance batches so
@@ -368,9 +522,10 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Ghoul2 vertex-shader skinning path and never allocates/dispatches this.
     pub(in crate::renderer) rt_skinning: Option<Ghoul2RtSkinningResources>,
     pub(in crate::renderer) rt_prepared: bool,
-    // Per-frame pointer -> stable key cache. TextureData is Arc-backed and immutable
-    // during prepare, so identical surfaces can avoid rebuilding the same formatted
-    // texture cache key hundreds of times in crowd scenes. Cleared every frame so
-    // allocator pointer reuse can never alias an older TextureData.
-    pub(in crate::renderer) frame_texture_keys: HashMap<usize, Arc<str>>,
+    // Per-frame (colour map, normal map) pointer pair -> stable key cache.
+    // TextureData is Arc-backed and immutable during prepare, so identical
+    // surfaces can avoid rebuilding the same formatted texture cache key
+    // hundreds of times in crowd scenes. Cleared every frame so allocator
+    // pointer reuse can never alias an older TextureData.
+    pub(in crate::renderer) frame_texture_keys: HashMap<(usize, usize), Arc<str>>,
 }

@@ -5,7 +5,7 @@ use crate::renderer::{
     ocean_suppresses_batch, refresh_auto4_lazy_collapse, sample_view_rotation,
     snow_shell_draw_near_center, ui, update_visibility, Camera, CameraUniform, CompanionSceneView,
     CullDebugMode, DrawClass, DynamicModelSurface, FootprintMode, FrameInfo, GpuPass, Instant,
-    LatestViewState, PvsMode, RenderError, Renderer, Vec3, ViewLatchMode,
+    LatestViewState, PvsMode, RenderError, Renderer, SpectatorHighlight, Vec3, ViewLatchMode,
 };
 
 impl Renderer {
@@ -15,6 +15,7 @@ impl Renderer {
         player_position: Option<Vec3>,
         area_mask: Option<&[u8; 32]>,
         dynamic_models: &[DynamicModelSurface],
+        spectator_highlights: &[SpectatorHighlight],
         companion_scene: Option<&CompanionSceneView>,
         dynamic_crosshair_world: Option<[f32; 3]>,
         view_latch: ViewLatchMode,
@@ -44,7 +45,7 @@ impl Renderer {
             clip_plane: [0.0; 4],
             render_flags: [
                 0,
-                u32::from(self.static_bsp_ao_enabled),
+                (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)),
                 self.classic_world_render_flags(),
                 if self.taa_enabled {
                     self.taa_frame_index
@@ -64,9 +65,17 @@ impl Renderer {
         }
         self.ensure_wireframe_pipelines();
         self.update_sun_ray_preview(&render_camera, player_position);
+        if self.weather.wind_visuals.active() {
+            // Wind visuals are deliberately compatible with FastBaseline: they
+            // need only the shared camera/depth target and weather heightfield.
+            self.prepare_wind_visuals_frame(uniform.camera_pos_time[3]);
+        }
 
+        // One relaxed check per frame; the disabled path does no per-call work.
+        let capture_api_calls = crate::renderer::diagnostics::perf_capture::enabled();
         let mut info = FrameInfo {
             world_path: "fast-baseline",
+            late_latch_after_acquire: latest_view.is_some() && !needs_early_latch,
             ..FrameInfo::default()
         };
         let snow_deform_center = self.surface_deformation.field_center();
@@ -131,6 +140,7 @@ impl Renderer {
         let dynamic_prepare_started = Instant::now();
         self.dynamic_model_renderer.entity_sun_relight = self.entity_sun_relight();
         self.sync_entity_cloud_shadow_sun();
+        self.sync_entity_dlights(false);
         let entity_light_grid = self
             .world
             .as_ref()
@@ -236,15 +246,21 @@ impl Renderer {
             .unwrap_or(dynamic_crosshair_world);
         self.rebuild_player_name_tail(view_proj, crosshair_world);
 
+        let perf_timing = crate::renderer::diagnostics::perf_capture::enabled();
         let encode_started = Instant::now();
         // Profiler hooks are no-ops unless r_gpuTimings is on; they let the
         // baseline's world/post passes be timed directly against the unified path.
         self.gpu_profiler.begin_frame(&self.device);
+        let perf_setup_started = perf_timing.then(Instant::now);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("JKA fast baseline frame encoder"),
             });
+        if let Some(started) = perf_setup_started {
+            info.perf_encode_setup_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_pre_world_started = perf_timing.then(Instant::now);
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
         let use_gamma_post = self.frame_plan.use_post;
@@ -290,6 +306,10 @@ impl Renderer {
             }
         }
 
+        if let Some(started) = perf_pre_world_started {
+            info.perf_encode_pre_world_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_scene_started = perf_timing.then(Instant::now);
         if let Some(world) = &self.world {
             let (color_view, resolve_target) = if let Some(msaa_view) = &self.targets.msaa_view {
                 (msaa_view, Some(scene_output))
@@ -303,6 +323,7 @@ impl Renderer {
 
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::World, false);
+            if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA world (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -326,9 +347,13 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
             pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
             pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+            if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             let mut current_pipeline = None;
             let mut grass_drawn = false;
@@ -361,6 +386,7 @@ impl Renderer {
                             snow_deform_center,
                             &mut current_pipeline,
                         );
+                        if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
                         snow_shell_drawn = true;
                     }
@@ -385,15 +411,19 @@ impl Renderer {
                                 GpuPass::Grass,
                                 true,
                             );
+                            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                             pass.set_vertex_buffer(
                                 1,
                                 world.legacy_dlight_surface_id_buffer.slice(..),
                             );
+                            if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
                             pass.set_index_buffer(
                                 world.index_buffer.slice(..),
                                 wgpu::IndexFormat::Uint32,
                             );
+                            if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                             pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
                             current_pipeline = None;
                         }
@@ -401,10 +431,13 @@ impl Renderer {
                     grass_drawn = true;
                 }
                 if current_pipeline != Some(batch.source.pipeline) {
+                    if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                     pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
                     current_pipeline = Some(batch.source.pipeline);
                 }
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+                if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
                 draw_world_batch(&mut pass, batch, 0..1, self.ocean_clipmap_quality());
             }
             if !snow_shell_drawn {
@@ -415,6 +448,7 @@ impl Renderer {
                     snow_deform_center,
                     &mut current_pipeline,
                 );
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
             }
             if !grass_drawn && self.grass_enabled {
@@ -430,9 +464,13 @@ impl Renderer {
                     );
                     self.gpu_profiler
                         .write_render_pass_timestamp(&mut pass, GpuPass::Grass, true);
+                    if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                     pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                    if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                     pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                    if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                     pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
                 }
             }
@@ -464,20 +502,28 @@ impl Renderer {
                 .draw(&mut pass, &self.camera_bind_group);
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, true);
+            self.weather
+                .wind_visuals
+                .render(&mut pass, &self.camera_bind_group);
 
             // DynamicModelRenderer::draw() binds its own transient entity vertex/index
             // buffers. Everything below this point (wireframe, surface inspector, PVS
             // debug) addresses BSP/world index ranges, so restore the world geometry
             // bindings unconditionally before any of those debug draws run.
+            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
             pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
             pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+            if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
             if self.wireframe_mask != 0 {
                 let mask = self.wireframe_mask;
                 if mask & (ui::wireframe::MAP | ui::wireframe::ENTITIES) != 0 {
                     if let Some(pipeline) = &self.wireframe_pipeline {
+                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(pipeline);
+                        if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(0, &self.camera_bind_group, &[]);
                         for &batch_index in active.indices {
                             let batch = &active.batches[batch_index];
@@ -495,6 +541,7 @@ impl Renderer {
                                     view_proj,
                                 )
                             {
+                                if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
                         }
@@ -503,8 +550,11 @@ impl Renderer {
 
                 if mask & ui::wireframe::DEFORMATION != 0 {
                     if let Some(pipeline) = &self.fast_world_wireframe_pipeline {
+                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(pipeline);
+                        if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                        if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                         pass.set_vertex_buffer(
                             1,
                             world.snow_shell.legacy_dlight_surface_id_buffer.slice(..),
@@ -516,6 +566,7 @@ impl Renderer {
                             if !chunk.near_center(snow_deform_center) {
                                 continue;
                             }
+                            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                             for draw in &chunk.draws {
                                 if !snow_shell_draw_near_center(draw, snow_deform_center)
@@ -531,7 +582,9 @@ impl Renderer {
                                 else {
                                     continue;
                                 };
+                                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                                 pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+                                if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
                                 pass.draw(draw.vertices.clone(), 1..2);
                             }
                         }
@@ -573,14 +626,20 @@ impl Renderer {
 
                 // Grass/dynamic/deformation overlays all bind their own geometry.
                 // Diagnostics below still address BSP index ranges.
+                if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                 pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             }
             if self.debug_volumes.draw(&mut pass, &self.camera_bind_group) {
                 // The overlay bound its own buffers; the inspector below addresses BSP ranges.
+                if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                 pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             }
             if let (Some(vertices), Some(pipeline)) = (
@@ -588,8 +647,11 @@ impl Renderer {
                 self.surface_inspector_pipeline.as_ref(),
             ) {
                 if let Some(indices) = inspector_index_range(active.batches, vertices) {
+                    if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                     pass.set_pipeline(pipeline);
+                    if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                     pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                    if capture_api_calls { info.perf_encode_calls.draw_indexed = info.perf_encode_calls.draw_indexed.saturating_add(1); }
                     pass.draw_indexed(indices, 0, 0..1);
                 }
             }
@@ -603,6 +665,7 @@ impl Renderer {
             } else {
                 (scene_output, None)
             };
+            if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA worldless dynamic scene (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -632,6 +695,9 @@ impl Renderer {
                 .draw(&mut pass, &self.camera_bind_group);
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, true);
+            self.weather
+                .wind_visuals
+                .render(&mut pass, &self.camera_bind_group);
             let dynamic_mask =
                 ui::wireframe::PLAYERS | ui::wireframe::ENTITIES | ui::wireframe::EFFECTS;
             if self.wireframe_mask & dynamic_mask != 0 {
@@ -646,9 +712,42 @@ impl Renderer {
 
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::World, true);
+        if self.world_flares_enabled && self.world.is_some() {
+            let (flare_color_view, flare_resolve) = if let Some(view) = &self.targets.msaa_view {
+                (view, Some(scene_output))
+            } else {
+                (scene_output, None)
+            };
+            let flare_format = if use_gamma_post {
+                self.scene_format()
+            } else {
+                self.config.format
+            };
+            self.world_flares.draw(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                flare_color_view,
+                flare_resolve,
+                &self.targets.depth_view,
+                flare_format,
+                self.msaa_samples,
+                &render_camera,
+                self.config.width,
+                self.config.height,
+                self.world.as_ref().and_then(|world| world.visibility.as_ref()),
+                self.pvs_mode != PvsMode::Off,
+                self.weather.fog.legacy_drawfog_value(),
+            );
+        }
+        if let Some(started) = perf_scene_started {
+            info.perf_encode_scene_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_post_ui_started = perf_timing.then(Instant::now);
         if use_gamma_post {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Post, false);
+            if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA gamma/color post (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -666,19 +765,37 @@ impl Renderer {
                 multiview_mask: None,
             });
             if self.frame_plan.lut_post {
+                if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                 pass.set_pipeline(&self.gamma_post_pipeline);
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(0, &self.gamma_post_bind_group, &[]);
             } else {
                 // Preserve the original smaller shader/bind group for gamma
                 // alone. No grading code runs on the maximum-FPS baseline.
+                if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                 pass.set_pipeline(&self.fast_post_pipeline);
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(0, &self.fast_post_bind_group, &[]);
             }
+            if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
             pass.draw(0..3, 0..1);
             drop(pass);
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Post, true);
         }
+
+        self.spectator_highlight.encode(
+            &self.device,
+            &mut encoder,
+            presentation_output,
+            &self.dynamic_model_renderer,
+            &self.camera_bind_group,
+            &self.targets.depth_view,
+            spectator_highlights,
+            self.config.width,
+            self.config.height,
+            self.msaa_samples,
+        );
 
         let native_ui_in_main = !menu_backdrop_active
             && match self.crt_scope {
@@ -693,6 +810,7 @@ impl Renderer {
                 || self.ui_dynamic_vertex_count != 0
                 || self.ui_transient_vertex_count != 0)
         {
+            if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA overlay (fast baseline)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -758,16 +876,33 @@ impl Renderer {
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, true);
         self.gpu_profiler.resolve(&mut encoder);
+        if let Some(started) = perf_post_ui_started {
+            info.perf_encode_post_ui_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_finish_started = perf_timing.then(Instant::now);
         let command_buffer = encoder.finish();
+        if let Some(started) = perf_finish_started {
+            info.perf_encoder_finish_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_readback_started = perf_timing.then(Instant::now);
         let profiler_readback_copy = self.gpu_profiler.encode_readback_copy(&self.device);
+        if let Some(started) = perf_readback_started {
+            info.perf_profiler_readback_encode_ms = started.elapsed().as_secs_f64() * 1000.0;
+            info.perf_primary_command_buffers = 1 + u32::from(profiler_readback_copy.is_some());
+        }
         info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = Instant::now();
         info.submit_call_at = Some(submit_started);
+        let perf_submit_api_started = perf_timing.then(Instant::now);
         let frame_submission = if let Some(readback_copy) = profiler_readback_copy {
             self.queue.submit([command_buffer, readback_copy])
         } else {
             self.queue.submit([command_buffer])
         };
+        if let Some(started) = perf_submit_api_started {
+            info.perf_primary_submit_api_ms = started.elapsed().as_secs_f64() * 1000.0;
+        }
+        let perf_followup_started = perf_timing.then(Instant::now);
         if let Some(scene_frame) = companion_scene_frame {
             self.companion_scene_ready.push(scene_frame);
         }
@@ -799,6 +934,9 @@ impl Renderer {
             .filter(|readback| !readback.inline_copy)
         {
             self.submit_screenshot_copy(&frame.texture, readback);
+        }
+        if let Some(started) = perf_followup_started {
+            info.perf_followup_ms = started.elapsed().as_secs_f64() * 1000.0;
         }
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();

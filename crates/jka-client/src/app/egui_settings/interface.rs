@@ -329,8 +329,34 @@ impl App {
                 );
                 theme::row(
                     ui,
+                    "Clean chatbox",
+                    "cg_cleanChatbox. Filters repeated messages and common spam. Mode 1 strips colors from message bodies; mode 2 changes a leading body color to green. Sender colors are preserved.",
+                    theme::Reset::None,
+                    |ui| {
+                        let selected = match self.clean_chatbox {
+                            1 => "Clean messages (no body colors)",
+                            2 => "Clean messages (green initial color)",
+                            _ => "Off (original chat)",
+                        };
+                        egui::ComboBox::from_id_salt("clean_chatbox_mode")
+                            .selected_text(selected)
+                            .show_ui(ui, |ui| {
+                                for (value, label) in [
+                                    (0, "Off (original chat)"),
+                                    (1, "Clean messages (no body colors)"),
+                                    (2, "Clean messages (green initial color)"),
+                                ] {
+                                    if ui.selectable_label(self.clean_chatbox == value, label).clicked() {
+                                        let _ = self.set_console_cvar("cg_cleanChatbox", &value.to_string());
+                                    }
+                                }
+                            });
+                    },
+                );
+                theme::row(
+                    ui,
                     "Chat logging",
-                    "cl_chatLog. Saves live server chat as a self-contained HTML session under the active fs_game/chatlogs directory. A dedicated writer thread batches user-space flushes for up to 10 seconds; demo playback is not logged.",
+                    "cl_chatLog. Saves live chat to one HTML file per day per server under the active fs_game/chatlogs directory. Reconnects append to that day; a dedicated writer thread flushes about every 10 seconds. Demo playback is not logged.",
                     theme::Reset::None,
                     |ui| {
                         if let Some(value) = theme::switch(ui, self.chat_log_enabled) {

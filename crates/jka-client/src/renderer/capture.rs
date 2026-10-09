@@ -16,6 +16,7 @@ pub(in crate::renderer) enum ScreenshotDestination {
         format: ScreenshotFormat,
     },
     Clipboard,
+    VideoFrame { frame_index: u64, depth: bool },
 }
 
 pub(in crate::renderer) struct ScreenshotReadback {
@@ -30,6 +31,7 @@ pub(in crate::renderer) struct ScreenshotReadback {
     pub(in crate::renderer) copy_submit_ms: f64,
     pub(in crate::renderer) inline_copy: bool,
     pub(in crate::renderer) reused_buffer: bool,
+    pub(in crate::renderer) depth_requested: bool,
     pub(in crate::renderer) started: Instant,
 }
 
@@ -41,6 +43,7 @@ pub(in crate::renderer) enum ScreenshotPixelFormat {
 
 pub(in crate::renderer) struct ScreenshotEncodeJob {
     pub(in crate::renderer) pixels: Vec<u8>,
+    pub(in crate::renderer) depth_pixels: Option<Vec<u8>>,
     pub(in crate::renderer) width: u32,
     pub(in crate::renderer) height: u32,
     pub(in crate::renderer) padded_bytes_per_row: u32,
@@ -316,6 +319,36 @@ pub(in crate::renderer) fn encode_screenshot_job(
             );
             Ok(ScreenshotOutput::Saved(path))
         }
+        ScreenshotDestination::VideoFrame { frame_index, depth: _ } => {
+            let row_bytes = job.width as usize * 4;
+            let padded = job.padded_bytes_per_row as usize;
+            let mut bgra = Vec::with_capacity(row_bytes * job.height as usize);
+            for y in 0..job.height as usize {
+                let row = &job.pixels[y * padded..y * padded + row_bytes];
+                match job.pixel_format {
+                    ScreenshotPixelFormat::Bgra => bgra.extend_from_slice(row),
+                    ScreenshotPixelFormat::Rgba => {
+                        for px in row.chunks_exact(4) {
+                            bgra.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                        }
+                    }
+                }
+            }
+            let depth_f32le = job.depth_pixels.map(|pixels| {
+                let mut depth = Vec::with_capacity(row_bytes * job.height as usize);
+                for y in 0..job.height as usize {
+                    depth.extend_from_slice(&pixels[y * padded..y * padded + row_bytes]);
+                }
+                depth
+            });
+            Ok(ScreenshotOutput::VideoFrame {
+                frame_index,
+                width: job.width,
+                height: job.height,
+                bgra,
+                depth_f32le,
+            })
+        }
         ScreenshotDestination::Clipboard => {
             // PrintScreen is clipboard-only: same GPU readback as /screenshot.
             // The clipboard carries the raw bitmap (CF_DIB, for image editors)
@@ -390,6 +423,17 @@ impl Renderer {
         self.request_screenshot_capture(ScreenshotDestination::Clipboard);
     }
 
+    pub(in crate::renderer) fn request_video_frame_capture(&mut self, frame_index: u64, depth: bool) {
+        self.request_screenshot_capture(ScreenshotDestination::VideoFrame { frame_index, depth });
+    }
+
+    pub(in crate::renderer) fn video_depth_capture_requested(&self) -> bool {
+        matches!(
+            self.screenshot_requested.as_ref(),
+            Some(ScreenshotDestination::VideoFrame { depth: true, .. })
+        )
+    }
+
     pub(in crate::renderer) fn request_screenshot_capture(
         &mut self,
         destination: ScreenshotDestination,
@@ -415,6 +459,10 @@ impl Renderer {
         &mut self,
     ) -> Option<ScreenshotReadback> {
         let destination = self.screenshot_requested.take()?;
+        let depth_requested = matches!(
+            &destination,
+            ScreenshotDestination::VideoFrame { depth: true, .. }
+        );
 
         let started = Instant::now();
         let width = self.config.width.max(1);
@@ -466,6 +514,22 @@ impl Renderer {
                 size: buffer_size,
             });
         }
+        if depth_requested
+            && !self
+                .video_depth_readback_buffer
+                .as_ref()
+                .is_some_and(|readback| readback.size >= buffer_size)
+        {
+            self.video_depth_readback_buffer = Some(ScreenshotReadbackBuffer {
+                buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("JKA video depth readback"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                size: buffer_size,
+            });
+        }
 
         Some(ScreenshotReadback {
             destination,
@@ -479,6 +543,7 @@ impl Renderer {
             copy_submit_ms: 0.0,
             inline_copy: false,
             reused_buffer,
+            depth_requested,
             started,
         })
     }
@@ -530,6 +595,19 @@ impl Renderer {
             .expect("screenshot staging buffer must exist after preparation")
             .buffer;
         Self::encode_screenshot_copy(&mut encoder, texture, staging_buffer, readback);
+        if readback.depth_requested {
+            let depth_staging_buffer = &self
+                .video_depth_readback_buffer
+                .as_ref()
+                .expect("video depth staging buffer must exist after preparation")
+                .buffer;
+            Self::encode_screenshot_copy(
+                &mut encoder,
+                &self.targets._linear_depth_texture,
+                depth_staging_buffer,
+                readback,
+            );
+        }
         let submit_started = Instant::now();
         readback.submission_index = Some(self.queue.submit([encoder.finish()]));
         readback.copy_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
@@ -555,6 +633,26 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = mapped_tx.send(result);
         });
+
+        let depth_staging = if readback.depth_requested {
+            Some(
+                self.video_depth_readback_buffer
+                    .as_ref()
+                    .ok_or_else(|| "video depth readback buffer is missing".to_owned())?,
+            )
+        } else {
+            None
+        };
+        let depth_slice = depth_staging
+            .as_ref()
+            .map(|staging| staging.buffer.slice(0..readback.buffer_size));
+        let depth_mapped_rx = depth_slice.as_ref().map(|slice| {
+            let (tx, rx) = mpsc::sync_channel(1);
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            rx
+        });
         let map_request_ms = map_request_started.elapsed().as_secs_f64() * 1000.0;
 
         let gpu_wait_started = Instant::now();
@@ -569,13 +667,28 @@ impl Renderer {
             .recv()
             .map_err(|_| "GPU screenshot mapping callback was lost".to_owned())?
             .map_err(|error| format!("GPU screenshot mapping failed: {error}"))?;
+        if let Some(depth_rx) = depth_mapped_rx {
+            depth_rx
+                .recv()
+                .map_err(|_| "GPU depth mapping callback was lost".to_owned())?
+                .map_err(|error| format!("GPU depth mapping failed: {error}"))?;
+        }
 
-        let mapped = slice.get_mapped_range();
         let copy_started = Instant::now();
+        let mapped = slice.get_mapped_range();
         let pixels = mapped.to_vec();
-        let readback_copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
         drop(mapped);
         staging.buffer.unmap();
+        let depth_pixels = if let (Some(depth_staging), Some(depth_slice)) = (depth_staging, depth_slice) {
+            let mapped = depth_slice.get_mapped_range();
+            let pixels = mapped.to_vec();
+            drop(mapped);
+            depth_staging.buffer.unmap();
+            Some(pixels)
+        } else {
+            None
+        };
+        let readback_copy_ms = copy_started.elapsed().as_secs_f64() * 1000.0;
 
         let pixel_format = if matches!(
             readback.format,
@@ -588,6 +701,7 @@ impl Renderer {
         self.screenshot_worker_tx
             .send(ScreenshotEncodeJob {
                 pixels,
+                depth_pixels,
                 width: readback.width,
                 height: readback.height,
                 padded_bytes_per_row: readback.padded_bytes_per_row,

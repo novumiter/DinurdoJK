@@ -14,6 +14,13 @@ mod diagnostics;
 mod environment;
 mod frame;
 mod initialize;
+mod input_diagnostic;
+
+#[cfg(target_os = "windows")]
+pub(crate) fn input_diag_win32_message(message: *const std::ffi::c_void) {
+    input_diagnostic::record_win32_message(message);
+}
+
 mod lighting;
 mod models;
 mod overlay;
@@ -21,6 +28,7 @@ mod post;
 mod reflections;
 mod render_thread;
 mod static_ao;
+mod spectator_highlight;
 mod targets;
 mod textures;
 mod brightness;
@@ -28,6 +36,7 @@ mod brightness_settings;
 mod uniforms;
 mod visibility;
 mod world;
+mod world_flares;
 use api::{
     dynamic_model_writes_depth, Ghoul2RtInputVertex, LegacyDlightPerfStats, RenderBatchTiming,
     DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_WORDS, MAX_CLOUD_FOREGROUND_BLADES,
@@ -37,7 +46,8 @@ pub use api::{
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData,
     FxGpuSpriteInstance, FxGpuSprites, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand,
-    RenderSnapshot, ScreenshotFormat, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
+    RenderSnapshot, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
+    SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
     PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
     PBR_PROFILE_POM_ADAPTIVE_STEPS, PBR_PROFILE_POM_MIP_AWARE, PBR_PROFILE_SHARED_MATERIAL_EVAL,
     PBR_PROFILE_SHARED_TANGENT_FRAME, PBR_PROFILE_VERTEX_LIGHTGRID,
@@ -77,9 +87,13 @@ use environment::surface_sprites::{
     RT_RECEIVER_RAW_COLOR_ATTRIBUTES, RT_RECEIVER_RAW_COLOR_LOCATION,
 };
 use environment::water::{
-    is_upward_water_face, ocean_surface_key, water_surface_extent, MAX_OCEAN_SURFACES,
+    is_upward_water_face, ocean_surface_key, water_surface_extent, OceanVisibility,
+    MAX_OCEAN_SURFACES,
 };
 use frame::late_latch::{sample_view_rotation, LatestViewState, ViewSampleMeasurement};
+use input_diagnostic::{
+    InputDiagFrameSample, InputDiagLatchPhase, InputDiagRendererMetadata, InputDiagnostic,
+};
 pub use frame::late_latch::{InputLatencySample, ViewLatchMode};
 use lighting::cascades::{bevy_cascade_bounds, bevy_cascade_shadow_matrices};
 #[cfg(test)]
@@ -91,20 +105,21 @@ use lighting::legacy_dlights::{
 };
 use lighting::local_shadows::{
     aabb_behind_plane, aabb_intersects_clip_frustum, aabb_intersects_shadow_frustum,
+    aabb_screen_rect,
     create_local_shadow_resources, gpu_point_lights,
 };
 use lighting::ray_tracing::{
     compose_world_shader, create_rt_receiver_bind_group, create_shadow_receiver_bind_group,
     ray_traced_world_shader_source, rt_alpha_mask_source_from_gpu_vertices,
-    rt_alpha_storage_entries, rt_sampled_light_loops, RayTracedRigidMeshKey,
-    RayTracedShadowResources, RtAlphaMaskSource,
+    rt_alpha_storage_entries, rt_glass_source_from_gpu_vertices, rt_sampled_light_loops,
+    RayTracedRigidMeshKey, RayTracedShadowResources, RtAlphaMaskSource, RtAlphaVertexGpu,
 };
 #[cfg(test)]
 use lighting::ray_tracing::{
     create_ray_traced_shadow_receiver_layout, create_rt_alpha_buffer, create_rt_triangle_blas,
     rt_alpha_dynamic_material, rt_alpha_empty_buffer_descriptor, rt_alpha_ensure_dynamic_texture,
     rt_alpha_texture_key, rt_triangle_blas_build_entry, RtAlphaGeometryGpu, RtAlphaMaterialGpu,
-    RtAlphaTextureGpu, RtAlphaVertexGpu,
+    RtAlphaTextureGpu,
 };
 use lighting::shadow_resources::{
     create_shadow_mask_pipeline, create_shadow_pipeline, create_shadow_resources,
@@ -119,11 +134,12 @@ use models::pipelines::{
 pub(crate) use models::types::{EntityLegacyFog, EntityWeather};
 use models::types::{
     classic_vertex_illumination, sample_entity_classic_light, DynamicEntityLightingUniform,
-    DynamicGpuTexture, DynamicModelRenderer, DynamicPreparedDraw, EntitySunRelight,
+    DynamicGpuTexture, DynamicModelRenderer, DynamicPreparedDraw, EntityDlight, EntityLightMemo,
+    EntitySunRelight, MAX_ENTITY_DLIGHTS,
     FxGpuSpritePreparedDraw, Ghoul2GpuDrawUniform, Ghoul2GpuMesh, Ghoul2PendingDraw,
     Ghoul2PreparedDraw, Ghoul2RtComputeBatch, Ghoul2RtComputeMesh, Ghoul2RtSkinningResources,
-    RayTracedSkinnedMeshKey, RayTracedSkinnedPrepared, BLOB_MARK_PROJECTION,
-    BLOB_MARK_SURFACE_LIFT,
+    RayTracedSkinnedMeshKey, RayTracedSkinnedPrepared, source_fresnel, source_phong,
+    BLOB_MARK_PROJECTION, BLOB_MARK_SURFACE_LIFT,
 };
 use overlay::{
     empty_ui_font_texture, load_ui_font_texture, load_ui_loading_texture,
@@ -139,7 +155,8 @@ use post::crt::CrtResources;
 use post::pipelines::{
     create_bloom_pipeline, create_cloud_pass_pipeline, create_cloud_resolve_bind_group,
     create_cull_debug_pipeline, create_dof_pipeline, create_gamma_post_pipeline,
-    create_planar_debug_pipeline, create_post_pipeline, create_ssao_temporal_pipeline,
+    create_planar_debug_pipeline, create_post_pipeline, create_rain_post_pipeline,
+    create_ssao_temporal_pipeline,
     create_ssr_temporal_pipeline, create_ssr_visibility_resources, create_taa_post_pipeline,
     create_wireframe_pipeline,
 };
@@ -155,6 +172,7 @@ use reflections::planar::{
     collect_planar_reflectors, create_planar_reflection_resources, select_planar_reflection_views,
 };
 pub use render_thread::RenderThread;
+use spectator_highlight::SpectatorHighlightResources;
 use static_ao::bake::{
     collect_static_ao_lightmap_triangles, collect_static_ao_render_triangles,
     collect_static_ao_vertex_receivers, run_static_ao_worker,
@@ -232,7 +250,9 @@ use world::inline_models::{
 };
 use world::pipelines::{
     create_depth_prepass_mask_pipeline, create_depth_prepass_pipeline,
-    create_entity_prepass_pipeline, create_entity_shadow_pipeline, create_hiz_prepass_pipeline,
+    create_entity_prepass_pipeline, create_entity_rain_prepass_pipeline,
+    create_entity_shadow_pipeline, create_hiz_prepass_pipeline,
+    create_rain_depth_prepass_pipeline,
     create_legacy_dlight_pass_pipelines, create_legacy_fog_pass_pipelines,
     create_reflection_fog_pass_pipelines, create_reflection_pipelines,
     create_world_pipeline_variant_from_plan, create_world_pipelines, legacy_dlight_receives,
@@ -241,6 +261,7 @@ use world::pipelines::{
 use world::types::{
     GpuReflectionProbe, InlineModelGpu, LegacyDlightRun, PlanarReflectionResources,
     PlanarReflectionView, PlanarReflector, PlanarReflectorKind, ReflectionProbeGpuSet,
+    RuntimeOceanClipmap,
     StaticLightGridGpu, UniformArena, UniformSlot, VoxelProbeGiGpu, WorldBatch, WorldBatchSet,
     WorldDrawGroup, WorldGpu, WorldPipelineCompilePlan, WorldPipelineVariant,
     STATIC_AO_ADAPTIVE_MAX_CENTER_ERROR, STATIC_AO_ADAPTIVE_MAX_VISIBILITY_RANGE,
@@ -256,6 +277,10 @@ use world::variants::{WorldRenderPath, WorldShaderFamily, WorldShaderVariantKey}
 mod rt_models;
 #[path = "renderer/lighting/rt_resolution.rs"]
 mod rt_resolution;
+#[path = "renderer/lighting/rt_radiance.rs"]
+mod rt_radiance;
+#[path = "renderer/lighting/rt_local_radiance.rs"]
+mod rt_local_radiance;
 #[cfg(test)]
 #[path = "renderer/tests/shader_audit.rs"]
 mod shader_audit;
@@ -530,6 +555,12 @@ struct Renderer {
     queue: wgpu::Queue,
     pipeline_jobs: PipelineJobManager,
     config: wgpu::SurfaceConfiguration,
+    /// Monotonic counter for every primary-surface configure after creation.
+    /// Input diagnostics use this to prove whether focus/resize/present changes
+    /// altered surface state between a bad and good capture.
+    surface_config_generation: u64,
+    surface_config_reason: &'static str,
+    surface_configured_at: Instant,
     ray_tracing_supported: bool,
     ray_traced_shadows: Option<RayTracedShadowResources>,
     size: PhysicalSize<u32>,
@@ -560,9 +591,17 @@ struct Renderer {
     planar_reflection_layout: wgpu::BindGroupLayout,
     planar_reflection: PlanarReflectionResources,
     weather: WeatherSystem,
+    weather_assets: Option<AssetSearchPath>,
     grass_renderer: GrassRenderer,
     surface_sprite_effect_renderer: SurfaceSpriteEffectRenderer,
+    world_flares: world_flares::WorldFlareRenderer,
+    // The sky portal is another separately depth-tested view.
+    world_flares_sky: world_flares::WorldFlareRenderer,
+    // Each planar view has independent flare histories, depth bindings and camera buffers.
+    world_flares_planar: [world_flares::WorldFlareRenderer; PLANAR_REFLECTION_SLOTS],
+    world_flares_enabled: bool,
     ocean_layout: wgpu::BindGroupLayout,
+    ocean_interaction: crate::ocean::interaction::InteractionGpu,
     ocean_optics_layout: wgpu::BindGroupLayout,
     ocean_optics: crate::ocean::optics::Resources,
     ocean_inert_bind_group: wgpu::BindGroup,
@@ -579,11 +618,19 @@ struct Renderer {
     /// Shared by every ocean; lazy, see ensure_lazy_scene_pipelines.
     ocean_spray_pipeline: Option<wgpu::RenderPipeline>,
     authored_ocean_definitions: Vec<crate::ocean::authoring::AuthoredOcean>,
-    /// Render-space min/max of every water volume this frame (at most eight).
-    water_boxes: Vec<([f32; 3], [f32; 3])>,
+    /// Render-space water volumes this frame (at most eight): the bounding box
+    /// of each plus the outline slot that cuts holes out of it.
+    water_boxes: Vec<crate::ocean::WaterVolume>,
     /// Top of the water volume the camera is inside, or NO_WATER_SURFACE.
     camera_water_surface: f32,
     ocean_enabled: bool,
+    /// GPU occlusion query: how many ocean samples actually survived depth.
+    ocean_visibility: OceanVisibility,
+    /// Seconds since an ocean surface was last drawn (or the camera was last
+    /// submerged). The FFT is encoded before this frame's culling runs, so the
+    /// simulation gate necessarily uses the previous frame's answer; the grace
+    /// period below keeps a glance away from a pond from stuttering the waves.
+    ocean_hidden_time: f32,
     ocean_settings: crate::ocean::OceanSettings,
     promoted_ocean_overrides: Vec<(usize, crate::ocean::OceanSettings)>,
     world_pipeline_layout: wgpu::PipelineLayout,
@@ -679,6 +726,7 @@ struct Renderer {
     /// `videoMap` cinematics of the current world, streamed into `world.textures`.
     world_videos: Vec<WorldVideoPlayer>,
     dynamic_model_renderer: DynamicModelRenderer,
+    spectator_highlight: SpectatorHighlightResources,
     white: GpuImage,
     missing: GpuImage,
     flat_normal: GpuImage,
@@ -717,6 +765,7 @@ struct Renderer {
     fxaa_enabled: bool,
     smaa_enabled: bool,
     taa_enabled: bool,
+    rt_taa_mode: u32,
     contact_shadows_enabled: bool,
     sun_override: bool,
     sun_yaw: f32,
@@ -725,13 +774,14 @@ struct Renderer {
     sun_color: [f32; 3],
     sun_visibility: SunVisibilityMode,
     entity_sun_lighting: bool,
+    sky_fractal_override: bool,
     clouds_enabled: bool,
     cloud_type: CloudType,
     cloud_quality: f32,
     cloud_coverage: f32,
     cloud_height: f32,
     cloud_thickness: f32,
-    weather_wind: crate::ocean::OceanWind,
+    weather_wind: crate::ocean::AtmosphericWind,
     cloud_shadows_enabled: bool,
     cloud_render_resolution: CloudRenderResolution,
     cloud_temporal_enabled: bool,
@@ -821,7 +871,11 @@ struct Renderer {
     gpu_driven_enabled: bool,
     hiz_occlusion_enabled: bool,
     dynamic_lights_mode: DynamicLightsMode,
+    dynamic_light_debug: bool,
+    tinted_glass_enabled: bool,
+    tinted_glass_debug: u32,
     rt_samples: u32,
+    rt_denoiser_mode: u32,
     dynamic_light_falloff: u32,
     rt_reduced_shadows: bool,
     clustered_lighting_enabled: bool,
@@ -834,6 +888,8 @@ struct Renderer {
     /// Setup > Video brightness multiplier applied to runtime dynamic lights.
     dynamic_light_brightness: f32,
     emissive_area_lights_enabled: bool,
+    shader_light_promotion_enabled: bool,
+    shader_light_promotion_mask: u32,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,
     local_light_shadows_enabled: bool,
@@ -874,6 +930,9 @@ struct Renderer {
     ssr_frame_index: u32,
     depth_prepass_pipeline: wgpu::RenderPipeline,
     depth_prepass_mask_pipeline: wgpu::RenderPipeline,
+    /// Rain-only variant: writes only R32 linear depth + hardware depth.
+    rain_depth_prepass_pipeline: wgpu::RenderPipeline,
+    rain_depth_prepass_mask_pipeline: wgpu::RenderPipeline,
     /// Depth-only world pipelines for the Hi-Z early pass (no colour targets,
     /// so none of the full prepass's motion / reflection-policy fill cost).
     hiz_prepass_pipeline: wgpu::RenderPipeline,
@@ -912,7 +971,10 @@ struct Renderer {
     /// `None` until the background compile finishes and a frame needs it; see
     /// `ensure_post_pipeline`.
     post_pipeline: Option<wgpu::RenderPipeline>,
+    /// Specialized rain-only full-screen post, compiled lazily for A/B testing.
+    rain_post_pipeline: Option<wgpu::RenderPipeline>,
     taa_post_pipeline: Option<wgpu::RenderPipeline>,
+    rt_taa_resources: Option<post::rt_taa::RtTaaResources>,
     cloud_march_pipeline: wgpu::RenderPipeline,
     cloud_resolve_pipeline: wgpu::RenderPipeline,
     cloud_resolve_layout: wgpu::BindGroupLayout,
@@ -962,6 +1024,7 @@ struct Renderer {
     screenshot_requested: Option<ScreenshotDestination>,
     screenshot_result: Option<Result<ScreenshotOutput, String>>,
     screenshot_readback_buffer: Option<ScreenshotReadbackBuffer>,
+    video_depth_readback_buffer: Option<ScreenshotReadbackBuffer>,
     screenshot_worker_tx: Sender<ScreenshotEncodeJob>,
     screenshot_worker_rx: Receiver<Result<ScreenshotOutput, String>>,
     started: Instant,
@@ -981,3 +1044,7 @@ mod shader_tests;
 #[cfg(test)]
 #[path = "renderer/tests/entity_shadow_tests.rs"]
 mod entity_shadow_tests;
+
+#[cfg(test)]
+#[path = "renderer/tests/entity_dlight_tests.rs"]
+mod entity_dlight_tests;

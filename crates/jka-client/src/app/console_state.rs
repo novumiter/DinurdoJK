@@ -220,14 +220,15 @@ impl App {
         self.last_console_notify_refresh = now;
     }
 
-    fn push_console_line_kind(
+    fn push_console_line_kind_with_notify(
         &mut self,
         line: impl Into<String>,
         kind: crate::logging::ConsoleLineKind,
+        notify_eligible: bool,
     ) {
         let (line, skip_notify) = Self::strip_console_notify_prefix(line.into());
         crate::logging::write_console_line(kind, format_args!("{line}"));
-        self.record_console_notify_print(&line, !skip_notify);
+        self.record_console_notify_print(&line, notify_eligible && !skip_notify);
 
         let console_changed = self.sync_console_log();
         if console_changed && self.overlay == OverlayMode::Console {
@@ -235,6 +236,26 @@ impl App {
         } else {
             self.publish_transient_ui();
         }
+    }
+
+    fn push_console_line_kind(
+        &mut self,
+        line: impl Into<String>,
+        kind: crate::logging::ConsoleLineKind,
+    ) {
+        self.push_console_line_kind_with_notify(line, kind, true);
+    }
+
+    /// TaystJK `trap->Print("*%s\n", ...)`: keep a line in console scrollback
+    /// while forcing its Con_DrawNotify timestamp to zero. The semantic line
+    /// kind is preserved so notify-word matches can still get the cyan console
+    /// stamp/highlight without leaking into the top-left notify area.
+    pub(in crate::app) fn push_console_line_no_notify(
+        &mut self,
+        line: impl Into<String>,
+        kind: crate::logging::ConsoleLineKind,
+    ) {
+        self.push_console_line_kind_with_notify(line, kind, false);
     }
 
     /// Rust-side equivalent of TaystJK `CL_ConsolePrint`: engine/game console
@@ -255,7 +276,10 @@ impl App {
         self.push_console_line_kind(line, crate::logging::ConsoleLineKind::Error);
     }
 
-    /// TaystJK-style semantic notification line (mention/connect/vote).
+    /// TaystJK server `print` classifications that still follow ordinary
+    /// CL_ConsolePrint / Con_DrawNotify behavior. Chat mention highlighting is
+    /// deliberately excluded: TaystJK prints enabled-chatbox lines with a
+    /// leading `*`, which zeroes their notify timestamp.
     pub(in crate::app) fn push_console_notification(
         &mut self,
         line: impl Into<String>,
@@ -263,8 +287,7 @@ impl App {
     ) {
         debug_assert!(matches!(
             kind,
-            crate::logging::ConsoleLineKind::NotifyMention
-                | crate::logging::ConsoleLineKind::NotifyConnect
+            crate::logging::ConsoleLineKind::NotifyConnect
                 | crate::logging::ConsoleLineKind::NotifyVote
         ));
         self.push_console_line_kind(line, kind);

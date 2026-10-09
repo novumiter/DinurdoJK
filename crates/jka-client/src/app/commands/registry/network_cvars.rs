@@ -438,50 +438,6 @@ settings_cvars! { NetworkSettings;
         ]
     }
 
-    APP_CG_PREDICTBACKEND {
-        runtime: CvarDef::new("cg_predictBackend", "", "-1..1", "Which native pmove predicts: -1 detect (JA+/jaPRO servers use the TaystJK backend; Base/other servers are tried against stock and TaystJK by snapshot replay), 0 stock OpenJK, 1 TaystJK shared BG/Pmove.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_predictbackend(app)), |app, value| App::cvar_set_cg_predictbackend(app, APP_CG_PREDICTBACKEND.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_predictbackend, None),
-        config: CvarBinding {
-                load_presentation: Some(|settings, name, value| {
-                    let _ = settings.network.set_cvar(name, value);
-                }),
-                ..CvarBinding::NONE
-            },
-        settings: SETTINGS_CG_PREDICTBACKEND = APP_CG_PREDICTBACKEND
-                .bind(
-                    |state: &NetworkSettings| CvarValue::String(state.predict_backend.to_string()),
-                    |state, value| {
-                        NetworkSettings::cvar_set_cg_predictbackend(
-                            state,
-                            APP_CG_PREDICTBACKEND.entry.name,
-                            &value.to_string(),
-                        )
-                    },
-                )
-                .with_text_setter(NetworkSettings::cvar_set_cg_predictbackend, None),
-        implementations: [
-            impl NetworkSettings {
-                fn cvar_set_cg_predictbackend(&mut self, _name: &str, value: &str) -> Result<(), String> {
-                    (Ok({
-                        self.predict_backend = atoi(value.as_bytes()).clamp(-1, 1);
-                        false
-                    }))
-                    .map(|_: bool| ())
-                }
-            }
-            impl App {
-                fn cvar_get_cg_predictbackend(&self) -> String {
-                    (SETTINGS_CG_PREDICTBACKEND.get)(&self.network).to_string()
-                }
-                fn cvar_set_cg_predictbackend(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    (SETTINGS_CG_PREDICTBACKEND.set_text.unwrap())(&mut self.network, name, value)?;
-                    self.mark_config_dirty();
-
-                    Ok(())
-                }
-            }
-        ]
-    }
-
     APP_CG_PREDICTIONDEBUG {
         runtime: CvarDef::new(
                 "cg_predictionDebug",
@@ -796,50 +752,6 @@ settings_cvars! { NetworkSettings;
                 }
                 fn cvar_set_cg_showmiss(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_CG_SHOWMISS.set_text.unwrap())(&mut self.network, name, value)?;
-                    self.mark_config_dirty();
-
-                    Ok(())
-                }
-            }
-        ]
-    }
-
-    APP_CG_SNAPMODE {
-        runtime: CvarDef::new("cg_snapMode", "", "-1..4", "How prediction rounds velocity after each pmove step (the engine's trap_SnapVector): -1 detect per server by replaying snapshot intervals (default), 0 OpenJK nearest, 1 truncate, 2 floor, 3 nearest-even, 4 none. Retail servers differ from OpenJK here and at cl_commandRate 1000 it decides friction and gravity.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_snapmode(app)), |app, value| App::cvar_set_cg_snapmode(app, APP_CG_SNAPMODE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_snapmode, None),
-        config: CvarBinding {
-                load_presentation: Some(|settings, name, value| {
-                    let _ = settings.network.set_cvar(name, value);
-                }),
-                ..CvarBinding::NONE
-            },
-        settings: SETTINGS_CG_SNAPMODE = APP_CG_SNAPMODE
-                .bind(
-                    |state: &NetworkSettings| CvarValue::String(state.snap_mode.to_string()),
-                    |state, value| {
-                        NetworkSettings::cvar_set_cg_snapmode(
-                            state,
-                            APP_CG_SNAPMODE.entry.name,
-                            &value.to_string(),
-                        )
-                    },
-                )
-                .with_text_setter(NetworkSettings::cvar_set_cg_snapmode, None),
-        implementations: [
-            impl NetworkSettings {
-                fn cvar_set_cg_snapmode(&mut self, _name: &str, value: &str) -> Result<(), String> {
-                    (Ok({
-                        self.snap_mode = atoi(value.as_bytes()).clamp(-1, 4);
-                        false
-                    }))
-                    .map(|_: bool| ())
-                }
-            }
-            impl App {
-                fn cvar_get_cg_snapmode(&self) -> String {
-                    (SETTINGS_CG_SNAPMODE.get)(&self.network).to_string()
-                }
-                fn cvar_set_cg_snapmode(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    (SETTINGS_CG_SNAPMODE.set_text.unwrap())(&mut self.network, name, value)?;
                     self.mark_config_dirty();
 
                     Ok(())
@@ -2675,6 +2587,9 @@ settings_cvars! { NetworkSettings;
                 }
                 fn cvar_set_sex(&mut self, name: &str, value: &str) -> Result<(), String> {
                     (SETTINGS_SEX.set_text.unwrap())(&mut self.network, name, value)?;
+                    self.sync_local_client_info();
+                    self.profile_preview_key = None;
+                    self.publish_ui();
                     self.mark_config_dirty();
                     self.request_userinfo_send();
 
@@ -2796,7 +2711,7 @@ settings_cvars! { NetworkSettings;
                 "ui_password",
                 "",
                 "string",
-                "jaPRO account password used by the login menu. Not saved to the config.",
+                "Legacy ui_password account field retained for compatibility. Saved Account rows use Windows Credential Manager.",
                 CvarType::String,
                 CvarFlags::NONE,
                 LatchScope::None,
@@ -2851,7 +2766,7 @@ settings_cvars! { NetworkSettings;
                 "ui_username",
                 "",
                 "string",
-                "jaPRO account name used by the login menu (MOD) and the login command.",
+                "Legacy ui_username account field retained for compatibility with servers and scripts.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,

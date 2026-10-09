@@ -30,6 +30,9 @@ pub struct ClientPresentationSettings {
     pub team_overlay: crate::ui::TeamOverlaySettings,
     /// TaystJK cg_scoreDeaths: 0 off, 1 server deaths, 2 local fallback, 3 local count.
     pub score_deaths: i32,
+    /// Heuristically identify spectators following the local player by matching
+    /// three consecutive *distinct* ping samples. Cosmetic only.
+    pub score_spectator_guess: bool,
     /// TaystJK cg_drawScores: 0 off, 1 classic, 2 coloured classic, 3 centred boxes.
     pub draw_scores: i32,
     pub mouse: MouseInputSettings,
@@ -78,6 +81,8 @@ pub struct ClientPresentationSettings {
     pub console_suggest: bool,
     /// cg_chatboxCompletion: Tab in the chat input completes player names.
     pub chatbox_completion: bool,
+    /// cg_cleanChatbox: 0 off, 1 strip body colors and filter spam, 2 recolor initial body color and filter spam.
+    pub clean_chatbox: u8,
     /// cl_chatLog: persist live server chat sessions as self-contained HTML.
     pub chat_log: bool,
     /// TaystJK ui_vgs: use the jaPRO VGS menu in place of stock team voice chat.
@@ -177,6 +182,8 @@ pub struct AudioSettings {
     pub steam_audio: bool,
     /// Live Steam Audio HRTF rendering for positional sounds.
     pub steam_audio_binaural: bool,
+    /// Steam Audio HRTF direction interpolation: 0 = nearest, 1 = bilinear.
+    pub steam_audio_hrtf_interpolation: u8,
     /// Live direct-path Steam Audio occlusion and transmission.
     pub steam_audio_environmental: bool,
     pub game: GameOptions,
@@ -193,6 +200,7 @@ impl Default for AudioSettings {
             mute_when_unfocused: true,
             steam_audio: false,
             steam_audio_binaural: true,
+            steam_audio_hrtf_interpolation: 0,
             steam_audio_environmental: true,
             game: GameOptions::default(),
         }
@@ -255,6 +263,7 @@ impl Default for ClientPresentationSettings {
             saber_staff_multi_color: false,
             team_overlay: crate::ui::TeamOverlaySettings::default(),
             score_deaths: 1,
+            score_spectator_guess: true,
             draw_scores: 1,
             mouse: MouseInputSettings::default(),
             fov: DEFAULT_CG_FOV,
@@ -284,6 +293,7 @@ impl Default for ClientPresentationSettings {
             console_notify_beep: true,
             console_suggest: true,
             chatbox_completion: true,
+            clean_chatbox: 0,
             chat_log: true,
             ui_vgs: 1,
             jump_height_shade: true,
@@ -732,7 +742,7 @@ mod tests {
             foam_lifetime: 12.0,
             ..Default::default()
         };
-        settings.weather_wind = crate::ocean::OceanWind {
+        settings.weather_wind = crate::ocean::AtmosphericWind {
             speed: 800.0,
             direction: 160.0,
             gust: 0.5,
@@ -980,12 +990,13 @@ mod tests {
         settings.cloud_temporal_depth_fix = false;
         settings.cloud_shear = 0.75;
         settings.cloud_base_variation = 0.125;
-        settings.weather_wind = crate::ocean::OceanWind {
+        settings.weather_wind = crate::ocean::AtmosphericWind {
             speed: 720.0,
             direction: 135.0,
             gust: 0.6,
             shift: 28.0,
         };
+        settings.wind_visuals = 0.67;
         settings.cloud_shape_evolution = true;
         settings.cloud_terrain_interaction = true;
         settings.cloud_empty_skip = true;
@@ -1019,6 +1030,7 @@ mod tests {
         assert!((loaded.cloud_shear - 0.75).abs() < 1e-3);
         assert!((loaded.cloud_base_variation - 0.125).abs() < 1e-3);
         assert_eq!(loaded.weather_wind, settings.weather_wind);
+        assert!((loaded.wind_visuals - 0.67).abs() < 1e-3);
         assert_eq!(loaded.cloud_shape_evolution, true);
         assert_eq!(loaded.cloud_terrain_interaction, true);
         assert_eq!(loaded.cloud_empty_skip, true);

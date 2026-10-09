@@ -404,7 +404,8 @@ mod local_saber_stance {
     use super::support::*;
     use jka_movement::CollisionWorld;
     use jka_movement::{
-        PlayerState, SaberMovementInfo, UserCmd, BUTTON_ATTACK, GENCMD_SABERATTACKCYCLE, TICK_MSEC,
+        PlayerState, SaberMovementInfo, UserCmd, BUTTON_ATTACK, GENCMD_SABERATTACKCYCLE,
+        GENCMD_SABERSWITCH, TICK_MSEC,
     };
 
     // protocol-26 playerStateFields slots.
@@ -442,6 +443,33 @@ mod local_saber_stance {
     fn equip(p: &mut PlayerState, first: SaberMovementInfo, second: SaberMovementInfo) {
         p.set_saber_movement_info(0, first).unwrap();
         p.set_saber_movement_info(1, second).unwrap();
+    }
+
+    #[test]
+    fn weapon_one_generic_command_retracts_and_relights_the_saber() {
+        let movement = animations();
+        let mut world = Map::floor().world();
+        let mut p = player(24.125);
+        equip(&mut p, SaberMovementInfo::equipped_default(), SaberMovementInfo::default());
+        assert_eq!(holstered(&p), 0);
+
+        let toggle = |p: &PlayerState| UserCmd {
+            server_time: p.view().command_time + TICK_MSEC,
+            generic_command: GENCMD_SABERSWITCH,
+            ..UserCmd::default()
+        };
+        let cmd = toggle(&p);
+        movement.step(&mut p, cmd, &mut world).unwrap();
+        assert_eq!(holstered(&p), 2);
+
+        // Cmd_ToggleSaber_f applies a 400 ms weapon lockout when holstering.
+        // Let both that and the generic-command debounce expire before relighting.
+        for _ in 0..55 {
+            tick(&movement, &mut p, &mut world, 0, 0, 0);
+        }
+        let cmd = toggle(&p);
+        movement.step(&mut p, cmd, &mut world).unwrap();
+        assert_eq!(holstered(&p), 0);
     }
 
     #[test]

@@ -66,10 +66,10 @@ pub struct NetworkSettings {
     pub fs_game: String,
     /// jaPRO `cp_clanPwd`. Never archived, as in jaPRO.
     pub clan_pwd: String,
-    /// jaPRO `ui_username`: account name for the login menu / `login` command.
+    /// Legacy `ui_username` account field retained for server/script compatibility.
     pub ui_username: String,
-    /// jaPRO `ui_password`. jaPRO archives it in plain text; here it lives for
-    /// the session only, like `cp_clanPwd`.
+    /// Legacy `ui_password` account field. It remains non-archived for compatibility.
+    /// Saved Account rows use Windows Credential Manager instead.
     pub ui_password: String,
     /// `rconPassword` (CVAR_TEMP in jaPRO, so never archived or sent in userinfo).
     pub rcon_password: String,
@@ -98,14 +98,6 @@ pub struct NetworkSettings {
     /// `cg_physicsDiag`: 0 off, 1 = report snapshot intervals whose replay does not reproduce the
     /// server's state, 2 = every interval. Session-only.
     pub physics_diag: u8,
-    /// `cg_snapMode`: how the native pmove rounds velocity after each step (the engine's
-    /// `trap_SnapVector`). -1 = detect per server (default), 0 OpenJK nearest, 1 truncate,
-    /// 2 floor, 3 nearest-even, 4 none.
-    pub snap_mode: i32,
-    /// `cg_predictBackend`: which native pmove predicts. -1 = detect (JA+/jaPRO and
-    /// servers advertising TaystJK movement capabilities use the shared backend; plain Base/other
-    /// servers are replay-tested), 0 stock OpenJK, 1 TaystJK shared BG/Pmove. Session-only.
-    pub predict_backend: i32,
     /// Minimum correction distance, in JKA units, for the visual miss warning.
     pub prediction_miss_threshold: f32,
     /// Legacy compatibility escape hatch; normal joins now use the explicit missing-map prompt.
@@ -152,7 +144,7 @@ impl Default for NetworkSettings {
             predict_items: true,
             team_overlay: false,
             cosmetics: 0,
-            fs_game: "japro".into(),
+            fs_game: String::new(),
             clan_pwd: "none".into(),
             ui_username: String::new(),
             ui_password: String::new(),
@@ -169,8 +161,6 @@ impl Default for NetworkSettings {
             model_frame_debug: false,
             ground_trace_debug: 0,
             physics_diag: 0,
-            snap_mode: -1,
-            predict_backend: -1,
             prediction_miss_threshold: 8.0,
             allow_missing_map: false,
             allow_http_downloads: true,
@@ -942,7 +932,6 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
                 u32::from_str_radix(value, 8).ok()
             } else { value.parse().ok() }
         }).unwrap_or(0);
-    let tayst_movement = taystjk_info & mod_support::TAYSTJK_INFO_MOVEMENT_MASK != 0 || legacy_fixes != 0;
     // TaystJK also recognizes Raven SDK gamecode independently of gamename.
     let mut base_game = detected_mod == mod_support::ServerMod::Base;
     if info_value(server, b"g_saberWallDamageScale").is_some() {
@@ -980,10 +969,9 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
         no_spec_move: int(server, b"g_noSpecMove", 0),
         tracemask,
         no_footsteps: i32::from(int(server, b"dmflags", 0) & 32 != 0),
-        // TaystJK's shared BG/Pmove backend contains the JA+/jaPRO branches.
-        // Base/unknown stays on stock by default unless auto-detection or an
-        // explicit cg_predictBackend selection chooses the shared backend.
-        backend: i32::from(japro || japlus || tayst_movement),
+        // One authoritative Pmove implementation for all servers. The server's
+        // advertised mod/capabilities still configure TaystJK's internal rules.
+        backend: 1,
         // Compact Rust-side identity consumed by native japro_configure:
         // 0 Base/other, 1 jaPRO, 2 JA+.
         server_mod: if japro { 1 } else if japlus { 2 } else { 0 },
@@ -1428,14 +1416,6 @@ pub struct Predictor {
     diag_previous: Option<(i32, PlayerState)>,
     diag_compared: u32,
     diag_matched: u32,
-    /// Per candidate rounding mode: how many compared intervals it reproduced exactly, and the
-    /// votes (intervals where it was exact and at least one other mode was not).
-    diag_combo_matched: [u32; 10],
-    combo_votes: [u32; 10],
-    /// What detection currently selects, and the rounding mode last handed to the native side.
-    auto_backend: i32,
-    auto_snap: i32,
-    snap_mode_applied: Option<i32>,
 }
 
 /// One predicted command's ground state, for `cg_groundTraceDebug`.
@@ -1478,17 +1458,6 @@ fn check_interval(replayed: &PlayerState, server: &PlayerState) -> IntervalCheck
     IntervalCheck { exact, origin_delta, velocity_delta, ground, flags, timer }
 }
 
-/// Index of a (backend, rounding) pair in the vote arrays.
-fn combo_index(backend: i32, snap: i32) -> usize {
-    (backend.clamp(0, 1) * 5 + snap.clamp(0, 4)) as usize
-}
-
-fn combo_name(backend: i32, snap: i32) -> String {
-    let backend = if backend == 1 { "TaystJK backend" } else { "stock backend" };
-    let snap = ["nearest", "truncate", "floor", "nearest-even", "no rounding"][snap.clamp(0, 4) as usize];
-    format!("{backend}, {snap} rounding")
-}
-
 /// `cg_groundTraceDebug 1` reports a snapshot comparison once the origin differs by more than this.
 const DRIFT_UNITS: f32 = 3.0;
 
@@ -1518,14 +1487,13 @@ pub struct PredictionInput<'a> {
     /// OpenJK builds a real usercmd every client frame; we pace real ones
     /// (cl_commandRate) and predict this one only for display.
     pub provisional: Option<UserCmd>,
+    /// BSP entity graph, used to identify jaPRO race movers by their actual classname.
+    pub entity_graph: Option<&'a crate::entity_graph::EntityGraph>,
 }
 
 impl Predictor {
     pub fn reset(&mut self) {
         *self = Self::default();
-        // The rounding mode is process-wide native state; solo play and the next server start at
-        // OpenJK's and detection starts over.
-        jka_movement::set_snap_mode(0);
     }
 
     /// Install the predicted client's equipped sabers (what CG_NewClientInfo's
@@ -1647,7 +1615,7 @@ impl Predictor {
 
     /// CG_PredictPlayerState (vanilla, no vehicles).
     pub fn predict(&mut self, input: PredictionInput<'_>) -> Result<(), String> {
-        let PredictionInput { session, snap, next, time, movement, world, entities, settings, provisional } = input;
+        let PredictionInput { session, snap, next, time, movement, world, entities, settings, provisional, entity_graph } = input;
         let client_num = snap.player_state.field_i32("clientNum").unwrap_or(0);
         // cg.thisFrameTeleport is raised by CG_TransitionSnapshot when the
         // playerstate teleport bit or client number changes.
@@ -1704,27 +1672,8 @@ impl Predictor {
         let base_ps = &base.player_state;
         let mut prediction_settings = predict_settings(&session.decoder().configstrings, base_ps);
         prediction_settings.plugin_disable = settings.plugin_disable;
-        // Backend and server identity are separate. JA+ and jaPRO use the
-        // TaystJK backend by default. Base/other servers only require it for
-        // movement-related taystJKinfo bits or CS_LEGACY_FIXES; presentation-only
-        // flags (RGB/black sabers) must not silently change prediction.
-        // Plain Base/unknown can still auto-detect stock vs Tayst from replay.
-        let fixed_tayst_backend = prediction_settings.server_mod != 0
-            || prediction_settings.taystjk_info & mod_support::TAYSTJK_INFO_MOVEMENT_MASK != 0
-            || prediction_settings.legacy_fixes != 0;
-        let effective_backend = if settings.predict_backend >= 0 {
-            settings.predict_backend
-        } else if fixed_tayst_backend {
-            1
-        } else {
-            self.auto_backend
-        };
-        prediction_settings.backend = effective_backend;
-        let effective_snap_mode = if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap };
-        if self.snap_mode_applied != Some(effective_snap_mode) {
-            jka_movement::set_snap_mode(effective_snap_mode);
-            self.snap_mode_applied = Some(effective_snap_mode);
-        }
+        // Pmove is always TaystJK-derived; server-specific rules remain in
+        // prediction_settings (server_mod, cinfo, jcinfo, legacy_fixes, etc.).
         let regime = (prediction_settings, base_ps.stats[STAT_RACEMODE], base_ps.stats[STAT_MOVEMENTSTYLE]);
         if self.last_regime != Some(regime) {
             // This is diagnostic context, not normal gameplay output. Keep it visible when the
@@ -1782,7 +1731,7 @@ impl Predictor {
 
         native.set_foot_bolts(self.foot_bolts)?;
         native.configure(&prediction_settings)?;
-        if prediction_settings.backend == 1 {
+        {
             let prediction_entities: Vec<_> = entities.iter().map(|entity| {
                 let int = |key| entity.state.field_i32(key).unwrap_or(0);
                 let float = |key| entity.state.field_f32(key).unwrap_or(0.0);
@@ -1794,6 +1743,15 @@ impl Predictor {
                     velocity: [float("pos.trDelta[0]"), float("pos.trDelta[1]"), float("pos.trDelta[2]")],
                     angular_velocity: [float("apos.trDelta[0]"), float("apos.trDelta[1]"), float("apos.trDelta[2]")],
                     legs_anim: int("legsAnim"), torso_anim: int("torsoAnim"), saber_move: int("saberMove"),
+                    mover_class: if entity.entity_type == 6 {
+                        entity_graph.and_then(|graph| graph.entities.iter().find(|map_ent| {
+                            map_ent.inline_model == u32::try_from(int("modelindex")).ok()
+                        })).map_or(0, |map_ent| match map_ent.classname.to_ascii_lowercase().as_str() {
+                            "func_train" => 1,
+                            "func_door" | "func_door_rotating" | "func_plat" => 2,
+                            _ => 0,
+                        })
+                    } else { 0 },
                 }
             }).collect();
             native.set_prediction_entities(&prediction_entities)?;
@@ -2047,35 +2005,12 @@ impl Predictor {
         }
         let replay_ground_trace = *world.ground_trace;
         let replay_ground_probe = *world.ground_probe;
-        let backend_candidates: Vec<i32> = if settings.predict_backend >= 0 {
-            vec![settings.predict_backend]
-        } else if fixed_tayst_backend {
-            vec![1]
-        } else {
-            vec![0, 1]
-        };
-        let snap_candidates: Vec<i32> = if settings.snap_mode >= 0 {
-            vec![settings.snap_mode]
-        } else if fixed_tayst_backend {
-            vec![0]
-        } else {
-            vec![0, 1, 2]
-        };
-        let combos: Vec<(i32, i32)> = backend_candidates
-            .iter()
-            .flat_map(|&backend| snap_candidates.iter().map(move |&snap| (backend, snap)))
-            .collect();
-        let detecting = combos.len() > 1;
-        if (settings.physics_diag > 0 || detecting)
+        if settings.physics_diag > 0
             && self.diag_previous.as_ref().map_or(true, |(message, _)| *message != base.message_num)
         {
-            // Does this client's pmove reproduce the server's? Replay exactly the commands the server
-            // ran between the previous snapshot and this one, starting from the previous snapshot's
-            // state, and compare with this snapshot. Any difference is a pure physics mismatch over
-            // one snapshot interval, with no long replay chain, time sync or smoothing involved.
-            // The same interval is replayed under every candidate (stock or TaystJK backend, each
-            // velocity rounding) and the candidate that reproduces the server wins the vote: at 1 ms
-            // steps the rounding, and any modded server's movement, decide friction and gravity.
+            // Diagnostic only. Re-run a single snapshot interval through the *same*
+            // TaystJK pmove and rounding path as live prediction. Never select or
+            // mutate physics based on this comparison.
             if let Some((_, previous)) = self.diag_previous.take() {
                 let start = previous.field_i32("commandTime").unwrap_or(0);
                 let end = base_ps.field_i32("commandTime").unwrap_or(0);
@@ -2085,123 +2020,56 @@ impl Predictor {
                     || previous.field_i32("clientNum") != base_ps.field_i32("clientNum")
                     || previous.field_i32("pm_type") != base_ps.field_i32("pm_type");
                 if end > start && !skipped {
-                    let mut results: Vec<(i32, i32, IntervalCheck, PlayerState)> = Vec::new();
-                    let (mut steps, mut min_gap, mut max_gap) = (0u32, i32::MAX, 0i32);
-                    for &(backend, snap) in &combos {
-                        jka_movement::set_snap_mode(snap);
-                        let mut candidate = prediction_settings;
-                        candidate.backend = backend;
-                        let mut probe = NativePlayerState::from_network(&to_native(&previous))?;
-                        probe.configure(&candidate)?;
-                        probe.set_foot_bolts(self.foot_bolts)?;
-                        let (mut count, mut low, mut high, mut last) = (0u32, i32::MAX, 0i32, start);
-                        for number in first..=current {
-                            let mut cmd = command(number);
-                            let mut time = cmd.server_time;
-                            if candidate.pmove_fixed != 0 {
-                                let msec = candidate.pmove_msec;
-                                time = ((time + msec - 1) / msec) * msec;
-                            }
-                            if time <= start {
-                                continue;
-                            }
-                            if time > end {
-                                break;
-                            }
-                            if candidate.pmove_fixed != 0 {
-                                movement.update_view_angles(&mut probe, movement_cmd(&cmd));
-                                cmd.server_time = time;
-                            }
-                            low = low.min(time - last);
-                            high = high.max(time - last);
-                            last = time;
-                            movement.predict(&mut probe, movement_cmd(&cmd), &candidate, &mut world)?;
-                            count += 1;
+                    let mut probe = NativePlayerState::from_network(&to_native(&previous))?;
+                    probe.configure(&prediction_settings)?;
+                    probe.set_foot_bolts(self.foot_bolts)?;
+                    let (mut steps, mut min_gap, mut max_gap, mut last) = (0u32, i32::MAX, 0i32, start);
+                    for number in first..=current {
+                        let mut cmd = command(number);
+                        let mut cmd_time = cmd.server_time;
+                        if prediction_settings.pmove_fixed != 0 {
+                            let msec = prediction_settings.pmove_msec;
+                            cmd_time = ((cmd_time + msec - 1) / msec) * msec;
                         }
-                        if count > 0 && last == end {
-                            let replayed = from_native(probe.network());
-                            let check = check_interval(&replayed, base_ps);
-                            (steps, min_gap, max_gap) = (count, low, high);
-                            results.push((backend, snap, check, replayed));
+                        if cmd_time <= start {
+                            continue;
                         }
+                        if cmd_time > end {
+                            break;
+                        }
+                        if prediction_settings.pmove_fixed != 0 {
+                            movement.update_view_angles(&mut probe, movement_cmd(&cmd));
+                            cmd.server_time = cmd_time;
+                        }
+                        min_gap = min_gap.min(cmd_time - last);
+                        max_gap = max_gap.max(cmd_time - last);
+                        last = cmd_time;
+                        movement.predict(&mut probe, movement_cmd(&cmd), &prediction_settings, &mut world)?;
+                        steps += 1;
                     }
-                    jka_movement::set_snap_mode(effective_snap_mode);
-                    if !results.is_empty() {
-                        if detecting && results.len() == combos.len() {
-                            for (backend, snap, check, _) in &results {
-                                self.diag_combo_matched[combo_index(*backend, *snap)] += u32::from(check.exact);
-                            }
-                            let exact: Vec<(i32, i32)> = results.iter().filter(|r| r.2.exact).map(|r| (r.0, r.1)).collect();
-                            // Informative only when the candidates disagree about this interval.
-                            if !exact.is_empty() && exact.len() < results.len() {
-                                for &(backend, snap) in &exact {
-                                    self.combo_votes[combo_index(backend, snap)] += 1;
-                                }
-                                if self.combo_votes.iter().sum::<u32>() > 400 {
-                                    self.combo_votes = self.combo_votes.map(|votes| votes / 2);
-                                }
-                                let best = combos
-                                    .iter()
-                                    .copied()
-                                    .max_by_key(|&(backend, snap)| self.combo_votes[combo_index(backend, snap)])
-                                    .unwrap_or((effective_backend, effective_snap_mode));
-                                let best_votes = self.combo_votes[combo_index(best.0, best.1)];
-                                let current_votes = self.combo_votes[combo_index(effective_backend, effective_snap_mode)];
-                                if best != (effective_backend, effective_snap_mode)
-                                    && best_votes >= 4
-                                    && best_votes >= current_votes + 3
-                                {
-                                    if settings.predict_backend < 0 && !fixed_tayst_backend {
-                                        self.auto_backend = best.0;
-                                    }
-                                    if settings.snap_mode < 0 && !fixed_tayst_backend {
-                                        self.auto_snap = best.1;
-                                    }
-                                    jka_movement::set_snap_mode(if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap });
-                                    self.snap_mode_applied = Some(if settings.snap_mode >= 0 { settings.snap_mode } else { self.auto_snap });
-                                    self.misses.push(format!(
-                                        "^3PREDICT-MODE^7 detected: {} reproduces this server best ({best_votes} votes vs {current_votes} for {}); applying it",
-                                        combo_name(best.0, best.1),
-                                        combo_name(effective_backend, effective_snap_mode),
-                                    ));
-                                }
-                            }
-                        }
-                        let active = results
-                            .iter()
-                            .find(|r| r.0 == effective_backend && r.1 == effective_snap_mode)
-                            .unwrap_or(&results[0]);
-                        let (check, replayed) = (&active.2, &active.3);
+                    if steps > 0 && last == end {
+                        let replayed = from_native(probe.network());
+                        let check = check_interval(&replayed, base_ps);
                         let field = |ps: &PlayerState, name: &str| ps.field_f32(name).unwrap_or(0.0);
                         let magnitude = |v: [f32; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
                         self.diag_compared += 1;
                         self.diag_matched += u32::from(check.exact);
-                        if settings.physics_diag > 0 && (!check.exact || settings.physics_diag >= 2) {
+                        if !check.exact || settings.physics_diag >= 2 {
                             self.misses.push(format!(
-                                "{}^7 snap#{} cmdtime {start}->{end} steps={steps} gaps={min_gap}..{max_gap}ms using {} | origin d=({:.3},{:.3},{:.3}) |d|={:.3} | vel d=({:.2},{:.2},{:.2}) | start v=({:.0},{:.0},{:.0}) replay v=({:.2},{:.2},{:.2}) server v=({:.2},{:.2},{:.2}) | ground {}/{} pmf {:#x}/{:#x} pmt {}/{} (replay/server)",
+                                "{}^7 snap#{} cmdtime {start}->{end} steps={steps} gaps={min_gap}..{max_gap}ms using TaystJK (engine rounding) | origin d=({:.3},{:.3},{:.3}) |d|={:.3} | vel d=({:.2},{:.2},{:.2}) | start v=({:.0},{:.0},{:.0}) replay v=({:.2},{:.2},{:.2}) server v=({:.2},{:.2},{:.2}) | ground {}/{} pmf {:#x}/{:#x} pmt {}/{} (replay/server)",
                                 if check.exact { "^2PHYS-OK" } else { "^1PHYS-DIAG" },
                                 base.message_num,
-                                combo_name(active.0, active.1),
                                 check.origin_delta[0], check.origin_delta[1], check.origin_delta[2], magnitude(check.origin_delta),
                                 check.velocity_delta[0], check.velocity_delta[1], check.velocity_delta[2],
                                 field(&previous, "velocity[0]"), field(&previous, "velocity[1]"), field(&previous, "velocity[2]"),
-                                field(replayed, "velocity[0]"), field(replayed, "velocity[1]"), field(replayed, "velocity[2]"),
+                                field(&replayed, "velocity[0]"), field(&replayed, "velocity[1]"), field(&replayed, "velocity[2]"),
                                 field(base_ps, "velocity[0]"), field(base_ps, "velocity[1]"), field(base_ps, "velocity[2]"),
                                 check.ground.0, check.ground.1, check.flags.0, check.flags.1, check.timer.0, check.timer.1,
                             ));
                         }
-                        if settings.physics_diag > 0 && self.diag_compared % 20 == 0 {
-                            let by_candidate = if detecting {
-                                let parts: Vec<String> = combos
-                                    .iter()
-                                    .map(|&(backend, snap)| format!("{} {}", combo_name(backend, snap), self.diag_combo_matched[combo_index(backend, snap)]))
-                                    .collect();
-                                format!("; exact per candidate: {}; using {}", parts.join(" | "), combo_name(effective_backend, effective_snap_mode))
-                            } else {
-                                String::new()
-                            };
+                        if self.diag_compared % 20 == 0 {
                             self.misses.push(format!(
-                                "^3PHYS-DIAG summary^7: {} of {} snapshot intervals reproduced exactly ({} commands per interval, gaps {min_gap}..{max_gap} ms){by_candidate}",
+                                "^3PHYS-DIAG summary^7: {} of {} snapshot intervals reproduced exactly ({} commands per interval, gaps {min_gap}..{max_gap} ms; TaystJK, engine rounding)",
                                 self.diag_matched, self.diag_compared, steps,
                             ));
                         }
@@ -2209,6 +2077,10 @@ impl Predictor {
                 }
             }
             self.diag_previous = Some((base.message_num, base_ps.clone()));
+        } else if settings.physics_diag == 0 {
+            // Re-enabling diagnostics starts at a fresh authoritative snapshot,
+            // not an old interval captured before diagnostics were disabled.
+            self.diag_previous = None;
         }
         if let Some(sequence) = miss_sequence_this_frame {
             if let Some(miss) = self.latest_miss.as_mut().filter(|miss| miss.sequence == sequence) {
@@ -2499,6 +2371,7 @@ mod tests {
                         entities: &[],
                         settings: &settings,
                         provisional,
+                        entity_graph: None,
                     })
                     .unwrap();
                 predictions += 1;
@@ -2693,7 +2566,7 @@ mod tests {
         assert_eq!((settings.pmove_msec, settings.hook_pull, settings.legacy_fixes), (1, 900, 7));
         config.insert(0, br"\gamename\basejka\jcinfo\123".to_vec());
         let settings = predict_settings(&config, &ps);
-        assert_eq!((settings.backend, settings.server_mod, settings.cinfo, settings.jcinfo, settings.jcinfo2, settings.legacy_fixes), (0, 0, 0, 0, 0, 7));
+        assert_eq!((settings.backend, settings.server_mod, settings.cinfo, settings.jcinfo, settings.jcinfo2, settings.legacy_fixes), (1, 0, 0, 0, 0, 7));
         assert_eq!(settings.pmove_msec, 8);
         assert_eq!(settings.hook_pull, 0);
         config.clear();
@@ -2720,7 +2593,7 @@ mod tests {
         config.remove(&36);
         config.insert(0, br"\gamename\basejka\taystJKinfo\1".to_vec());
         let settings = predict_settings(&config, &ps);
-        assert_eq!(settings.backend, 0, "RGB-only capability must not change movement implementation");
+        assert_eq!(settings.backend, 1, "Presentation-only capability flags must not change the fixed TaystJK backend");
 
         // A TaystJK server explicitly advertises whether its game module uses
         // the Raven SDK API. This overrides gamename, including a false value.
@@ -2728,6 +2601,21 @@ mod tests {
         assert_eq!(predict_settings(&config, &ps).base_game, 0);
         config.insert(0, br"\gamename\futuremod\sv_legacyGameAPI\1".to_vec());
         assert_eq!(predict_settings(&config, &ps).base_game, 1);
+    }
+
+    #[test]
+    fn base_and_unknown_servers_always_use_taystjk_prediction() {
+        let ps = PlayerState::default();
+        for serverinfo in [
+            br"\gamename\basejka".as_slice(),
+            br"\gamename\mysterymod".as_slice(),
+            br"\gamename\basejka\taystJKinfo\1".as_slice(),
+        ] {
+            let config = std::collections::BTreeMap::from([(0, serverinfo.to_vec())]);
+            let settings = predict_settings(&config, &ps);
+            assert_eq!(settings.backend, 1);
+            assert_eq!(settings.server_mod, 0);
+        }
     }
 
     #[test]

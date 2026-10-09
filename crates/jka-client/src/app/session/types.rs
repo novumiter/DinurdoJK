@@ -36,6 +36,26 @@ pub(in crate::app) fn snapshot_owns_playerstate_events(
         || player_state.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0
 }
 
+/// TaystJK CG_TransitionPlayerState -> CG_DamageFeedback trigger.
+/// `cg.attackerTime` only becomes nonzero when a new damage event with a
+/// nonzero count is received; PERS_ATTACKER alone does not mean a hit occurred.
+pub(in crate::app) fn attacker_damage_transition(
+    old: &jka_protocol::server::PlayerState,
+    current: &jka_protocol::server::PlayerState,
+) -> bool {
+    current.field_i32("damageEvent") != old.field_i32("damageEvent")
+        && current.field_i32("damageCount").unwrap_or(0) != 0
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::app) struct SiegeExtendedClient {
+    pub(in crate::app) health: i32,
+    pub(in crate::app) max_health: i32,
+    pub(in crate::app) ammo: i32,
+    pub(in crate::app) weapon: i32,
+    pub(in crate::app) last_updated: i32,
+}
+
 pub(in crate::app) struct GameSession {
     /// Live sessions take snapshots from `live_snapshots` (filled by the
     /// network pump) instead of the demo reader, and their clock comes from
@@ -76,13 +96,26 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) demo_spectator_camera_mode: Option<SpectatorCameraMode>,
     /// Client-side obituary counts used by TaystJK cg_scoreDeaths modes 2/3.
     pub(in crate::app) client_deaths: [i32; 32],
+    /// TaystJK cg.attackerTime validity: latched by CG_DamageFeedback upon
+    /// a nonzero damageCount and changed damageEvent, on this CGame lifetime.
+    pub(in crate::app) attacker_damage_seen: bool,
     pub(in crate::app) player_position: Option<glam::Vec3>,
+    pub(in crate::app) ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
+    pub(in crate::app) ocean_interaction_enabled: bool,
     /// Canonical current player, analogous to cg.predictedPlayerState. Computed
     /// once per presentation frame from prediction's provisional display state
     /// or snapshot interpolation, with input-owned view angles applied.
     pub(in crate::app) presented_player_state: Option<jka_protocol::server::PlayerState>,
     pub(in crate::app) client_game: ClientGameState,
+    pub(in crate::app) siege_catalog: jka_assets::siege::SiegeCatalog,
     pub(in crate::app) siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
+    /// TaystJK `sxd` teammate stat-viewer cache. Entries are server-time stamped
+    /// and are intentionally invalidated by weapon changes in the HUD path.
+    pub(in crate::app) siege_extended: [SiegeExtendedClient; 32],
+    /// Absolute server/cgame time supplied by `EV_SIEGESPEC` for this viewer.
+    pub(in crate::app) siege_respawn_time: i32,
+    /// Last announced 3/2/1 value for the current Siege start countdown.
+    pub(in crate::app) siege_last_countdown: i32,
     pub(in crate::app) presented_entities: Vec<PresentedEntity>,
     /// The predicted/followed player is intentionally absent from
     /// `presented_entities`; keep the synthesized entity for this frame so
@@ -141,6 +174,9 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) sound_presenter: Option<crate::cgame::sound_presenter::SoundPresenter>,
     /// OpenJK FX system driven by CGame (missile trails, impacts, effect events).
     pub(in crate::app) weapon_fx: crate::cgame::weapon_fx::WeaponFx,
+    /// Material/texture analysis cache used by inferred legacy-EFX lights.
+    pub(in crate::app) fx_light_promoter: crate::fx::light_promotion::FxLightPromoter,
+    pub(in crate::app) promote_fx_lights: bool,
     /// This frame's FX primitives, tessellated once the final camera is known.
     pub(in crate::app) fx_draws: Vec<crate::fx::system::FxDraw>,
     /// RE_AddLightToScene-style FX lights in renderer coordinates.
@@ -162,10 +198,29 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) event_suppressed_zero: u64,
 }
 
+#[cfg(test)]
+mod attacker_tests {
+    use super::attacker_damage_transition;
+    use jka_protocol::server::PlayerState;
+
+    #[test]
+    fn attacker_damage_feedback_requires_nonzero_changed_event() {
+        let old = PlayerState::default();
+        let mut next = old.clone();
+        assert!(!attacker_damage_transition(&old, &next));
+        next.set_field_bits("damageEvent", 1);
+        assert!(!attacker_damage_transition(&old, &next));
+        next.set_field_bits("damageCount", 25);
+        assert!(attacker_damage_transition(&old, &next));
+        assert!(!attacker_damage_transition(&next, &next));
+    }
+}
+
 /// CPU-heavy CGame assets prepared while the challenge/gamestate handshake is
 /// still in flight. Sound device creation intentionally remains on the main
 /// thread; the expensive VFS/material/presenter work is safe to overlap.
 pub(in crate::app) struct LiveCgamePrepared {
+    pub(in crate::app) siege_catalog: jka_assets::siege::SiegeCatalog,
     pub(in crate::app) siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
     pub(in crate::app) player_presenter: PlayerPresenter,
     pub(in crate::app) entity_presenter: EntityPresenter,

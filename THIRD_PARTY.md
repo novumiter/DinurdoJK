@@ -1,5 +1,21 @@
 # Reference provenance
 
+The optional nearby ocean interaction field (`ocean/interaction.rs` and
+`ocean_interaction.wgsl`) adapts the height/velocity finite-difference update
+and height-derived normals from [jeantimex/webgpu-water](https://github.com/jeantimex/webgpu-water),
+whose supplied local snapshot is MIT licensed, Copyright (c) 2026 Su. Its
+README credits Evan Wallace's original WebGL Water. Solver source hashes are
+recorded in `docs/ocean-interaction-plan.md`. World reprojection, Courant
+stability limiting, boundary damping and signed velocity-force falloff follow
+[Crest](https://github.com/wave-harmonic/crest), specifically
+`UpdateDynWaves.compute` and `Shaders/OceanInputs/Resources/DynWavesSphereWaterInteraction.shader`
+in the supplied `crest-master` snapshot (MIT, Copyright (c) 2019 Wave Harmonic
+and contributors). Full notices are in `crates/jka-client/LICENSE-OceanInteraction-MIT`.
+The local jaPRO sailing branch at `20172b38dcde9469d055ff3e2349018712636f9e`
+was consulted for entity wiring and its existing nine-point isotropic stencil;
+jaPRO retains its GPL-2.0 source licensing. This adaptation uses the existing
+Dinurdo presentation/renderer architecture and does not import sailing physics.
+
 The protocol research and generated Huffman/entity-schema data use [JACoders/OpenJK](https://github.com/JACoders/OpenJK) at revision `1a6a643427aa347553e9073dac5570b33337c4d9`. OpenJK's source is licensed under GNU GPL version 2 and carries notices for id Software, Raven Software, Activision, ioquake3 contributors and OpenJK contributors.
 
 The reference-fetch script retrieves `LICENSE.txt` alongside source into `.references/OpenJK/<revision>/`. The isolated protocol C++ test harness compiles that reference code separately from the Rust application. Generated tables and conformance fixtures identify their source revision and include a source-hash manifest. They are derived from the reference, not claimed as clean-room artifacts.
@@ -12,7 +28,7 @@ The `japro-web`, local jaPRO and OpenJK WASM working trees are additional resear
 
 The native RBSP importer uses the format declarations in the local OpenJK WASM `codemp/qcommon/qfiles.h` and patch index ordering in `codemp/rd-vanilla/tr_surface.cpp` as references. `japro-web/viewer/lib/bspLoader.js` informed the format audit. Source hashes and importer limits are recorded in `Development Docs/Map validation.md`. The fixed quadratic patch evaluator is native Rust, not a port of OpenJK's adaptive subdivision/collision code. User-owned BSP content is extracted only into ignored `target/dev-assets` and is not a distributable fixture.
 
-The rain-on-lens pass is a native WGPU port of [toadstorm/RainyGlassShader](https://github.com/toadstorm/RainyGlassShader) (`Assets/Shaders/Effects/RainScrollerShader.shader`), which is licensed under **GNU LGPL 2.1**. The license text is at `crates/jka-client/LICENSE-RainyGlassShader-LGPL-2.1`. The two mask textures in `crates/jka-client/src/weather/assets/` are converted directly from that package's `droplets_mask.tif` and `rivulets_mask.tif` following its own Unity importer metadata; `RAINY_GLASS_SOURCE.txt` in that directory records the conversion. The port keeps the upstream droplet erosion, rivulet flow-map, world-up mask and the serialized `RainOnGlass.mat` constants, so it is a derivative work and not a clean-room implementation.
+The rain-on-lens pass is a native WGPU port of [toadstorm/RainyGlassShader](https://github.com/toadstorm/RainyGlassShader) (`Assets/Shaders/Effects/RainScrollerShader.shader`), which is licensed under **GNU LGPL 2.1**. The license text is at `crates/jka-client/LICENSE-RainyGlassShader-LGPL-2.1`. The two mask textures in `assets/dinurdo-assets.pk3` are stored under `textures/japro/` and converted directly from that package's `droplets_mask.tif` and `rivulets_mask.tif` following its own Unity importer metadata; `assets/RAINY_GLASS_SOURCE.txt` records the conversion. The port keeps the upstream droplet erosion, rivulet flow-map, world-up mask and the serialized `RainOnGlass.mat` constants, so it is a derivative work and not a clean-room implementation.
 
 The graphical application uses native winit and wgpu rendering with egui for its interface; it does not depend on Bevy. PK3 reading uses zip 8.6.0 (MIT). Dependency versions are recorded in Cargo.lock. Bevy was consulted during earlier renderer research but is not part of the application or runtime. The runtime reads user-supplied PK3s in place; no game content is bundled in the executable.
 

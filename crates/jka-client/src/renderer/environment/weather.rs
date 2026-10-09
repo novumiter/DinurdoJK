@@ -148,6 +148,21 @@ impl Renderer {
             return;
         };
         self.shadow_resources.weather_height_view = weather_height_view;
+        {
+            let weather = &mut self.weather;
+            weather.snow.rebuild_collision_bind_group(
+                &self.device,
+                weather.rain.collision_view(),
+                &weather.rain.gpu.wind_noise_view,
+                &weather.rain.gpu.wind_noise_sampler,
+            );
+            weather.wind_visuals.rebuild_field_bind_group(
+                &self.device,
+                weather.rain.collision_view(),
+                &weather.rain.gpu.wind_noise_view,
+                &weather.rain.gpu.wind_noise_sampler,
+            );
+        }
         self.rebuild_weather_surface_receiver_bind_group();
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
@@ -182,13 +197,16 @@ impl Renderer {
             if boxes.len() == 8 {
                 break;
             }
-            boxes.push((
-                [a.mins[0], a.mins[2], -a.maxs[1]],
-                [a.maxs[0], a.height, -a.mins[1]],
-            ));
+            boxes.push(crate::ocean::WaterVolume {
+                minimum: [a.mins[0], a.mins[2], -a.maxs[1]],
+                maximum: [a.maxs[0], a.height, -a.mins[1]],
+                mask_slot: None,
+            });
         }
         if let Some(world) = &self.world {
-            for s in &world.ocean_surfaces {
+            // `slot` is the index baked into the clipmap, which is what the
+            // outline masks are keyed by (ocean_surfaces is pushed in slot order).
+            for (slot, s) in world.ocean_surfaces.iter().enumerate() {
                 if boxes.len() == 8 {
                     break;
                 }
@@ -204,18 +222,50 @@ impl Renderer {
                 {
                     continue;
                 }
-                boxes.push((
-                    [s.minimum[0], -65536.0, s.minimum[1]],
-                    [s.maximum[0], s.plane_height, s.maximum[1]],
-                ));
+                boxes.push(crate::ocean::WaterVolume {
+                    minimum: [s.minimum[0], -65536.0, s.minimum[1]],
+                    maximum: [s.maximum[0], s.plane_height, s.maximum[1]],
+                    mask_slot: world.ocean_masks.is_masked(slot).then_some(slot as u8),
+                });
             }
         }
-        self.camera_water_surface = boxes
+        // The camera is submerged only inside the real outline: standing in the
+        // hollow of an island ring is inside the box but not in the water.
+        let no_masks = crate::ocean::OceanMasks::default();
+        let masks = self.world.as_ref().map_or(&no_masks, |world| &*world.ocean_masks);
+        let eye_point = [eye.x, eye.y, eye.z];
+        let surface = boxes
             .iter()
-            .filter(|(lo, hi)| (0..3).all(|axis| eye[axis] >= lo[axis] && eye[axis] <= hi[axis]))
-            .map(|(_, hi)| hi[1])
+            .filter(|volume| volume.contains(eye_point, masks))
+            .map(|volume| volume.maximum[1])
             .fold(NO_WATER_SURFACE, f32::max);
+        self.camera_water_surface = surface;
         self.water_boxes = boxes;
+    }
+
+    pub(in crate::renderer) fn prepare_wind_visuals_frame(&mut self, frame_time: f32) {
+        if !self.weather.wind_visuals.active() {
+            return;
+        }
+        self.weather
+            .wind_visuals
+            .ensure_render_pipelines(&mut self.pipeline_jobs, &self.device);
+        // TaystJK/Raven weather particles are explicitly outside-only. Reuse the
+        // existing heightfield rather than introducing another indoor/outdoor cache.
+        self.ensure_weather_occlusion();
+        let occlusion = match &self.weather.rain.occlusion {
+            weather::WeatherOcclusionCache::Ready(info) => Some(*info),
+            weather::WeatherOcclusionCache::Pending(_)
+            | weather::WeatherOcclusionCache::Building(_)
+            | weather::WeatherOcclusionCache::Unavailable => None,
+        };
+        self.weather.wind_visuals.prepare(
+            &self.queue,
+            frame_time,
+            self.weather_wind,
+            occlusion,
+            self.ocean_enabled && self.camera_water_surface > NO_WATER_SURFACE,
+        );
     }
 
     pub(in crate::renderer) fn prepare_rain_frame(&mut self, camera: &Camera, frame_time: f32) {
@@ -240,11 +290,15 @@ impl Renderer {
             } else {
                 &[]
             },
+            &self
+                .world
+                .as_ref()
+                .map_or_else(Default::default, |world| std::sync::Arc::clone(&world.ocean_masks)),
             self.ocean_enabled && self.camera_water_surface > NO_WATER_SURFACE,
         );
-        // Toadstorm's original shader fades rivulets off horizontal glass with
-        // abs(dot(worldNormal, worldUp)). For a camera lens the glass normal is
-        // the view direction; renderer space is already Y-up.
+        // RainyGlass receives the same instantaneous weather gust/veer as the
+        // rain particles. It transforms that wind into lens space and applies it
+        // only to local droplet/rivulet flow; the authored mask itself stays put.
         self.weather.rain.prepare_lens_glass(
             &mut self.pipeline_jobs,
             &self.device,
@@ -253,7 +307,34 @@ impl Renderer {
             self.config.height,
             self.config.format,
             frame_time,
-            camera.forward().y,
+            camera,
+            self.weather_wind,
+            self.weather_assets.as_mut(),
+        );
+    }
+
+    pub(in crate::renderer) fn prepare_snow_frame(&mut self, camera: &Camera, frame_time: f32) {
+        self.weather
+            .snow
+            .ensure_render_pipeline(&mut self.pipeline_jobs, &self.device);
+        self.ensure_weather_occlusion();
+        let occlusion = match &self.weather.rain.occlusion {
+            weather::WeatherOcclusionCache::Ready(info) => Some(*info),
+            weather::WeatherOcclusionCache::Pending(_)
+            | weather::WeatherOcclusionCache::Building(_)
+            | weather::WeatherOcclusionCache::Unavailable => None,
+        };
+        let sun = self.active_sun();
+        self.weather.snow.prepare_frame(
+            &self.queue,
+            camera,
+            frame_time,
+            self.previous_frame_time,
+            self.config.height,
+            self.weather_wind,
+            occlusion,
+            sun.color,
+            sun.intensity,
         );
     }
 }

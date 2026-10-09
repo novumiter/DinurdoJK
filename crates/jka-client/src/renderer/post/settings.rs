@@ -22,6 +22,7 @@ impl Renderer {
         let desired_smaa = effects.smaa && !desired_taa;
         let desired_fxaa = effects.fxaa && !desired_taa && !desired_smaa;
         let taa_changed = self.taa_enabled != desired_taa;
+        let rt_taa_changed = self.rt_taa_mode != effects.rt_taa.min(2);
         let smaa_changed = self.smaa_enabled != desired_smaa;
         let color_grade = effects.color_grade.sanitize();
         let split_toning = effects.split_toning.sanitize();
@@ -44,10 +45,14 @@ impl Renderer {
             || split_changed
             || (grading_active && self.color_lut_strength != lut_strength);
         let old_legacy_fog_effective = self.weather.fog.legacy_effective();
-        let rain_history_changed = self.weather.rain.enabled != effects.rain
+        let weather_history_changed = self.weather.rain.enabled != effects.rain
             || self.weather.rain.intensity != effects.rain_intensity
+            || (self.weather.rain.density_scale - effects.rain_density_scale).abs() > 0.0005
+            || self.weather.rain.tint != effects.rain_tint
             || self.weather.rain.puddle_quality != effects.puddle_quality
-            || (self.weather.rain.puddle_scatter - effects.puddle_scatter).abs() > 0.0005;
+            || (self.weather.rain.puddle_scatter - effects.puddle_scatter).abs() > 0.0005
+            || self.weather.snow.enabled != effects.snow
+            || (self.weather.snow.density_scale - effects.snow_density_scale).abs() > 0.0005;
         let cloud_resolution_changed =
             self.cloud_render_resolution != effects.cloud_render_resolution;
         // Anything that changes what the cloud history holds. Built from the
@@ -107,6 +112,7 @@ impl Renderer {
             self.request_static_ao(true);
         }
         self.taa_enabled = desired_taa;
+        self.rt_taa_mode = effects.rt_taa.min(2);
         self.smaa_enabled = desired_smaa;
         self.fxaa_enabled = desired_fxaa;
         if self.smaa_enabled {
@@ -122,6 +128,7 @@ impl Renderer {
         self.sun_color = effects.sun_color.map(|channel| channel.clamp(0.0, 1.0));
         self.sun_visibility = effects.sun_visibility;
         self.entity_sun_lighting = effects.entity_sun_lighting;
+        self.sky_fractal_override = effects.sky_fractal_override;
         self.clouds_enabled = effects.clouds;
         self.cloud_type = effects.cloud_type;
         self.cloud_quality = effects.cloud_quality.clamp(0.0, 1.0);
@@ -132,7 +139,22 @@ impl Renderer {
         self.cloud_thickness = effects
             .cloud_thickness
             .clamp(ui::CLOUD_THICKNESS_MIN, ui::CLOUD_THICKNESS_MAX);
-        self.weather_wind = effects.weather_wind.sanitize();
+        let atmospheric_wind = effects.weather_wind.sanitize();
+        let atmospheric_wind_changed = self.weather_wind != atmospheric_wind;
+        self.weather_wind = atmospheric_wind;
+        if atmospheric_wind_changed {
+            // There is one atmospheric wind for the rendered world. Keep the
+            // ocean simulation on the same source even when this value came from
+            // a legacy r_we override rather than the user's r_weatherWind cvar.
+            let mut ocean_settings = self.ocean_settings;
+            ocean_settings.wind = atmospheric_wind;
+            self.set_ocean_settings(ocean_settings);
+        }
+        self.weather.wind_visuals.strength = if effects.wind_visuals.is_finite() {
+            effects.wind_visuals.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let sun = self.active_sun();
         self.grass_renderer.update_environment(
             &self.queue,
@@ -165,6 +187,26 @@ impl Renderer {
         self.weather.rain.enabled = effects.rain;
         self.weather.rain.glass_enabled = effects.rain_glass;
         self.weather.rain.intensity = effects.rain_intensity;
+        self.weather.rain.density_scale = if effects.rain_density_scale.is_finite() {
+            effects.rain_density_scale.clamp(0.0, crate::world_effects::MAX_PARTICLE_CLOUDS as f32)
+        } else {
+            1.0
+        };
+        self.weather.rain.tint = effects.rain_tint.map(|channel| channel.clamp(0.0, 1.0));
+        self.weather.rain.acid_strength = effects.legacy_acid_rain.clamp(0.0, 1.0);
+        self.weather.rain.frozen = effects.rain_frozen;
+        self.weather.snow.enabled = effects.snow;
+        self.weather.snow.density_scale = if effects.snow_density_scale.is_finite() {
+            effects.snow_density_scale.clamp(0.0, crate::world_effects::MAX_PARTICLE_CLOUDS as f32)
+        } else {
+            1.0
+        };
+        self.weather.snow.frozen = effects.snow_frozen;
+        self.weather.atmosphere.set_override(crate::world_effects::AtmosphereOverride {
+            sand_layers: effects.legacy_sand_layers,
+            space_dust_count: effects.legacy_space_dust_count,
+            frozen: effects.legacy_weather_frozen,
+        });
         self.weather.rain.puddle_quality = effects.puddle_quality;
         self.weather.rain.puddle_scatter = effects.puddle_scatter.clamp(0.0, 1.0);
         self.weather.rain.wet_grade = effects.rain_grade.clamp(0.0, 1.0);
@@ -248,10 +290,11 @@ impl Renderer {
                     if self.vignette_enabled { 1.0 } else { 0.0 },
                     self.color_grade.exposure_ev,
                 ],
+                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
             }),
         );
         self.rebuild_frame_plan();
-        if taa_changed || smaa_changed || rain_history_changed {
+        if taa_changed || rt_taa_changed || smaa_changed || weather_history_changed {
             self.history_valid = false;
             self.taa_frame_index = 0;
             self.history_read_index = 0;

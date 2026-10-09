@@ -7,6 +7,9 @@ use crate::renderer::{
     LOCAL_SHADOW_RESELECT_DISTANCE, MAX_LOCAL_SHADOW_LIGHTS,
 };
 use bytemuck::Zeroable;
+use crate::renderer::lighting::glass_transmission::{
+    RasterGlassSlot, RASTER_GLASS_PER_LIGHT,
+};
 use wgpu::util::DeviceExt;
 
 impl Renderer {
@@ -35,7 +38,7 @@ impl Renderer {
             return;
         }
         let direct_local_lighting_enabled =
-            self.static_point_lighting_enabled() || self.emissive_area_lights_enabled;
+            self.static_point_lighting_enabled() || self.any_area_lights_enabled();
         if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
             return;
         }
@@ -65,6 +68,8 @@ impl Renderer {
                 camera,
                 self.static_point_lighting_enabled(),
                 self.emissive_area_lights_enabled,
+                self.shader_light_promotion_enabled,
+                self.shader_light_promotion_mask,
             )
         };
 
@@ -164,7 +169,7 @@ impl Renderer {
             return;
         }
         let direct_local_lighting_enabled =
-            self.static_point_lighting_enabled() || self.emissive_area_lights_enabled;
+            self.static_point_lighting_enabled() || self.any_area_lights_enabled();
         if !direct_local_lighting_enabled || !self.local_light_shadows_enabled {
             return;
         }
@@ -188,6 +193,25 @@ impl Renderer {
                     continue;
                 };
                 let light = world.dynamic_lights[light_index];
+                // Pack only triangles inside the light volume, once per invalidated
+                // slot. Store count in the slot header, not in global light color.
+                let glass = if self.tinted_glass_enabled {
+                    let pack_started = std::time::Instant::now();
+                    let (glass, total) = crate::renderer::lighting::glass_transmission::pack_raster_glass_slot(
+                        light.position, light.radius,
+                        &world.raster_glass_static, &world.raster_glass_dynamic);
+                    if total > RASTER_GLASS_PER_LIGHT {
+                        rverbose!(1, "Raster tinted glass: light {} has {} candidate triangles (cap {}), tint disabled for this light",
+                            light_index, total, RASTER_GLASS_PER_LIGHT);
+                    }
+                    rverbose!(2, "Raster tinted glass: light {}, slot {}, candidates {}, packed {}, cpu {:.3}ms",
+                        light_index, slot, total, glass.header[0],
+                        pack_started.elapsed().as_secs_f64() * 1000.0);
+                    glass
+                } else { RasterGlassSlot::default() };
+                self.queue.write_buffer(&world.local_shadows.glass_buffer,
+                    (slot * std::mem::size_of::<RasterGlassSlot>()) as u64,
+                    bytemuck::bytes_of(&glass));
                 let light_sphere = [
                     light.position[0],
                     light.position[1],
@@ -224,6 +248,14 @@ impl Renderer {
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
+                        if self.tinted_glass_enabled
+                            && crate::renderer::lighting::glass_transmission::classify_glass(
+                                &batch.source,
+                                batch.source.texture.and_then(|index| world.glass_texture_names.get(index)).map(String::as_str),
+                                None,
+                                true,
+                            ).is_some()
+                        { continue; }
                         if batch.source.pipeline.blend != BlendMode::Opaque
                             || !aabb_intersects_sphere(
                                 batch.bounds_min,
@@ -310,6 +342,12 @@ pub(in crate::renderer) fn gpu_point_lights(
                     0.0
                 },
             ],
+            shape: [
+                    0.0,
+                    0.0,
+                    (light.shader_promotion_mask & crate::materials::SHADER_LIGHT_ALL) as f32,
+                    0.0,
+                ],
             shadow: [
                 shadow_slot_by_light.get(index).copied().unwrap_or(0) as f32,
                 light.falloff.shader_value(),
@@ -407,7 +445,9 @@ pub(in crate::renderer) fn select_relevant_shadow_lights(
     world: &WorldGpu,
     camera: &Camera,
     include_point_lights: bool,
-    include_area_lights: bool,
+    include_authored_area_lights: bool,
+    shader_promotion_enabled: bool,
+    shader_promotion_mask: u32,
 ) -> Vec<usize> {
     let mut candidates = world
         .dynamic_lights
@@ -419,8 +459,20 @@ pub(in crate::renderer) fn select_relevant_shadow_lights(
                 return None;
             }
             let is_area = light.emitter_normal.iter().any(|value| value.abs() > 1e-6);
-            if is_area && !include_area_lights {
-                return None;
+            if is_area {
+                let enabled = if light.shader_promotion_mask != 0 {
+                    shader_promotion_enabled
+                        && (light.shader_promotion_mask & shader_promotion_mask) != 0
+                        && !(include_authored_area_lights
+                            && (light.shader_promotion_mask
+                                & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP)
+                                != 0)
+                } else {
+                    include_authored_area_lights
+                };
+                if !enabled {
+                    return None;
+                }
             }
             if !is_area && !include_point_lights {
                 return None;
@@ -562,6 +614,13 @@ pub(in crate::renderer) fn create_local_shadow_resources(
         selection_cluster: None,
         selection_position: None,
         selection_serial: 0,
+        glass_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA raster RGB glass caster slots"),
+            size: ((LOCAL_SHADOW_CACHE_SLOTS + crate::renderer::lighting::glass_transmission::RASTER_SUN_GLASS_SLOTS)
+                * std::mem::size_of::<RasterGlassSlot>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }),
     }
 }
 
@@ -628,6 +687,50 @@ pub(in crate::renderer) fn aabb_intersects_clip_frustum(
     let outside_far = clip.iter().all(|point| point.z > point.w);
 
     !(outside_left || outside_right || outside_bottom || outside_top || outside_near || outside_far)
+}
+
+/// Pixel-space bounding rectangle of a world AABB, as `(x, y, width, height)`.
+///
+/// `None` means "cannot be bounded, use the whole target": any corner at or
+/// behind the near plane makes the perspective divide meaningless, and a box
+/// straddling the eye projects to the entire screen anyway. Callers use this to
+/// restrict full-screen work to the part of the framebuffer an object can
+/// affect, so an unbounded answer has to be the conservative one.
+pub(in crate::renderer) fn aabb_screen_rect(
+    minimum: [f32; 3],
+    maximum: [f32; 3],
+    view_proj: Mat4,
+    width: u32,
+    height: u32,
+) -> Option<(f32, f32, f32, f32)> {
+    let corners = [
+        Vec3::new(minimum[0], minimum[1], minimum[2]),
+        Vec3::new(maximum[0], minimum[1], minimum[2]),
+        Vec3::new(minimum[0], maximum[1], minimum[2]),
+        Vec3::new(maximum[0], maximum[1], minimum[2]),
+        Vec3::new(minimum[0], minimum[1], maximum[2]),
+        Vec3::new(maximum[0], minimum[1], maximum[2]),
+        Vec3::new(minimum[0], maximum[1], maximum[2]),
+        Vec3::new(maximum[0], maximum[1], maximum[2]),
+    ];
+    let (width, height) = (width as f32, height as f32);
+    let mut lo = [f32::INFINITY; 2];
+    let mut hi = [f32::NEG_INFINITY; 2];
+    for corner in corners {
+        let clip = view_proj * corner.extend(1.0);
+        if clip.w <= 1.0e-4 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        // wgpu NDC has +y up; the framebuffer has +y down.
+        let x = (ndc.x * 0.5 + 0.5) * width;
+        let y = (0.5 - ndc.y * 0.5) * height;
+        lo[0] = lo[0].min(x);
+        lo[1] = lo[1].min(y);
+        hi[0] = hi[0].max(x);
+        hi[1] = hi[1].max(y);
+    }
+    (lo[0].is_finite() && lo[1].is_finite()).then_some((lo[0], lo[1], hi[0], hi[1]))
 }
 
 /// Culls a caster against a directional cascade. Only the sides of the box are

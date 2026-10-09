@@ -1,8 +1,8 @@
 //! Frame.
 use crate::app::{
     rendering_third_person, ui, App, Arc, ClientFramePerf, FrontendPage, InputLatencySample,
-    Instant, LocalServer, MapEditor, OverlayMode, PlayerViewPolicyState, RenderCommand,
-    RenderSnapshot, SessionPhase, ViewLatchMode,
+    DemoViewMode, Instant, LocalServer, MapEditor, OverlayMode, PlayerViewPolicyState, RenderCommand,
+    RenderSnapshot, SessionPhase, SpectatorHighlight, SpectatorHighlightTeam, ViewLatchMode,
 };
 
 impl App {
@@ -79,6 +79,69 @@ impl App {
         } else {
             self.subframe_input_view_rotation()
         };
+        let spectator_highlights = if !isolated_preview
+            && self.japro_cg.spec_hud
+            && self.spectator_binding_context()
+        {
+            self.game_session.as_ref().map_or_else(
+                || Arc::new(Vec::new()),
+                |session| {
+                    const EF_DEAD: i32 = 1 << 1;
+                    // Exclude exactly the player whose camera we are presenting.
+                    // Do not infer this from the demo recorder's playerState: fake
+                    // follow owns another client and freecam owns no client at all.
+                    let viewed_client = if session.live {
+                        match session.spectate_info() {
+                            Some(info) => info.followed.map(|(client, _)| client),
+                            None => session.client_game.presentation_client_num(),
+                        }
+                    } else if session.local {
+                        session.client_game.presentation_client_num()
+                    } else {
+                        match self.demo_view_mode {
+                            DemoViewMode::Authoritative => session.demo_followed_client(),
+                            DemoViewMode::Follow(client) => Some(client),
+                            DemoViewMode::Free => None,
+                        }
+                    };
+                    Arc::new(
+                        session
+                            .presented_entities
+                            .iter()
+                            // The snapshot/predicted player is deliberately
+                            // absent from presented_entities and submitted via
+                            // a synthesized entity instead. Include it here too:
+                            // once freecam/fake-follow detaches from that player,
+                            // they become an ordinary outline candidate.
+                            .chain(session.audio_followed_entity.iter())
+                            .filter(|entity| {
+                                entity.entity_type == crate::cgame::ET_PLAYER
+                                    && viewed_client != Some(i32::from(entity.number))
+                                    && entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD == 0
+                                    // TaystJK cg_specHud deliberately excludes racers.
+                                    && entity.state.field_i32("bolt1").unwrap_or(0) != 2
+                            })
+                            .map(|entity| {
+                                let team = session
+                                    .client_game
+                                    .client_info(usize::from(entity.number), &session.siege_classes)
+                                    .map_or(0, |info| info.team);
+                                SpectatorHighlight {
+                                    entity_num: entity.number,
+                                    team: match team {
+                                        crate::cgame::TEAM_RED => SpectatorHighlightTeam::Red,
+                                        crate::cgame::TEAM_BLUE => SpectatorHighlightTeam::Blue,
+                                        _ => SpectatorHighlightTeam::Yellow,
+                                    },
+                                }
+                            })
+                            .collect(),
+                    )
+                },
+            )
+        } else {
+            Arc::new(Vec::new())
+        };
         RenderSnapshot {
             model_frame_source: self.network.model_frame_debug.then(|| {
                 let playback = self.game_session.as_ref();
@@ -95,8 +158,12 @@ impl App {
                 let mut camera = self.camera;
                 camera.set_presentation_fov(self.japro_effective_fov(Instant::now()));
                 if let Some(playback) = self.game_session.as_ref() {
-                    // Render space is Y-up: landing dip and stair smoothing move the eye vertically.
-                    camera.position.y += playback.view_offset_z;
+                    // Render space is Y-up: landing dip and stair smoothing move a
+                    // player-owned eye vertically. Demo freecam has no player owner;
+                    // its stored camera position is already the exact render position.
+                    if playback.live || playback.local || self.demo_view_mode != DemoViewMode::Free {
+                        camera.position.y += playback.view_offset_z;
+                    }
                 }
                 camera
             },
@@ -113,12 +180,15 @@ impl App {
                 .flatten(),
             player_position: demo_player_position
                 .or_else(|| self.local_server.as_ref().map(LocalServer::world_position)),
+            ocean_actors: self.game_session.as_ref().map_or_else(
+                || Arc::new(Vec::new()), |s| Arc::clone(&s.ocean_actors)),
             area_mask: self
                 .game_session
                 .as_ref()
                 .and_then(|playback| playback.current_snapshot.as_ref())
                 .map(|snapshot| snapshot.area_mask),
             dynamic_models,
+            spectator_highlights,
             transient_lights: if self.profile_preview_active {
                 Arc::new(Vec::new())
             } else {

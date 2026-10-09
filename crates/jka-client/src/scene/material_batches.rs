@@ -264,6 +264,8 @@ pub(in crate::scene) fn stage_batch(
         parallax_depth: stage.enhancements.parallax_depth,
         lightmap,
         modulate_lightmap: false,
+        reverse_lightmap_fold_role: 0,
+        reverse_lightmap_fold_detail: false,
         dlight_in_lightmap_stage: material_dlight_in_lightmap_stage(material),
         vertex_lit,
         pipeline,
@@ -415,6 +417,32 @@ pub(in crate::scene) fn debug_texture_source(index: Option<usize>, textures: &Te
         .unwrap_or_else(|| "-".into())
 }
 
+/// Map-load-only audit classification; never changes stage emission, blending,
+/// depth, fog or authored shader state. Used for ranking potential work.
+
+pub(in crate::scene) fn stage_audit_class(material: &SurfaceMaterial) -> &'static str {
+    if material.sky { return "sky_ordered"; }
+    if !material.explicit { return "implicit_base"; }
+    if material.stages.len() <= 1 { return "single_stage"; }
+    if can_fold_jka_lightmap_pair(&material.stages[0], &material.stages[1]) {
+        return "existing_lightmap_pair_when_eligible";
+    }
+    if material.water || material.planar_reflection { return "water_or_reflection"; }
+    if can_fold_openjk_reverse_lightmap_modulate_pair(&material.stages[0], &material.stages[1]) {
+        return "optional_reverse_lightmap_pair_when_no_fog";
+    }
+    if material.stages.iter().any(|s| s.glow) { return "glow_requires_parity"; }
+    if material.stages.iter().any(|s| s.alpha_cutoff != 0.0 || s.depth_equal || s.depth_write) {
+        return "depth_or_alpha_test";
+    }
+    if material.stages.iter().any(|s| !s.tc_mods.is_empty() || !matches!(s.tc_gen, TcGen::Base | TcGen::Lightmap)) {
+        return "dynamic_or_special_texcoords";
+    }
+    if material.stages.iter().any(has_stage_enhancements) { return "enhanced_stage_companion"; }
+    if material.stages.iter().any(|s| s.blend.is_some()) { return "ordered_framebuffer_blend"; }
+    "multiple_opaque_stages_review"
+}
+
 pub(in crate::scene) fn build_material_debug_entry(
     name: &str,
     definition: Option<&Shader>,
@@ -523,17 +551,27 @@ pub(in crate::scene) fn build_material_debug_entry(
 
     if let Some(surface_light) = material.surface_light {
         lines.push(format!(
-            "{} surface emitter: value={:.1} color={:.3},{:.3},{:.3} subdivide={:.1}",
-            if surface_light.inferred_from_emissive {
-                "emissive-texture inferred"
-            } else {
-                "q3map authored"
-            },
+            "q3map authored surface emitter: value={:.1} color={:.3},{:.3},{:.3} subdivide={:.1}",
             surface_light.value,
             surface_light.color[0],
             surface_light.color[1],
             surface_light.color[2],
             surface_light.subdivide,
+        ));
+    }
+    if let Some(promoted) = material.shader_light {
+        let mut reasons = Vec::new();
+        if promoted.reasons & materials::SHADER_LIGHT_GLOW != 0 { reasons.push("glow"); }
+        if promoted.reasons & materials::SHADER_LIGHT_ADDITIVE != 0 { reasons.push("additive"); }
+        if promoted.reasons & materials::SHADER_LIGHT_EMISSIVE_COMPANION != 0 { reasons.push("emissive-map"); }
+        lines.push(format!(
+            "shader-promoted surface emitter: reasons={} value={:.1} color={:.3},{:.3},{:.3} subdivide={:.1}",
+            reasons.join("+"),
+            promoted.value,
+            promoted.color[0],
+            promoted.color[1],
+            promoted.color[2],
+            promoted.subdivide,
         ));
     }
 
@@ -548,6 +586,20 @@ pub(in crate::scene) fn build_material_debug_entry(
         ));
     }
 
+    if material.stages.len() >= 2
+        && can_fold_openjk_reverse_lightmap_modulate_pair(&material.stages[0], &material.stages[1])
+    {
+        lines.push(format!(
+            "optional OpenJK GL_ZERO/GL_SRC_COLOR modulation: r_stageCollapseExtra (requires BSP lightmap, no BSP fog, no water/reflection; default OFF)",
+        ));
+    }
+
+    lines.push(format!(
+        "performance stage audit: authored={} resolved={} class={} (classification only; actual draw recipe depends on LM/vertex/fog/visibility)",
+        definition.map_or(material.stages.len(), |d| d.stages.len()),
+        material.stages.len(),
+        stage_audit_class(material),
+    ));
     let mut enhanced = false;
     let mut image_sources = Vec::new();
     for (index, stage) in material.stages.iter().enumerate() {
@@ -636,6 +688,15 @@ pub(in crate::scene) fn build_material_debug_entry(
         mtr_override: origin.is_some_and(|origin| origin.mtr_override),
         definition_text: definition.and_then(|definition| definition.definition_text.clone()),
         enhanced,
+        authored_stage_count: definition.map_or(material.stages.len(), |d| d.stages.len()),
+        resolved_stage_count: material.stages.len(),
+        stage_audit_class: stage_audit_class(material),
+        stage_sequence: material.stages.iter().map(|stage| format!(
+            "{:?} / {:?} / rgb={:?} / alpha={:?} / tc={:?} / mods={} / glow={} / depth_equal={} / depth_write={} / alpha_cutoff={}",
+            stage.texture, stage.blend, stage.rgb_gen, stage.alpha_gen,
+            stage.tc_gen, stage.tc_mods.len(), stage.glow,
+            stage.depth_equal, stage.depth_write, stage.alpha_cutoff,
+        )).collect(),
         image_sources,
         lines,
     }
@@ -701,6 +762,42 @@ pub(in crate::scene) fn can_fold_jka_lightmap_pair(
         && matches!(material_stage.alpha_gen, AlphaGen::Identity)
         && matches!(material_stage.tc_gen, TcGen::Base)
         && !material_stage.depth_equal
+}
+
+/// OpenJK `CollapseMultitexture` explicitly permits the companion modulation
+/// case: opaque `$lightmap`, then `blendFunc GL_ZERO GL_SRC_COLOR`. Both RGB
+/// blend equations yield `diffuse * lightmap`. Use the *existing* fused WGPU
+/// base*lightmap path; don't author a second rendering implementation.
+///
+/// This eligibility test is intentionally *stricter* than OpenJK: no authored
+/// glow (separate bloom extraction), secondary depth writes, PBR companion maps,
+/// or dynamically transformed texcoords. Caller also rules out BSP fog, water
+/// and special reflections so this opt-in cannot silently change those paths.
+pub(in crate::scene) fn can_fold_openjk_reverse_lightmap_modulate_pair(
+    lightmap_stage: &MaterialStage,
+    material_stage: &MaterialStage,
+) -> bool {
+    if material_stage.blend
+        != Some(materials::BlendFunc {
+            src: BlendFactor::Zero,
+            dst: BlendFactor::SrcColor,
+        })
+    {
+        return false;
+    }
+    let mut forward_modulate = material_stage.clone();
+    forward_modulate.blend = Some(materials::BlendFunc {
+        src: BlendFactor::DstColor,
+        dst: BlendFactor::Zero,
+    });
+    can_fold_jka_lightmap_pair(lightmap_stage, &forward_modulate)
+        && !lightmap_stage.glow
+        && !material_stage.glow
+        && !lightmap_stage.depth_write
+        && !material_stage.depth_write
+        && !has_stage_enhancements(lightmap_stage)
+        && !has_stage_enhancements(material_stage)
+        && material_stage.tc_mods.is_empty()
 }
 
 /// A sky surface is the outer box (discarded by the shader when the sky has
@@ -944,9 +1041,21 @@ pub(in crate::scene) fn append_material_batches_unflagged(
         return;
     }
 
-    // Other explicit shader scripts remain true ordered passes.
+    // Retain the two authored passes in the pristine cached PreparedMap.
+    // A map-local reverse-modulation marker allows a *runtime* cvar change to
+    // derive a one-pass recipe without reparsing shaders or modifying the
+    // original cache. Do not fold on the map worker: it cannot know the
+    // live cvar and the unfused variant must remain recoverable.
+    let reverse_foldable = !vertex_lit
+        && lightmap.is_some()
+        && stages.len() >= 2
+        && !material.sky
+        && !material.water
+        && !material.planar_reflection
+        && fog[3] <= 0.001
+        && can_fold_openjk_reverse_lightmap_modulate_pair(&stages[0], &stages[1]);
     for (stage_index, stage) in stages.iter().enumerate() {
-        out.push(stage_batch(
+        let mut batch = stage_batch(
             material,
             stage,
             stage_index == 0,
@@ -959,6 +1068,13 @@ pub(in crate::scene) fn append_material_batches_unflagged(
             area_signature,
             fog,
             fog_is_global,
-        ));
+        );
+        if reverse_foldable && stage_index < 2 {
+            batch.reverse_lightmap_fold_role = (stage_index + 1) as u8;
+            if stage_index == 1 {
+                batch.reverse_lightmap_fold_detail = !material.authored_detail;
+            }
+        }
+        out.push(batch);
     }
 }

@@ -186,6 +186,7 @@ impl App {
             follow_name,
             game_timer: self.game_timer_text(),
             mini_scores: self.mini_scores_ui(),
+            siege_hud: self.siege_hud_ui(),
             race_timer,
             vote_line,
             scoreboard,
@@ -824,9 +825,26 @@ impl App {
     }
 
     pub(in crate::app) fn visible_scoreboard(&self) -> Option<UiScoreboard> {
-        self.scoreboard_should_show()
-            .then(|| self.scoreboard.clone())
-            .flatten()
+        if !self.scoreboard_should_show() {
+            return None;
+        }
+        let mut board = self.scoreboard.clone()?;
+
+        // TaystJK CG_DrawClientScore does not cache readiness in the `scores`
+        // command. It reads cg.snap->ps.stats[STAT_CLIENTS_READY] while drawing
+        // every row, so spectators and followed views see the authoritative
+        // intermission mask as soon as a snapshot changes. The wire stat is a
+        // signed 16-bit value; normalize it back to its low 16 mask bits.
+        board.ready_clients = self
+            .game_session
+            .as_ref()
+            .and_then(|session| session.client_game.current_snapshot())
+            .map(|snapshot| {
+                snapshot.player_state.stats[jka_protocol::server::STAT_CLIENTS_READY] as u16
+            })
+            .unwrap_or(0);
+
+        Some(board)
     }
 
     /// Jump-height helper for the renderer. Only a jaPRO server in the SP
@@ -873,6 +891,7 @@ impl App {
             // cg_draw.c shows saberDrawAnimLevel: the server updates it the
             // moment a style is queued, while saberAnimLevel waits out the swing.
             saber_style: ps.field_i32("fd.saberDrawAnimLevel").unwrap_or(0),
+            saber_active_style: ps.field_i32("fd.saberAnimLevel").unwrap_or(0),
             force_flash: self.force_flash_active(),
         }
     }
@@ -929,6 +948,7 @@ impl App {
             ammo: None,
             weapon: info.weapon,
             saber_style: 0,
+            saber_active_style: 0,
             force_flash: false,
         })
     }
@@ -967,6 +987,7 @@ impl App {
                     ammo: (view.ammo >= 0).then_some(view.ammo),
                     weapon: view.weapon,
                     saber_style: player.saber_style(),
+                    saber_active_style: player.saber_active_style(),
                     force_flash: self.force_flash_active(),
                 }
             })

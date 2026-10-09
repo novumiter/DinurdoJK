@@ -27,7 +27,11 @@ pub(crate) struct PipelineJobKey {
 
 impl PipelineJobKey {
     pub const fn new(family: &'static str, slot: u32, config: u64) -> Self {
-        Self { family, slot, config }
+        Self {
+            family,
+            slot,
+            config,
+        }
     }
 }
 
@@ -82,6 +86,7 @@ pub(crate) struct PipelineJobStats {
 /// a first-sighting event into a whole-machine CPU spike at very high frame rates.
 pub(crate) struct PipelineJobManager {
     work_tx: mpsc::Sender<WorkMessage>,
+    world_work_tx: mpsc::Sender<WorkMessage>,
     done_rx: mpsc::Receiver<CompletedJob>,
     workers: Vec<JoinHandle<()>>,
     states: HashMap<PipelineJobKey, JobState>,
@@ -97,17 +102,30 @@ pub(crate) struct PipelineJobManager {
 impl PipelineJobManager {
     pub fn new() -> Self {
         let (work_tx, work_rx) = mpsc::channel::<WorkMessage>();
+        let (world_work_tx, world_work_rx) = mpsc::channel::<WorkMessage>();
+        let world_work_rx = Arc::new(Mutex::new(world_work_rx));
         let (done_tx, done_rx) = mpsc::channel::<CompletedJob>();
         let work_rx = Arc::new(Mutex::new(work_rx));
         let stopping = Arc::new(AtomicBool::new(false));
         let available = thread::available_parallelism().map_or(2, |count| count.get());
         let worker_count = available.saturating_sub(1).clamp(1, 2);
         let mut workers = Vec::with_capacity(worker_count);
-        for index in 0..worker_count {
-            let work_rx = Arc::clone(&work_rx);
+        // A long BSP lighting variant must not consume the workers that make
+        // newly visible sabers, models and FX renderable.
+        for index in 0..=worker_count {
+            let world_worker = index == worker_count;
+            let work_rx = Arc::clone(if world_worker {
+                &world_work_rx
+            } else {
+                &work_rx
+            });
             let done_tx = done_tx.clone();
             let stopping_worker = Arc::clone(&stopping);
-            let name = format!("pipeline-compile-{}", index + 1);
+            let name = if world_worker {
+                "pipeline-compile-world".into()
+            } else {
+                format!("pipeline-compile-{}", index + 1)
+            };
             if let Ok(handle) = thread::Builder::new().name(name).spawn(move || loop {
                 let message = {
                     let receiver = match work_rx.lock() {
@@ -119,7 +137,12 @@ impl PipelineJobManager {
                 let Ok(message) = message else { break };
                 match message {
                     WorkMessage::Shutdown => break,
-                    WorkMessage::Compile { id, key, label, build } => {
+                    WorkMessage::Compile {
+                        id,
+                        key,
+                        label,
+                        build,
+                    } => {
                         // Renderer teardown/vid_restart should not grind through jobs that
                         // were only queued speculatively. An in-flight driver compile cannot
                         // be cancelled safely, but queued work can be dropped immediately.
@@ -127,8 +150,8 @@ impl PipelineJobManager {
                             continue;
                         }
                         let started = Instant::now();
-                        let result = panic::catch_unwind(AssertUnwindSafe(build))
-                            .map_err(panic_message);
+                        let result =
+                            panic::catch_unwind(AssertUnwindSafe(build)).map_err(panic_message);
                         let _ = done_tx.send(CompletedJob {
                             id,
                             key,
@@ -144,6 +167,7 @@ impl PipelineJobManager {
         }
         Self {
             work_tx,
+            world_work_tx,
             done_rx,
             workers,
             states: HashMap::new(),
@@ -176,8 +200,12 @@ impl PipelineJobManager {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.states.insert(key, JobState::Compiling { id });
-        if self
-            .work_tx
+        let work_tx = if key.family == "world-variant" {
+            &self.world_work_tx
+        } else {
+            &self.work_tx
+        };
+        if work_tx
             .send(WorkMessage::Compile {
                 id,
                 key,
@@ -206,7 +234,10 @@ impl PipelineJobManager {
                 Ok(value) => Some(*value),
                 Err(_) => {
                     self.failed = self.failed.saturating_add(1);
-                    eprintln!("Renderer pipeline job type mismatch for {}:{}", key.family, key.slot);
+                    eprintln!(
+                        "Renderer pipeline job type mismatch for {}:{}",
+                        key.family, key.slot
+                    );
                     None
                 }
             },
@@ -272,6 +303,7 @@ impl Drop for PipelineJobManager {
         for _ in 0..self.workers.len() {
             let _ = self.work_tx.send(WorkMessage::Shutdown);
         }
+        let _ = self.world_work_tx.send(WorkMessage::Shutdown);
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
@@ -285,5 +317,49 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
         message.clone()
     } else {
         "pipeline compiler panicked".to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn slow_world_variants_do_not_starve_visible_fx() {
+        let mut jobs = PipelineJobManager::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        for slot in 0..2 {
+            let started = started_tx.clone();
+            let release = Arc::clone(&release_rx);
+            jobs.request(
+                PipelineJobKey::new("world-variant", slot, 1),
+                "blocked world",
+                move || {
+                    let _ = started.send(());
+                    let _ = release.lock().unwrap().recv_timeout(Duration::from_secs(5));
+                    1u32
+                },
+            );
+        }
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let fx = PipelineJobKey::new("fx-sprite", 0, 1);
+        jobs.request(fx, "visible FX", || 42u32);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut result = None;
+        while Instant::now() < deadline {
+            result = jobs.take_ready::<u32>(fx);
+            if result.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let _ = release_tx.send(());
+        let _ = release_tx.send(());
+        assert_eq!(
+            result,
+            Some(42),
+            "visible FX must compile while world variants are blocked"
+        );
     }
 }

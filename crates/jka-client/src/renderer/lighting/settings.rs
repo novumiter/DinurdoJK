@@ -36,6 +36,19 @@ impl Renderer {
         self.update_lighting_settings();
     }
 
+    pub(in crate::renderer) fn set_dynamic_light_debug(&mut self, enabled: bool) {
+        if self.dynamic_light_debug == enabled {
+            return;
+        }
+        self.dynamic_light_debug = enabled;
+        // The baseline BSP path has no local-light bindings. Debug always uses
+        // the advanced receiver shader so the view can be toggled without a
+        // map reload or pipeline mutation.
+        self.rebuild_frame_plan();
+        self.update_lighting_settings();
+        self.history_valid = false;
+    }
+
     pub(in crate::renderer) fn set_rt_samples(&mut self, samples: u32) {
         let samples = if matches!(samples, 1 | 2 | 4) {
             samples
@@ -50,6 +63,19 @@ impl Renderer {
             self.update_lighting_settings();
             self.history_valid = false;
         }
+    }
+
+    pub(in crate::renderer) fn set_rt_denoiser_mode(&mut self, mode: u32) {
+        let mode = if crate::renderer::lighting::rt_diagnostics::config().receiver.denoiser { mode } else { 0 };
+        let mode = mode.min(11);
+        if self.rt_denoiser_mode == mode { return; }
+        self.rt_denoiser_mode = mode;
+        if let Some(rt) = self.ray_traced_shadows.as_mut() {
+            rt.sun_shadow_history.radiance.invalidate();
+            rt.sun_shadow_history.local_radiance.filter.invalidate();
+        }
+        self.rebuild_frame_plan();
+        self.activate_world_pipeline_variant();
     }
 
     pub(in crate::renderer) fn set_rt_half_resolution(&mut self, enabled: bool) {
@@ -76,6 +102,7 @@ impl Renderer {
         self.rebuild_frame_plan();
         self.update_lighting_settings();
         self.activate_world_pipeline_variant();
+        rverbose!(1, "Dynamic lighting requested={mode:?}; world shaders {}; enable r_verbose 1 to see activation", if self.world_variant_pending.is_some() { "compiling" } else { "active" });
         if mode == DynamicLightsMode::RayTracedHardware {
             rverbose!(
                 1,
@@ -144,13 +171,27 @@ impl Renderer {
             // Force the local-shadow cache to drop/reconsider area emitters.
             world.local_shadows.selection_position = None;
         }
-        // Area emitters share the clustered-light transport, but the user-facing
-        // area-light switch is independent from the ordinary dynamic-light
-        // switch. Keep the cluster compute path alive whenever either source
-        // class needs it.
+        self.upload_light_buffer();
         self.rebuild_frame_plan();
         self.update_lighting_settings();
         self.activate_world_pipeline_variant();
+    }
+
+    pub(in crate::renderer) fn set_shader_light_promotion(&mut self, enabled: bool, mask: u32) {
+        let mask = mask & crate::materials::SHADER_LIGHT_ALL;
+        if self.shader_light_promotion_enabled == enabled && self.shader_light_promotion_mask == mask {
+            return;
+        }
+        self.shader_light_promotion_enabled = enabled;
+        self.shader_light_promotion_mask = mask;
+        if let Some(world) = &mut self.world {
+            world.local_shadows.selection_position = None;
+        }
+        self.upload_light_buffer();
+        self.rebuild_frame_plan();
+        self.update_lighting_settings();
+        self.activate_world_pipeline_variant();
+        self.history_valid = false;
     }
 
     pub(in crate::renderer) fn set_model_brightness(&mut self, brightness: f32) {
@@ -205,6 +246,32 @@ impl Renderer {
         self.rebuild_frame_plan();
         self.update_lighting_settings();
         self.activate_world_pipeline_variant();
+    }
+
+    pub(in crate::renderer) fn set_tinted_glass(&mut self, enabled: bool) {
+        let enabled = enabled && crate::renderer::lighting::rt_diagnostics::config().receiver.glass;
+        if self.tinted_glass_enabled != enabled {
+            self.tinted_glass_enabled = enabled;
+            // Opaque-classified lightfilter panes must be removed/reinstated
+            // in the raster depth cubemap on either toggle.
+            if let Some(world) = self.world.as_mut() {
+                for slot in 0..world.local_shadows.cache_entries.len() {
+                    if world.local_shadows.cache_entries[slot].light_index.is_some()
+                        && !world.local_shadows.pending_slots.contains(&slot)
+                    {
+                        world.local_shadows.pending_slots.push(slot);
+                    }
+                }
+            }
+            self.update_lighting_settings();
+            // Local RT light queries are traced every frame; no sun-shadow
+            // history is used for this RGB signal, so no cache flush is needed.
+        }
+    }
+
+    pub(in crate::renderer) fn set_tinted_glass_debug(&mut self, mode: u32) {
+        self.tinted_glass_debug = mode.min(2);
+        self.update_lighting_settings();
     }
 
     pub(in crate::renderer) fn set_local_light_shadows(&mut self, enabled: bool) {

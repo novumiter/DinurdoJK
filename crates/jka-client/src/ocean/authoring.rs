@@ -44,18 +44,18 @@ impl OceanAuthoring {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct OceanWind {
+pub struct AtmosphericWind {
     pub speed: f32,
     pub direction: f32,
     pub gust: f32,
     pub shift: f32,
 }
 
-impl Default for OceanWind {
+impl Default for AtmosphericWind {
     fn default() -> Self { Self { speed: 180.0, direction: 0.0, gust: 0.2, shift: 0.0 } }
 }
 
-impl OceanWind {
+impl AtmosphericWind {
     pub fn sanitize(mut self) -> Self {
         self.speed = finite(self.speed, 180.0, 0.0, 8192.0);
         self.direction = finite(self.direction, 0.0, -360.0, 360.0);
@@ -74,6 +74,11 @@ impl OceanWind {
     }
 }
 
+/// Backward-compatible name for older ocean-authoring callers. New code should
+/// use `AtmosphericWind`: this wind is shared by ocean, grass, precipitation,
+/// fog and wind-visualization systems.
+pub type OceanWind = AtmosphericWind;
+
 // JAPRO bg_public.h: CS_BSP_MODELS (1612) + 32 sub-BSPs + 16 runtime BSPs.
 pub const CS_OCEANS: u16 = 1660;
 pub const CS_WEATHER: u16 = CS_OCEANS + 8;
@@ -87,7 +92,7 @@ pub struct AuthoredOcean {
     pub current_scale: f32,
     pub waves: OceanAuthoring,
     pub weather: usize,
-    pub wind: OceanWind,
+    pub wind: AtmosphericWind,
     pub rain: f32,
     pub wave_model: u32,
     pub wave_count: u32,
@@ -118,7 +123,7 @@ impl AuthoredOcean {
             let mut ocean = Self {
                 index: result.len(), mins, maxs, height: number(e,"waterHeight",maxs[2]),
                 current_scale:number(e,"currentScale",0.25), weather:weather_index,
-                wind:OceanWind::default(), rain:0.0, wave_model:number(e,"waveModel",1.0) as u32,
+                wind:AtmosphericWind::default(), rain:0.0, wave_model:number(e,"waveModel",1.0) as u32,
                 wave_count:number(e,"gerstnerWaveCount",8.0) as u32, horizontal_scale:number(e,"gerstnerHorizontalScale",1.0),
                 waves: OceanAuthoring {
                     amplitude:number(e,"amplitude",128.0), wavelength:number(e,"wavelength",1400.0),
@@ -130,7 +135,7 @@ impl AuthoredOcean {
                 }.sanitize(),
             };
             if let Some(w) = weather.get(weather_index) {
-                ocean.wind = OceanWind {speed:number(w,"windSpeed",180.0), direction:number(w,"windAngle",0.0),
+                ocean.wind = AtmosphericWind {speed:number(w,"windSpeed",180.0), direction:number(w,"windAngle",0.0),
                     gust:number(w,"windGust",0.2),shift:number(w,"windShift",0.0)}.sanitize();
                 ocean.rain=number(w,"rainIntensity",0.0).clamp(0.0,1.0);
             }
@@ -158,7 +163,7 @@ impl AuthoredOcean {
             }.sanitize(),
             wave_count: words[16].parse::<u32>().ok()?.clamp(2, 12),
             horizontal_scale: v[17].clamp(0.0,1.0), wave_model: words[18].parse().ok()?,
-            weather, wind: OceanWind::default(), rain: 0.0,
+            weather, wind: AtmosphericWind::default(), rain: 0.0,
         })
     }
 
@@ -166,7 +171,7 @@ impl AuthoredOcean {
         let v: Vec<f32> = std::str::from_utf8(bytes).ok()?.split_whitespace()
             .map(str::parse).collect::<Result<_,_>>().ok()?;
         if v.len() != 12 || v.iter().any(|v| !v.is_finite()) { return None; }
-        self.wind = OceanWind { direction: v[1].atan2(v[0]).to_degrees(), speed: v[2], gust: v[3], shift: v[4] }.sanitize();
+        self.wind = AtmosphericWind { direction: v[1].atan2(v[0]).to_degrees(), speed: v[2], gust: v[3], shift: v[4] }.sanitize();
         self.rain = v[11].clamp(0.0,1.0);
         Some(())
     }
@@ -183,7 +188,7 @@ mod tests {
     use super::*;
     #[test]
     fn calm_wind_stays_calm_and_invalid_controls_are_finite() {
-        let wind = OceanWind { speed: 0.0, gust: 1.0, shift: 180.0, ..Default::default() };
+        let wind = AtmosphericWind { speed: 0.0, gust: 1.0, shift: 180.0, ..Default::default() };
         assert_eq!(wind.at(123.0), [0.0, 0.0]);
         let ocean = OceanAuthoring { amplitude: f32::NAN, wavelength: 0.0, ..Default::default() }.sanitize();
         assert_eq!(ocean.amplitude, 128.0);

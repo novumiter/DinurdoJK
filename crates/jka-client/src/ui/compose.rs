@@ -5,6 +5,7 @@ use crate::ui::{
     build_demo_timeline,
     build_follow_indicator, build_force_select, build_fps_simple, build_game_timer, build_hud,
     build_lagometer, build_loading_screen, build_mini_scores, build_movement_keys, build_perf,
+    build_siege_hud,
     build_prediction_debug, build_race_timer, build_reflection_debug_legend, build_scoreboard,
     build_speedometer, build_splash_background, build_strafe_helper, build_team_overlay,
     build_vote, draw_placed, HudElementId, OverlayMode, ProportionalFont, UiSnapshot, UiVertex,
@@ -196,6 +197,7 @@ pub fn build_transient_vertices(
             build_game_timer(out, ui, width, height);
         });
         build_mini_scores(out, ui, small_font, width, height);
+        build_siege_hud(out, ui, width, height);
     }
     if ui.mode == OverlayMode::Chat {
         // TaystJK message entry is a console/notify field, not a child of the

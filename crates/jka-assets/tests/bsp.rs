@@ -257,3 +257,34 @@ fn unused_lightmap_nan_is_tolerated_but_active_nan_is_rejected() {
         .to_string()
         .contains("active lightmap"));
 }
+
+/// RBSP flare payload is stored in lightmapOrigin/Vecs, not the vertex lump.
+#[test]
+fn retains_flare_semantics_without_draw_triangles() {
+    let mut raw = fixture(false);
+    let surface = offset(&raw, 13);
+    put(&mut raw, surface + 8, 4); // MST_FLARE
+    // No mesh triangles or vertices are needed by the flare surface.
+    put(&mut raw, surface + 16, 0);
+    put(&mut raw, surface + 24, 0);
+    for (i, value) in [120.0, -8.0, 44.0].into_iter().enumerate() {
+        float(&mut raw, surface + 92 + i * 4, value);
+    }
+    for (i, value) in [0.25, 0.5, 1.0].into_iter().enumerate() {
+        float(&mut raw, surface + 104 + i * 4, value);
+    }
+    for (i, value) in [0.0, 0.0, -1.0].into_iter().enumerate() {
+        float(&mut raw, surface + 128 + i * 4, value);
+    }
+    put(&mut raw, surface + 4, 7);
+    let bsp = Bsp::parse(&raw).unwrap();
+    let parsed = &bsp.surfaces[0];
+    assert_eq!(parsed.kind, SurfaceKind::Flare);
+    assert_eq!(parsed.fog_num, 7);
+    assert_eq!(parsed.shader, 0);
+    let flare = parsed.flare.unwrap();
+    assert_eq!(flare.origin, [120.0, -8.0, 44.0]);
+    assert_eq!(flare.color, [0.25, 0.5, 1.0]);
+    assert_eq!(flare.normal, [0.0, 0.0, -1.0]);
+    assert!(bsp.world_mesh(4).unwrap().indices.is_empty());
+}

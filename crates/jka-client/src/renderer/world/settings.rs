@@ -342,10 +342,10 @@ impl Renderer {
                                 .map(|rt| match variant.family() {
                                     WorldShaderFamily::Lean => (
                                         rt.world_pipeline_layout_lean.clone(),
-                                        rt.world_shader_lean.clone(),
+                                        rt.world_shader_for_variant(variant).clone(),
                                     ),
                                     WorldShaderFamily::Enhanced => {
-                                        (rt.world_pipeline_layout.clone(), rt.world_shader.clone())
+                                        (rt.world_pipeline_layout.clone(), rt.world_shader_for_variant(variant).clone())
                                     }
                                 })
                         } else {
@@ -452,7 +452,7 @@ impl Renderer {
         let clustered_lite_dlights = self.dynamic_lights_mode == DynamicLightsMode::ClusteredLite;
         let point_lights = self.point_lighting_enabled_for(source_map);
         let map_light_simulation = self.map_light_simulation_active_for(source_map);
-        let shadowable_local_lights = point_lights || self.emissive_area_lights_enabled;
+        let shadowable_local_lights = point_lights || self.any_area_lights_enabled();
         WorldShaderVariantKey {
             pbr: self.pbr_enabled && PBR_PROFILE_MATERIALS,
             pom: self.pbr_enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
@@ -470,7 +470,7 @@ impl Renderer {
             legacy_dlights,
             vertex_dlights,
             clustered_lite_dlights,
-            area_lights: self.emissive_area_lights_enabled,
+            area_lights: self.any_area_lights_enabled(),
             irradiance_volume: self.irradiance_volume_enabled,
             voxel_gi: self.voxel_probe_gi_enabled,
             // A local-shadow shader path is useless without a direct local-light
@@ -483,6 +483,11 @@ impl Renderer {
             ray_traced_shadows: self.hardware_rt_requested() && self.ray_tracing_supported,
             ray_traced_sun: self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
                 && self.ray_tracing_supported,
+            rt_receiver_denoiser: self.hardware_rt_requested() && self.ray_tracing_supported
+                && self.rt_denoiser_mode != 0
+                && crate::renderer::lighting::rt_diagnostics::config().receiver.denoiser,
+            rt_receiver_glass: self.hardware_rt_requested() && self.ray_tracing_supported
+                && crate::renderer::lighting::rt_diagnostics::config().receiver.glass,
             planar_reflections: self.planar_reflection.active,
             // MAP/DEFAULT is a no-op on maps with no authored fog. FogSystem owns
             // the current map's authored-fog state and decides whether the legacy
@@ -567,6 +572,8 @@ impl Renderer {
             // but this particular map exceeds an acceleration-structure limit.
             key.ray_traced_shadows = false;
             key.ray_traced_sun = false;
+            key.rt_receiver_denoiser = false;
+            key.rt_receiver_glass = false;
         }
         let Some(current_key) = self
             .world
@@ -589,6 +596,7 @@ impl Renderer {
             if let Some(world) = &mut self.world {
                 world.active_pipeline_variant = key;
                 self.world_variant_pending = None;
+                rverbose!(1, "World lighting shaders active (cached): {}", key.short_label());
                 rverbose!(
                     3,
                     "Renderer pipeline cache: hit {} ({} cached variant(s))",
@@ -607,11 +615,11 @@ impl Renderer {
             };
             match key.family() {
                 WorldShaderFamily::Enhanced => {
-                    (rt.world_pipeline_layout.clone(), rt.world_shader.clone())
+                    (rt.world_pipeline_layout.clone(), rt.world_shader_for_variant(key).clone())
                 }
                 WorldShaderFamily::Lean => (
                     rt.world_pipeline_layout_lean.clone(),
-                    rt.world_shader_lean.clone(),
+                    rt.world_shader_for_variant(key).clone(),
                 ),
             }
         } else {
@@ -646,6 +654,7 @@ impl Renderer {
                 world.pipeline_variants.insert(key, variant);
                 world.active_pipeline_variant = key;
                 self.world_variant_pending = None;
+                rverbose!(1, "World lighting shaders active (compiled): {}", key.short_label());
                 rverbose!(
                     3,
                     "Renderer pipeline cache: ready {} ({} cached variant(s))",
@@ -693,6 +702,43 @@ impl Renderer {
         self.rebuild_frame_plan();
         self.last_planar_debug_selection = None;
         println!("Planar reflection debug: {}", mode.label());
+    }
+
+    pub(in crate::renderer) fn set_rain_optimizations(
+        &mut self,
+        fast_post: bool,
+        water_field: bool,
+        fast_vertex: bool,
+        lean_depth: bool,
+        static_depth: bool,
+        opaque_depth: bool,
+        lean_models: bool,
+        lean_post: bool,
+    ) {
+        let plan_changed = self.weather.rain.fast_post != fast_post
+            || self.weather.rain.lean_post != lean_post;
+        self.weather.rain.fast_post = fast_post;
+        if self.weather.rain.water_field_enabled != water_field {
+            self.weather.rain.water_field_dirty = true;
+        }
+        self.weather.rain.water_field_enabled = water_field;
+        self.weather.rain.fast_vertex = fast_vertex;
+        self.weather.rain.lean_depth = lean_depth;
+        self.weather.rain.static_depth = static_depth;
+        self.weather.rain.opaque_depth = opaque_depth;
+        self.weather.rain.lean_models = lean_models;
+        self.weather.rain.lean_post = lean_post;
+        if plan_changed {
+            self.history_valid = false;
+            self.rebuild_frame_plan();
+        }
+    }
+
+    /// Rain haze follows the selected fog renderer automatically. Volumetric
+    /// fog uses the froxel rain volume; legacy/off modes use the cheaper
+    /// depth-aware 2D weather haze. Fog Off still keeps rain haze visible.
+    pub(in crate::renderer) fn rain_uses_2d_haze(&self) -> bool {
+        self.weather.fog.mode != ui::FogMode::Volumetric
     }
 
     pub(in crate::renderer) fn set_puddle_debug(&mut self, mode: u32) {

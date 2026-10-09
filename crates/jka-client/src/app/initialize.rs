@@ -7,7 +7,7 @@ use crate::app::{
     FrontendPage, HashMap, HashSet, Instant, KeyCode, MapLoadingState, ModifiersState, OverlayMode,
     PathBuf, PerfStats, PhysicsMapMesh, SpectatorCameraState, ThirdPersonCameraState,
     ThreadPerfStats, UserEvent, VecDeque, VideoSection, VideoSettings, ViewLatchMode,
-    DEMO_FREE_SPEED_DEFAULT_INDEX,
+    DEMO_EXPORT_DEFAULT_FPS, DEMO_FREE_SPEED_DEFAULT_INDEX, DemoVideoPreset,
 };
 
 impl App {
@@ -100,7 +100,7 @@ impl App {
                 config_dirty = true;
             }
         }
-        let (japro_saved_logins, japro_credential_error) = match crate::credential_store::list() {
+        let (saved_accounts, account_credential_error) = match crate::credential_store::list() {
             Ok(entries) => (entries, None),
             Err(error) => (Vec::new(), Some(error)),
         };
@@ -189,6 +189,7 @@ impl App {
             profile_selected_section: 0,
             profile_model_search: String::new(),
             profile_model_team_filter: 0,
+            profile_model_staged: None,
             profile_model_icon_textures: HashMap::new(),
             crosshair_image_textures: HashMap::new(),
             profile_name_input: presentation.network.name.clone(),
@@ -213,6 +214,8 @@ impl App {
             profile_preview_active: false,
             demo_entries: Vec::new(),
             demo_selected: 0,
+            demo_game_choices: Vec::new(),
+            demo_game_filter: String::new(),
             demo_catalog_loaded: false,
             demo_catalog_error: None,
             demo_metadata_cache: BTreeMap::new(),
@@ -260,6 +263,10 @@ impl App {
             server_browser_rx,
             server_browser,
             game_session: None,
+            siege_dialog: None,
+            siege_round_message: None,
+            siege_dialog_return_overlay: OverlayMode::None,
+            siege_dialog_opened_overlay: false,
             live_without_world: false,
             demo_without_world: false,
             disconnect_notice: None,
@@ -279,9 +286,10 @@ impl App {
             pending_live_server_commands: VecDeque::new(),
             live_join_timing: None,
             network: presentation.network.clone(),
-            japro_saved_logins,
-            japro_credential_error,
-            japro_login_editor: None,
+            saved_accounts,
+            account_credential_error,
+            account_editor: None,
+            show_other_accounts: false,
             japro_cg: presentation.japro,
             camera_edit: None,
             vote_menu: egui_pages::VoteMenuState::default(),
@@ -334,6 +342,8 @@ impl App {
             saber_staff_multi_color: presentation.saber_staff_multi_color,
             team_overlay: presentation.team_overlay,
             score_deaths: presentation.score_deaths,
+            score_spectator_guess: presentation.score_spectator_guess,
+            spectator_ping_guesses: [Default::default(); 32],
             draw_scores: presentation.draw_scores,
             mini_scores_shown: None,
             team_overlay_shown: None,
@@ -368,7 +378,12 @@ impl App {
             third_person_camera: ThirdPersonCameraState::default(),
             local_player_presenter: None,
             solo_dynamic_models: Arc::new(Vec::new()),
-            solo_client_info: ClientInfo::solo_model(&presentation.model),
+            solo_client_info: {
+                let mut info = ClientInfo::solo_model(&presentation.model);
+                info.female = presentation.network.sex.as_bytes().first()
+                    .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'f'));
+                info
+            },
             menu_selected: 0,
             setup_selected: 1,
             keys: HashSet::new(),
@@ -380,6 +395,7 @@ impl App {
             mouse_buttons_down: HashSet::new(),
             modifiers: ModifiersState::empty(),
             captured: false,
+            mouse_grab_mode: "none",
             mouse_input: presentation.mouse,
             last_mouse_motion_at: None,
             noclip_primary_down: false,
@@ -393,6 +409,12 @@ impl App {
             demo_scrub_last_seek: None,
             demo_scrub_last_applied_fraction: None,
             last_demo_timeline_refresh: Instant::now(),
+            demo_export_in_ms: None,
+            demo_export_out_ms: None,
+            demo_export_preset: DemoVideoPreset::DEFAULT,
+            demo_export_fps: DEMO_EXPORT_DEFAULT_FPS,
+            demo_export_depth: false,
+            demo_video_export: None,
             previous_tick: Instant::now(),
             overlay: OverlayMode::Game,
             overlay_before_console: OverlayMode::Game,
@@ -418,6 +440,8 @@ impl App {
             console_notify_beep: presentation.console_notify_beep,
             console_suggest: presentation.console_suggest,
             chatbox_completion: presentation.chatbox_completion,
+            clean_chatbox: presentation.clean_chatbox,
+            last_clean_chat_message: None,
             chat_log_enabled: presentation.chat_log,
             chat_log: crate::chat_log::ChatLog::spawn(),
             console_suggest_index: 0,
@@ -481,6 +505,11 @@ impl App {
             cloud_tuning_open: false,
             cloud_tuning_selected: 0,
             video,
+            world_effects: {
+                let mut effects = crate::world_effects::LegacyWorldEffects::default();
+                let _ = effects.set_weather_type(video.weather_type);
+                effects
+            },
             gamma_runtime: crate::app::gamma::GammaRuntime::default(),
             windows_timer_resolution,
             quality_preset_selected: None,
@@ -532,6 +561,9 @@ impl App {
                 steam_audio: audio.steam_audio,
             },
             prepared_map_cache: None,
+            fx_light_promotion_catalog: Arc::new(
+                crate::fx::light_promotion::FxLightPromotionCatalog::default(),
+            ),
             shader_remaps: scene::ShaderRemapState::default(),
             shader_remap_upload: false,
             shader_remap_dirty: false,

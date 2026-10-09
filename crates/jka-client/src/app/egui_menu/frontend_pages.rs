@@ -344,6 +344,10 @@ impl App {
             "Browse Internet, LAN, favorites, and recent servers.",
             true,
         ) {
+            // The front-end browser uses its own page-navigation path.
+            // Default to recent visits only when entering; column clicks remain sticky.
+            self.server_browser.sort = crate::server_browser::BrowserSort::LastVisited;
+            self.server_browser.sort_ascending = false;
             self.frontend_page = FrontendPage::ServerBrowser;
             self.egui_repaint_requested = true;
             return;

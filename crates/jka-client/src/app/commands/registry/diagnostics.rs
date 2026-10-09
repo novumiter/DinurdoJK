@@ -1,8 +1,21 @@
 //! Declarative command handlers.
-use crate::app::{App, GameSession, RenderCommand, SessionPhase};
+use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, SessionPhase};
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_coastal_debug ["coastal_debug", ] ("coastal_debug", "Print background BSP bathymetry results and the interactive debug report path.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            self.push_console_line("usage: coastal_debug".to_owned());
+            return CommandResult::Handled;
+        }
+        let lines = self.prepared_map_cache.as_ref()
+            .and_then(|cache| cache.map.coastal_bathymetry.as_ref())
+            .map(|job| job.report_lines())
+            .unwrap_or_else(|| vec!["No coastal geometry job for this map (enable ocean and load a BSP with promoted water).".to_owned()]);
+        for line in lines { self.push_console_line(line); }
+        CommandResult::Handled
+    }
+
     cmd_configstrings ["configstrings", ] ("configstrings", "Print the active client configstrings list.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -91,6 +104,91 @@ commands! {
             }
             [_verb, ..] => {
                 self.push_console_line("^3usage:^7 hitchmark [label]".to_owned());
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
+    cmd_render_perf_capture ["render_perf_capture", "renderperfcapture"] ("render_perf_capture [frames=600] [label]", "Record per-frame renderer CPU stage timings to CSV/JSON after a 2s delay and 120 warmup frames. Opt-in; no GPU stalls.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        if words.len() > 3 {
+            self.push_console_line("^3usage:^7 render_perf_capture [frames=600] [label]".to_owned());
+            return CommandResult::Handled;
+        }
+        let frames = if let Some(arg) = words.get(1) {
+            match arg.parse::<usize>() {
+                Ok(value) if (30..=6000).contains(&value) => value,
+                _ => {
+                    self.push_console_line("^1render_perf_capture:^7 frames must be 30..6000".to_owned());
+                    return CommandResult::Handled;
+                }
+            }
+        } else { 600 };
+        let label: String = words.get(2).copied().unwrap_or("")
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .take(32)
+            .collect();
+        let stem_name = if label.is_empty() {
+            format!("renderperf-{}", demo_recording_timestamp())
+        } else {
+            format!("renderperf-{}-{label}", demo_recording_timestamp())
+        };
+        let stem = self.game_write_path(std::path::PathBuf::from("renderperf").join(stem_name));
+        let result = self.render.as_ref().ok_or("renderer is unavailable")
+            .and_then(|render| render.start_render_perf_capture(stem.clone(), frames));
+        match result {
+            Ok(()) => self.push_console_line(format!(
+                "^2RENDER PERF ARMED^7 {frames} samples after 2s + 120-frame warmup. Close console; output: {}.csv/.json",
+                stem.display()
+            )),
+            Err(error) => self.push_console_line(format!("^1render_perf_capture:^7 {error}")),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_inputdiag ["inputdiag", "framediag"] ("inputdiag [label]", "Arm a 5-second raw-mouse/Win32/event-loop/render capture. Recording starts on the first gameplay mouse movement and stops/writes automatically.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] | [_verb, _] => {
+                let label = words.get(1).copied().unwrap_or("");
+                let label: String = label
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                    .take(32)
+                    .collect();
+                let stem_name = if label.is_empty() {
+                    format!("inputdiag-{}", demo_recording_timestamp())
+                } else {
+                    format!("inputdiag-{}-{label}", demo_recording_timestamp())
+                };
+                let stem = self.game_write_path(std::path::PathBuf::from("inputdiag").join(stem_name));
+                if let Some(parent) = stem.parent() {
+                    if let Err(error) = std::fs::create_dir_all(parent) {
+                        self.push_console_line(format!(
+                            "^1inputdiag:^7 couldn't create {}: {error}",
+                            parent.display()
+                        ));
+                        return CommandResult::Handled;
+                    }
+                }
+                let result = self
+                    .render
+                    .as_ref()
+                    .ok_or("renderer is unavailable")
+                    .and_then(|render| render.arm_input_diagnostic(stem));
+                match result {
+                    Ok(()) => self.push_console_line(
+                        "^2INPUT DIAG ARMED^7 - close the console, then move the mouse in steady circles continuously. Capture starts on the first gameplay mouse movement, records 5 seconds, and stops automatically."
+                            .to_owned(),
+                    ),
+                    Err(error) => self.push_console_line(format!("^1inputdiag:^7 {error}")),
+                }
+                CommandResult::Handled
+            }
+            [_verb, ..] => {
+                self.push_console_line("^3usage:^7 inputdiag [label]".to_owned());
                 CommandResult::Handled
             }
             _ => return CommandResult::Unhandled,

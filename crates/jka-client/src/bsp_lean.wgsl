@@ -37,7 +37,8 @@ struct PlanarReflectionSettings {
 struct PointLight {
     position_radius: vec4<f32>,
     color_intensity: vec4<f32>,
-    emitter: vec4<f32>, // xyz normal; w: 0 point, 1 one-sided area, 2 two-sided area
+    emitter: vec4<f32>, // xyz normal/direction; w: -1 segment, 0 point, 1/2 area, 3 spot
+    shape: vec4<f32>,   // spot: x inner cone cos, y outer cone cos
     shadow: vec4<f32>,
 };
 struct ClusterRecord {
@@ -446,9 +447,11 @@ fn transient_vertex_dlight(world_position: vec3<f32>, world_normal: vec3<f32>) -
         let light_direction = delta / distance_to_light;
         let ndotl = max(dot(normal, light_direction), 0.0);
         if (ndotl <= 0.0) { continue; }
+        let emission_visibility = emitter_visibility(light, light_direction);
+        if (emission_visibility <= 0.0) { continue; }
         let falloff = max(1.0 - distance_to_light / radius, 0.0);
         result += light.color_intensity.rgb * light.color_intensity.a
-            * (falloff * falloff) * ndotl * 2.20;
+            * (falloff * falloff) * ndotl * emission_visibility * 2.20;
     }
     return result;
 }
@@ -881,7 +884,156 @@ fn local_light_shadow_visibility(light: PointLight, world_position: vec3<f32>, r
     return visibility * 0.25;
 }
 
+
+struct RasterGlassTriangle {
+    a: vec4<f32>, b: vec4<f32>, c: vec4<f32>,
+    color_a: vec4<f32>, color_b: vec4<f32>, color_c: vec4<f32>,
+};
+struct RasterGlassSlot {
+    header: vec4<u32>,
+    triangles: array<RasterGlassTriangle, 64>,
+};
+@group(2) @binding(17) var<storage, read> raster_glass_slots: array<RasterGlassSlot>;
+
+fn raster_glass_throughput(light: PointLight, receiver: vec3<f32>) -> vec3<f32> {
+    if ((lighting_settings.feature_flags.z & 0x200u) == 0u
+        || lighting_settings.local_shadows.x == 0u || light.shadow.x < 0.5) {
+        return vec3<f32>(1.0);
+    }
+    let slot_index = u32(light.shadow.x - 1.0);
+    if (slot_index >= arrayLength(&raster_glass_slots)) { return vec3<f32>(1.0); }
+    let count = min(raster_glass_slots[slot_index].header.x, 64u);
+    if (count == 0u) { return vec3<f32>(1.0); }
+    let ray = receiver - light.position_radius.xyz;
+    let distance = length(ray);
+    if (distance < 0.5 || distance > light.position_radius.w) { return vec3<f32>(1.0); }
+    let direction = ray / distance;
+    var throughput = vec3<f32>(1.0);
+    for (var i = 0u; i < count; i += 1u) {
+        let triangle = raster_glass_slots[slot_index].triangles[i];
+        let e1 = triangle.b.xyz - triangle.a.xyz;
+        let e2 = triangle.c.xyz - triangle.a.xyz;
+        let p = cross(direction, e2);
+        let determinant = dot(e1, p);
+        if (abs(determinant) <= 0.0000001) { continue; }
+        let inv = 1.0 / determinant;
+        let t = light.position_radius.xyz - triangle.a.xyz;
+        let u = dot(t, p) * inv;
+        if (u < 0.00001 || u > 0.99999) { continue; }
+        let q = cross(t, e1);
+        let v = dot(direction, q) * inv;
+        if (v < 0.00001 || u + v > 0.99999) { continue; }
+        let hit = dot(e2, q) * inv;
+        // This is the essential depth test: a pane behind the receiver
+        // never casts colored light onto a surface in front of it.
+        if (hit < 0.25 || hit > distance - 0.25) { continue; }
+        let color = triangle.color_a.rgb * (1.0 - u - v)
+                  + triangle.color_b.rgb * u + triangle.color_c.rgb * v;
+        throughput *= clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+        if (all(throughput < vec3<f32>(0.001))) { return vec3<f32>(0.0); }
+    }
+    return throughput;
+}
+
+// Directional thin-glass transmission. Uses the same per-triangle linear RGB
+// throughput as local lights, but the segment extends toward shaderSun rather
+// than a finite point emitter. Opaque cascade visibility is always applied first.
+fn raster_sun_glass_throughput(receiver: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    if ((lighting_settings.feature_flags.z & 0x200u) == 0u) { return vec3<f32>(1.0); }
+    // Empty and overflow-disabled tables take one read instead of probing eight slots.
+    if (arrayLength(&raster_glass_slots) <= 8u || raster_glass_slots[8u].header.x == 0u) {
+        return vec3<f32>(1.0);
+    }
+    let toward_sun = -shadow_settings.light_direction_enabled.xyz;
+    let len_sq = dot(toward_sun, toward_sun);
+    if (len_sq < 1.0e-8) { return vec3<f32>(1.0); }
+    let direction = toward_sun * inverseSqrt(len_sq);
+    let safe_normal = normal * inverseSqrt(max(dot(normal, normal), 1.0e-12));
+    let oriented = select(-safe_normal, safe_normal, dot(safe_normal, direction) >= 0.0);
+    let origin = receiver + oriented * 0.5;
+    var transmission = vec3<f32>(1.0);
+    // Sun casters live in reserved slots after the local-light cubemaps.
+    for (var slot = 8u; slot < 16u; slot += 1u) {
+        if (slot >= arrayLength(&raster_glass_slots)) { break; }
+        let count = min(raster_glass_slots[slot].header.x, 64u);
+        if (count == 0u) { continue; }
+        // Conservative ray-vs-slot sphere check, avoiding up to 64 triangle
+        // tests for almost every sunlit fragment outside this glass patch.
+        let bounds = raster_glass_slots[slot].triangles[0];
+        let center = vec3<f32>(bounds.a.w, bounds.b.w, bounds.c.w);
+        let offset = center - origin;
+        let projected = dot(offset, direction);
+        let radius = bounds.color_a.w;
+        if (projected < -radius || dot(offset, offset) - projected * projected > radius * radius) { continue; }
+        for (var i = 0u; i < count; i += 1u) {
+            let tri = raster_glass_slots[slot].triangles[i];
+            let e1 = tri.b.xyz - tri.a.xyz;
+            let e2 = tri.c.xyz - tri.a.xyz;
+            let p = cross(direction, e2);
+            let determinant = dot(e1, p);
+            if (abs(determinant) < 1e-7) { continue; }
+            let inv = 1.0 / determinant;
+            let t = origin - tri.a.xyz;
+            let u = dot(t, p) * inv;
+            if (u < -1e-5 || u > 1.00001) { continue; }
+            let q = cross(t, e1);
+            let v = dot(direction, q) * inv;
+            if (v < -1e-5 || u + v > 1.00001) { continue; }
+            // Only panes sunward of this receiver filter it. A pane behind the
+            // receiving surface must not stain the ground in front of it.
+            let hit = dot(e2, q) * inv;
+            if (hit < 0.25) { continue; }
+            let rgb = tri.color_a.rgb * (1.0 - u - v)
+                    + tri.color_b.rgb * u + tri.color_c.rgb * v;
+            transmission *= clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+            if (all(transmission < vec3<f32>(0.001))) { return vec3<f32>(0.0); }
+        }
+    }
+    return transmission;
+}
+
+fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {
+    if (!ENABLE_CASCADED_SHADOWS) { return vec3<f32>(1.0); }
+    let opaque_visibility = cascaded_shadow_visibility(input, normal);
+    if (opaque_visibility <= 0.0 || (lighting_settings.feature_flags.z & 0x200u) == 0u) {
+        return vec3<f32>(opaque_visibility);
+    }
+    let transmission = raster_sun_glass_throughput(input.world_position, normal);
+    if ((lighting_settings.feature_flags.z & 0x400u) != 0u) {
+        return vec3<f32>(opaque_visibility) * select(vec3<f32>(1.0), vec3<f32>(1.0, 0.05, 0.8), any(transmission < vec3<f32>(0.995)));
+    }
+    if ((lighting_settings.feature_flags.z & 0x800u) != 0u) {
+        return vec3<f32>(opaque_visibility) * (vec3<f32>(1.0) - transmission);
+    }
+    return vec3<f32>(opaque_visibility) * transmission;
+}
+
+fn local_light_shadow_rgb(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> vec3<f32> {
+    let opaque_visibility = local_light_shadow_visibility(light, world_position, receiver_normal);
+    if (opaque_visibility <= 0.0) { return vec3<f32>(0.0); }
+    let transmission = raster_glass_throughput(light, world_position);
+    if ((lighting_settings.feature_flags.z & 0x400u) != 0u) {
+        return select(vec3<f32>(1.0), vec3<f32>(1.0, 0.05, 0.8),
+            any(transmission < vec3<f32>(0.995))) * opaque_visibility;
+    }
+    if ((lighting_settings.feature_flags.z & 0x800u) != 0u) {
+        return (vec3<f32>(1.0) - transmission) * opaque_visibility;
+    }
+    return vec3<f32>(opaque_visibility) * transmission;
+}
+
 fn emitter_visibility(light: PointLight, direction_to_light: vec3<f32>) -> f32 {
+    // Runtime spot/projected light. direction_to_light points receiver->source,
+    // so -direction_to_light is the emitted ray direction source->receiver.
+    if (light.shadow.w >= 0.5 && light.emitter.w > 2.5) {
+        let cone_cos = dot(normalize(light.emitter.xyz), -direction_to_light);
+        let inner = clamp(light.shape.x, -1.0, 1.0);
+        let outer = clamp(light.shape.y, -1.0, inner);
+        if (inner - outer <= 1.0e-5) {
+            return select(0.0, 1.0, cone_cos >= inner);
+        }
+        return smoothstep(outer, inner, cone_cos);
+    }
     if (light.emitter.w < 0.5) {
         return 1.0;
     }
@@ -893,7 +1045,7 @@ fn emitter_visibility(light: PointLight, direction_to_light: vec3<f32>) -> f32 {
 }
 
 fn direct_light_source_enabled(light: PointLight) -> bool {
-    let is_area_light = light.emitter.w >= 0.5;
+    let is_area_light = light.emitter.w >= 0.5 && light.emitter.w < 2.5;
     if (is_area_light) {
         return ENABLE_AREA_LIGHTS;
     }
@@ -915,6 +1067,77 @@ fn direct_light_source_enabled(light: PointLight) -> bool {
 
 struct LegacyDynamicLighting { diffuse_factor: vec3<f32>, wet_specular: vec3<f32>, };
 
+
+fn dynamic_light_debug_enabled() -> bool {
+    // feature_flags.z low byte is the normal point-light/cluster mode. Bit 8 is
+    // a session-only receiver diagnostic flag so the uniform ABI stays stable.
+    return (lighting_settings.feature_flags.z & 0x100u) != 0u;
+}
+
+fn runtime_dynamic_light_debug(input: VertexOut) -> vec3<f32> {
+    if (camera.render_flags.x != 0u || lighting_settings.values.y == 0u) {
+        return vec3<f32>(0.0);
+    }
+
+    // Runtime/transient Vertex lighting is already accumulated in the vertex
+    // output. Legacy runtime lights are drawn by their late additive pass. In
+    // both modes we can still inspect shader-promoted area emitters through the
+    // clustered list, because those are static geometry sources rather than
+    // RE_AddLightToScene-style transient lights.
+    var result = vec3<f32>(0.0);
+    if (ENABLE_VERTEX_DLIGHTS) {
+        result += input.vertex_dlight;
+    }
+
+    let cluster_sources = ENABLE_AREA_LIGHTS
+        || (!ENABLE_VERTEX_DLIGHTS && !ENABLE_LEGACY_DLIGHTS
+            && (ENABLE_POINT_LIGHTS || ENABLE_CLUSTERED_LITE_DLIGHTS));
+    if (!cluster_sources) {
+        return result;
+    }
+
+    let cluster = cluster_for_fragment(input);
+    let normal = normalize(input.world_normal);
+    for (var i = 0u; i < min(cluster.count, 32u); i += 1u) {
+        let light = dynamic_lights[cluster.indices[i]];
+        let is_area = light.emitter.w >= 0.5 && light.emitter.w < 2.5;
+        // Debug means "show the active direct-local light result", not only
+        // transient FX. In Vertex/Legacy modes runtime dlights are already
+        // supplied by their mode-specific path, so the clustered side contributes
+        // only active area emitters (authored q3map or shader-promoted). In
+        // Clustered/Forward+/RT the GPU list already contains exactly the source
+        // classes enabled by the current settings.
+        let debug_source = select(true, is_area, ENABLE_VERTEX_DLIGHTS || ENABLE_LEGACY_DLIGHTS);
+        if (!debug_source || !direct_light_source_enabled(light)) {
+            continue;
+        }
+        let delta = light.position_radius.xyz - input.world_position;
+        let distance_to_light = length(delta);
+        let radius = max(light.position_radius.w, 1.0);
+        if (distance_to_light <= 0.0001 || distance_to_light >= radius) {
+            continue;
+        }
+        let light_direction = delta / distance_to_light;
+        let ndotl = max(dot(normal, light_direction), 0.0);
+        if (ndotl <= 0.0) {
+            continue;
+        }
+        let emission = emitter_visibility(light, light_direction);
+        if (emission <= 0.0) {
+            continue;
+        }
+        let shadow = local_light_shadow_rgb(light, input.world_position, normal);
+        let attenuation = local_light_attenuation(light, distance_to_light);
+        result += light.color_intensity.rgb
+            * light.color_intensity.a
+            * attenuation
+            * emission
+            * shadow
+            * ndotl
+            * local_light_surface_scale(light);
+    }
+    return result;
+}
 fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
     var result: LegacyDynamicLighting;
     result.diffuse_factor = vec3<f32>(0.0);
@@ -968,10 +1191,15 @@ fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
         let x = 1.0 - radial_sq;
         let blob = x * x * (3.0 - 2.0 * x);
         let plane_modulate = max(1.0 - (plane_distance * plane_distance) / radius_sq, 0.0);
+        let distance_to_light = length(delta);
+        if (distance_to_light <= 1.0e-5) { continue; }
+        let emission_visibility = emitter_visibility(light, delta / distance_to_light);
+        if (emission_visibility <= 0.0) { continue; }
         result.diffuse_factor += light.color_intensity.rgb
             * light.color_intensity.a
             * plane_modulate
             * blob
+            * emission_visibility
             * 0.225;
     }
     return result;
@@ -1091,6 +1319,10 @@ fn openjk_projected_dlight_contribution(input: VertexOut) -> vec3<f32> {
         }
 
         let plane_modulate = 1.0 - (plane_distance * plane_distance) / radius_sq;
+        let distance_to_light = length(to_light);
+        if (distance_to_light <= 1.0e-5) { continue; }
+        let emission_visibility = emitter_visibility(light, to_light / distance_to_light);
+        if (emission_visibility <= 0.0) { continue; }
         // Preserve DinurdoJK's existing Legacy source-strength calibration while
         // replacing only the expensive full-material subtraction. The spatial
         // projection and triangle-plane attenuation above are OpenJK's.
@@ -1099,6 +1331,7 @@ fn openjk_projected_dlight_contribution(input: VertexOut) -> vec3<f32> {
             * light.color_intensity.a
             * plane_modulate
             * dlight_image
+            * emission_visibility
             * 0.225;
     }
     return contribution;
@@ -1129,7 +1362,7 @@ fn clustered_dynamic_light_legacy(input: VertexOut, weather: WeatherSurfaceRespo
         let light_direction = delta / distance_to_light;
         let ndotl = max(dot(normal, light_direction), 0.0);
         let emission_visibility = emitter_visibility(light, light_direction);
-        let shadow_visibility = local_light_shadow_visibility(light, input.world_position, normal);
+        let shadow_visibility = local_light_shadow_rgb(light, input.world_position, normal);
         var energy = vec3<f32>(0.0);
         if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
             let surface_angle = q3map_surface_angle(light, ndotl);
@@ -1535,7 +1768,7 @@ fn clustered_dynamic_light_pbr(
         let h = normalize(v + l);
         let ndotl = max(dot(n, l), 0.0);
         let emission_visibility = emitter_visibility(light, l);
-        let shadow_visibility = local_light_shadow_visibility(light, input.world_position, n);
+        let shadow_visibility = local_light_shadow_rgb(light, input.world_position, n);
         if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
             let surface_angle = q3map_surface_angle(light, ndotl);
             let light_scalar = q3map_light_scalar(light, distance_to_light, surface_angle);
@@ -1737,6 +1970,38 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
         has_map_fog
     );
     return vec4<f32>(mix(color.rgb, fog_color, amount), color.a);
+}
+
+// Legacy OpenGL dithers fixed-point framebuffer writes (GL_DITHER). The fog
+// pass is blended in fixed function (SrcAlpha, OneMinusSrcAlpha), so the shader
+// cannot dither the blended pixel itself; instead jitter the blend alpha so the
+// 8-bit rounding of the result becomes ordered noise instead of contour bands.
+// A change of d in alpha moves the result by d * |fog - scene|. The scene pixel
+// is unknown here, so assume a typical dark-ish scene luminance and size d so
+// the result moves by about one 8-bit sRGB code step (the same linear LSB
+// model post_fast.wgsl uses). One scalar offset keeps neutral fog hues.
+fn legacy_fog_dither_alpha(fog: vec4<f32>, pixel_position: vec2<f32>) -> vec4<f32> {
+    if (fog.a <= 0.0 || fog.a >= 1.0) {
+        return fog;
+    }
+    let bayer4 = array<f32, 16>(
+         0.0,  8.0,  2.0, 10.0,
+        12.0,  4.0, 14.0,  6.0,
+         3.0, 11.0,  1.0,  9.0,
+        15.0,  7.0, 13.0,  5.0
+    );
+    let x = u32(pixel_position.x) & 3u;
+    let y = u32(pixel_position.y) & 3u;
+    let ordered = (bayer4[y * 4u + x] + 0.5) / 16.0 - 0.5;
+    let fog_luma = clamp(dot(fog.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+    let assumed_scene_luma = 0.15;
+    let result_luma = mix(assumed_scene_luma, fog_luma, fog.a);
+    let dark_lsb = 1.0 / (255.0 * 12.92);
+    let bright_lsb = 2.275 / 255.0;
+    let linear_lsb = mix(dark_lsb, bright_lsb, sqrt(result_luma));
+    let color_span = max(abs(fog_luma - assumed_scene_luma), 0.12);
+    let alpha_jitter = ordered * linear_lsb / color_span;
+    return vec4<f32>(fog.rgb, clamp(fog.a + alpha_jitter, 0.0, 1.0));
 }
 
 fn legacy_separate_fog(world_position: vec3<f32>) -> vec4<f32> {
@@ -2128,6 +2393,16 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     if (material.params.x > 0.0 && base.a < material.params.x) {
         discard;
     }
+    if (dynamic_light_debug_enabled()) {
+        if (!opaque_stage) {
+            discard;
+        }
+        var debug_light = vec3<f32>(0.0);
+        if ((material.header.z & 4u) != 0u) {
+            debug_light = runtime_dynamic_light_debug(input);
+        }
+        return vec4<f32>(vec3<f32>(0.035) + debug_light, base.a);
+    }
     var weather: WeatherSurfaceResponse;
     if (ENABLE_WEATHER_SURFACE) {
         weather = weather_surface_response(input);
@@ -2200,7 +2475,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // Cached static BSP AO only modulates the normal baked-light contribution.
     // Classic debug/compatibility modes should show their source lighting rather
     // than a second modern AO modulation.
-    if (ENABLE_STATIC_BSP_AO && camera.render_flags.y != 0u && classic_flags == 0u
+    if (ENABLE_STATIC_BSP_AO && (camera.render_flags.y & 1u) != 0u && classic_flags == 0u
         && (material.header.x == 1u || (material.header.z & 2u) != 0u || (material.header.z & 131072u) != 0u)) {
         let static_ao = clamp(input.sky_dir_ao.w, 0.0, 1.0);
         base = vec4<f32>(base.rgb * static_ao, base.a);
@@ -2209,11 +2484,11 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         base = vec4<f32>(base.rgb + reflection_probe_specular(input, albedo, surface_uv, weather, shared_frame, shared_pbr), base.a);
     }
     if (ENABLE_CASCADED_SHADOWS && (material.header.z & 4u) != 0u) {
-        let shadow_visibility = cascaded_shadow_visibility(input, input.world_normal);
+        let shadow_rgb = sun_shadow_transmission(input, input.world_normal);
         let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);
         let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);
-        let shadow_strength = shadow_settings.params.z * sun_facing * (1.0 - shadow_visibility);
-        base = vec4<f32>(base.rgb * (1.0 - shadow_strength), base.a);
+        let shadow_strength = shadow_settings.params.z * sun_facing;
+        base = vec4<f32>(base.rgb * (vec3<f32>(1.0) - shadow_strength * (vec3<f32>(1.0) - shadow_rgb)), base.a);
     }
     if ((material.header.z & 4u) != 0u) {
         if (ENABLE_VERTEX_DLIGHTS) {
@@ -2284,7 +2559,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // Separate Legacy fog has already been composited into the base world pass.
     // The old inline dlight lived underneath it, so attenuate this late additive
     // redraw by the same transmittance without re-running any material stages.
-    if (ENABLE_LEGACY_FOG) {
+    if (ENABLE_LEGACY_FOG && !dynamic_light_debug_enabled()) {
         contribution *= 1.0 - legacy_separate_fog(input.world_position).a;
     }
     return vec4<f32>(contribution, 0.0);
@@ -2297,7 +2572,11 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     )) {
         discard;
     }
-    return apply_jump_shade(shade_surface(input), input.world_position);
+    let shaded = shade_surface(input);
+    if (dynamic_light_debug_enabled()) {
+        return shaded;
+    }
+    return apply_jump_shade(shaded, input.world_position);
 }
 
 @fragment fn fs_main_legacy_fog(input: VertexOut) -> @location(0) vec4<f32> {
@@ -2307,18 +2586,29 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     )) {
         discard;
     }
-    let shaded = apply_jump_shade(shade_surface(input), input.world_position);
-    return apply_legacy_fog(shaded, input.world_position);
+    let shaded = shade_surface(input);
+    if (dynamic_light_debug_enabled()) {
+        return shaded;
+    }
+    return apply_legacy_fog(apply_jump_shade(shaded, input.world_position), input.world_position);
 }
 
 @fragment fn fs_legacy_fog_pass(input: VertexOut) -> @location(0) vec4<f32> {
+    if (dynamic_light_debug_enabled()) {
+        discard;
+    }
     if (surface_deformation_should_discard(
         input.world_position, material.header.w, input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
     }
-    return legacy_separate_fog(input.world_position);
+    let fog = legacy_separate_fog(input.world_position);
+    // Only Legacy 2 (EXP2) bands visibly; Legacy 1 keeps its authored 8-bit table.
+    if (legacy_fog.values.w >= 1.5) {
+        return legacy_fog_dither_alpha(fog, input.clip_position.xy);
+    }
+    return fog;
 }
 
 fn sky_uv(s: f32, t: f32) -> vec2<f32> {
@@ -2370,8 +2660,18 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
 }
 
 @fragment fn fs_sky(input: VertexOut) -> @location(0) vec4<f32> {
+    if (dynamic_light_debug_enabled()) {
+        return vec4<f32>(0.012, 0.012, 0.012, 1.0);
+    }
     // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
     let d = normalize(vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y));
+    // The runtime override replaces sky cubemaps AND authored sky-cloud stages.
+    // World geometry is never touched. Restore the OpenJK sky on the next frame
+    // by switching this bit off; this requires no pipeline rebuild.
+    if ((camera.render_flags.y & 2u) != 0u) {
+        if (material.header.x == 4u) { discard; }
+        return experimental_star_nest_sky(d);
+    }
     if (material.header.x == 4u) {
         // A cloud-layer stage of the sky shader (tcGen sky cloud).
         return sky_cloud_color(input, d);

@@ -120,16 +120,11 @@ impl Renderer {
     /// carries qpath candidate lists, so all VFS/image work stays on the render
     /// thread and the normal disabled-overlay path remains a 1x1 placeholder.
     pub(in crate::renderer) fn sync_ui_team_icons(&mut self) {
-        let wanted = self
-            .ui_state
-            .team_overlay
-            .as_ref()
-            .map(|overlay| overlay.icon_paths.clone())
-            .or_else(|| match self.ui_state.mini_scores.as_ref() {
-                Some(ui::UiMiniScores::Duel { icon_paths, .. }) => Some(icon_paths.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
+        // One atlas backs every player/class/powerup icon consumer. Keep all
+        // active lists in deterministic order so the retained scoreboard and
+        // transient team/duel HUD can coexist without rebinding source 6 to a
+        // different layout between batches.
+        let wanted = ui::shared_player_icon_paths(&self.ui_state);
         if wanted == self.ui_team_icon_key {
             return;
         }

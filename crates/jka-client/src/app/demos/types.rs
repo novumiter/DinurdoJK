@@ -43,6 +43,12 @@ pub(in crate::app) enum DemoAdvance {
 pub(in crate::app) enum DemoTimelineHit {
     PlayPause,
     Track(f32),
+    MarkIn,
+    MarkOut,
+    Export,
+    ExportPreset,
+    ExportFps,
+    ExportDepth,
     Speed,
 }
 

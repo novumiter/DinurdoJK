@@ -201,7 +201,7 @@ fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
     // Keep the known-fast fragment path free of the camera bind group.
     // When cached BSP AO is disabled, feed neutral AO (1.0) through the
     // existing interpolator so fs_main never needs camera.render_flags.
-    let cached_static_ao = select(1.0, input.static_ao, camera.render_flags.y != 0u);
+    let cached_static_ao = select(1.0, input.static_ao, (camera.render_flags.y & 1u) != 0u);
     output.sky_dir_ao = vec4<f32>(world_position - camera.camera_pos_time.xyz, cached_static_ao);
     output.world_position = world_position;
     output.world_normal = surface_deformation_vertex_normal(
@@ -376,6 +376,13 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
 @fragment fn fs_sky(input: VertexOut) -> @location(0) vec4<f32> {
     // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
     let d = normalize(vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y));
+    // The runtime override replaces sky cubemaps AND authored sky-cloud stages.
+    // World geometry is never touched. Restore the OpenJK sky on the next frame
+    // by switching this bit off; this requires no pipeline rebuild.
+    if ((camera.render_flags.y & 2u) != 0u) {
+        if (material.header.x == 4u) { discard; }
+        return experimental_star_nest_sky(d);
+    }
     if (material.header.x == 4u) {
         // A cloud-layer stage of the sky shader (tcGen sky cloud).
         return sky_cloud_color(input, d);

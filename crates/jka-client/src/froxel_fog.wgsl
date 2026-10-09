@@ -18,7 +18,7 @@ struct FroxelSettings {
     sun_color_intensity: vec4<f32>,
     fog_params: vec4<f32>,
     fog_color_anisotropy: vec4<f32>,
-    rain_params: vec4<f32>,
+    rain_params: vec4<f32>, // x rain enabled, y intensity, z rain haze, w snow cloud density
     rain_occlusion: vec4<f32>,
     rain_wind: vec4<f32>, // base weather wind X/Z JKA/s, remaining lanes reserved
     shadow_view_proj: array<mat4x4<f32>, 4>,
@@ -30,7 +30,8 @@ struct FroxelSettings {
 struct PointLight {
     position_radius: vec4<f32>,
     color_intensity: vec4<f32>,
-    emitter: vec4<f32>, // xyz normal; w: 0 point, 1 one-sided area, 2 two-sided area
+    emitter: vec4<f32>, // xyz normal/direction; w: -1 segment, 0 point, 1/2 area, 3 spot
+    shape: vec4<f32>,   // spot: x inner cone cos, y outer cone cos
     shadow: vec4<f32>,
 };
 
@@ -194,6 +195,17 @@ fn local_light_attenuation(light: PointLight, distance_to_light: f32) -> f32 {
 }
 
 fn emitter_visibility(light: PointLight, direction_to_light: vec3<f32>) -> f32 {
+    // Runtime spot/projected light. direction_to_light points receiver->source,
+    // so -direction_to_light is the emitted ray direction source->receiver.
+    if (light.shadow.w >= 0.5 && light.emitter.w > 2.5) {
+        let cone_cos = dot(normalize(light.emitter.xyz), -direction_to_light);
+        let inner = clamp(light.shape.x, -1.0, 1.0);
+        let outer = clamp(light.shape.y, -1.0, inner);
+        if (inner - outer <= 1.0e-5) {
+            return select(0.0, 1.0, cone_cos >= inner);
+        }
+        return smoothstep(outer, inner, cone_cos);
+    }
     if (light.emitter.w < 0.5) {
         return 1.0;
     }
@@ -204,8 +216,8 @@ fn emitter_visibility(light: PointLight, direction_to_light: vec3<f32>) -> f32 {
     return max(facing, 0.0);
 }
 
-fn rain_exposure(world: vec3<f32>) -> f32 {
-    if (settings.rain_params.x <= 0.5) {
+fn precipitation_exposure(world: vec3<f32>) -> f32 {
+    if (settings.rain_params.x <= 0.5 && settings.rain_params.w <= 0.001) {
         return 0.0;
     }
     if (settings.rain_occlusion.z <= 0.0 || settings.rain_occlusion.w <= 0.0) {
@@ -255,6 +267,33 @@ fn rain_gust_strength(world: vec3<f32>) -> f32 {
     return strength * strength;
 }
 
+fn fog_wind_density(world: vec3<f32>) -> f32 {
+    // Keep the mapper-authored/manual fog envelope fixed in world space. Wind
+    // only advects a broad internal density field through it. This preserves
+    // fog brush/global-fog placement while making volumetric fog share the same
+    // atmospheric motion as precipitation and grass.
+    let wind_speed = length(settings.rain_wind.xy);
+    if (wind_speed <= 0.001) {
+        return 1.0;
+    }
+
+    let root_m = world.xz * JKA_TO_GODOT_METERS;
+    let advected_root = root_m
+        - weather_wind_offset_jka(settings.camera_pos_time.w) * JKA_TO_GODOT_METERS;
+    let broad_noise = textureSampleLevel(
+        wind_noise,
+        wind_noise_sampler,
+        advected_root * 0.0125,
+        0.0
+    ).x;
+
+    // Fade in gently from calm air and cap at +/-10% so authored JKA fog keeps
+    // its intended average opacity/color instead of turning into rolling smoke.
+    let wind_response = smoothstep(24.0, 180.0, wind_speed);
+    let moving_density = mix(0.90, 1.10, broad_noise);
+    return mix(1.0, moving_density, wind_response);
+}
+
 fn rain_segment_extinction(
     world: vec3<f32>,
     midpoint_depth: f32,
@@ -277,7 +316,7 @@ fn rain_segment_extinction(
     if (distance_ramp <= 0.001) {
         return 0.0;
     }
-    let exposure = rain_exposure(world);
+    let exposure = precipitation_exposure(world);
     if (exposure <= 0.001) {
         return 0.0;
     }
@@ -310,6 +349,46 @@ fn rain_max_optical_depth() -> f32 {
     return -log(max(1.0 - maximum, 1.0e-4));
 }
 
+fn snow_segment_extinction(
+    world: vec3<f32>,
+    midpoint_depth: f32,
+    segment_length: f32,
+    remaining_optical_depth: f32,
+) -> f32 {
+    let clouds = clamp(settings.rain_params.w, 0.0, 5.0);
+    if (clouds <= 0.001 || remaining_optical_depth <= 0.0) {
+        return 0.0;
+    }
+    // Snow's atmosphere is suspended bright ice/dust rather than a dark rain
+    // curtain: it starts a little closer, rises softly, and scales sub-linearly
+    // when maps stack several stock 1,000-flake clouds.
+    let density_scale = sqrt(clouds);
+    let distance_ramp = smoothstep(410.0, 760.0, midpoint_depth);
+    if (distance_ramp <= 0.001) {
+        return 0.0;
+    }
+    let exposure = precipitation_exposure(world);
+    if (exposure <= 0.001) {
+        return 0.0;
+    }
+    // The visible flake simulation already carries turbulent structure. Keep the
+    // atmosphere smooth so snow-only haze adds no per-froxel noise-texture read.
+    let base_density = 0.000145 * density_scale;
+    let raw = base_density * distance_ramp * exposure * segment_length;
+    return min(raw, remaining_optical_depth);
+}
+
+fn snow_max_optical_depth() -> f32 {
+    let clouds = clamp(settings.rain_params.w, 0.0, 5.0);
+    if (clouds <= 0.001) {
+        return 0.0;
+    }
+    // Keep even stacked snow translucent. Bright scattering supplies the milky
+    // whiteout feel without throwing away the whole distant scene.
+    let maximum = clamp(0.40 + 0.105 * (clouds - 1.0), 0.0, 0.78);
+    return -log(max(1.0 - maximum, 1.0e-4));
+}
+
 fn local_light_scattering(
     gid: vec3<u32>,
     world: vec3<f32>,
@@ -319,7 +398,7 @@ fn local_light_scattering(
     g: f32,
 ) -> vec3<f32> {
     if (lighting_settings.values.x == 0u || lighting_settings.values.y == 0u
-        || (lighting_settings.feature_flags.x == 0u && lighting_settings.feature_flags.z == 0u)) {
+        || (lighting_settings.feature_flags.x == 0u && (lighting_settings.feature_flags.z & 0xffu) == 0u)) {
         return vec3<f32>(0.0);
     }
     let cluster = cluster_for_froxel(gid, camera_depth);
@@ -397,6 +476,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var previous_depth = FROXEL_NEAR;
     var rain_optical_depth = 0.0;
     let rain_optical_depth_limit = rain_max_optical_depth();
+    var snow_optical_depth = 0.0;
+    let snow_optical_depth_limit = snow_max_optical_depth();
 
     for (var slice = 0u; slice < FROXEL_Z; slice = slice + 1u) {
         let current_depth = slice_edge(slice + 1u);
@@ -404,25 +485,29 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let segment_length = current_depth - previous_depth;
         let world = settings.camera_pos_time.xyz + ray * midpoint_depth;
         var fog_extinction = 0.0;
-        if (authored_depth > 0.001) {
-            // Integrate OpenJK's EXP2 law exactly over this froxel segment:
-            // T(z) = exp(-ln(255) * (z / depthForOpaque)^2). Fixed-function
-            // fog uses eye-forward depth, not radial world distance.
-            let previous_forward = previous_depth * ray_forward_scale;
-            let current_forward = current_depth * ray_forward_scale;
-            let inv_depth2 = 1.0 / max(authored_depth * authored_depth, 1e-6);
-            fog_extinction = 5.5412635
-                * density_or_authored_scale
-                * max(
-                    current_forward * current_forward
-                        - previous_forward * previous_forward,
-                    0.0
-                )
-                * inv_depth2;
-        } else {
-            let height_density = clamp(exp(-(world.y + height_offset) * height_falloff), 0.20, 2.5);
-            let density = density_or_authored_scale * height_density;
-            fog_extinction = density * segment_length;
+        if (density_or_authored_scale > 1.0e-7) {
+            let wind_density = fog_wind_density(world);
+            if (authored_depth > 0.001) {
+                // Integrate OpenJK's EXP2 law over this froxel segment, then
+                // modulate only the local participating-medium density. The
+                // authored depth/color and spatial envelope remain unchanged.
+                let previous_forward = previous_depth * ray_forward_scale;
+                let current_forward = current_depth * ray_forward_scale;
+                let inv_depth2 = 1.0 / max(authored_depth * authored_depth, 1e-6);
+                fog_extinction = 5.5412635
+                    * density_or_authored_scale
+                    * max(
+                        current_forward * current_forward
+                            - previous_forward * previous_forward,
+                        0.0
+                    )
+                    * inv_depth2
+                    * wind_density;
+            } else {
+                let height_density = clamp(exp(-(world.y + height_offset) * height_falloff), 0.20, 2.5);
+                let density = density_or_authored_scale * height_density * wind_density;
+                fog_extinction = density * segment_length;
+            }
         }
 
         let rain_extinction = rain_segment_extinction(
@@ -432,7 +517,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             max(rain_optical_depth_limit - rain_optical_depth, 0.0)
         );
         rain_optical_depth += rain_extinction;
-        let extinction = fog_extinction + rain_extinction;
+        let snow_extinction = snow_segment_extinction(
+            world,
+            midpoint_depth,
+            segment_length,
+            max(snow_optical_depth_limit - snow_optical_depth, 0.0)
+        );
+        snow_optical_depth += snow_extinction;
+        let extinction = fog_extinction + rain_extinction + snow_extinction;
         let step_transmittance = exp(-extinction);
 
         var direct_visibility = 1.0;
@@ -444,9 +536,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             max(sun_color, vec3<f32>(0.04)),
             0.30
         );
+        // High-albedo ice crystals make snow haze conspicuously brighter and
+        // milkier than rain while retaining a hint of the map's sunlight.
+        let snow_color = mix(
+            vec3<f32>(0.78, 0.84, 0.91),
+            max(sun_color, vec3<f32>(0.16)),
+            0.42
+        );
         var medium_color = fog_color;
         if (extinction > 1.0e-7) {
-            medium_color = (fog_color * fog_extinction + rain_color * rain_extinction) / extinction;
+            medium_color = (
+                fog_color * fog_extinction
+                + rain_color * rain_extinction
+                + snow_color * snow_extinction
+            ) / extinction;
         }
         // Manual volumetric fog keeps the stylized low ambient term. Authored
         // MAP fog, however, should converge toward the mapper's fog color just

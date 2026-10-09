@@ -243,6 +243,22 @@ fn fs_mask(input: MaskVertexOut) -> FragmentOut {
     return out;
 }
 
+// Rain-only linear-depth prepass. Unlike the general spatial-post prepass,
+// these entry points write only radial depth (plus hardware depth).
+@fragment
+fn fs_rain(input: VertexOut) -> @location(0) f32 {
+    return radial_depth(input.world_position);
+}
+
+@fragment
+fn fs_rain_mask(input: MaskVertexOut) -> @location(0) f32 {
+    let alpha = textureSample(base_texture, base_sampler, input.uv).a * input.alpha_multiplier;
+    if (alpha < material.params.x) {
+        discard;
+    }
+    return radial_depth(input.world_position);
+}
+
 // Depth-only alpha test for the Hi-Z early pass. Opaque surfaces need no
 // fragment stage at all (`vs_main` alone); this is only for alpha-tested ones.
 @fragment

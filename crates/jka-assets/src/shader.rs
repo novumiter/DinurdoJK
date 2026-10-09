@@ -65,6 +65,15 @@ fn parse_wave(args: &[String]) -> Option<Wave> {
 pub enum RgbGen {
     #[default]
     Identity,
+    /// `rgbGen identityLighting`: renderer identity-light factor (1 with
+    /// overbright disabled). Do not confuse this with diffuse lighting.
+    IdentityLighting,
+    /// `rgbGen lightingDiffuse`: OpenJK/TaystJK CGEN_LIGHTING_DIFFUSE.
+    /// Uses the current refEntity's ambient/directed light and vertex normal,
+    /// not baked BSP vertex RGB. World entity's light fields are zero.
+    LightingDiffuse,
+    /// `rgbGen lightingDiffuseEntity`: diffuse lighting modulated by shaderRGBA.
+    LightingDiffuseEntity,
     Vertex,
     ExactVertex,
     OneMinusVertex,
@@ -243,6 +252,8 @@ pub struct Stage {
     pub color: Option<[f32; 3]>,
     pub rgb_gen: RgbGen,
     pub alpha_gen: AlphaGen,
+    /// Portal alpha (distance / portalRange) applies to this shader stage.
+    pub alpha_portal: bool,
     pub tc_gen: TcGen,
     pub tc_mods: Vec<TcMod>,
     pub depth_write: bool,
@@ -275,6 +286,8 @@ pub struct Shader {
     /// Classic id Tech 3 portal/mirror surface. The renderer can use this as
     /// an authored planar-reflection mask instead of guessing from gloss.
     pub portal: bool,
+    /// TaystJK alphaGen portal range, also used by RB_RenderFlare as sprite radius.
+    pub portal_range: Option<f32>,
     pub sky: bool,
     pub sky_box: Option<String>,
     /// `skyParms <outerbox> <cloudheight> <innerbox>`: height of the cloud layer
@@ -795,6 +808,12 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                     "alphagen" if first == "oneminusvertex" => {
                         stage.alpha_gen = AlphaGen::OneMinusVertex
                     }
+                    "alphagen" if first == "portal" => {
+                        // tr_shader.cpp: alphaGen portal <range> sets shader.portalRange.
+                        shader.portal_range = Some(args.get(1).and_then(|s| s.parse::<f32>().ok())
+                            .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(256.0));
+                        stage.alpha_portal = true;
+                    }
                     "alphagen" if first == "identity" => stage.alpha_gen = AlphaGen::Identity,
                     "alphagen" if first == "lightingspecular" => {
                         stage.alpha_gen = AlphaGen::LightingSpecular
@@ -831,18 +850,21 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                         stage.color = Some(v.map(|n| n.clamp(0.0, 1.0)));
                         stage.rgb_gen = RgbGen::Const;
                     }
-                    "rgbgen" if first == "lightingdiffuseentity" || first == "entity" => {
+                    "rgbgen" if first == "lightingdiffuseentity" => {
+                        stage.entity_rgb = true;
+                        stage.rgb_gen = RgbGen::LightingDiffuseEntity;
+                    }
+                    "rgbgen" if first == "entity" => {
                         stage.entity_rgb = true;
                         stage.rgb_gen = RgbGen::Identity;
                     }
-                    "rgbgen"
-                        if ["identity", "identitylighting", "lightingdiffuse"]
-                            .contains(&first.as_str()) =>
-                    {
-                        // identityLighting and lightingDiffuse are intentionally
-                        // approximated as identity by this renderer today. Keep
-                        // the generation mode explicit so RGB and alpha sources
-                        // are never accidentally coupled.
+                    "rgbgen" if first == "lightingdiffuse" => {
+                        stage.rgb_gen = RgbGen::LightingDiffuse;
+                    }
+                    "rgbgen" if first == "identitylighting" => {
+                        stage.rgb_gen = RgbGen::IdentityLighting;
+                    }
+                    "rgbgen" if first == "identity" => {
                         stage.rgb_gen = RgbGen::Identity;
                     }
                     "rgbgen" => stage
@@ -1671,7 +1693,25 @@ rgbGen lightingDiffuse
         assert!(!stages[1].entity_rgb);
         assert!(stages[1].detail);
         assert!(stages[0].unsupported.is_empty());
-        assert_eq!(stages[0].rgb_gen, RgbGen::Identity);
+        assert_eq!(stages[0].rgb_gen, RgbGen::LightingDiffuseEntity);
+        assert_eq!(stages[1].rgb_gen, RgbGen::LightingDiffuse);
+    }
+
+    #[test]
+    fn parses_trickarena_glass_and_identity_lighting_distinctly() {
+        let shaders = parse(
+            "textures/trickarena/glass_cpm {\nq3map_nolightmap\ncull twosided\n{\nmap textures/trickarena/newglass\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\nrgbGen lightingDiffuse\n}\n{\nmap textures/trickarena/glass_reflect_cpm\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\ndetail\nalphaGen const 0.05\ntcGen environment\ntcMod scale 1.5 1.5\n}\n}\ntextures/test/idlight {\n{\nmap $whiteimage\nrgbGen identityLighting\n}\n}",
+        ).unwrap();
+        let stages = &shaders["textures/trickarena/glass_cpm"].stages;
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].rgb_gen, RgbGen::LightingDiffuse);
+        assert_eq!(stages[0].alpha_gen, AlphaGen::Identity);
+        assert_eq!(stages[1].rgb_gen, RgbGen::Identity);
+        assert_eq!(stages[1].alpha_gen, AlphaGen::Const);
+        assert_eq!(stages[1].alpha, Some(0.05));
+        assert_eq!(stages[1].tc_gen, TcGen::Environment);
+        assert!(stages.iter().all(|stage| stage.unsupported.is_empty()));
+        assert_eq!(shaders["textures/test/idlight"].stages[0].rgb_gen, RgbGen::IdentityLighting);
     }
 
     #[test]
@@ -1707,6 +1747,18 @@ map models/players/test/torso_04
                 "textures/byss/byss_basic1_piller_light\n{\n    {\n        map $lightmap\n    }\n    {\n        map textures/byss/byss_basic1_piller_light\n        blendFunc GL_DST_COLOR GL_ZERO\n    }\n    {\n        map textures/byss/byss_piller_glow\n        blendFunc GL_ONE GL_ONE\n        glow\n    }\n}"
             )
         );
+    }
+
+    #[test]
+    fn world_flare_alpha_portal_keeps_authored_stage_and_radius() {
+        let shaders = parse("textures/test/flare {\n {\n map textures/test/flare\n alphaGen portal 72\n blendFunc GL_SRC_ALPHA GL_ONE\n }\n }\n").unwrap();
+        let shader = &shaders["textures/test/flare"];
+        assert_eq!(shader.portal_range, Some(72.0));
+        assert!(shader.stages[0].alpha_portal);
+        assert!(shader.stages[0].unsupported.is_empty());
+        let fallback = parse("textures/test/flare {\n { alphaGen portal\n }\n }\n");
+        // The basic marker remains a valid parsed directive with fallback range.
+        assert!(fallback.is_ok());
     }
 
 }

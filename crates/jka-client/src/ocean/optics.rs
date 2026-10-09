@@ -9,12 +9,13 @@ pub fn linear_color(rgb: [f32; 3]) -> [f32; 3] {
 
 /// Cull only rays guaranteed to stay inside one convex water volume. A blanket
 /// underwater far plane would incorrectly remove the sky/shore through the surface.
+/// Volumes with an outline mask (`minimum[v][3] != 0`) are not convex, so they never cull.
 pub fn cull_submerged(eye: [f32; 3], min: [f32; 3], max: [f32; 3], volumes: &Uniform, cutoff: f32, wave_margin: f32) -> bool {
     if cutoff <= 0.0 { return false; }
     let distance_squared: f32 = (0..3).map(|i| (eye[i] - eye[i].clamp(min[i], max[i])).powi(2)).sum();
     if distance_squared < cutoff * cutoff { return false; }
     (0..volumes.params[3] as usize).any(|v| {
-        (0..3).all(|i| eye[i] >= volumes.minimum[v][i] && eye[i] <= volumes.maximum[v][i]
+        volumes.minimum[v][3] == 0.0 && (0..3).all(|i| eye[i] >= volumes.minimum[v][i] && eye[i] <= volumes.maximum[v][i]
             && min[i] >= volumes.minimum[v][i] && max[i] <= volumes.maximum[v][i])
             && eye[1].max(max[1]) < volumes.maximum[v][1] - wave_margin
     })
@@ -29,11 +30,34 @@ pub struct Settings {
     pub refraction: f32,
     pub caustics: f32,
     pub underwater_cull: f32,
+    /// Skip the whole capture when the camera is dry and no ocean clipmap
+    /// survived this frame's culling. The capture is read only by the ocean
+    /// surface shader (bsp.wgsl) and the submerged composite, so with neither
+    /// present its result cannot be observed.
+    pub cull: bool,
+    /// Restrict the capture to the screen rectangle the visible water covers
+    /// instead of the whole framebuffer. The surface shader samples the capture
+    /// at its own fragment plus a refraction offset bounded by `refraction`, so
+    /// a padded water rect contains every read.
+    pub scissor: bool,
+    /// Honour each water volume's outline mask in the capture. Off makes every
+    /// volume a plain box, which is visually wrong on hollow water (an island
+    /// ring's centre counts as submerged) but isolates the cost of
+    /// `add_masked_spans`: that runs per pixel, per volume hit, looping every
+    /// mask triangle while maintaining a dynamically indexed local array.
+    /// Purely a measurement lever - no shader change, the mask slot simply
+    /// stops being written into the uniform.
+    pub masks: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { fog_color: [20.0 / 255.0, 40.0 / 255.0, 50.0 / 255.0], fog_distance: 300.0, transparency: 4.0,
-            depth_darkening: 1.0, refraction: 0.025, caustics: 0.0, underwater_cull: 3.0 }
+        Self { fog_color: [20.0 / 255.0, 40.0 / 255.0, 50.0 / 255.0], fog_distance: 384.0, transparency: 6.0,
+            depth_darkening: 1.0, refraction: 0.1, caustics: 1.0, underwater_cull: 3.0,
+            // The scissor is off by default: measured on a real map, a promoted
+            // surface's bounds surround the camera, so there is no tight screen
+            // rectangle to find and it falls back to full-screen anyway. Kept
+            // only as an A/B lever.
+            cull: true, scissor: false, masks: true }
     }
 }
 impl Settings {
@@ -132,8 +156,14 @@ impl Resources {
         Self { key, bind_group, uniform, capture_layout, sampler, color, depth, capture, blit }
     }
 
+    /// `scissor` is `(x, y, width, height)` in pixels, or `None` for the whole
+    /// target. The attachments are still cleared in full (a clear is cheap and a
+    /// pass-level clear ignores the scissor anyway); the scissor only keeps the
+    /// expensive per-pixel volume/mask work inside the rectangle that something
+    /// will actually sample.
     pub fn capture(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
-        scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup) {
+        scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
+        scissor: Option<(u32, u32, u32, u32)>) {
         let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform);
         let attachments = [&self.color, &self.depth].map(|view| Some(wgpu::RenderPassColorAttachment {
             view, depth_slice: None, resolve_target: None,
@@ -145,6 +175,12 @@ impl Resources {
         pass.set_pipeline(&self.capture);
         pass.set_bind_group(0, &input, &[]);
         pass.set_bind_group(1, ocean, &[]);
+        if let Some((x, y, width, height)) = scissor {
+            if width == 0 || height == 0 {
+                return;
+            }
+            pass.set_scissor_rect(x, y, width, height);
+        }
         pass.draw(0..3, 0..1);
     }
     pub fn composite(&self, encoder: &mut wgpu::CommandEncoder, color: &wgpu::TextureView, resolve: Option<&wgpu::TextureView>) {
@@ -268,14 +304,17 @@ mod tests {
         assert!(!cull_submerged(eye, [4000.0,-1200.0,0.0], [11000.0,-800.0,100.0], &volume, 3600.0, 512.0));
         assert!(!cull_submerged(eye, [40.0,-1200.0,0.0], [100.0,-800.0,100.0], &volume, 3600.0, 512.0));
         assert!(!cull_submerged(eye, [4000.0,-1200.0,0.0], [4100.0,-800.0,100.0], &volume, 0.0, 512.0));
+        // A holed (masked) volume is not convex, so nothing inside it may be culled.
+        volume.minimum[0][3] = 1.0;
+        assert!(!cull_submerged(eye, [4000.0,-1200.0,0.0], [4100.0,-800.0,100.0], &volume, 3600.0, 512.0));
     }
 
     #[test]
     fn invalid_settings_are_finite_and_bounded() {
         let settings = Settings { transparency: f32::NAN, fog_distance: -1.0, refraction: f32::INFINITY, ..Default::default() }.sanitize();
         assert_eq!(settings.fog_distance, 1.0);
-        assert_eq!(settings.transparency, 4.0);
-        assert_eq!(settings.refraction, 0.025);
+        assert_eq!(settings.transparency, 6.0);
+        assert_eq!(settings.refraction, 0.1);
     }
 
     #[test]
@@ -331,7 +370,7 @@ mod tests {
                         });
                     }
                     let capture_color = if samples == 1 { &color_view } else { &msaa_view };
-                    resources.capture(&device, &mut encoder, capture_color, &depth_view, &ocean);
+                    resources.capture(&device, &mut encoder, capture_color, &depth_view, &ocean, None);
                     resources.composite(&mut encoder, output, resolve);
                     let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256*8,
                         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });

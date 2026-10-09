@@ -13,3 +13,7 @@ pub mod shader;
 pub mod siege;
 pub mod skin;
 pub mod vehicle;
+
+pub mod source1;
+pub mod source1_geometry;
+pub mod source1_rig;

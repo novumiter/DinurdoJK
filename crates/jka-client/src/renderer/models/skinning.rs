@@ -1,15 +1,18 @@
 //! Models skinning.
 use crate::renderer::{
-    classic_vertex_illumination, ghoul2_specular_light, ghoul2_specular_viewer,
-    sample_entity_classic_light, scene, storage_buffer_entry, Arc, DynamicModelAlphaMode,
-    DynamicModelRenderer, DynamicModelSurface, DynamicModelVertex, DynamicPreparedDraw,
-    EntityAmbientLightingMode, Entry, Ghoul2GpuDrawUniform, Ghoul2RtComputeBatch,
+    classic_vertex_illumination, ghoul2_specular_light, ghoul2_specular_viewer, scene,
+    storage_buffer_entry, Arc, DynamicModelAlphaMode, DynamicModelRenderer, DynamicModelSurface,
+    DynamicModelVertex, DynamicPreparedDraw, EntityAmbientLightingMode, EntityLightMemo, Entry, Ghoul2GpuDrawUniform, Ghoul2RtComputeBatch,
     Ghoul2RtComputeMesh, Ghoul2RtInputVertex, Ghoul2RtSkinningResources, HashMap, PipelineJobKey,
     PipelineJobManager, RayTracedSkinnedMeshKey, RayTracedSkinnedPrepared, Vec3,
     DYNAMIC_MODEL_VERTEX_WORDS,
 };
 use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod state_tests;
 
 impl DynamicModelRenderer {
     pub(in crate::renderer) fn ensure_rt_skinning_resources(
@@ -23,6 +26,7 @@ impl DynamicModelRenderer {
         let job_key = PipelineJobKey::new("ghoul2-rt-skinning", 0, 0);
         if let Some(resources) = jobs.take_ready::<Ghoul2RtSkinningResources>(job_key) {
             self.rt_skinning = Some(resources);
+            self.rebuild_rt_skinning_global_bind_group(device);
             rverbose!(1, "RT Shadows: Ghoul2 compute-skin path initialized (RT-only; normal GPU skinning unchanged when RT is off)");
             return true;
         }
@@ -270,7 +274,10 @@ impl DynamicModelRenderer {
         raw_colors.clear();
         self.draws.clear();
         self.fx_sprite_draws.clear();
+        let mut fx_sprite_instances = std::mem::take(&mut self.scratch_fx_sprite_instances);
+        fx_sprite_instances.clear();
         self.skin_draws.clear();
+        self.skin_instance_entities.clear();
         self.frame_texture_keys.clear();
         self.ghoul2_input_instances = 0;
         self.ghoul2_encoded_draws = 0;
@@ -298,6 +305,7 @@ impl DynamicModelRenderer {
         let mut mesh_draw_indices = HashMap::<Arc<str>, Vec<u32>>::new();
         let mut rt_casters = Vec::<RayTracedSkinnedPrepared>::new();
         let mut visible_gpu_draws = 0u32;
+        let mut light_memo = EntityLightMemo::default();
 
         for surface in surfaces {
             // Camera-culled RT-only surfaces should never leak into ordinary
@@ -308,8 +316,27 @@ impl DynamicModelRenderer {
             }
             let texture_key = surface
                 .raster_visible
-                .then(|| self.ensure_texture(brightness, device, queue, surface.texture.as_ref()))
+                .then(|| {
+                    self.ensure_texture(
+                        brightness,
+                        device,
+                        queue,
+                        surface.texture.as_ref(),
+                        // RT Shadows draws Ghoul2 through compute skinning and
+                        // the MD3 pipelines, which have no Source material path,
+                        // so this surface only needs its colour map here.
+                        None,
+                    )
+                })
                 .flatten();
+            let first_vertex = vertices.len();
+            if self.prepare_fx_surface(surface, &texture_key, &mut vertices, &mut indices,
+                &mut fx_sprite_instances) {
+                if rt_receivers {
+                    raw_colors.extend(vertices[first_vertex..].iter().map(|vertex| vertex.color));
+                }
+                continue;
+            }
             let classic_light = if surface.raster_visible
                 && self.entity_ambient_lighting == EntityAmbientLightingMode::BspLightgridClassic
                 && !matches!(
@@ -323,9 +350,16 @@ impl DynamicModelRenderer {
                         | DynamicModelAlphaMode::Darken
                 ) {
                 match (surface.lighting_origin, classic_grid) {
-                    (Some(origin), Some(grid)) => {
-                        sample_entity_classic_light(grid, origin, self.entity_sun_relight)
-                    }
+                    (Some(origin), Some(grid)) => light_memo.light(
+                        grid,
+                        origin,
+                        self.entity_sun_relight,
+                        if self.entity_dlights_rt_per_pixel {
+                            &[]
+                        } else {
+                            self.entity_dlights.as_slice()
+                        },
+                    ),
                     _ => None,
                 }
             } else {
@@ -464,6 +498,10 @@ impl DynamicModelRenderer {
                     jiggle1: skin.jiggle_offsets[1],
                     jiggle2: skin.jiggle_offsets[2],
                     jiggle3: skin.jiggle_offsets[3],
+                    // See the ensure_texture call above: this path never selects
+                    // a Source material pipeline.
+                    source_phong: [0.0; 4],
+                    source_fresnel: [0.0; 4],
                 });
                 mesh_draw_indices
                     .entry(Arc::clone(&mesh_key))
@@ -670,6 +708,8 @@ impl DynamicModelRenderer {
         rt.casters = rt_casters;
         self.rt_prepared = true;
         self.ensure_model_pipelines(jobs, device, prepare_authored_glow);
+        self.upload_prepared_fx_sprites(jobs, device, queue, &fx_sprite_instances, prepare_authored_glow);
+        self.scratch_fx_sprite_instances = fx_sprite_instances;
 
         self.scratch_vertices = vertices;
         self.scratch_indices = indices;

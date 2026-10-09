@@ -17,23 +17,44 @@ impl App {
             return;
         };
         if captured && self.overlay == OverlayMode::None {
-            let grabbed = window
-                .set_cursor_grab(CursorGrabMode::Locked)
-                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-            if grabbed.is_ok() {
+            let grab_mode = if window.set_cursor_grab(CursorGrabMode::Locked).is_ok() {
+                Some("locked")
+            } else if window.set_cursor_grab(CursorGrabMode::Confined).is_ok() {
+                Some("confined")
+            } else {
+                None
+            };
+            if let Some(grab_mode) = grab_mode {
                 window.set_cursor_visible(false);
                 self.captured = true;
+                self.mouse_grab_mode = grab_mode;
+            } else {
+                self.captured = false;
+                self.mouse_grab_mode = "none";
             }
         } else {
             let _ = window.set_cursor_grab(CursorGrabMode::None);
             window.set_cursor_visible(true);
             self.captured = false;
+            self.mouse_grab_mode = "none";
         }
     }
 
     pub(in crate::app) fn sync_profile_preview_mode(&mut self, active: bool) {
         if self.profile_preview_active == active {
             return;
+        }
+        // Only commit a selected model when the entire Profile menu closes,
+        // not while clicking tiles, switching Profile sections, or pressing APPLY.
+        // This route is shared by ESC, Back, top-level tabs, and uipage.
+        if !active {
+            if let Some(model) = self.profile_model_staged.take() {
+                if !model.eq_ignore_ascii_case(&self.solo_client_info.model_cvar()) {
+                    if let Err(error) = self.set_console_cvar("model", &model) {
+                        self.console_status = error;
+                    }
+                }
+            }
         }
         self.profile_preview_active = active;
         if active {

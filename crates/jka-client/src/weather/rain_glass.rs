@@ -1,7 +1,7 @@
 //! Fullscreen lens-rain pass, ported from Toadstorm/RainyGlassShader.
 //!
 //! The shader math and material values are kept in `rain_glass.wgsl`. The two
-//! embedded masks are direct channel-preserving conversions of the upstream
+//! PK3-loaded mask payloads are direct channel-preserving conversions of the upstream
 //! `droplets_mask.tif` and `rivulets_mask.tif`: RGBA (including TIFF meta0 as
 //! Unity's alpha), linear data, Mitchell-scaled from 2048 to the Unity Standalone
 //! importer cap of 1024. The upstream importer uses repeat wrapping and a -100
@@ -9,17 +9,25 @@
 
 use crate::pipeline_jobs::{hash_config as pipeline_hash, PipelineJobKey, PipelineJobManager};
 use bytemuck::{Pod, Zeroable};
+use jka_assets::pk3::AssetSearchPath;
 use wgpu::util::DeviceExt;
 
 const MASK_SIZE: u32 = 1024;
-const DROPLET_MASK_RGBA: &[u8] = include_bytes!("assets/rainy_glass_droplets.rgba");
-const RIVULET_MASK_RGBA: &[u8] = include_bytes!("assets/rainy_glass_rivulets.rgba");
+const MASK_CHANNELS: u32 = 4;
+const MASK_BYTES: usize = (MASK_SIZE * MASK_SIZE * MASK_CHANNELS) as usize;
+const DROPLET_MASK_QPATH: &str = "textures/japro/droplets.rgba";
+const RIVULET_MASK_QPATH: &str = "textures/japro/rivulets.rgba";
 const SHADER: &str = include_str!("rain_glass.wgsl");
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RainGlassUniform {
     time_amount_up: [f32; 4],
+    /// Instantaneous weather wind expressed in lens space, in JKA units/sec:
+    /// x = camera-right, y = camera-up, z = toward the lens, w = world speed.
+    /// The shader uses this only to deform water that is already present in the
+    /// authored masks; it never pans the mask domain itself.
+    wind_lens: [f32; 4],
 }
 
 pub(super) struct RainGlassResources {
@@ -50,14 +58,23 @@ impl RainGlassResources {
         width: u32,
         height: u32,
         format: wgpu::TextureFormat,
-    ) -> Self {
-        debug_assert_eq!(DROPLET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
-        debug_assert_eq!(RIVULET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
+        assets: &mut AssetSearchPath,
+    ) -> Result<Self, String> {
+        let droplet_mask = load_mask(assets, DROPLET_MASK_QPATH)?;
+        let rivulet_mask = load_mask(assets, RIVULET_MASK_QPATH)?;
 
-        let (droplet_texture, droplet_view) =
-            create_mask_texture(device, queue, "JKA RainyGlass droplet mask", DROPLET_MASK_RGBA);
-        let (rivulet_texture, rivulet_view) =
-            create_mask_texture(device, queue, "JKA RainyGlass rivulet mask", RIVULET_MASK_RGBA);
+        let (droplet_texture, droplet_view) = create_mask_texture(
+            device,
+            queue,
+            "JKA RainyGlass droplet mask",
+            &droplet_mask,
+        );
+        let (rivulet_texture, rivulet_view) = create_mask_texture(
+            device,
+            queue,
+            "JKA RainyGlass rivulet mask",
+            &rivulet_mask,
+        );
 
         let source_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("JKA RainyGlass scene sampler"),
@@ -131,7 +148,7 @@ impl RainGlassResources {
             &uniform_buffer,
         );
 
-        Self {
+        Ok(Self {
             _droplet_texture: droplet_texture,
             _rivulet_texture: rivulet_texture,
             droplet_view,
@@ -150,7 +167,7 @@ impl RainGlassResources {
             height,
             format,
             amount: 0.0,
-        }
+        })
     }
 
     pub(super) fn prepare(
@@ -164,6 +181,7 @@ impl RainGlassResources {
         frame_time: f32,
         amount: f32,
         lens_up_alignment: f32,
+        wind_lens: [f32; 4],
     ) {
         if self.width != width || self.height != height || self.format != format {
             let format_changed = self.format != format;
@@ -196,6 +214,7 @@ impl RainGlassResources {
                 lens_up_alignment.abs().clamp(0.0, 1.0),
                 0.0,
             ],
+            wind_lens,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
 
@@ -372,6 +391,20 @@ fn create_bind_group(
     })
 }
 
+fn load_mask(assets: &mut AssetSearchPath, qpath: &str) -> Result<Vec<u8>, String> {
+    let asset = assets
+        .read(qpath, MASK_BYTES.saturating_add(1))
+        .map_err(|error| format!("failed to read {qpath}: {error}"))?
+        .ok_or_else(|| format!("missing {qpath}"))?;
+    if asset.bytes.len() != MASK_BYTES {
+        return Err(format!(
+            "invalid {qpath}: expected {MASK_BYTES} RGBA8 bytes, got {}",
+            asset.bytes.len()
+        ));
+    }
+    Ok(asset.bytes)
+}
+
 fn create_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -408,11 +441,34 @@ fn create_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::weather::rain::layout_tests::wgsl_struct_layout;
+    use std::mem::size_of;
 
     #[test]
     fn rainy_glass_assets_match_unity_standalone_import_size() {
-        assert_eq!(DROPLET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
-        assert_eq!(RIVULET_MASK_RGBA.len(), (MASK_SIZE * MASK_SIZE * 4) as usize);
+        assert_eq!(MASK_BYTES, 1024 * 1024 * 4);
+        assert_eq!(
+            DROPLET_MASK_QPATH,
+            "textures/japro/droplets.rgba"
+        );
+        assert_eq!(
+            RIVULET_MASK_QPATH,
+            "textures/japro/rivulets.rgba"
+        );
+    }
+
+    #[test]
+    fn packaged_rainy_glass_masks_have_expected_size() {
+        let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let mut assets = AssetSearchPath::open_search_dirs([assets_dir])
+            .expect("RainyGlass package directory must open");
+        for qpath in [DROPLET_MASK_QPATH, RIVULET_MASK_QPATH] {
+            let asset = assets
+                .read(qpath, MASK_BYTES.saturating_add(1))
+                .expect("RainyGlass mask read must succeed")
+                .expect("RainyGlass mask must be packaged");
+            assert_eq!(asset.bytes.len(), MASK_BYTES);
+        }
     }
 
     #[test]
@@ -425,5 +481,11 @@ mod tests {
         )
         .validate(&module)
         .expect("RainyGlass WGSL must validate");
+    }
+
+    #[test]
+    fn rain_glass_uniform_matches_wgsl_layout() {
+        let (size, _) = wgsl_struct_layout(SHADER, "RainGlassSettings");
+        assert_eq!(size as usize, size_of::<RainGlassUniform>());
     }
 }

@@ -12,6 +12,7 @@ use rapier_cloth_core::{
     Real, Solver, SolverSettings, StepReport, Target, Vec3,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 /// JKA world units are inches closely enough for presentation physics. Keeping
 /// the solver in metres also keeps gravity/material defaults in their intended
@@ -159,17 +160,72 @@ struct ClothSurfaceLayout {
     render_to_particle: Vec<u32>,
 }
 
+/// Immutable weld mapping shared with presentation. Rebuilding geometry from a
+/// current pose must keep all render copies of a physical particle together.
+pub(crate) struct ClothRenderTopology {
+    signature: Vec<SurfaceSignature>,
+    /// Flattened render copies belonging to each welded physical particle.
+    particle_members: Vec<Vec<usize>>,
+    layouts: Vec<ClothSurfaceLayout>,
+}
+
+impl ClothRenderTopology {
+    pub(crate) fn matches(&self, surfaces: &[ClothSurfaceFrame]) -> bool {
+        self.signature.len() == surfaces.len()
+            && self.signature.iter().zip(surfaces).all(|(signature, surface)| {
+                signature.surface_index == surface.surface_index
+                    && signature.surface_name == surface.surface_name
+                    && signature.vertex_count == surface.posed_positions.len()
+                    && signature.triangle_count == surface.triangles.len()
+                    && surface.posed_normals.len() == surface.posed_positions.len()
+            })
+    }
+
+    pub(crate) fn reconstruct(
+        &self,
+        surfaces: &[ClothSurfaceFrame],
+        offsets: &HashMap<usize, Vec<[f32; 3]>>,
+    ) -> HashMap<usize, ClothOutput> {
+        if !self.matches(surfaces)
+            || surfaces.iter().any(|surface| {
+                offsets.get(&surface.surface_index)
+                    .is_none_or(|offset| offset.len() != surface.posed_positions.len())
+            })
+        {
+            return HashMap::new();
+        }
+        let displaced = surfaces.iter().flat_map(|surface| {
+            surface.posed_positions.iter().zip(&offsets[&surface.surface_index])
+                .map(|(base, offset)| std::array::from_fn(|j| base[j] + offset[j]))
+        }).collect::<Vec<_>>();
+        // Average the CURRENT animated copies plus their interpolated offsets.
+        // Old per-copy seam corrections must not reopen the current seam.
+        let shared = particle_targets(&self.particle_members, &displaced);
+        let mut outputs = HashMap::with_capacity(surfaces.len());
+        let mut global = 0;
+        for (layout, surface) in self.layouts.iter().zip(surfaces) {
+            let positions = layout.render_to_particle.iter().enumerate().map(|(i, &particle)| {
+                if particle == u32::MAX {
+                    displaced[global + i]
+                } else {
+                    from_metres(shared[particle as usize])
+                }
+            }).collect::<Vec<_>>();
+            let normals = recompute_normals(&positions, &surface.posed_normals, &surface.triangles);
+            global += positions.len();
+            outputs.insert(surface.surface_index, ClothOutput { positions, normals });
+        }
+        smooth_garment_normals(self, surfaces, &mut outputs);
+        outputs
+    }
+}
+
 struct ClothInstance {
     model_label: String,
     lod_index: usize,
-    signature: Vec<SurfaceSignature>,
+    topology: Arc<ClothRenderTopology>,
     cloth: Cloth,
     solver: Solver,
-    /// Each physical particle maps back to flattened render vertices from one
-    /// or more GLM surfaces. Cross-surface seam welding therefore follows the
-    /// average authoritative animation target for all authored copies.
-    particle_members: Vec<Vec<usize>>,
-    layouts: Vec<ClothSurfaceLayout>,
     pinned: Vec<u32>,
     /// Fraction of isolated target error corrected at the reference 60Hz rate.
     /// Hard-pinned particles store zero because pins are supplied by
@@ -272,6 +328,11 @@ impl ClothSystem {
 
     pub fn reset(&mut self) {
         self.instances.clear();
+    }
+
+    pub(crate) fn render_topology(&self, entity_num: u16) -> Option<Arc<ClothRenderTopology>> {
+        self.instances.get(&ClothKey { entity_num })
+            .map(|instance| Arc::clone(&instance.topology))
     }
 
     pub fn begin_frame(&mut self, now_ms: i32) {
@@ -378,7 +439,7 @@ impl ClothSystem {
         let rebuild = self.instances.get(&key).is_none_or(|instance| {
             instance.model_label != model_label
                 || instance.lod_index != lod_index
-                || instance.signature != signature
+                || instance.topology.signature != signature
         });
         if rebuild {
             match build_instance(model_label, lod_index, surfaces, capsules, motion, now_ms) {
@@ -408,7 +469,7 @@ impl ClothSystem {
             .expect("cloth garment inserted above");
         instance.last_seen_ms = now_ms;
 
-        let authored_targets = particle_targets(&instance.particle_members, &flat_positions);
+        let authored_targets = particle_targets(&instance.topology.particle_members, &flat_positions);
         let mut targets = garment_targets(
             instance,
             surfaces,
@@ -645,7 +706,7 @@ impl ClothSystem {
         );
 
         let mut outputs = HashMap::with_capacity(surfaces.len());
-        for (layout, surface) in instance.layouts.iter().zip(surfaces) {
+        for (layout, surface) in instance.topology.layouts.iter().zip(surfaces) {
             if layout.surface_index != surface.surface_index
                 || layout.render_to_particle.len() != surface.posed_positions.len()
             {
@@ -677,7 +738,7 @@ impl ClothSystem {
             let normals = recompute_normals(&positions, &surface.posed_normals, &surface.triangles);
             outputs.insert(surface.surface_index, ClothOutput { positions, normals });
         }
-        smooth_garment_normals(instance, surfaces, &mut outputs);
+        smooth_garment_normals(&instance.topology, surfaces, &mut outputs);
         Ok(outputs)
     }
 }
@@ -686,7 +747,7 @@ impl ClothSystem {
 /// normal angles to preserve intentional creases instead of smoothing all UV
 /// and material seams indiscriminately.
 fn smooth_garment_normals(
-    instance: &ClothInstance,
+    topology: &ClothRenderTopology,
     surfaces: &[ClothSurfaceFrame],
     outputs: &mut HashMap<usize, ClothOutput>,
 ) {
@@ -725,7 +786,7 @@ fn smooth_garment_normals(
         offset += surface.posed_positions.len();
     }
     offset = 0;
-    for (layout, surface) in instance.layouts.iter().zip(surfaces) {
+    for (layout, surface) in topology.layouts.iter().zip(surfaces) {
         let output = outputs
             .get_mut(&surface.surface_index)
             .expect("cloth output inserted");
@@ -735,7 +796,7 @@ fn smooth_garment_normals(
             }
             let global = offset + render;
             let mut sum = Vec3::ZERO;
-            for &member in &instance.particle_members[particle as usize] {
+            for &member in &topology.particle_members[particle as usize] {
                 if authored[global].dot(authored[member]) >= 0.5 {
                     sum += face_sums[member];
                 }
@@ -854,7 +915,7 @@ fn garment_targets(
         .driver_particles
         .iter()
         .map(|&particle| {
-            let members = &instance.particle_members[particle as usize];
+            let members = &instance.topology.particle_members[particle as usize];
             let mut matrix = [[0.0; 4]; 3];
             for &render in members {
                 for row in 0..3 {
@@ -1270,11 +1331,11 @@ fn build_instance(
     Ok(ClothInstance {
         model_label: model_label.to_owned(),
         lod_index,
-        signature: garment_signature(surfaces),
+        topology: Arc::new(ClothRenderTopology {
+            signature: garment_signature(surfaces), particle_members, layouts,
+        }),
         cloth,
         solver: Solver::new(),
-        particle_members,
-        layouts,
         pinned,
         follow_strengths,
         reference: rest_positions.clone(),
@@ -3015,7 +3076,7 @@ mod tests {
         surface.posed_positions[0][2] += 20.0;
         surface.skin_transforms[0][2][3] += 20.0;
         let flat = flatten_positions(std::slice::from_ref(&surface), |s| &s.posed_positions);
-        let authored = particle_targets(&instance.particle_members, &flat);
+        let authored = particle_targets(&instance.topology.particle_members, &flat);
         let free = garment_targets(instance, std::slice::from_ref(&surface), &authored, 0.0);
         let mixed = garment_targets(instance, std::slice::from_ref(&surface), &authored, 0.35);
         let full = garment_targets(instance, std::slice::from_ref(&surface), &authored, 1.0);
@@ -3031,7 +3092,7 @@ mod tests {
             transform[0][3] += 15.0;
         }
         let flat = flatten_positions(std::slice::from_ref(&surface), |s| &s.posed_positions);
-        let authored = particle_targets(&instance.particle_members, &flat);
+        let authored = particle_targets(&instance.topology.particle_members, &flat);
         let moved = garment_targets(instance, std::slice::from_ref(&surface), &authored, 0.0);
         assert!(
             (from_metres(moved[0])[0] - 3.0).abs() < 0.001,

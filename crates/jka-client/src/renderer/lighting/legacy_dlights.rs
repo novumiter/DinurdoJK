@@ -60,6 +60,34 @@ pub(in crate::renderer) fn barycentric_coordinates(
     Some([u, v, w])
 }
 
+fn transient_spot_visibility(light: &TransientLight, receiver: Vec3) -> f32 {
+    let Some(spot) = light.spot else {
+        return 1.0;
+    };
+    if !spot.direction.iter().all(|value| value.is_finite())
+        || !spot.inner_cone_cos.is_finite()
+        || !spot.outer_cone_cos.is_finite()
+    {
+        // A malformed inferred cone should never make an otherwise-valid
+        // emissive FX disappear; degrade to the ordinary point-light path.
+        return 1.0;
+    }
+    let source = Vec3::from_array(light.position);
+    let emitted = (receiver - source).normalize_or_zero();
+    let direction = Vec3::from_array(spot.direction).normalize_or_zero();
+    if emitted.length_squared() <= 1.0e-8 || direction.length_squared() <= 1.0e-8 {
+        return 0.0;
+    }
+    let inner = spot.inner_cone_cos.clamp(-1.0, 1.0);
+    let outer = spot.outer_cone_cos.clamp(-1.0, inner);
+    let cosine = direction.dot(emitted);
+    if inner - outer <= 1.0e-5 {
+        return if cosine >= inner { 1.0 } else { 0.0 };
+    }
+    let t = ((cosine - outer) / (inner - outer)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 pub(in crate::renderer) fn vertex_dlight_cpu(
     position: Vec3,
     normal: Vec3,
@@ -86,8 +114,16 @@ pub(in crate::renderer) fn vertex_dlight_cpu(
         let light_direction = delta / distance_to_light;
         let ndotl = normal.dot(light_direction).max(0.0);
         let facing = 0.35 + 0.65 * ndotl;
-        result +=
-            Vec3::from_array(light.color) * light.intensity.max(0.0) * attenuation * facing * 0.70;
+        let cone = transient_spot_visibility(light, position);
+        if cone <= 0.0 {
+            continue;
+        }
+        result += Vec3::from_array(light.color)
+            * light.intensity.max(0.0)
+            * attenuation
+            * facing
+            * cone
+            * 0.70;
     }
     result
 }

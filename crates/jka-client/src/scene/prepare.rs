@@ -4,7 +4,8 @@ use crate::scene::{
     assign_reflection_probes, authored_sun, bsp_brush_entities, bsp_dynamic_lights, bsp_fx_runners,
     bsp_global_fog_num, bsp_global_fog_params, bsp_physics_collision_mesh,
     bsp_portal_surface_anchors, bsp_sky_portal, bsp_surface_lights, bsp_weather_occlusion_source,
-    bsp_worldspawn_distance_cull, build_prepared_portal_draw_plan, build_voxel_probe_gi,
+    bsp_world_effect_registrations, bsp_worldspawn_distance_cull, build_prepared_portal_draw_plan,
+    build_voxel_probe_gi,
     cache_reflection_decisions, class_for, collect_grass_emitters,
     collect_surface_sprite_effect_emitters, embedded_deluxe_mapping, embedded_deluxemap_texture,
     embedded_lightmap_texture, external_lightmap_pages, finish_grass_patches_with_jobs,
@@ -17,6 +18,7 @@ use crate::scene::{
     retain_authored_planar_mirrors, static_bsp_ao_cache_info, try_load_external_deluxemap,
     try_load_hdr_lightmap, Arc, AssetSearchPath, Atlas, BTreeMap, BTreeSet, Bsp, BspMapStats,
     DrawClass, Geometry, GpuVertex, GrassInstance, GrassPatchKey, GroupKey, InlineModelGeometry,
+    WorldFlare,
     Instant, LegacyDlightSurface, MapJobPool, MapLoadTimings, MapPrepareOptions, Path,
     PrepStageKeys, PreparedMap, PreparedPortalDrawPlan, SourceMapLighting, SpawnPoint,
     StageFingerprint, SurfaceKind, SurfaceMaterial, Task, TcGen, TextureData, Textures, Vec3,
@@ -57,6 +59,53 @@ pub fn prepare_with_jobs_options(
     seed: Option<&Arc<PreparedMap>>,
 ) -> Result<PreparedMap, String> {
     prepare_internal(root, game, name, Some(jobs), options, seed)
+}
+
+/// Prepare only the Steam Audio data for an already-running BSP. This is the
+/// targeted path used by `snd_restart` when Steam Audio was disabled during
+/// the original map load: no renderer materials/textures/collision are rebuilt.
+pub fn prepare_steam_audio_scene(
+    root: &Path,
+    game: Option<&Path>,
+    name: &str,
+    allow_asset_overrides: bool,
+) -> Result<crate::scene::PreparedSteamAudioScene, String> {
+    let asset_name = map_asset_name(name, "bsp")?;
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
+    assets.set_allow_asset_overrides(allow_asset_overrides);
+    let asset = assets
+        .read(&asset_name, MAX_FILE_BYTES)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Map {asset_name} not found on the game/base asset search path"))?;
+    let map_hash = map_content_hash(asset.bytes.as_slice());
+    let bsp = Bsp::parse(asset.bytes.as_slice()).map_err(|error| error.to_string())?;
+    let acoustic_mesh = Arc::new(
+        bsp.world_acoustic_mesh(4)
+            .map_err(|error| error.to_string())?,
+    );
+    let cache = crate::steam_audio::cache_info(root, game, name, map_hash);
+
+    let (bake, bake_request) = match crate::steam_audio::load_cached_bake(&cache) {
+        Ok(Some(data)) => (Some(Arc::new(data)), None),
+        Ok(None) | Err(_) => {
+            let num_threads = std::thread::available_parallelism()
+                .map_or(1, |count| count.get().saturating_sub(2).clamp(1, 8));
+            (
+                None,
+                Some(crate::steam_audio::SteamAudioBakeRequest {
+                    mesh: Arc::clone(&acoustic_mesh),
+                    cache,
+                    num_threads,
+                }),
+            )
+        }
+    };
+
+    Ok(crate::scene::PreparedSteamAudioScene {
+        acoustic_mesh,
+        bake,
+        bake_request,
+    })
 }
 
 /// Records a stage lent by the seed and shows it as finished on the loading panel.
@@ -268,12 +317,18 @@ pub(in crate::scene) fn prepare_internal(
     // Which shaders (and so which textures) the map uses needs only the meshes and
     // the shader library. Queue texture reads and decodes on the workers right now
     // so they overlap everything the loader does until `preload_finish`.
-    let used: BTreeSet<_> = mesh
+    let mut used: BTreeSet<_> = mesh
         .batches
         .iter()
         .chain(&inline_mesh.batches)
         .map(|batch| batch.shader)
         .collect();
+    // MST_FLARE has no mesh triangles, but its shader still needs to be
+    // decoded/uploaded, including flare-only images and animation stages.
+    for surface_id in bsp.models[0].surfaces.clone() {
+        let surface = &bsp.surfaces[surface_id];
+        if surface.flare.is_some() { used.insert(surface.shader); }
+    }
     let used_shader_names: Vec<String> = used
         .iter()
         .filter_map(|&index| bsp.shaders.get(index))
@@ -499,6 +554,7 @@ pub(in crate::scene) fn prepare_internal(
         });
     }
     let fx_runners = bsp_fx_runners(&bsp, &mut warnings);
+    let world_effect_registrations = bsp_world_effect_registrations(&bsp);
     let brush_entities = bsp_brush_entities(&bsp);
     let entity_graph = Some(Arc::new(crate::entity_graph::EntityGraph::build(&bsp)));
     phase_lap(&mut load_timings, 3, &mut phase_clock);
@@ -563,7 +619,8 @@ pub(in crate::scene) fn prepare_internal(
     let tints_ms = tints_started.elapsed().as_secs_f64() * 1000.0;
 
     let lights_started = Instant::now();
-    let (surface_lights, surface_light_candidates) = bsp_surface_lights(&mesh, &surface_materials);
+    let (surface_lights, gi_surface_lights, surface_light_stats) =
+        bsp_surface_lights(&mesh, &surface_materials);
     let surface_lights_ms = lights_started.elapsed().as_secs_f64() * 1000.0;
 
     let debug_started = Instant::now();
@@ -1184,12 +1241,21 @@ pub(in crate::scene) fn prepare_internal(
     phase_lap(&mut load_timings, 7, &mut phase_clock);
     let mut lights = bsp_dynamic_lights(&bsp);
     let entity_light_count = lights.len();
+    let mut gi_lights = lights.clone();
     let surface_light_count = surface_lights.len();
+    let gi_surface_light_count = gi_surface_lights.len();
     lights.extend(surface_lights);
-    if surface_light_candidates > 0 {
+    gi_lights.extend(gi_surface_lights);
+    if surface_light_stats.authored_candidates > 0 || surface_light_stats.promoted_candidates > 0 {
         devprintln!(
             1,
-            "{name}: emissive/area lights: {surface_light_count} real-time sample(s) selected from {surface_light_candidates} candidate(s); {entity_light_count} entity light(s) retained first"
+            "{name}: surface emitters: authored {}/{} real-time, shader-promoted {}/{} real-time; {} total real-time sample(s); {} authored probe-GI sample(s); {entity_light_count} entity light(s) retained first",
+            surface_light_stats.authored_selected,
+            surface_light_stats.authored_candidates,
+            surface_light_stats.promoted_selected,
+            surface_light_stats.promoted_candidates,
+            surface_light_count,
+            gi_surface_light_count,
         );
     }
     // GI reads immutable world geometry/lights only. Clone the modest render mesh
@@ -1200,7 +1266,7 @@ pub(in crate::scene) fn prepare_internal(
         fingerprint
             .pod(&vertices)
             .draw_batches(&mut batches)
-            .debug(&lights)
+            .debug(&gi_lights)
             .debug(&sun);
         fingerprint.finish()
     });
@@ -1218,7 +1284,10 @@ pub(in crate::scene) fn prepare_internal(
         if let Some(jobs) = jobs {
             let gi_vertices = vertices.clone();
             let gi_batches = batches.clone();
-            let gi_lights = lights.clone();
+            // gi_lights already contains the full authored q3map emitter budget
+            // and deliberately excludes shader-promoted emitters so their live
+            // A/B toggles cannot leave stale indirect light in the probe volume.
+            let gi_lights = gi_lights.clone();
             Some(jobs.submit(Task::MapGi, move || {
                 let started = Instant::now();
                 let grid = build_voxel_probe_gi(&gi_vertices, &gi_batches, &gi_lights, sun);
@@ -1226,7 +1295,7 @@ pub(in crate::scene) fn prepare_internal(
             })?)
         } else {
             let gi_stage = Instant::now();
-            let grid = build_voxel_probe_gi(&vertices, &batches, &lights, sun);
+            let grid = build_voxel_probe_gi(&vertices, &batches, &gi_lights, sun);
             gi_sync = Some((grid, gi_stage.elapsed().as_secs_f64() * 1000.0));
             None
         }
@@ -1678,7 +1747,47 @@ pub(in crate::scene) fn prepare_internal(
     load_timings.archive_open_ms = archive_opens_after.1 - archive_opens_before.1;
     load_timings.prepare_wall_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
 
+    // TaystJK ParseFlare: these entries have no triangles. Build a separate
+    // stable-ID list from the RBSP surface table, including PVS associations.
+    let world_flares = bsp.models[0].surfaces.clone().filter_map(|surface_id| {
+        let surface = &bsp.surfaces[surface_id];
+        let flare = surface.flare?;
+        Some(WorldFlare {
+            surface_id: surface_id as u32,
+            origin: flare.origin,
+            normal: flare.normal,
+            color: flare.color,
+            shader: String::from_utf8_lossy(&bsp.shaders[surface.shader].name).into_owned(),
+            shader_index: surface.shader,
+            fog_num: surface.fog_num,
+            fog: resolved_bsp_surface_fog(
+                &bsp, &library, &surface_materials[surface.shader],
+                surface.fog_num, global_fog_num, global_fog,
+            ).0,
+            fog_is_global: resolved_bsp_surface_fog(
+                &bsp, &library, &surface_materials[surface.shader],
+                surface.fog_num, global_fog_num, global_fog,
+            ).1,
+            radius: library.get(&String::from_utf8_lossy(&bsp.shaders[surface.shader].name).to_ascii_lowercase())
+                .and_then(|shader| shader.portal_range).unwrap_or(30.0),
+            alpha_portal_stages: library.get(&String::from_utf8_lossy(&bsp.shaders[surface.shader].name).to_ascii_lowercase())
+                .map(|shader| shader.stages.iter().map(|stage| stage.alpha_portal).collect())
+                .unwrap_or_default(),
+            stages: surface_materials[surface.shader].stages.clone(),
+            clusters: bsp.visibility.as_ref().and_then(|v| v.surface_clusters.get(surface_id))
+                .cloned().unwrap_or_default(),
+        })
+    }).collect::<Vec<_>>();
+    devprintln!(1, "{name}: RBSP world flares: {} authored candidate(s)", world_flares.len());
+
+    let coastal_bathymetry = if options.ocean {
+        crate::ocean::bathymetry::start(Arc::clone(&bsp), &vertices, &batches, &pvs_batches,
+            map_hash, root, game)
+    } else { None };
+
     Ok(PreparedMap {
+        coastal_bathymetry,
+        world_flares,
         shader_library: Arc::new(library),
         shader_origins: Arc::new(library_debug.origins.clone()),
         sub_bsp_names: Vec::new(),
@@ -1723,6 +1832,7 @@ pub(in crate::scene) fn prepare_internal(
         warnings,
         spawns,
         fx_runners,
+        world_effect_registrations,
         brush_entities,
         entity_graph,
         distance_cull,

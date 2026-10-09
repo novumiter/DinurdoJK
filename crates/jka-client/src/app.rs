@@ -30,8 +30,10 @@ mod performance;
 mod race_ghost_runtime;
 mod session;
 mod settings;
+mod siege;
 mod text_input;
 mod tick;
+mod world_effects;
 use commands::buffer::{random_unit, split_console_script};
 use connection::types::{
     LiveDownloadState, LiveDownloadTransfer, LiveJoinUiPhase, LiveJoinUiState, MissingMapPrompt,
@@ -46,6 +48,7 @@ use constants::{
 };
 use demos::probe::probe_demo_gamestate;
 use demos::recording::{demo_recording_timestamp, DemoRecording};
+use demos::video_export::{DemoVideoExport, DemoVideoPreset, DEMO_EXPORT_DEFAULT_FPS};
 use demos::types::{
     DemoAdvance, DemoCameraSample, DemoConsoleFilter, DemoEventStat, DemoFakeView,
     DemoMetadataResult, DemoTimeline, DemoTimelineHit, DemoViewMode, RaceGhostLoadResult,
@@ -69,7 +72,7 @@ use notices::{
 };
 use session::sampling::{playerstate_vec3, strafehelper_walking_anim, PlayerPresentationInput};
 use session::types::{
-    snapshot_owns_playerstate_events, GameSession, LiveCgamePrepared, LiveJoinTiming,
+    attacker_damage_transition, snapshot_owns_playerstate_events, GameSession, LiveCgamePrepared, LiveJoinTiming,
     LivePredictionFrame,
 };
 
@@ -129,7 +132,7 @@ use crate::{
     renderer::{
         ClientFramePerf, DynamicModelSurface, EguiRenderData, InputLatencySample,
         InspectorEntityHint, PostEffects, RenderCommand, RenderSnapshot, RenderThread,
-        TransientLight, ViewLatchMode,
+        SpectatorHighlight, SpectatorHighlightTeam, TransientLight, ViewLatchMode,
     },
     runtime::{
         RenderStats, ScreenshotOutput, SurfaceInspectorInfo, SurfaceInspectorSection, UserEvent,
@@ -146,7 +149,7 @@ use crate::{
         MapLoadingBar, MapLoadingUi, OverlayMode, PerfStats, PlanarReflectionDebugMode,
         PredictionDebugUi, PuddleQuality, PvsMode, RainIntensity, ReflectionQuality,
         RendererBackend, TextureFilter, ThreadPerfStats, UiChatLine,
-        UiScoreEntry, UiScoreboard, UiSnapshot, VideoSettings, VsyncMode,
+        UiScoreEntry, UiScoreboard, UiSiegeHud, UiSiegeStatViewer, UiSnapshot, VideoSettings, VsyncMode,
     },
 };
 use std::{
@@ -165,7 +168,7 @@ use std::{
 use winit::{
     application::ApplicationHandler,
     dpi::{PhysicalPosition, PhysicalSize},
-    event::{DeviceEvent, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{DeviceEvent, ElementState, KeyEvent, MouseButton, MouseScrollDelta, StartCause, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{CursorGrabMode, Fullscreen, Window, WindowId},
@@ -180,15 +183,33 @@ use jka_protocol::{
     },
 };
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SpectatorPingGuessState {
+    /// Last local ping value that advanced this spectator's match streak.
+    /// Repeated score replies with the same ping do not make the guess stronger.
+    last_matching_ping: Option<i32>,
+    /// Number of consecutive distinct local ping values this spectator mirrored.
+    distinct_match_streak: u8,
+    confirmed: bool,
+}
+
+impl SpectatorPingGuessState {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Clone, Debug)]
-struct JaproLoginEditor {
+struct AccountEditor {
     server: SocketAddr,
     server_name: String,
+    account_type: crate::credential_store::AccountType,
+    /// The original key for an edited row. `None` means a new account.
+    original_type: Option<crate::credential_store::AccountType>,
     username: String,
     /// Empty while editing means "keep the saved password". New entries must
     /// provide one before they can be written to Credential Manager.
     password: String,
-    new_entry: bool,
 }
 
 pub struct App {
@@ -277,6 +298,8 @@ pub struct App {
     profile_model_search: String,
     /// 0=all, 1=red variants, 2=blue variants.
     profile_model_team_filter: u8,
+    /// Selected model/skin shown in Profile until exit commits the model cvar once.
+    profile_model_staged: Option<String>,
     profile_model_icon_textures: HashMap<String, egui::TextureHandle>,
     /// Settings-page thumbnails of the `gfx/2d/crosshair{a..j}` image crosshairs,
     /// keyed by `cg_crosshairImage` (1..=10).
@@ -291,10 +314,10 @@ pub struct App {
     profile_preview_zoom: f32,
     profile_preview_started: Instant,
     profile_preview_key: Option<(String, i32, i32, i32)>,
-    /// Profile edits change the local cvars (so the preview and config follow)
-    /// but nothing reaches the server until APPLY, which avoids the server's
-    /// "Too many info changes" throttle. `profile_defer_send` is set only
-    /// while a Profile control writes a cvar.
+    /// Other Profile edits change local cvars until APPLY (Force still needs
+    /// forcechanged). Model selection is separately staged until Profile closes,
+    /// avoiding repeated userinfo updates while browsing skins. This flag is
+    /// set only while a non-model Profile control writes a cvar.
     profile_defer_send: bool,
     /// A userinfo cvar was edited on the Profile page and not yet sent.
     profile_userinfo_pending: bool,
@@ -316,6 +339,9 @@ pub struct App {
     profile_preview_active: bool,
     demo_entries: Vec<DemoEntry>,
     demo_selected: usize,
+    demo_game_choices: Vec<String>,
+    /// Demo browser source directory. Empty means the base game directory.
+    demo_game_filter: String,
     demo_catalog_loaded: bool,
     demo_catalog_error: Option<String>,
     demo_metadata_cache: BTreeMap<String, DemoMetadata>,
@@ -366,6 +392,16 @@ pub struct App {
     server_browser_rx: Receiver<BrowserEvent>,
     server_browser: BrowserUiState,
     game_session: Option<GameSession>,
+    /// Server-driven Siege briefing/class/profile/round-message surface.
+    siege_dialog: Option<siege::SiegeDialog>,
+    /// Text owned by `UIMENU_SIEGEMESSAGE` / `cg_siegeMessage`. Kept separate
+    /// so the compact dialog selector can stay `Copy`.
+    siege_round_message: Option<String>,
+    /// Overlay that was active before the server opened the Siege surface.
+    siege_dialog_return_overlay: OverlayMode,
+    /// True when we temporarily opened the ordinary Game catcher only to host
+    /// a Siege server-driven dialog; lets closing it restore gameplay cleanly.
+    siege_dialog_opened_overlay: bool,
     /// True while live CGame/networking are active without a locally loaded BSP.
     live_without_world: bool,
     /// True while demo playback is active without the demo's locally loaded BSP.
@@ -409,13 +445,15 @@ pub struct App {
     pending_live_server_commands: VecDeque<jka_protocol::server::ServerCommand>,
     live_join_timing: Option<LiveJoinTiming>,
     network: crate::net::NetworkSettings,
-    /// Secure jaPRO credentials discovered in the OS credential store. Secrets
-    /// themselves are never cached here; this list contains endpoint/user/label.
-    japro_saved_logins: Vec<crate::credential_store::SavedLogin>,
-    japro_credential_error: Option<String>,
-    /// Local editor state for one saved jaPRO login. Existing passwords are not
+    /// Secure per-server accounts discovered in the OS credential store. Secrets
+    /// themselves are never cached here; this list contains endpoint/type/user/label.
+    saved_accounts: Vec<crate::credential_store::SavedAccount>,
+    account_credential_error: Option<String>,
+    /// Local editor state for one saved account. Existing passwords are not
     /// copied into this state; a blank password keeps the stored secret.
-    japro_login_editor: Option<JaproLoginEditor>,
+    account_editor: Option<AccountEditor>,
+    /// Other-server accounts stay hidden by default on Join -> Account.
+    show_other_accounts: bool,
     /// jaPRO cgame options (`cg_stylePlayer`, race timer, spectator aids).
     japro_cg: crate::japro_cg::JaproCgame,
     /// The camera editor's undo state while `OverlayMode::CameraEdit` is open.
@@ -498,6 +536,10 @@ pub struct App {
     team_overlay: ui::TeamOverlaySettings,
     /// TaystJK cg_scoreDeaths (0..3).
     score_deaths: i32,
+    /// Cosmetic spectator-follow heuristic; see `cg_scoreSpectatorGuess`.
+    score_spectator_guess: bool,
+    /// Per-client streak state for the ping-mirroring spectator heuristic.
+    spectator_ping_guesses: [SpectatorPingGuessState; 32],
     /// TaystJK cg_drawScores (0..3).
     draw_scores: i32,
     mini_scores_shown: Option<ui::UiMiniScores>,
@@ -558,6 +600,7 @@ pub struct App {
     mouse_buttons_down: HashSet<u8>,
     modifiers: ModifiersState,
     captured: bool,
+    mouse_grab_mode: &'static str,
     mouse_input: MouseInputSettings,
     last_mouse_motion_at: Option<Instant>,
     noclip_primary_down: bool,
@@ -571,6 +614,12 @@ pub struct App {
     demo_scrub_last_seek: Option<Instant>,
     demo_scrub_last_applied_fraction: Option<f32>,
     last_demo_timeline_refresh: Instant,
+    demo_export_in_ms: Option<i32>,
+    demo_export_out_ms: Option<i32>,
+    demo_export_preset: DemoVideoPreset,
+    demo_export_fps: u32,
+    demo_export_depth: bool,
+    demo_video_export: Option<DemoVideoExport>,
     previous_tick: Instant,
     overlay: OverlayMode,
     overlay_before_console: OverlayMode,
@@ -605,6 +654,8 @@ pub struct App {
     console_suggest: bool,
     /// `cg_chatboxCompletion`: Tab in the chat input completes player names.
     chatbox_completion: bool,
+    clean_chatbox: u8,
+    last_clean_chat_message: Option<String>,
     /// `cl_chatLog`: session-based HTML logging for live server chat.
     chat_log_enabled: bool,
     chat_log: crate::chat_log::ChatLog,
@@ -693,6 +744,10 @@ pub struct App {
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,
     video: VideoSettings,
+    /// OpenJK/TaystJK renderer world-effect state shared by `/r_we` and
+    /// CS_EFFECTS strings beginning with `*`. User weather cvars remain
+    /// untouched; this is a presentation override layered on top.
+    world_effects: crate::world_effects::LegacyWorldEffects,
     gamma_runtime: gamma::GammaRuntime,
     /// Owns the paired timeBeginPeriod(1)/timeEndPeriod(1) request while enabled.
     windows_timer_resolution: crate::windows_timer::TimerResolutionGuard,
@@ -779,6 +834,8 @@ pub struct App {
     latest_request_id: u64,
     latest_prepare_options: scene::MapPrepareOptions,
     prepared_map_cache: Option<PreparedMapCache>,
+    /// EFX light-promotion metadata built off-thread during the active map load.
+    fx_light_promotion_catalog: Arc<crate::fx::light_promotion::FxLightPromotionCatalog>,
     /// Active OpenJK/TaystJK R_RemapShader state. Changes are resolved into a
     /// prepared-map upload, so ordinary frames pay no remap lookup cost.
     shader_remaps: scene::ShaderRemapState,

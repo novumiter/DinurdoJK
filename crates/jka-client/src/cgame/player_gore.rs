@@ -76,16 +76,24 @@ pub(crate) fn skin_vertex(vertex: &Ghoul2GpuVertex, snap: &GpuSnap) -> ([f32; 3]
     };
     if vertex.jiggle_weight > 0.0 && vertex.jiggle_region < 4 {
         let offset = snap.jiggle_offsets[vertex.jiggle_region as usize];
-        let overall = snap.jiggle_offsets[0][3];
         let effective_weight = if vertex.jiggle_coord.abs() < 2.0 {
-            let lift = snap.jiggle_offsets[3][3];
-            let t = ((vertex.jiggle_coord - (-0.70 + lift))
-                / ((-0.15 + lift) - (-0.70 + lift)))
+            let bottom = snap.jiggle_offsets[0][3];
+            let top = snap.jiggle_offsets[1][3];
+            let t = ((vertex.jiggle_coord - (-0.70 + bottom))
+                / ((-0.15 + bottom) - (-0.70 + bottom)))
                 .clamp(0.0, 1.0);
-            let vertical = t * t * (3.0 - 2.0 * t);
-            vertex.jiggle_weight * overall * snap.jiggle_offsets[2][3] * vertical
+            let lower = t * t * (3.0 - 2.0 * t);
+            let upper = if top < 0.0 {
+                let t = ((vertex.jiggle_coord - (0.65 + top))
+                    / ((1.0 + top) - (0.65 + top)))
+                    .clamp(0.0, 1.0);
+                1.0 - t * t * (3.0 - 2.0 * t)
+            } else {
+                1.0
+            };
+            vertex.jiggle_weight * lower * upper
         } else {
-            vertex.jiggle_weight * overall * snap.jiggle_offsets[1][3]
+            vertex.jiggle_weight
         };
         for axis in 0..3 {
             model[axis] += offset[axis] * effective_weight;

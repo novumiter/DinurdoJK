@@ -107,8 +107,6 @@ pub(in crate::cgame::player_presenter) const MAX_GLA_BYTES: usize = 128 * 1024 *
 
 pub(in crate::cgame::player_presenter) const MAX_SKIN_BYTES: usize = 4 * 1024 * 1024;
 
-pub(in crate::cgame::player_presenter) const MAX_JIGGLE_BYTES: usize = 64 * 1024;
-
 /// Renderer-view data used by the Ghoul2 presenter for the same whole-model
 /// sphere cull and projected-radius LOD decision that OpenJK performs in
 /// `R_AddGhoulSurfaces`/`G2_ComputeLOD`.

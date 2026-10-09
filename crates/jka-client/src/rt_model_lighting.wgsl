@@ -27,7 +27,7 @@ fn rt_model_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
         scalar *= emitter_visibility(light, direction);
         if (scalar <= 0.0) { continue; }
         irradiance += light.color_intensity.rgb * scalar
-            * ray_traced_local_shadow_visibility(light, input.world_position, normal);
+            * rt_local_shadow_rgb(light, input.world_position, normal);
     }
     return vec4<f32>(base.rgb + tex.rgb * input.raw_color.rgb * irradiance, base.a);
 }

@@ -197,13 +197,18 @@ impl App {
         } else {
             self.profile_preview_started.elapsed()
         };
+        // Preview the staged skin without mutating the live model cvar or
+        // sending any userinfo until Profile actually closes.
+        let preview_model = self.profile_model_staged.as_deref()
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.solo_client_info.model_cvar());
         let animation_tick = (animation_elapsed.as_millis() / 33) as i32;
         let current_time = animation_tick.saturating_mul(33);
         let key = (
             format!(
                 "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}",
                 animation_name,
-                self.solo_client_info.model_cvar(),
+                preview_model,
                 self.network.saber1,
                 self.network.saber2,
                 with_sabers,
@@ -227,6 +232,13 @@ impl App {
         let axis = [[c, s, 0.0], [-s, c, 0.0], [0.0, 0.0, 1.0]];
         let zoom = self.profile_preview_zoom.clamp(0.45, 2.5);
         let mut info = self.solo_client_info.clone();
+        if let Some(model) = self.profile_model_staged.as_deref() {
+            let staged = ClientInfo::solo_model(model);
+            info.model_name = staged.model_name;
+            info.skin_name = staged.skin_name;
+        }
+        info.female = self.network.sex.as_bytes().first()
+            .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'f'));
         info.saber_name = self.network.saber1.clone();
         info.saber2_name = self.network.saber2.clone();
         // Preview what a jaPRO / JA+ server would show, RGB included.

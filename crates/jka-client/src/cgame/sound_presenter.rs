@@ -202,6 +202,10 @@ pub(crate) fn prepare_sound_event(
 pub struct SoundPresenter {
     assets: SoundAssets,
     backend: Option<AudioBackend>,
+    /// Physical-device backend parked while deterministic demo export owns an
+    /// offline software mixer. None during ordinary gameplay.
+    offline_restore_backend: Option<AudioBackend>,
+    offline_capture_active: bool,
     warnings: HashSet<String>,
     custom_sound_profiles: HashMap<String, CustomSoundProfile>,
     /// Last audible EV_PAIN per entity (CG_PainEvent's 500ms throttle).
@@ -270,6 +274,8 @@ impl SoundPresenter {
         Self {
             assets,
             backend,
+            offline_restore_backend: None,
+            offline_capture_active: false,
             warnings: HashSet::new(),
             custom_sound_profiles: HashMap::new(),
             pain_times: HashMap::new(),
@@ -781,6 +787,50 @@ impl SoundPresenter {
         }
     }
 
+    /// Route presentation audio into a caller-drained 48 kHz stereo software
+    /// source. The physical backend is cleared and parked so export never plays
+    /// sped-up/offline audio through the user's speakers.
+    pub(crate) fn begin_offline_capture(
+        &mut self,
+        game: &ClientGameState,
+    ) -> Result<rodio::mixer::MixerSource, String> {
+        if self.offline_capture_active {
+            return Err("offline audio capture is already active".into());
+        }
+        let mut live = self.backend.take();
+        let (offline, output) = if let Some(backend) = live.as_ref() {
+            backend.offline_like()
+        } else {
+            AudioBackend::offline()
+        };
+        if let Some(backend) = live.as_mut() {
+            backend.clear();
+        }
+        self.offline_restore_backend = live;
+        self.offline_capture_active = true;
+        self.backend = Some(offline);
+        self.map_music = None;
+        self.start_map_music(game, true);
+        Ok(output)
+    }
+
+    /// Restore the physical audio backend after demo export. Persistent map music
+    /// is restarted; normal CGame frames rebuild looping sounds on the next tick.
+    pub(crate) fn end_offline_capture(&mut self, game: &ClientGameState) {
+        if !self.offline_capture_active {
+            return;
+        }
+        self.offline_capture_active = false;
+        if let Some(offline) = self.backend.as_mut() {
+            offline.clear();
+        }
+        self.backend = self.offline_restore_backend.take();
+        self.map_music = None;
+        if self.backend.is_some() {
+            self.start_map_music(game, true);
+        }
+    }
+
     pub fn set_rate(&mut self, rate: f32) { if let Some(b) = &mut self.backend { b.set_rate(rate); } }
     pub fn clear(&mut self) {
         self.event_loops.clear();
@@ -810,6 +860,12 @@ impl SoundPresenter {
         }
     }
 
+    pub fn set_steam_audio_hrtf_interpolation(&mut self, interpolation: u8) {
+        if let Some(backend) = &mut self.backend {
+            backend.set_steam_audio_hrtf_interpolation(interpolation);
+        }
+    }
+
     pub fn set_steam_audio_environmental_enabled(&mut self, enabled: bool) {
         if let Some(backend) = &mut self.backend {
             backend.set_steam_audio_environmental_enabled(enabled);
@@ -823,6 +879,59 @@ impl SoundPresenter {
         if let Some(backend) = &mut self.backend {
             backend.set_steam_audio_map(mesh, bake);
         }
+    }
+
+    /// TaystJK/OpenJK-style `snd_restart`: destroy and recreate the physical
+    /// sound backend, then restore the live mixer controls and map music. The
+    /// presenter-level caches/state deliberately survive; CGame will repopulate
+    /// looping/ambient submissions on the following frame just like the legacy
+    /// engine does after S_Shutdown/S_Init.
+    pub fn restart_backend(
+        &mut self,
+        steam_audio_enabled: bool,
+        steam_audio_binaural_enabled: bool,
+        steam_audio_environmental_enabled: bool,
+        steam_audio_hrtf_interpolation: u8,
+        effects_volume: f32,
+        voice_volume: f32,
+        separation: f32,
+        music_volume: f32,
+        acoustic_mesh: Option<Arc<AcousticMesh>>,
+        bake: Option<Arc<SteamAudioBakeData>>,
+    ) -> Result<AudioInfo, String> {
+        if self.offline_capture_active {
+            return Err("cannot restart sound while offline demo audio capture is active".into());
+        }
+
+        let rate = self.backend.as_ref().map_or(1.0, AudioBackend::rate);
+        if let Some(mut old) = self.backend.take() {
+            old.clear();
+        }
+
+        let mut backend = AudioBackend::open(
+            steam_audio_enabled,
+            steam_audio_binaural_enabled,
+            steam_audio_environmental_enabled,
+        )?;
+        backend.set_steam_audio_hrtf_interpolation(steam_audio_hrtf_interpolation);
+        backend.set_mix(effects_volume, voice_volume, separation);
+        backend.set_music_level((music_volume * self.music_mult).clamp(0.0, 1.0));
+        backend.set_rate(rate);
+        backend.set_steam_audio_map(acoustic_mesh, bake);
+        let info = backend.info();
+        self.backend = Some(backend);
+        self.music_base = music_volume;
+
+        // S_RestartMusic equivalent, but retain the exact CS_MUSIC string we
+        // were already presenting so this does not depend on a gamestate borrow.
+        if let Some(value) = self.map_music.clone() {
+            let mut words = value.split_whitespace().map(|word| word.trim_matches('"'));
+            let intro = words.next().unwrap_or("");
+            let looped = words.next().unwrap_or("");
+            self.start_background_track(intro, looped);
+        }
+
+        Ok(info)
     }
     pub fn info(&self) -> Option<AudioInfo> { self.backend.as_ref().map(AudioBackend::info) }
     pub fn source_rate_summary(&self) -> String { self.assets.sample_rate_summary() }

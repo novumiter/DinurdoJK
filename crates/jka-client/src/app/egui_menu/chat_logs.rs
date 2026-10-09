@@ -9,7 +9,7 @@ impl App {
         self.ensure_chat_log_browser_catalog();
 
         if self.ui_catalog.pending.chat_logs && self.chat_log_browser_entries.is_empty() {
-            theme::page_title(ui, "CHAT LOGS", "Browse saved live-server chat sessions.");
+            theme::page_title(ui, "CHAT LOGS", "Browse saved chat by day and server (including older session logs).");
             theme::label(
                 ui,
                 theme::plain("Scanning chat logs...", 12.0, theme::TEXT_FAINT),
@@ -17,7 +17,7 @@ impl App {
             return;
         }
         if let Some(error) = &self.chat_log_browser_catalog_error {
-            theme::page_title(ui, "CHAT LOGS", "Browse saved live-server chat sessions.");
+            theme::page_title(ui, "CHAT LOGS", "Browse saved chat by day and server (including older session logs).");
             theme::banner(
                 ui,
                 &format!("Chat log scan failed: {error}"),
@@ -148,7 +148,7 @@ impl App {
                             ));
 
                             ui.horizontal(|ui| {
-                                theme::label(ui, theme::plain("SESSIONS", 11.0, theme::TEXT_DIM));
+                                theme::label(ui, theme::plain("LOG FILES", 11.0, theme::TEXT_DIM));
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     refresh_requested |= refresh_icon(ui, "Rescan chat log folders");
                                     if theme::ghost_button(ui, "CLEAR").clicked() {
@@ -254,7 +254,7 @@ impl App {
                                 theme::label(
                                     ui,
                                     theme::plain(
-                                        &format!("{} / {} sessions", filtered.len(), self.chat_log_browser_entries.len()),
+                                        &format!("{} / {} logs", filtered.len(), self.chat_log_browser_entries.len()),
                                         9.5,
                                         theme::TEXT_FAINT,
                                     ),
@@ -276,7 +276,7 @@ impl App {
                                         ui.add_space(8.0);
                                         theme::label(
                                             ui,
-                                            theme::plain("No chat sessions match these filters.", 11.0, theme::TEXT_FAINT),
+                                            theme::plain("No chat logs match these filters.", 11.0, theme::TEXT_FAINT),
                                         );
                                     }
                                     for &index in &filtered {
@@ -431,7 +431,7 @@ impl App {
                                     format!("Mod: {}", detail.mod_name),
                                     format!("Player: {}", if detail.player.is_empty() { "—" } else { detail.player.as_str() }),
                                     format!("Initial map: {}", if detail.initial_map.is_empty() { "—" } else { detail.initial_map.as_str() }),
-                                    format!("Duration: {}", chat_log_duration_label(detail.started_unix_ms, detail.ended_unix_ms)),
+                                    format!("Time span: {}", chat_log_duration_label(detail.started_unix_ms, detail.ended_unix_ms)),
                                 ] {
                                     egui::Frame::new()
                                         .fill(theme::CONTROL)

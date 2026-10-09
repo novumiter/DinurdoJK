@@ -29,6 +29,7 @@ pub const MAX_AMMO_TRANSMIT: usize = 16;
 pub const MAX_POWERUPS: usize = 16;
 pub const MAX_WEAPONS: i8 = 19;
 pub const STAT_WEAPONS: usize = 4;
+pub const STAT_CLIENTS_READY: usize = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerCommand {

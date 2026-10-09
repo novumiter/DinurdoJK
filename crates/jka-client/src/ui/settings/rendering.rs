@@ -1050,6 +1050,14 @@ pub const VIDEO_ROW_CRT_SHARPNESS: usize = 91;
 pub const VIDEO_ROW_CRT_MASK_INTENSITY: usize = 92;
 pub const VIDEO_ROW_CRT_CURVATURE: usize = 93;
 pub const VIDEO_ROW_CRT_CORNER: usize = 94;
+pub const VIDEO_ROW_PROMOTE_FX_LIGHTS: usize = 96;
+pub const VIDEO_ROW_DYNAMIC_LIGHT_DEBUG: usize = 97;
+pub const VIDEO_ROW_PROMOTE_SHADER_LIGHTS: usize = 98;
+pub const VIDEO_ROW_PROMOTE_SHADER_GLOW: usize = 99;
+pub const VIDEO_ROW_PROMOTE_SHADER_ADDITIVE: usize = 100;
+pub const VIDEO_ROW_PROMOTE_SHADER_EMISSIVE: usize = 101;
+/// Separate from the standard RBSP flare switch (VIDEO_ROW_FLARES).
+pub const VIDEO_ROW_SABER_FLARES: usize = 102;
 
 pub const ENV_ROW_WEATHER_WIND_SPEED: usize = 8;
 

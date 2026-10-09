@@ -257,108 +257,296 @@ app_cvars! {
         ]
     }
 
-    APP_R_RAIN {
+
+    APP_R_RAINFASTPOST {
         runtime: CvarDef::new(
-                "r_rain",
+                "r_rainFastPost",
                 "",
                 "0..1",
-                "Camera-local GPU rain rendering.",
+                "A/B rain post optimization: omit rain's linear-depth/full spatial post requirement and depth-aware haze (runtime diagnostic; not persisted).",
                 CvarType::String,
-                CvarFlags::ARCHIVE,
+                CvarFlags::NONE,
                 LatchScope::None,
-                |app| CvarValue::String(App::cvar_get_r_rain(app)),
-                |app, value| App::cvar_set_r_rain(app, APP_R_RAIN.entry.name, &value.to_string()),
+                |app| CvarValue::String(App::cvar_get_r_rainfastpost(app)),
+                |app, value| App::cvar_set_r_rainfastpost(app, APP_R_RAINFASTPOST.entry.name, &value.to_string()),
             )
-            .with_text_setter(App::cvar_set_r_rain, None),
+            .with_text_setter(App::cvar_set_r_rainfastpost, None),
         config: CvarBinding {
-                load_video: Some(|settings, _name, value, _context| {
-                    settings.rain = parse_bool(value).unwrap_or(settings.rain)
-                }),
-                archive: Some((87, |state| {
-                    let settings = state.video;
-                    format!("{}", u8::from(settings.rain))
-                })),
+                default: Some(|state| bool_value(state.video.rain_fast_post)),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
-                fn cvar_get_r_rain(&self) -> String {
-                    bool_value(self.video.rain)
+                fn cvar_get_r_rainfastpost(&self) -> String {
+                    bool_value(self.video.rain_fast_post)
                 }
-                fn cvar_set_r_rain(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let lower = "r_rain".to_owned();
-                    {
-                        let enabled = Self::parse_cvar_bool(name, value)?;
-                        match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
-                            "r_halation" => self.video.halation = enabled,
-                            "r_ssao" => {
-                                self.video.ssao = enabled;
-                                if enabled {
-                                    self.video.static_bsp_ao = false;
-                                }
-                            }
-                            "r_staticbspao" => {
-                                self.video.static_bsp_ao = enabled;
-                                if enabled {
-                                    self.video.ssao = false;
-                                }
-                            }
-                            "r_fxaa" => {
-                                self.video.fxaa = enabled;
-                                if enabled {
-                                    self.video.smaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_smaa" => {
-                                self.video.smaa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_taa" => {
-                                self.video.taa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.smaa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_contactshadows" => self.video.contact_shadows = enabled,
-                            "r_cloudshadows" => self.video.cloud_shadows = enabled,
-                            "r_cloudtemporal" => self.video.cloud_temporal = enabled,
-                            "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
-                            "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
-                            "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
-                            "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
-                            "r_rain" => self.video.rain = enabled,
-                            "r_sunoverride" => {
-                                self.set_sun_override(enabled, enabled);
-                                return Ok(());
-                            }
-                            "r_entitysunlighting" => self.video.entity_sun_lighting = enabled,
-                            "r_reflectiondebug" => self.video.reflection_debug = enabled,
-                            "r_vignette" => self.video.vignette = enabled,
-                            _ => unreachable!(),
-                        }
-                        self.sync_post_effects();
-                        if lower != "r_reflectiondebug" {
-                            self.mark_config_dirty();
-                        }
-                        // r_floatLightmap is only effective while HDR is active, matching
-                        // Rend2. If that changes the prepared lightmap representation,
-                        // video_restart_required() exposes the normal renderer-restart path.
-                        self.publish_ui();
+                fn cvar_set_r_rainfastpost(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_fast_post = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: fast_post={}", u8::from(self.video.rain_fast_post));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_RAINWATERFIELD {
+        runtime: CvarDef::new(
+                "r_rainWaterField",
+                "",
+                "0..1",
+                "A/B rain water collision: one prebaked water-height texture load instead of per-drop promoted-water outline scans (runtime diagnostic; not persisted).",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_rainwaterfield(app)),
+                |app, value| App::cvar_set_r_rainwaterfield(app, APP_R_RAINWATERFIELD.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_rainwaterfield, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.rain_water_field)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_rainwaterfield(&self) -> String {
+                    bool_value(self.video.rain_water_field)
+                }
+                fn cvar_set_r_rainwaterfield(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_water_field = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: water_field={}", u8::from(self.video.rain_water_field));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_RAINFASTVERTEX {
+        runtime: CvarDef::new(
+                "r_rainFastVertex",
+                "",
+                "0..1",
+                "A/B rain vertex optimization: squared compute bounds and early center clip rejection before streak math (runtime diagnostic; not persisted).",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_rainfastvertex(app)),
+                |app, value| App::cvar_set_r_rainfastvertex(app, APP_R_RAINFASTVERTEX.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_rainfastvertex, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.rain_fast_vertex)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_rainfastvertex(&self) -> String {
+                    bool_value(self.video.rain_fast_vertex)
+                }
+                fn cvar_set_r_rainfastvertex(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_fast_vertex = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: fast_vertex={}", u8::from(self.video.rain_fast_vertex));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_RAINLEANDEPTH {
+        runtime: CvarDef::new(
+                "r_rainLeanDepth",
+                "",
+                "0..1",
+                "A/B rain depth optimization: when rain is the only linear-depth consumer, write only linear depth + hardware depth instead of motion/reflection MRTs. Dynamic models remain omitted unless r_rainLeanModels 1 is enabled.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_rainleandepth(app)),
+                |app, value| App::cvar_set_r_rainleandepth(app, APP_R_RAINLEANDEPTH.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_rainleandepth, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.rain_lean_depth)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_rainleandepth(&self) -> String {
+                    bool_value(self.video.rain_lean_depth)
+                }
+                fn cvar_set_r_rainleandepth(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_lean_depth = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: lean_depth={}", u8::from(self.video.rain_lean_depth));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_RAINSTATICDEPTH {
+        runtime: CvarDef::new(
+                "r_rainStaticDepth",
+                "",
+                "0..1",
+                "A/B rain depth optimization: skip players/vehicles/dynamic models in a rain-only linear-depth prepass.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_rainstaticdepth(app)),
+                |app, value| App::cvar_set_r_rainstaticdepth(app, APP_R_RAINSTATICDEPTH.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_rainstaticdepth, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.rain_static_depth)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_rainstaticdepth(&self) -> String {
+                    bool_value(self.video.rain_static_depth)
+                }
+                fn cvar_set_r_rainstaticdepth(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_static_depth = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: static_depth={}", u8::from(self.video.rain_static_depth));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_RAINOPAQUEDEPTH {
+        runtime: CvarDef::new(
+                "r_rainOpaqueDepth",
+                "",
+                "0..1",
+                "A/B rain depth optimization: skip alpha-tested BSP surfaces in a rain-only linear-depth prepass.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_rainopaquedepth(app)),
+                |app, value| App::cvar_set_r_rainopaquedepth(app, APP_R_RAINOPAQUEDEPTH.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_rainopaquedepth, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.rain_opaque_depth)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_rainopaquedepth(&self) -> String {
+                    bool_value(self.video.rain_opaque_depth)
+                }
+                fn cvar_set_r_rainopaquedepth(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_opaque_depth = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: opaque_depth={}", u8::from(self.video.rain_opaque_depth));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_RAINLEANMODELS {
+        runtime: CvarDef::new(
+                "r_rainLeanModels",
+                "",
+                "0..1",
+                "A/B rain depth optimization: with r_rainLeanDepth 1, draw dynamic models into the lean R32 linear-depth target instead of omitting them.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_rainleanmodels(app)),
+                |app, value| App::cvar_set_r_rainleanmodels(app, APP_R_RAINLEANMODELS.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_rainleanmodels, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.rain_lean_models)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_rainleanmodels(&self) -> String {
+                    bool_value(self.video.rain_lean_models)
+                }
+                fn cvar_set_r_rainleanmodels(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_lean_models = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: lean_models={}", u8::from(self.video.rain_lean_models));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_RAINLEANPOST {
+        runtime: CvarDef::new(
+                "r_rainLeanPost",
+                "",
+                "0..1",
+                "A/B rain post optimization: when rain is the only spatial post effect, use the specialized rain-only fullscreen post shader.",
+                CvarType::String,
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_rainleanpost(app)),
+                |app, value| App::cvar_set_r_rainleanpost(app, APP_R_RAINLEANPOST.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_rainleanpost, None),
+        config: CvarBinding {
+                default: Some(|state| bool_value(state.video.rain_lean_post)),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_rainleanpost(&self) -> String {
+                    bool_value(self.video.rain_lean_post)
+                }
+                fn cvar_set_r_rainleanpost(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.rain_lean_post = Self::parse_cvar_bool(name, value)?;
+                    self.sync_rain_optimizations();
+                    println!("Rain A/B: lean_post={}", u8::from(self.video.rain_lean_post));
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WE {
+        runtime: CvarDef::new(
+            "r_we", "clear", "clear|lightrain|rain|acidrain|heavyrain|snow|spacedust|sand|fog|heavyrainfog|light_fog",
+            "Archived weather type. Also accepts legacy world-effect arguments such as wind and freeze.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_we(app)),
+            |app, value| App::cvar_set_r_we(app, APP_R_WE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_we, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(weather) = crate::world_effects::WeatherType::from_cvar(value) {
+                    settings.weather_type = weather;
+                    settings.rain = weather.is_rain();
+                }
+            }),
+            archive: Some((87, |state| state.video.weather_type.cvar_value().to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_we(&self) -> String {
+                    self.video.weather_type.cvar_value().to_owned()
+                }
+                fn cvar_set_r_we(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let value = value.trim();
+                    if let Some(weather) = crate::world_effects::WeatherType::from_cvar(value) {
+                        self.set_weather_type(weather);
+                        return Ok(());
                     }
+                    // Keep retail r_we arguments available without archiving transient
+                    // server/world-effect controls as the chosen weather type.
+                    self.world_effects.apply(value).map_err(|error| format!("{name}: {error}"))?;
+                    self.sync_post_effects();
                     Ok(())
                 }
             }
@@ -458,7 +646,7 @@ app_cvars! {
                 "r_rainIntensity",
                 "",
                 "light|rain|heavy",
-                "Rain preset used by the shared precipitation renderer.",
+                "Compatibility rain preset; when rain is active this selects the matching r_we rain type.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -487,9 +675,18 @@ app_cvars! {
                     self.video.rain_intensity.config_value().to_owned()
                 }
                 fn cvar_set_r_rainintensity(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        self.video.rain_intensity = RainIntensity::from_config(value)
-                            .ok_or_else(|| format!("{name}: expected light|rain|heavy"))?;
+                    let intensity = RainIntensity::from_config(value)
+                        .ok_or_else(|| format!("{name}: expected light|rain|heavy"))?;
+                    self.video.rain_intensity = intensity;
+                    let current = self.effective_weather_type();
+                    if current.is_rain() && current != crate::world_effects::WeatherType::AcidRain {
+                        let weather = match intensity {
+                            RainIntensity::Light => crate::world_effects::WeatherType::LightRain,
+                            RainIntensity::Rain => crate::world_effects::WeatherType::Rain,
+                            RainIntensity::Heavy => crate::world_effects::WeatherType::HeavyRain,
+                        };
+                        self.set_weather_type(weather);
+                    } else {
                         self.sync_post_effects();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -865,6 +1062,53 @@ app_cvars! {
         ]
     }
 
+    APP_R_WINDVISUALS {
+        runtime: CvarDef::new(
+                "r_windVisuals",
+                "",
+                "0..1",
+                "Strength of procedural airborne dust and gust wisps driven by the shared atmospheric wind.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_r_windvisuals(app)),
+                |app, value| App::cvar_set_r_windvisuals(app, APP_R_WINDVISUALS.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_windvisuals, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(strength) = value.parse::<f32>() {
+                        if strength.is_finite() {
+                            settings.wind_visuals = strength.clamp(0.0, 1.0);
+                        }
+                    }
+                }),
+                archive: Some((71, |state| {
+                    let settings = state.video;
+                    format!("{:.3}", settings.wind_visuals)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_windvisuals(&self) -> String {
+                    format!("{:.3}", self.video.wind_visuals)
+                }
+                fn cvar_set_r_windvisuals(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let strength = value
+                        .trim()
+                        .parse::<f32>()
+                        .map_err(|_| format!("{name}: expected 0..1"))?;
+                    if !strength.is_finite() {
+                        return Err(format!("{name}: expected finite 0..1"));
+                    }
+                    self.set_wind_visuals(strength);
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_WEATHERWIND {
         runtime: CvarDef::new(
                 "r_weatherWind",
@@ -884,7 +1128,7 @@ app_cvars! {
                 load_video: Some(|settings, _name, value, _context| {
                     let v: Option<Vec<f32>> = value.split_whitespace().map(|s| s.parse().ok()).collect();
                     if let Some(v) = v.filter(|v| v.len() == 4) {
-                        settings.weather_wind = crate::ocean::OceanWind {
+                        settings.weather_wind = crate::ocean::AtmosphericWind {
                             speed: v[0],
                             direction: v[1],
                             gust: v[2],
@@ -928,7 +1172,7 @@ app_cvars! {
                         if values.len() != 4 || !values.iter().all(|v| v.is_finite()) {
                             return Err(format!("{name}: expected four finite numbers"));
                         }
-                        self.set_weather_wind(crate::ocean::OceanWind {
+                        self.set_weather_wind(crate::ocean::AtmosphericWind {
                             speed: values[0],
                             direction: values[1],
                             gust: values[2],

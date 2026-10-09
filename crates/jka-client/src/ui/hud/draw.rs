@@ -70,7 +70,18 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
     let ammo_layout = ui.hud_layout.ammo;
     let ammo = hud_element_rect(HudElementId::Ammo, ammo_layout, &ctx, w, h);
     if hud.weapon == HUD_WP_SABER {
-        hud_style_panel(out, ammo, ammo_layout.scale, hud.saber_style, w, h);
+        let style_pending = hud.saber_style != 0
+            && hud.saber_active_style != 0
+            && hud.saber_style != hud.saber_active_style;
+        hud_style_panel(
+            out,
+            ammo,
+            ammo_layout.scale,
+            hud.saber_style,
+            style_pending,
+            w,
+            h,
+        );
     } else {
         let ammo_text = hud
             .ammo
@@ -132,7 +143,23 @@ pub(in crate::ui) fn hud_frame(
     w: u32,
     h: u32,
 ) {
+    hud_frame_with_accent_alpha(out, rect_, scale, accent, 1.0, w, h);
+}
+
+/// Shared panel backing with an independently fadeable accent. The backing
+/// stays stable while a queued saber style fades only its style-specific cues.
+#[allow(clippy::too_many_arguments)]
+fn hud_frame_with_accent_alpha(
+    out: &mut Vec<UiVertex>,
+    rect_: HudRect,
+    scale: f32,
+    accent: [f32; 4],
+    accent_alpha: f32,
+    w: u32,
+    h: u32,
+) {
     let s = scale.clamp(0.5, 2.0);
+    let accent_alpha = accent_alpha.clamp(0.0, 1.0);
     rect_gradient(
         out,
         rect_.x,
@@ -152,7 +179,7 @@ pub(in crate::ui) fn hud_frame(
         rect_.y,
         rect_.width,
         1.0,
-        with_alpha(accent, 0.22),
+        with_alpha(accent, 0.22 * accent_alpha),
         w,
         h,
     );
@@ -162,7 +189,7 @@ pub(in crate::ui) fn hud_frame(
         rect_.y,
         3.0 * s,
         rect_.height,
-        with_alpha(accent, 0.95),
+        with_alpha(accent, 0.95 * accent_alpha),
         w,
         h,
     );
@@ -316,12 +343,17 @@ pub(in crate::ui) fn hud_style_panel(
     rect_: HudRect,
     scale: f32,
     style: i32,
+    pending: bool,
     w: u32,
     h: u32,
 ) {
     let s = scale.clamp(0.5, 2.0);
     let (name, accent, lit) = saber_style_display(style);
-    hud_frame(out, rect_, scale, accent, w, h);
+    // EternalJK exposes the queued style through saberDrawAnimLevel before
+    // saberAnimLevel actually changes. Keep that immediate preview, but make
+    // the distinction visible: queued = faded, active = fully lit.
+    let pending_alpha = if pending { 0.48 } else { 1.0 };
+    hud_frame_with_accent_alpha(out, rect_, scale, accent, pending_alpha, w, h);
     let track_x = rect_.x + 10.0 * s;
     let track_w = rect_.width - 18.0 * s;
     let track_y = rect_.y + rect_.height - 6.0 * s;
@@ -331,9 +363,20 @@ pub(in crate::ui) fn hud_style_panel(
     for index in 0..3u32 {
         let segment_x = track_x + index as f32 * (segment_w + gap);
         if index < lit {
-            let dim = with_alpha(accent, 0.6);
+            let dim = with_alpha(accent, 0.6 * pending_alpha);
+            let bright = with_alpha(accent, pending_alpha);
             rect_gradient(
-                out, segment_x, track_y, segment_w, track_h, dim, accent, dim, accent, w, h,
+                out,
+                segment_x,
+                track_y,
+                segment_w,
+                track_h,
+                dim,
+                bright,
+                dim,
+                bright,
+                w,
+                h,
             );
         } else {
             rect(
@@ -342,7 +385,7 @@ pub(in crate::ui) fn hud_style_panel(
                 track_y,
                 segment_w,
                 track_h,
-                with_alpha(accent, 0.16),
+                with_alpha(accent, 0.16 * pending_alpha),
                 w,
                 h,
             );
@@ -354,7 +397,7 @@ pub(in crate::ui) fn hud_style_panel(
         scale,
         "STYLE",
         name,
-        lighten(accent, 0.25),
+        with_alpha(lighten(accent, 0.25), pending_alpha),
         w,
         h,
     );

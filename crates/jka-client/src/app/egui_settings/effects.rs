@@ -180,11 +180,19 @@ impl App {
 
         self.egui_toggle_row(
             ui,
-            "Flares",
-            "Screen-space flare overlays such as the OpenJK saber clash flash. Off suppresses only \
-             the flare overlay; saber impact particles, sounds, dynamic lights and marks are unchanged.",
+            "World flares (r_flares)",
+            "Standard authored BSP map flares. Uses the batched world-flare GPU renderer. \
+             The optional r_worldFlares override can also enable them independently.",
             ui::VIDEO_ROW_FLARES,
             self.video.flares,
+        );
+
+        self.egui_toggle_row(
+            ui,
+            "Saber flares (r_saberFlares)",
+            "Only the screen-space saber clash flash; other impact EFX, sounds, and marks are unaffected.",
+            ui::VIDEO_ROW_SABER_FLARES,
+            self.video.saber_flares,
         );
 
         self.egui_toggle_row(

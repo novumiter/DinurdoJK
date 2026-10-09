@@ -2,6 +2,7 @@ Bench plans
 ===========
 
 Run:      bench.cmd bench\plans\deluxe.bench
+          bench.cmd bench\plans\ocean.bench   (GodotOcean cost on RaceArena_Pro)
 Options:  --launches N   override launches        --only a,b   run only those cases
           --dry-run      print launch commands only
 Output:   bench\results\<plan>-<timestamp>.txt  (summary report; give this to Claude)
@@ -41,5 +42,9 @@ noise%               (max-min)/mean of per-launch FPS. A dms smaller than the no
                      is not a real difference; add launches.
 gpu_ms/per-pass      only with cfg r_gpuTimings 1
 draws                world draws encoded per frame
+sea_draws/sea_tris   ocean clipmap draws and triangles submitted per frame, from
+                     [JKA OCEAN PERF]. The clipmap is camera-centred, so these do
+                     not shrink when less water is on screen - that is the point
+                     of measuring them.
 variant              shader variant key the world pass used (shows which features
                      were compiled in)

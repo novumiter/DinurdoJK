@@ -10,6 +10,9 @@ use wgpu::util::DeviceExt;
 
 impl Renderer {
     pub(in crate::renderer) fn rebuild_planar_reflection_resources(&mut self) {
+        for flare_view in &mut self.world_flares_planar {
+            flare_view.invalidate_depth_binding();
+        }
         let planar_budget = self
             .reflection_quality
             .planar_slot_budget()
@@ -773,7 +776,7 @@ pub(in crate::renderer) fn create_planar_reflection_resources(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());

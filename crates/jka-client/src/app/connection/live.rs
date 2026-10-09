@@ -592,12 +592,14 @@ impl App {
                 format!("live:{server_name}"),
                 server_name.clone(),
                 Vec::new(),
+                prepared.siege_catalog,
                 prepared.siege_classes,
                 prepared.player_presenter,
                 prepared.entity_presenter,
                 crate::cgame::weapon_fx::WeaponFx::new(prepared.fx_assets),
                 self.forced_player_models.clone(),
             );
+            session.set_fx_light_promotion_catalog(Arc::clone(&self.fx_light_promotion_catalog));
             session
                 .weapon_fx
                 .set_modern_sabers(self.video.modern_sabers);
@@ -632,6 +634,7 @@ impl App {
                 self.video.fx_count_scale,
                 self.video.fx_lod_scale,
             );
+            session.promote_fx_lights = self.video.promote_fx_lights;
             session.apply_client_options(
                 self.screen_shake,
                 self.audio.game,

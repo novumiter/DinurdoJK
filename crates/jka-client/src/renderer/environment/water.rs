@@ -1,5 +1,5 @@
 //! Environment water.
-use crate::renderer::{DrawBatch, GpuVertex, Renderer, WorldBatch};
+use crate::renderer::{Renderer, WorldBatch};
 
 impl Renderer {
     pub(in crate::renderer) fn set_grass_enabled(&mut self, enabled: bool) {
@@ -25,24 +25,118 @@ impl Renderer {
             .then(|| usize::from(self.ocean_settings.mesh_quality.min(1)))
     }
 
+    /// Keeps promoted-water geometry in sync with the live pool amplitude and
+    /// the camera's shortest *3D* distance to that pool. Only threshold changes
+    /// rewrite indices; ordinary camera motion inside one LOD band is free.
+    pub(in crate::renderer) fn update_promoted_ocean_clipmap_lod(&mut self, camera: [f32; 3]) {
+        if !self.ocean_enabled {
+            return;
+        }
+        let quality = usize::from(self.ocean_settings.mesh_quality.min(1));
+        let overrides = &self.promoted_ocean_overrides;
+        let queue = &self.queue;
+        let Some(world) = self.world.as_mut() else { return; };
+        if world.runtime_ocean_clipmaps.is_empty() {
+            return;
+        }
+
+        let descriptors = &world.promoted_oceans;
+        let index_buffer = &world.index_buffer;
+        let mut changed_ranges: Option<Vec<(u8, usize, std::ops::Range<u32>)>> = None;
+        for runtime in &mut world.runtime_ocean_clipmaps {
+            if runtime.quality != quality {
+                continue;
+            }
+            let Some(descriptor) = descriptors.iter().find(|p| p.index == runtime.slot as usize) else {
+                continue;
+            };
+            let amplitude = overrides
+                .iter()
+                .find(|(slot, _)| *slot == descriptor.index)
+                .map_or(descriptor.heuristic.amplitude, |(_, settings)| settings.authored.amplitude);
+            let amplitude = if amplitude.is_finite() {
+                amplitude.max(crate::ocean::appearance::MIN_PROMOTED_AMPLITUDE)
+            } else {
+                descriptor
+                    .heuristic
+                    .amplitude
+                    .max(crate::ocean::appearance::MIN_PROMOTED_AMPLITUDE)
+            };
+            let half_cells = crate::ocean::promoted_clipmap_half_cells(amplitude);
+            let distance = crate::ocean::promoted_surface_distance(camera, descriptor.surface);
+            let minimum_level = runtime
+                .layout
+                .minimum_level_for_distance(half_cells, distance);
+            if half_cells == runtime.current_half_cells
+                && minimum_level == runtime.current_minimum_level
+            {
+                continue;
+            }
+
+            let mut indices = runtime.layout.indices_for(half_cells, minimum_level);
+            debug_assert!(indices.len() <= runtime.reserved_range.len());
+            for index in &mut indices {
+                *index = runtime.vertex_base.saturating_add(*index);
+            }
+            let byte_offset = u64::from(runtime.reserved_range.start)
+                * std::mem::size_of::<u32>() as u64;
+            if !indices.is_empty() {
+                queue.write_buffer(index_buffer, byte_offset, bytemuck::cast_slice(&indices));
+            }
+            let end = runtime
+                .reserved_range
+                .start
+                .saturating_add(u32::try_from(indices.len()).unwrap_or(u32::MAX));
+            runtime.active_range = runtime.reserved_range.start..end;
+            runtime.current_half_cells = half_cells;
+            runtime.current_minimum_level = minimum_level;
+            changed_ranges
+                .get_or_insert_with(Vec::new)
+                .push((runtime.slot, runtime.quality, runtime.active_range.clone()));
+        }
+
+        let Some(changed_ranges) = changed_ranges else { return; };
+        let apply = |batches: &mut [WorldBatch]| {
+            for batch in batches {
+                let Some(ranges) = batch.ocean_clipmap.as_mut() else { continue; };
+                for (slot, quality, range) in &changed_ranges {
+                    if batch.ocean_clipmap_id == *slot {
+                        ranges[*quality] = range.clone();
+                    }
+                }
+            }
+        };
+        apply(&mut world.coarse_batches);
+        apply(&mut world.full_batches);
+        apply(&mut world.auto4_batches);
+    }
+
     pub(in crate::renderer) fn set_ocean_settings(
         &mut self,
         settings: crate::ocean::OceanSettings,
     ) {
-        let settings = settings.sanitize();
+        let mut settings = settings.sanitize();
+        // Atmospheric wind is renderer-global. Ocean-specific settings may
+        // arrive through their legacy API, but they cannot fork the wind field.
+        settings.wind = self.weather_wind;
         let recreate = self
             .ocean
             .as_ref()
             .is_some_and(|ocean| ocean.map_size() != settings.map_size);
         self.ocean_settings = settings;
+        self.ocean_interaction.set_falloff(settings);
+        self.ocean_interaction.configure(&self.device, &self.queue,
+            self.ocean_enabled && settings.interaction, settings.interaction_strength,
+            settings.interaction_debug, settings.interaction_splash_mode);
         if self.ocean_enabled {
             if recreate {
-                let mut ocean = crate::ocean::OceanGpu::new(
+                let mut ocean = crate::ocean::OceanGpu::new_with_interaction(
                     &self.device,
                     &self.queue,
                     &self.ocean_layout,
                     &self.ocean_spray_albedo.view,
                     self.ocean_settings,
+                    &self.ocean_interaction.render,
                 );
                 ocean.set_enabled(&self.queue, true);
                 self.ocean = Some(ocean);
@@ -67,7 +161,10 @@ impl Renderer {
         for descriptor in descriptors {
             let mut settings = self.ocean_settings;
             settings.authored = descriptor.waves;
-            settings.wind = descriptor.wind;
+            // Wind is global atmospheric state, not per-ocean state. The parsed
+            // descriptor retains its original weather metadata for compatibility,
+            // but every rendered ocean consumes the same canonical wind.
+            settings.wind = self.weather_wind;
             settings.bounds = Some(crate::ocean::OceanSurface {
                 plane_height: descriptor.height,
                 minimum: [descriptor.mins[0], -descriptor.maxs[1]],
@@ -79,12 +176,13 @@ impl Renderer {
             {
                 previous.swap_remove(index).1
             } else {
-                crate::ocean::OceanGpu::new(
+                crate::ocean::OceanGpu::new_with_interaction(
                     &self.device,
                     &self.queue,
                     &self.ocean_layout,
                     &self.ocean_spray_albedo.view,
                     settings,
+                    &self.ocean_interaction.render,
                 )
             };
             gpu.set_settings(&self.queue, settings);
@@ -124,15 +222,20 @@ impl Renderer {
             return;
         }
         self.ocean_enabled = enabled;
+        self.ocean_interaction.set_falloff(self.ocean_settings);
+        self.ocean_interaction.configure(&self.device, &self.queue,
+            enabled && self.ocean_settings.interaction, self.ocean_settings.interaction_strength,
+            self.ocean_settings.interaction_debug, self.ocean_settings.interaction_splash_mode);
         self.set_authored_oceans(self.authored_ocean_definitions.clone());
         if enabled {
             if self.ocean.is_none() {
-                let mut ocean = crate::ocean::OceanGpu::new(
+                let mut ocean = crate::ocean::OceanGpu::new_with_interaction(
                     &self.device,
                     &self.queue,
                     &self.ocean_layout,
                     &self.ocean_spray_albedo.view,
                     self.ocean_settings,
+                    &self.ocean_interaction.render,
                 );
                 ocean.set_enabled(&self.queue, true);
                 self.ocean = Some(ocean);
@@ -160,58 +263,151 @@ impl Renderer {
 /// their authored faces rather than growing the vertex buffer without limit.
 pub(in crate::renderer) const MAX_OCEAN_SURFACES: usize = crate::ocean::OCEAN_MAX_SURFACES;
 
-/// Plane height and world-space xz footprint of a promoted water face.
-pub(in crate::renderer) fn water_surface_extent(
-    source: &DrawBatch,
-    vertices: &[GpuVertex],
-) -> (f32, [f32; 2], [f32; 2]) {
-    let slice = &vertices[source.vertices.start as usize..source.vertices.end as usize];
-    let mut minimum = [f32::INFINITY; 3];
-    let mut maximum = [f32::NEG_INFINITY; 3];
-    for vertex in slice {
-        for axis in 0..3 {
-            minimum[axis] = minimum[axis].min(vertex.position[axis]);
-            maximum[axis] = maximum[axis].max(vertex.position[axis]);
+pub(in crate::renderer) use crate::ocean::surfaces::{water_surface_extent, ocean_surface_key, is_upward_water_face};
+
+/// Ground-truth "is any ocean on screen" from the GPU.
+///
+/// Every CPU-side answer to that question was wrong on real maps: a promoted
+/// surface's bounding box routinely surrounds the camera, so a frustum test
+/// reports "visible" while the clipmap rasterizes almost nothing (measured:
+/// `ocean_surface` at 0.04ms with `reject_frustum=0`). The shape mask and world
+/// occluders only discard later, in the fragment stage, where no CPU test can
+/// see them. An occlusion query counts the water samples that actually survived
+/// depth, which is exactly the question, and it costs one query per frame.
+///
+/// The answer necessarily lags by a frame or two. Consumers must therefore be
+/// things that tolerate stale visibility: freezing a simulation nobody is
+/// looking at, and skipping a capture nobody is sampling.
+pub(in crate::renderer) struct OceanVisibilitySlot {
+    readback_buffer: wgpu::Buffer,
+    pending: Option<crate::renderer::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+}
+
+pub(in crate::renderer) struct OceanVisibility {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    slots: Vec<OceanVisibilitySlot>,
+    current: Option<usize>,
+    encoded: bool,
+    /// Samples that passed depth in the most recently read-back ocean pass.
+    pub(in crate::renderer) latest_samples: u64,
+    /// No readback has completed yet. Until one does, callers must assume the
+    /// ocean is visible, or the first frames on a map would skip work wrongly.
+    pub(in crate::renderer) primed: bool,
+}
+
+const OCEAN_VISIBILITY_SLOTS: usize = 3;
+const OCEAN_VISIBILITY_STRIDE: usize = 256;
+
+impl OceanVisibility {
+    pub(in crate::renderer) fn new(device: &wgpu::Device) -> Self {
+        Self {
+            query_set: device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("JKA ocean occlusion"),
+                ty: wgpu::QueryType::Occlusion,
+                count: OCEAN_VISIBILITY_SLOTS as u32,
+            }),
+            resolve_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JKA ocean occlusion resolve"),
+                // wgpu requires a 256-byte aligned destination offset for
+                // resolve_query_set, so each slot gets its own aligned stride
+                // even though a single occlusion result is 8 bytes.
+                size: (OCEAN_VISIBILITY_SLOTS * OCEAN_VISIBILITY_STRIDE) as u64,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }),
+            slots: (0..OCEAN_VISIBILITY_SLOTS)
+                .map(|_| OceanVisibilitySlot {
+                    readback_buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("JKA ocean occlusion readback"),
+                        size: 8,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    }),
+                    pending: None,
+                })
+                .collect(),
+            current: None,
+            encoded: false,
+            latest_samples: 0,
+            primed: false,
         }
     }
-    (
-        maximum[1],
-        [minimum[0], minimum[2]],
-        [maximum[0], maximum[2]],
-    )
-}
 
-pub(in crate::renderer) fn ocean_surface_key(
-    plane: f32,
-    minimum: [f32; 2],
-    maximum: [f32; 2],
-    material: u32,
-) -> [u32; 6] {
-    [
-        plane.to_bits(),
-        minimum[0].to_bits(),
-        minimum[1].to_bits(),
-        maximum[0].to_bits(),
-        maximum[1].to_bits(),
-        material,
-    ]
-}
-
-/// A `surfaceparm water` brush contributes every face it has, so its underside
-/// and its sides arrive looking exactly like its top. Only the upward-facing
-/// horizontal face is the water surface the FFT ocean should replace.
-pub(in crate::renderer) fn is_upward_water_face(
-    source: &DrawBatch,
-    vertices: &[GpuVertex],
-) -> bool {
-    let slice = &vertices[source.vertices.start as usize..source.vertices.end as usize];
-    let mut lowest = f32::INFINITY;
-    let mut highest = f32::NEG_INFINITY;
-    let mut facing = 0.0f32;
-    for vertex in slice {
-        lowest = lowest.min(vertex.position[1]);
-        highest = highest.max(vertex.position[1]);
-        facing += vertex.normal[1];
+    pub(in crate::renderer) fn begin_frame(&mut self, device: &wgpu::Device) {
+        if self.slots.iter().any(|slot| slot.pending.is_some()) {
+            let _ = device.poll(wgpu::PollType::Poll);
+            for slot in &mut self.slots {
+                let completed = {
+                    let Some(pending) = slot.pending.as_ref() else {
+                        continue;
+                    };
+                    match pending.try_recv() {
+                        Ok(Ok(())) => {
+                            let bytes = slot.readback_buffer.slice(..).get_mapped_range();
+                            let values: &[u64] = bytemuck::cast_slice(&bytes);
+                            let samples = values.first().copied().unwrap_or(0);
+                            drop(bytes);
+                            slot.readback_buffer.unmap();
+                            Some(samples)
+                        }
+                        Ok(Err(_)) | Err(crate::renderer::TryRecvError::Disconnected) => None,
+                        Err(crate::renderer::TryRecvError::Empty) => continue,
+                    }
+                };
+                slot.pending = None;
+                if let Some(samples) = completed {
+                    self.latest_samples = samples;
+                    self.primed = true;
+                }
+            }
+        }
+        self.current = self.slots.iter().position(|slot| slot.pending.is_none());
+        self.encoded = false;
     }
-    lowest.is_finite() && facing > 0.0 && lowest >= highest - 1.0
+
+    /// Query index to wrap this frame's ocean draws in, if a slot is free.
+    pub(in crate::renderer) fn query_index(&self) -> Option<u32> {
+        self.current.map(|current| current as u32)
+    }
+
+    pub(in crate::renderer) fn query_set(&self) -> &wgpu::QuerySet {
+        &self.query_set
+    }
+
+    pub(in crate::renderer) fn encode_resolve(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(current) = self.current else {
+            return;
+        };
+        let index = current as u32;
+        let offset = (current * OCEAN_VISIBILITY_STRIDE) as u64;
+        encoder.resolve_query_set(&self.query_set, index..index + 1, &self.resolve_buffer, offset);
+        encoder.copy_buffer_to_buffer(
+            &self.resolve_buffer,
+            offset,
+            &self.slots[current].readback_buffer,
+            0,
+            8,
+        );
+        self.encoded = true;
+    }
+
+    pub(in crate::renderer) fn submit(&mut self) {
+        if !self.encoded {
+            self.current = None;
+            return;
+        }
+        let Some(current) = self.current.take() else {
+            return;
+        };
+        let (sender, receiver) = crate::renderer::mpsc::channel();
+        self.slots[current]
+            .readback_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.slots[current].pending = Some(receiver);
+        self.encoded = false;
+    }
 }

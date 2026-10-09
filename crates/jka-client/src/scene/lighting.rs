@@ -3,7 +3,8 @@ use crate::scene::{
     materials, render_position, AssetSearchPath, BTreeSet, Bsp, ClassicEntityLightGrid,
     ClassicLightGridCell, CullMode, DirectionalSun, DrawBatch, DrawClass, DynamicLight,
     DynamicLightFalloff, GpuVertex, StaticLightGrid, SurfaceMaterial, Vec3, VoxelProbeGi,
-    MAX_EXTRACTED_SURFACE_LIGHTS, MAX_SURFACE_LIGHT_SUBDIVISION_DEPTH, VOXEL_GI_MAX_AXIS,
+    MAX_REALTIME_SURFACE_LIGHTS, MAX_SURFACE_LIGHT_SUBDIVISION_DEPTH,
+    MAX_VOXEL_GI_SURFACE_LIGHTS, VOXEL_GI_MAX_AXIS,
     VOXEL_GI_MAX_RADIANCE, VOXEL_GI_MIN_CELL_SIZE, VOXEL_GI_PROPAGATION,
     VOXEL_GI_PROPAGATION_STEPS,
 };
@@ -325,26 +326,36 @@ pub(in crate::scene) struct SurfaceLightCandidate {
     pub(in crate::scene) weight: f32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(in crate::scene) struct SurfaceLightBuildStats {
+    pub(in crate::scene) authored_candidates: usize,
+    pub(in crate::scene) authored_selected: usize,
+    pub(in crate::scene) promoted_candidates: usize,
+    pub(in crate::scene) promoted_selected: usize,
+}
+
 pub(in crate::scene) fn surface_light_luminance(color: [f32; 3]) -> f32 {
     color[0] * 0.2126 + color[1] * 0.7152 + color[2] * 0.0722
 }
 
-pub(in crate::scene) fn append_surface_light_triangle(
+fn append_emitting_triangle(
     candidates: &mut Vec<SurfaceLightCandidate>,
     positions: [Vec3; 3],
     normal: Vec3,
-    authored: materials::SurfaceLight,
+    value: f32,
+    color: [f32; 3],
+    subdivide: f32,
     two_sided: bool,
+    shader_promotion_mask: u32,
 ) {
-    if !authored.value.is_finite() || authored.value <= 0.0 {
+    if !value.is_finite() || value <= 0.0 {
         return;
     }
 
     // q3map2 subdivides emitting draw surfaces before creating its area lights.
-    // Do the same geometrically so a large emissive face is represented by
-    // several local sources rather than one giant point light. Longest-edge
-    // bisection is deterministic and also works for already-tessellated patches.
-    let max_edge = authored.subdivide.max(16.0);
+    // Use the same geometry treatment for shader-promoted emitters so a large
+    // glowing face is represented by local samples rather than one giant point.
+    let max_edge = subdivide.max(16.0);
     let max_edge_sq = max_edge * max_edge;
     let mut pending = vec![(positions, 0_u8)];
     while let Some((triangle, depth)) = pending.pop() {
@@ -383,22 +394,17 @@ pub(in crate::scene) fn append_surface_light_triangle(
         }
 
         let centroid = (triangle[0] + triangle[1] + triangle[2]) / 3.0;
-        // Normalize each generated sample by the authored subdivision cell area.
-        // This keeps total emitted energy approximately proportional to surface
-        // area and avoids depending on the BSP's incidental triangle density.
         let area_scale = (area / (max_edge * max_edge)).clamp(0.0, 1.0);
-        let intensity = ((authored.value / 300.0) * area_scale).clamp(0.0, 8.0);
+        let intensity = ((value / 300.0) * area_scale).clamp(0.0, 8.0);
         if intensity <= 1e-5 {
             continue;
         }
-        let radius = authored.value.max(max_edge * 2.0).clamp(64.0, 4096.0);
-        let luminance = surface_light_luminance(authored.color).max(0.0);
+        let radius = value.max(max_edge * 2.0).clamp(64.0, 4096.0);
+        let luminance = surface_light_luminance(color).max(0.0);
         candidates.push(SurfaceLightCandidate {
             light: DynamicLight {
-                // Keep the sample just in front of its source plane so receiving
-                // surfaces that meet the emitter do not start numerically behind it.
                 position: (centroid + emitter_normal * 8.0).to_array(),
-                color: authored.color,
+                color,
                 radius,
                 intensity,
                 falloff: DynamicLightFalloff::Smooth,
@@ -408,24 +414,40 @@ pub(in crate::scene) fn append_surface_light_triangle(
                 angle_attenuation: true,
                 angle_scale: 0.0,
                 extra_distance: 0.0,
+                shader_promotion_mask,
             },
-            // Modern mesh-light samplers prioritize emitting triangles by area
-            // times luminance. Include q3map's authored strength in that weight.
-            weight: area * luminance * authored.value,
+            weight: area * luminance * value,
         });
     }
+}
+
+pub(in crate::scene) fn append_surface_light_triangle(
+    candidates: &mut Vec<SurfaceLightCandidate>,
+    positions: [Vec3; 3],
+    normal: Vec3,
+    authored: materials::SurfaceLight,
+    two_sided: bool,
+) {
+    append_emitting_triangle(
+        candidates,
+        positions,
+        normal,
+        authored.value,
+        authored.color,
+        authored.subdivide,
+        two_sided,
+        0,
+    );
 }
 
 pub(in crate::scene) fn bsp_surface_lights(
     mesh: &jka_assets::bsp::Mesh,
     materials: &[SurfaceMaterial],
-) -> (Vec<DynamicLight>, usize) {
-    let mut candidates = Vec::new();
+) -> (Vec<DynamicLight>, Vec<DynamicLight>, SurfaceLightBuildStats) {
+    let mut authored_candidates = Vec::new();
+    let mut promoted_candidates = Vec::new();
     for batch in &mesh.batches {
         let Some(material) = materials.get(batch.shader) else {
-            continue;
-        };
-        let Some(authored) = material.surface_light else {
             continue;
         };
         let two_sided = material.cull == CullMode::None;
@@ -438,20 +460,68 @@ pub(in crate::scene) fn bsp_surface_lights(
                 .into_iter()
                 .sum::<Vec3>()
                 .normalize_or_zero();
-            append_surface_light_triangle(&mut candidates, positions, normal, authored, two_sided);
+            if let Some(authored) = material.surface_light {
+                append_surface_light_triangle(
+                    &mut authored_candidates,
+                    positions,
+                    normal,
+                    authored,
+                    two_sided,
+                );
+            }
+            if let Some(promoted) = material.shader_light {
+                let overlap = if material.surface_light.is_some() {
+                    materials::SHADER_LIGHT_AUTHORED_OVERLAP
+                } else {
+                    0
+                };
+                append_emitting_triangle(
+                    &mut promoted_candidates,
+                    positions,
+                    normal,
+                    promoted.value,
+                    promoted.color,
+                    promoted.subdivide,
+                    two_sided,
+                    promoted.reasons | overlap,
+                );
+            }
         }
     }
 
-    let candidate_count = candidates.len();
-    candidates.sort_by(|a, b| b.weight.total_cmp(&a.weight));
-    candidates.truncate(MAX_EXTRACTED_SURFACE_LIGHTS);
-    (
-        candidates
-            .into_iter()
-            .map(|candidate| candidate.light)
-            .collect(),
-        candidate_count,
-    )
+    let mut stats = SurfaceLightBuildStats {
+        authored_candidates: authored_candidates.len(),
+        promoted_candidates: promoted_candidates.len(),
+        ..Default::default()
+    };
+    authored_candidates.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+    promoted_candidates.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+
+    // Preserve independent real-time pools so authored q3map emitters and
+    // shader-promoted emitters remain live A/B testable. Do not carry the old
+    // 128-sample budget into the clustered hot path, though: every active sample
+    // participates in cluster construction and may be evaluated by visible
+    // fragments. Sixteen per provenance bounds that cost without making either
+    // source disappear merely because the other source filled the map-load pool.
+    //
+    // Probe GI is different: it is built once at map load, and shader-promoted
+    // emitters are intentionally excluded from that immutable volume elsewhere.
+    // Retain the strongest 128 authored q3map samples for the GI bake so this
+    // optimization does not reduce indirect emissive spill.
+    let gi_authored_lights = authored_candidates
+        .iter()
+        .take(MAX_VOXEL_GI_SURFACE_LIGHTS)
+        .map(|candidate| candidate.light)
+        .collect::<Vec<_>>();
+    authored_candidates.truncate(MAX_REALTIME_SURFACE_LIGHTS);
+    promoted_candidates.truncate(MAX_REALTIME_SURFACE_LIGHTS);
+    stats.authored_selected = authored_candidates.len();
+    stats.promoted_selected = promoted_candidates.len();
+
+    let mut lights = Vec::with_capacity(stats.authored_selected + stats.promoted_selected);
+    lights.extend(authored_candidates.into_iter().map(|candidate| candidate.light));
+    lights.extend(promoted_candidates.into_iter().map(|candidate| candidate.light));
+    (lights, gi_authored_lights, stats)
 }
 
 pub(in crate::scene) fn voxel_gi_index(x: u32, y: u32, z: u32, bounds: [u32; 3]) -> usize {

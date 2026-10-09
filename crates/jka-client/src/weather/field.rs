@@ -54,6 +54,19 @@ const FLAT_HEIGHT_RANGE_NONE: f32 = 8.0;
 const EDGE_FADE_START: f32 = 2.0;
 const EDGE_FADE_END: f32 = 28.0;
 
+// Rain-shadow softening. The field itself is one hard top-down height per texel, so
+// on its own a roof or wall edge ramps from wet to dry over a single texel (8
+// units). Mip level 1 of the same texture carries a wide blurred copy of the cover
+// instead, so the shader can widen that ramp for 4 extra loads and no new binding.
+// Each level-1 texel summarises a SHELTER_FOOTPRINT-wide window of level 0 as
+// [tallest blocker, lowest blocker, fraction standing SHELTER_HIGH_STEP or more
+// above the lowest, 0]. Height stays a runtime question (the shader compares it
+// with the fragment), which is why this is statistics and not a baked wetness.
+// With a 64 unit window, bilinear over the 16 unit level-1 pitch and the shader's
+// doubling, the open side of an edge reaches fully dry about 32..44 units from it.
+const SHELTER_FOOTPRINT: f32 = 64.0;
+const SHELTER_HIGH_STEP: f32 = 24.0;
+
 type Field = Vec<[f32; 4]>;
 
 fn smooth_unit(value: f32, low: f32, high: f32) -> f32 {
@@ -98,6 +111,57 @@ pub(super) fn build_heightfield(
         height: grid.height as u32,
     };
     Some((info, field))
+}
+
+/// Mip level 1 of the field texture (`(width/2) x (height/2)` texels, row-major):
+/// per-window statistics of the rain-blocking height. See SHELTER_FOOTPRINT.
+pub(super) fn build_shelter_level(info: &WeatherOcclusionInfo, field: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    let (width, height) = (info.width as usize, info.height as usize);
+    let (half_w, half_h) = ((width / 2).max(1), (height / 2).max(1));
+    let step_x = 1.0 / (info.inv_extent_xz[0] * width as f32);
+    let step_z = 1.0 / (info.inv_extent_xz[1] * height as f32);
+    let reach_x = (0.5 * SHELTER_FOOTPRINT / step_x).max(1.0);
+    let reach_z = (0.5 * SHELTER_FOOTPRINT / step_z).max(1.0);
+    let valid = |r: f32| r > WEATHER_NO_SURFACE_HEIGHT + 1.0;
+
+    // Texels j with |j + 0.5 - centre| <= reach, for a level-1 texel whose centre is
+    // (c + 0.5) * size / half in level-0 texel coordinates (the shader's uv mapping).
+    let window = |c: usize, half: usize, size: usize, reach: f32| -> Range<usize> {
+        let centre = (c as f32 + 0.5) * size as f32 / half as f32;
+        let lo = ((centre - reach - 0.5).ceil().max(0.0) as usize).min(size - 1);
+        let hi = (((centre + reach - 0.5).floor().max(0.0) as usize) + 1).min(size);
+        lo..hi.max(lo + 1)
+    };
+
+    let mut level = vec![[WEATHER_NO_SURFACE_HEIGHT, WEATHER_NO_SURFACE_HEIGHT, 0.0, 0.0]; half_w * half_h];
+    for cz in 0..half_h {
+        let zs = window(cz, half_h, height, reach_z);
+        for cx in 0..half_w {
+            let xs = window(cx, half_w, width, reach_x);
+            let (mut lowest, mut highest) = (f32::INFINITY, f32::NEG_INFINITY);
+            for z in zs.clone() {
+                for &[r, ..] in &field[z * width + xs.start..z * width + xs.end] {
+                    if valid(r) {
+                        lowest = lowest.min(r);
+                        highest = highest.max(r);
+                    }
+                }
+            }
+            if !highest.is_finite() {
+                continue;
+            }
+            let mut high = 0usize;
+            for z in zs.clone() {
+                high += field[z * width + xs.start..z * width + xs.end]
+                    .iter()
+                    .filter(|texel| valid(texel[0]) && texel[0] >= lowest + SHELTER_HIGH_STEP)
+                    .count();
+            }
+            let total = zs.len() * xs.len();
+            level[cz * half_w + cx] = [highest, lowest, high as f32 / total as f32, 0.0];
+        }
+    }
+    level
 }
 
 /// Uniform XZ raster the field is generated on. Render-space X/Z, matching the
@@ -652,6 +716,58 @@ mod tests {
         let px = ((u * info.width as f32) as usize).min(info.width as usize - 1);
         let pz = ((v * info.height as f32) as usize).min(info.height as usize - 1);
         field[pz * info.width as usize + px]
+    }
+
+    /// The shader's soft shelter (weather_shelter_window + bilinear + gain) for a
+    /// fragment at height 0 and render-space x, on a field that is constant along z.
+    fn soft_shelter(info: &WeatherOcclusionInfo, level: &[[f32; 4]], x: f32) -> f32 {
+        let half_w = (info.width / 2) as usize;
+        let position = (x - info.min_xz[0]) * info.inv_extent_xz[0] * half_w as f32 - 0.5;
+        let base = position.floor();
+        let blend = position - base;
+        let window = |index: f32| {
+            let [tallest, lowest, high_fraction, _] = level[(index.max(0.0) as usize).min(half_w - 1)];
+            let step = |edge0: f32, edge1: f32, v: f32| smooth_unit(v, edge0, edge1);
+            let beneath_all = step(6.0, 24.0, lowest);
+            let beneath_some = step(6.0, 24.0, tallest);
+            (high_fraction + (1.0 - high_fraction) * beneath_all) * beneath_some
+        };
+        let shelter = window(base) * (1.0 - blend) + window(base + 1.0) * blend;
+        (shelter * 2.0).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn cover_edge_ramps_to_dry_over_about_forty_units_on_the_open_side() {
+        // Open floor at height 0 up to x = 640, a roof at height 200 beyond it.
+        let (width, height) = (128usize, 128usize);
+        let info = WeatherOcclusionInfo {
+            min_xz: [0.0, 0.0],
+            inv_extent_xz: [1.0 / 1024.0, 1.0 / 1024.0],
+            width: width as u32,
+            height: height as u32,
+        };
+        let mut field = vec![[0.0, 0.0, 0.0, 0.0]; width * height];
+        for texel in field.iter_mut().enumerate().filter(|(i, _)| i % width >= 80) {
+            texel.1[0] = 200.0;
+        }
+        let level = build_shelter_level(&info, &field);
+        assert_eq!(level.len(), (width / 2) * (height / 2));
+
+        let edge = 640.0;
+        let at = |distance: f32| soft_shelter(&info, &level, edge - distance);
+        assert!(at(0.0) > 0.9, "the edge itself reads as sheltered: {}", at(0.0));
+        assert!(at(60.0) < 0.001, "60 units out is dry: {}", at(60.0));
+        let mut previous = at(0.0);
+        for distance in (2..=60).step_by(2) {
+            let value = at(distance as f32);
+            assert!(value <= previous + 1.0e-4, "shelter rose moving away from the cover at {distance}");
+            previous = value;
+        }
+        // Half-sheltered somewhere between 8 and 36 units out: wide, but not a smear.
+        let half = (0..=60).find(|d| at(*d as f32) < 0.5).unwrap();
+        assert!((8..=36).contains(&half), "half-shelter distance {half}");
+        // Far from any cover nothing is sheltered at all.
+        assert!(soft_shelter(&info, &level, 100.0) < 0.001);
     }
 
     #[test]

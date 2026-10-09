@@ -153,6 +153,11 @@ impl App {
     }
 
     pub(in crate::app) fn demo_timeline_ui(&self, now: Instant) -> Option<DemoTimelineUi> {
+        // Movie export captures the same final surface as screenshots, so the
+        // demo editor/timeline must be absent from every exported frame.
+        if self.demo_video_export.is_some() {
+            return None;
+        }
         let session = self
             .game_session
             .as_ref()
@@ -210,9 +215,63 @@ impl App {
                 DEMO_FREE_SPEEDS[self.demo_free_speed_index.min(DEMO_FREE_SPEEDS.len() - 1)]
             ),
         };
+        let export_available = self.demo_export_available();
+        let hover_text = self.window.as_ref().and_then(|window| {
+            if !self.live_buttons.contains("+speed") {
+                return None;
+            }
+            let size = window.inner_size();
+            let layout = ui::demo_timeline_layout(size.width, size.height)?;
+            let point = [self.cursor_position.0 as f32, self.cursor_position.1 as f32];
+            let inside = |rect: [f32; 4]| {
+                point[0] >= rect[0]
+                    && point[0] <= rect[0] + rect[2]
+                    && point[1] >= rect[1]
+                    && point[1] <= rect[1] + rect[3]
+            };
+            if inside(layout.export) {
+                Some(if !export_available {
+                    "EXPORT DISABLED — put ffmpeg.exe next to DinurdoJK.exe".to_owned()
+                } else if self.demo_export_in_ms.is_none() || self.demo_export_out_ms.is_none() {
+                    "EXPORT DISABLED — mark a valid IN and OUT range first".to_owned()
+                } else {
+                    format!(
+                        "Export {} at {} FPS — {}",
+                        self.demo_export_preset.label(),
+                        self.demo_export_fps,
+                        self.demo_export_preset.short_description()
+                    )
+                })
+            } else if inside(layout.export_preset) {
+                Some(format!(
+                    "QUALITY: {} — click to cycle. {}",
+                    self.demo_export_preset.label(),
+                    self.demo_export_preset.short_description()
+                ))
+            } else if inside(layout.export_fps) {
+                Some("EXPORT FPS — click to cycle 24 / 30 / 60 / 120. Export remains frame-perfect/offline.".to_owned())
+            } else if inside(layout.export_depth) {
+                Some(if self.demo_export_depth {
+                    "DEPTH EXR ON — synchronized 32-bit float scene depth for compositing/DOF; 2D HUD is not a depth layer.".to_owned()
+                } else {
+                    "DEPTH EXR OFF — click to add synchronized 32-bit float scene depth; 2D HUD is not a depth layer.".to_owned()
+                })
+            } else if inside(layout.mark_out) && self.demo_export_in_ms.is_none() {
+                Some("OUT DISABLED — mark IN first".to_owned())
+            } else {
+                None
+            }
+        });
         Some(DemoTimelineUi {
             elapsed_ms: session.demo_elapsed_ms(now).unwrap_or(0.0),
             duration_ms,
+            export_in_ms: self.demo_export_in_ms,
+            export_out_ms: self.demo_export_out_ms,
+            export_available,
+            export_preset_label: self.demo_export_preset.label().to_owned(),
+            export_fps: self.demo_export_fps,
+            export_depth: self.demo_export_depth,
+            hover_text,
             playback_rate,
             paused,
             scrub_fraction: self.demo_scrub_fraction,
@@ -242,6 +301,28 @@ impl App {
         }
         if inside(layout.play) {
             return Some(DemoTimelineHit::PlayPause);
+        }
+        if inside(layout.mark_in) {
+            return Some(DemoTimelineHit::MarkIn);
+        }
+        if inside(layout.mark_out) && self.demo_export_in_ms.is_some() {
+            return Some(DemoTimelineHit::MarkOut);
+        }
+        if inside(layout.export)
+            && self.demo_export_available()
+            && self.demo_export_in_ms.is_some()
+            && self.demo_export_out_ms.is_some()
+        {
+            return Some(DemoTimelineHit::Export);
+        }
+        if inside(layout.export_preset) {
+            return Some(DemoTimelineHit::ExportPreset);
+        }
+        if inside(layout.export_fps) {
+            return Some(DemoTimelineHit::ExportFps);
+        }
+        if inside(layout.export_depth) {
+            return Some(DemoTimelineHit::ExportDepth);
         }
         if inside(layout.speed) {
             return Some(DemoTimelineHit::Speed);
@@ -341,7 +422,7 @@ impl App {
         };
         self.restore_demo_transients(elapsed, now);
         self.third_person_camera = ThirdPersonCameraState::default();
-        self.apply_demo_view(sample, Duration::ZERO);
+        self.apply_demo_view(sample);
         self.previous_tick = now;
         Ok(())
     }
@@ -466,7 +547,7 @@ impl App {
                 .round() as i32;
             self.restore_demo_transients(elapsed, now);
             self.third_person_camera = ThirdPersonCameraState::default();
-            self.apply_demo_view(sample, Duration::ZERO);
+            self.apply_demo_view(sample);
             self.previous_tick = now;
             self.publish_transient_ui();
         } else if let Some(Err(error)) = result {

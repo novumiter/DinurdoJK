@@ -1,7 +1,7 @@
 //! Lighting ray tracing.
 use crate::renderer::{
     comparison_sampler_entry, depth_array_texture_entry, material_uniform,
-    nonfiltering_sampler_entry, rt_models, rt_resolution, unfilterable_texture_entry_stages,
+    nonfiltering_sampler_entry, rt_local_radiance, rt_models, rt_radiance, rt_resolution, unfilterable_texture_entry_stages,
     uniform_entry, weather, Arc, DrawBatch, DynamicModelAlphaMode, DynamicModelSurface,
     DynamicModelVertex, DynamicShadowsMode, Ghoul2GpuVertex, GpuVertex, Hash, HashMap, HashSet,
     Hasher, InlineModelGpu, InlineModelInstance, MaterialUniform, Pod, RayTracedRigidInstance,
@@ -10,6 +10,11 @@ use crate::renderer::{
     RT_SKINNED_BLAS_CACHE_LIMIT,
 };
 use wgpu::util::DeviceExt;
+use super::rt_diagnostics::{self, ReceiverFeatures};
+
+#[cfg(test)]
+#[path = "rt_glass_tests.rs"]
+mod rt_glass_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(in crate::renderer) struct RayTracedRigidMeshKey {
@@ -128,13 +133,18 @@ pub(in crate::renderer) struct RtAlphaTextureSource {
     pub(in crate::renderer) width: u32,
     pub(in crate::renderer) height: u32,
     pub(in crate::renderer) clamp: bool,
-    pub(in crate::renderer) alpha: Vec<u8>,
+    /// Alpha-only casters pack four bytes/word; glass uses full RGBA8.
+    pub(in crate::renderer) pixels: Vec<u32>,
+    pub(in crate::renderer) color: bool,
 }
 
 #[derive(Clone)]
 pub(in crate::renderer) struct RtAlphaMaterialSource {
     pub(in crate::renderer) uniform: MaterialUniform,
     pub(in crate::renderer) texture: RtAlphaTextureSource,
+    /// Non-opaque glass candidate, with the old opaque classification retained for OFF.
+    pub(in crate::renderer) glass: bool,
+    pub(in crate::renderer) was_opaque: bool,
 }
 
 #[derive(Clone)]
@@ -172,32 +182,27 @@ pub(in crate::renderer) fn rt_alpha_texture_source(
             width: 1,
             height: 1,
             clamp: true,
-            alpha: vec![255],
+            pixels: vec![0xffffffff],
+            color: true,
         };
     };
     let texel_count = (texture.width as usize).saturating_mul(texture.height as usize);
-    let mut alpha = Vec::with_capacity(texel_count);
-    for rgba in texture
-        .rgba
-        .get(..texel_count.saturating_mul(4))
-        .unwrap_or(&[])
-        .chunks_exact(4)
-    {
-        alpha.push(rgba[3]);
+    let mut alphas = Vec::with_capacity(texel_count);
+    for pixel in texture.rgba.get(..texel_count.saturating_mul(4)).unwrap_or(&[]).chunks_exact(4) {
+        alphas.push(pixel[3]);
     }
-    let (width, height) = if alpha.len() != texel_count || texel_count == 0 {
-        alpha.clear();
-        alpha.push(255);
-        (1, 1)
-    } else {
-        (texture.width.max(1), texture.height.max(1))
-    };
+    let (width, height) = if alphas.len() != texel_count || texel_count == 0 {
+        alphas.clear(); alphas.push(255); (1, 1)
+    } else { (texture.width.max(1), texture.height.max(1)) };
+    let mut pixels = Vec::with_capacity((alphas.len() + 3) / 4);
+    for chunk in alphas.chunks(4) {
+        let mut packed = 0u32;
+        for (lane, alpha) in chunk.iter().enumerate() { packed |= u32::from(*alpha) << (8 * lane); }
+        pixels.push(packed);
+    }
     RtAlphaTextureSource {
-        key: rt_alpha_texture_key(Some(texture)),
-        width,
-        height,
-        clamp: texture.clamp,
-        alpha,
+        key: rt_alpha_texture_key(Some(texture)), width, height, clamp: texture.clamp,
+        pixels, color: false,
     }
 }
 
@@ -209,6 +214,8 @@ pub(in crate::renderer) fn rt_alpha_material_from_draw(
         // Detail textures affect RGB only; candidate rejection uses base alpha.
         uniform: material_uniform(batch, false),
         texture: rt_alpha_texture_source(texture),
+        glass: false,
+        was_opaque: false,
     }
 }
 
@@ -237,6 +244,30 @@ pub(in crate::renderer) fn rt_alpha_mask_source_from_gpu_vertices(
     })
 }
 
+/// Glass alone pays for spatial RGB; regular alpha-mask textures retain
+/// their original quarter-size 4xA8 representation.
+fn rt_rgba_color_texture_source(texture: Option<&TextureData>) -> RtAlphaTextureSource {
+    let mut source = rt_alpha_texture_source(texture);
+    source.key.push_str(":rgba-glass");
+    let Some(texture) = texture else { return source; };
+    let count = (texture.width as usize).saturating_mul(texture.height as usize);
+    if count == 0 || texture.rgba.len() < count.saturating_mul(4) { return source; }
+    source.color = true;
+    source.pixels = texture.rgba[..count * 4].chunks_exact(4)
+        .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])).collect();
+    source
+}
+
+pub(in crate::renderer) fn rt_glass_source_from_gpu_vertices(
+    vertices: &[GpuVertex], batch: &DrawBatch, texture: Option<&TextureData>,
+) -> Option<RtAlphaMaskSource> {
+    let mut source = rt_alpha_mask_source_from_gpu_vertices(vertices, batch, texture)?;
+    source.material.texture = rt_rgba_color_texture_source(texture);
+    source.material.glass = true;
+    source.material.was_opaque = batch.pipeline.class == crate::scene::DrawClass::Opaque;
+    Some(source)
+}
+
 pub(in crate::renderer) fn rt_alpha_material_gpu(
     source: &RtAlphaMaterialSource,
     texture_index: u32,
@@ -249,7 +280,8 @@ pub(in crate::renderer) fn rt_alpha_material_gpu(
         mods: material.mods,
         color: material.color,
         params: material.params,
-        texture: [texture_index, 0, 0, 0],
+        // x: RGBA8 texel table, y: glass, z: opaque-before-glass promotion.
+        texture: [texture_index, u32::from(source.glass), u32::from(source.was_opaque), 0],
     }
 }
 
@@ -294,6 +326,8 @@ pub(in crate::renderer) struct RayTracedShadowResources {
     pub(in crate::renderer) world_pipeline_layout_lean: wgpu::PipelineLayout,
     pub(in crate::renderer) world_shader: wgpu::ShaderModule,
     pub(in crate::renderer) world_shader_lean: wgpu::ShaderModule,
+    world_shader_raw: wgpu::ShaderModule,
+    world_shader_lean_raw: wgpu::ShaderModule,
     pub(in crate::renderer) receiver_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) _blas: wgpu::Blas,
     pub(in crate::renderer) static_mask_blas: Option<RayTracedMaskBlas>,
@@ -351,20 +385,16 @@ pub(in crate::renderer) fn rt_alpha_append_texture(
     }
     let index = u32::try_from(textures.len()).unwrap_or(u32::MAX);
     let offset = u32::try_from(texels.len()).unwrap_or(u32::MAX);
-    for chunk in source.alpha.chunks(4) {
-        let mut packed = 0u32;
-        for (lane, alpha) in chunk.iter().copied().enumerate() {
-            packed |= u32::from(alpha) << (lane * 8);
-        }
-        texels.push(packed);
-    }
+    // 4xA8 compact masks, or RGBA8 only for glass. Cache key includes the
+    // packing choice so masks and glass may share an image safely.
+    texels.extend_from_slice(&source.pixels);
     textures.push(RtAlphaTextureGpu {
-        // x is the packed-u32 base. Four alpha texels occupy each word.
+        // x: word base; w bit0 clamp, bit1 RGBA8 (else 4xA8/word).
         values: [
             offset,
             source.width.max(1),
             source.height.max(1),
-            u32::from(source.clamp),
+            u32::from(source.clamp) | (u32::from(source.color) << 1),
         ],
     });
     cache.insert(source.key.clone(), index);
@@ -1096,20 +1126,36 @@ impl Renderer {
         let world_shader_lean_source =
             ray_traced_world_shader_source(include_str!("../../bsp_lean.wgsl"))
                 .expect("RT Shadows: bsp_lean.wgsl transform must match the renderer shader");
+        let world_shader_source = compose_world_shader(&world_shader_source);
+        let world_shader_lean_source = compose_world_shader(&world_shader_lean_source);
+        rt_diagnostics::dump_shader("bsp-rt-enhanced", &world_shader_source);
+        rt_diagnostics::dump_shader("bsp-rt-lean", &world_shader_lean_source);
         let world_shader = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("JKA BSP shader (hardware ray-traced shadows)"),
-                source: wgpu::ShaderSource::Wgsl(compose_world_shader(&world_shader_source).into()),
+                source: wgpu::ShaderSource::Wgsl(world_shader_source.into()),
             });
         let world_shader_lean = self
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("JKA BSP shader lean (hardware ray-traced shadows)"),
                 source: wgpu::ShaderSource::Wgsl(
-                    compose_world_shader(&world_shader_lean_source).into(),
+                    world_shader_lean_source.into(),
                 ),
             });
+        let raw_shader = |family: &str, base: &str, filtered: &wgpu::ShaderModule| {
+            if !rt_diagnostics::config().receiver.denoiser { return filtered.clone(); }
+            let features = ReceiverFeatures { denoiser: false, glass: rt_diagnostics::config().receiver.glass };
+            let source = compose_world_shader(&ray_traced_world_shader_source_with_features(base, features)
+                .expect("RT raw receiver shader anchors"));
+            rt_diagnostics::dump_shader(family, &source);
+            self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(family), source: wgpu::ShaderSource::Wgsl(source.into()),
+            })
+        };
+        let world_shader_raw = raw_shader("bsp-rt-enhanced-raw", include_str!("../../bsp.wgsl"), &world_shader);
+        let world_shader_lean_raw = raw_shader("bsp-rt-lean-raw", include_str!("../../bsp_lean.wgsl"), &world_shader_lean);
         let sun_shadow_history = rt_resolution::RtSunShadowHistory::new(&self.device);
         let receiver_bind_group = create_rt_receiver_bind_group(
             &self.device,
@@ -1145,6 +1191,8 @@ impl Renderer {
             world_pipeline_layout_lean,
             world_shader,
             world_shader_lean,
+            world_shader_raw,
+            world_shader_lean_raw,
             receiver_bind_group,
             _blas: blas,
             static_mask_blas,
@@ -1189,6 +1237,21 @@ impl Renderer {
         println!(
             "RT Shadows: built HW BLAS/TLAS: opaque BSP {geometry_count} geometries / {triangle_count} tris; alpha-tested BSP+movers {masked_geometry_count} geometries / {masked_triangle_count} tris; opaque inline {inline_geometry_count} BLASes / {inline_triangle_count} tris; dynamic capacity {dynamic_instance_capacity}"
         );
+        // Count static candidate surfaces at build time, rather than injecting
+        // expensive atomics into every shadow ray. Dynamic model glass has not
+        // yet been promoted by this implementation.
+        let glass_static = world.rt_shadow_masks.iter()
+            .filter(|source| source.material.glass).count();
+        let glass_inline = world.inline_models.iter()
+            .map(|model| model.rt_mask_sources.iter().filter(|source| source.material.glass).count())
+            .sum::<usize>();
+        if glass_static != 0 || glass_inline != 0 {
+            println!(
+                "RT tinted-glass candidates: static={glass_static}, inline={glass_inline}, mode={}",
+                if self.tinted_glass_enabled { "on" } else { "off" }
+            );
+        }
+
         true
     }
 
@@ -1851,19 +1914,27 @@ pub(in crate::renderer) fn rt_sampled_light_loops(source: &str) -> Result<String
 /// deformation).
 pub(in crate::renderer) fn compose_world_shader(base: &str) -> String {
     format!(
-        "{}\n{}",
+        "{}\n{}\n{}",
         weather::with_world_weather(base),
-        include_str!("../../surface_deformation.wgsl")
+        include_str!("../../surface_deformation.wgsl"),
+        include_str!("../../sky_fractal.wgsl")
     )
 }
 
 pub(in crate::renderer) fn ray_traced_world_shader_source(base: &str) -> Result<String, String> {
+    ray_traced_world_shader_source_with_features(base, rt_diagnostics::config().receiver)
+}
+
+pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
+    base: &str,
+    features: ReceiverFeatures,
+) -> Result<String, String> {
     const BINDING: &str =
         "@group(3) @binding(7) var sky_admission_texture: texture_depth_2d_array;";
     const CASCADE_FN: &str =
         "fn cascaded_shadow_visibility(input: VertexOut, normal: vec3<f32>) -> f32 {";
     const LOCAL_FN: &str = "fn local_light_shadow_visibility(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> f32 {";
-    const SURFACE_SUN: &str = "        let shadow_visibility = cascaded_shadow_visibility(input, input.world_normal);\n        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);";
+    const SURFACE_SUN: &str = "        let shadow_rgb = sun_shadow_transmission(input, input.world_normal);\n        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);";
 
     if !base.contains(BINDING) {
         return Err("group-3 sky-admission binding anchor not found".to_string());
@@ -1900,7 +1971,38 @@ pub(in crate::renderer) fn ray_traced_world_shader_source(base: &str) -> Result<
     // The shared ray-query core (sampling, alpha-tested candidate handling,
     // shadow-ray helpers). Lives in its own file so the world shader, the sun
     // compute pass and the model receivers all read one reviewable source.
-    let rt_visibility = include_str!("../../rt_core.wgsl").replace("\r\n", "\n");
+    let mut rt_visibility = include_str!("../../rt_core.wgsl").replace("\r\n", "\n");
+    if !features.glass {
+        // Remove RGB traversal from the module itself. A runtime uniform branch
+        // still feeds both ray-query paths into the driver's compiler.
+        for name in ["rt_candidate_glass_throughput", "rt_trace_shadow_throughput"] {
+            replace_rt_declaration(&mut rt_visibility, &format!("fn {name}("), "")?;
+        }
+        // Remove the RGB branch of the shared query as well: WGSL validation
+        // resolves function references before specialization removes dead code.
+        const COLOR_BRANCH: &str = "            if (colored && material.texture.y != 0u) {\n                throughput *= rt_candidate_glass_throughput(candidate);\n                if (all(throughput < vec3<f32>(0.001))) {\n                    throughput = vec3<f32>(0.0);\n                    rayQueryTerminate(&query);\n                    break;\n                }\n            } else if (rt_alpha_candidate_blocks(candidate)) {";
+        if !rt_visibility.contains(COLOR_BRANCH) {
+            return Err("shared RT glass query branch anchor changed".into());
+        }
+        rt_visibility = rt_visibility.replace(COLOR_BRANCH,
+            "            if (rt_alpha_candidate_blocks(candidate)) {");
+        rt_visibility = rt_visibility.replace("select(0x204u, 0x200u, colored)", "0x204u");
+        replace_rt_declaration(&mut rt_visibility, "fn rt_local_shadow_rgb(",
+            "fn rt_local_shadow_rgb(light: PointLight, world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(ray_traced_local_shadow_visibility(light, world_position, normal)); }")?;
+        replace_rt_declaration(&mut rt_visibility, "fn rt_sun_shadow_rgb(",
+            "fn rt_sun_shadow_rgb(input: VertexOut, normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(ray_traced_shadow_visibility(input, normal)); }")?;
+        // Keep the RGBA/alpha decoding and legacy glass-candidate classification:
+        // they match the CPU tables, even with RGB transmission compiled out.
+        let start = source.find("struct RasterGlassTriangle {")
+            .ok_or("raster glass declarations missing")?;
+        let end = source.find("fn sun_shadow_transmission(")
+            .ok_or("raster sun receiver missing")?;
+        source.replace_range(start..end, "");
+        replace_rt_declaration(&mut source, "fn sun_shadow_transmission(",
+            "fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> { if (!ENABLE_CASCADED_SHADOWS) { return vec3<f32>(1.0); } return vec3<f32>(cascaded_shadow_visibility(input, normal)); }")?;
+        replace_rt_declaration(&mut source, "fn local_light_shadow_rgb(",
+            "fn local_light_shadow_rgb(light: PointLight, world_position: vec3<f32>, receiver_normal: vec3<f32>) -> vec3<f32> { return vec3<f32>(local_light_shadow_visibility(light, world_position, receiver_normal)); }")?;
+    }
     source = source.replacen(
         CASCADE_FN,
         &format!(
@@ -1917,12 +2019,22 @@ pub(in crate::renderer) fn ray_traced_world_shader_source(base: &str) -> Result<
         1,
     );
 
+    // RGB sun queries go through the same RT BLAS/TLAS and material flags as
+    // local shadows. Enabled mode bypasses the scalar sun cache because its
+    // RG texel cannot encode RGB transmission; OFF keeps the cached fast path.
+    const SUN_RGB_FN: &str = "fn sun_shadow_transmission(input: VertexOut, normal: vec3<f32>) -> vec3<f32> {";
+    if !source.contains(SUN_RGB_FN) {
+        return Err("RGB sunlight receiver hook not found".to_string());
+    }
+    source = source.replacen(SUN_RGB_FN,
+        &format!("{SUN_RGB_FN}\n    if (ENABLE_RAY_TRACED_SUN) {{ return rt_sun_shadow_rgb(input, normal); }}"), 1);
+
     // The lean shader compiles the sun-shadow darkening out unless a cascade is
     // enabled. The RT sun is not a cascade, so open that gate for it. Absent in
     // bsp.wgsl, which keeps the block unconditional; the no-op replace is fine.
     source = source.replacen(
-        "    if (ENABLE_CASCADED_SHADOWS && (material.header.z & 4u) != 0u) {\n        let shadow_visibility = cascaded_shadow_visibility(",
-        "    if ((ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && (material.header.z & 4u) != 0u) {\n        let shadow_visibility = cascaded_shadow_visibility(",
+        "    if (ENABLE_CASCADED_SHADOWS && (material.header.z & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
+        "    if ((ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && (material.header.z & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
         1,
     );
 
@@ -1932,7 +2044,7 @@ pub(in crate::renderer) fn ray_traced_world_shader_source(base: &str) -> Result<
     // and must retain its own receiver rules.
     source = source.replacen(
         SURFACE_SUN,
-        "        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);\n        var shadow_visibility = 1.0;\n        if (sun_facing > 0.0 && shadow_settings.params.z != 0.0) {\n            shadow_visibility = cascaded_shadow_visibility(input, input.world_normal);\n        }",
+        "        let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);\n        let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);\n        var shadow_rgb = vec3<f32>(1.0);\n        if (sun_facing > 0.0 && shadow_settings.params.z != 0.0) {\n            shadow_rgb = sun_shadow_transmission(input, input.world_normal);\n        }",
         1,
     );
 
@@ -1943,7 +2055,51 @@ pub(in crate::renderer) fn ray_traced_world_shader_source(base: &str) -> Result<
         return Err("clustered emitter sampling anchors not found".to_string());
     }
     source = rt_sampled_light_loops(&source)?;
-    source.push_str(include_str!("../../rt_resolution_read.wgsl"));
+    // The newer RT radiance denoiser provides scalar visibility, which is
+    // correct only for neutral/opaque shadows. When RGB glass is enabled,
+    // preserve actual per-channel throughput through every pane instead of
+    // collapsing tinted light to a scalar filtered value. Keep the denoised
+    // scalar path intact when glass is disabled.
+    if features.denoiser {
+        for n in ["normal", "n"] {
+            source = source.replace(
+                &format!("local_light_shadow_rgb(light, input.world_position, {n})"),
+                &format!("rt_local_shadow_receiver_rgb(light, input, {n}, cluster.indices[i])"),
+            );
+        }
+        // Append only after call-site rewrites: helper fallback calls should not
+        // acquire out-of-scope cluster indices from a recursive replacement.
+        source.push_str(include_str!("../../rt_resolution_read.wgsl"));
+        source.push_str(r#"
+fn rt_local_shadow_receiver_rgb(
+    light: PointLight, input: VertexOut, normal: vec3<f32>, light_index: u32
+) -> vec3<f32> {
+    if ((lighting_settings.feature_flags.z & 0x200u) != 0u) {
+        return rt_denoised_local_throughput(light, input, normal, light_index);
+    }
+    return vec3<f32>(rt_denoised_local_visibility(light, input, normal, light_index));
+}
+"#);
+    } else {
+        // The pre-denoiser receiver source and group-3 interface (bindings 0..16).
+        source.push_str(include_str!("../../rt_resolution_read_legacy.wgsl"));
+        if features.glass {
+            for n in ["normal", "n"] {
+                source = source.replace(
+                    &format!("local_light_shadow_rgb(light, input.world_position, {n})"),
+                    &format!("rt_local_shadow_rgb(light, input.world_position, {n})"),
+                );
+            }
+        }
+    }
+
+
+    if features.denoiser {
+        source = source.replace(
+            "    let shaded = shade_surface(input, front);",
+            "    let rt_debug = rt_denoiser_debug(input);\n    if (rt_debug.a >= 0.0) { return rt_debug; }\n    let shaded = shade_surface(input, front);"
+        );
+    }
 
     // The enhanced ocean path has one outer guard that bypasses the common
     // visibility helper. Let the RT variant enter that same authoritative path.
@@ -1952,6 +2108,14 @@ pub(in crate::renderer) fn ray_traced_world_shader_source(base: &str) -> Result<
         "(ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && shadow_settings.light_direction_enabled.w > 0.5",
     );
     Ok(source)
+}
+
+fn replace_rt_declaration(source: &mut String, anchor: &str, replacement: &str) -> Result<(), String> {
+    let declaration = rt_models::declaration(source, anchor)?;
+    let start = source.find(anchor).ok_or_else(|| format!("missing {anchor}"))?;
+    let end = start + declaration.len();
+    source.replace_range(start..end, replacement);
+    Ok(())
 }
 
 pub(in crate::renderer) fn rt_alpha_storage_entry<T: Pod>(
@@ -1984,46 +2148,56 @@ pub(in crate::renderer) fn rt_alpha_storage_entries() -> [wgpu::BindGroupLayoutE
 pub(in crate::renderer) fn create_ray_traced_shadow_receiver_layout(
     device: &wgpu::Device,
 ) -> wgpu::BindGroupLayout {
-    let alpha_entries = rt_alpha_storage_entries();
-    let cache_entries = rt_resolution::receiver_entries();
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("JKA hardware ray-traced sun/weather receiver layout"),
-        entries: &[
+        entries: &rt_receiver_layout_entries(rt_diagnostics::config().receiver),
+    })
+}
+
+pub(in crate::renderer) fn rt_receiver_layout_entries(features: ReceiverFeatures) -> Vec<wgpu::BindGroupLayoutEntry> {
+    let alpha_entries = rt_alpha_storage_entries();
+    let cache_entries = rt_resolution::receiver_entries();
+    let radiance_entries = rt_radiance::receiver_entries();
+    let local_entries = rt_local_radiance::receiver_entries();
+    let entries = [
             depth_array_texture_entry(0),
             comparison_sampler_entry(1),
             uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
             uniform_entry(3, wgpu::ShaderStages::FRAGMENT),
-            unfilterable_texture_entry_stages(
-                4,
-                wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-            ),
-            uniform_entry(
-                5,
-                wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-            ),
+            unfilterable_texture_entry_stages(4, wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE),
+            uniform_entry(5, wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE),
             nonfiltering_sampler_entry(6, wgpu::ShaderStages::FRAGMENT),
             depth_array_texture_entry(7),
             wgpu::BindGroupLayoutEntry {
-                binding: 8,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::AccelerationStructure {
-                    vertex_return: false,
-                },
-                count: None,
+                binding: 8, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::AccelerationStructure { vertex_return: false }, count: None,
             },
-            alpha_entries[0],
-            alpha_entries[1],
-            alpha_entries[2],
-            alpha_entries[3],
-            alpha_entries[4],
-            alpha_entries[5],
-            cache_entries[0],
-            cache_entries[1],
-        ],
-    })
+            alpha_entries[0], alpha_entries[1], alpha_entries[2],
+            alpha_entries[3], alpha_entries[4], alpha_entries[5],
+            cache_entries[0], cache_entries[1],
+            radiance_entries[0], radiance_entries[1], radiance_entries[2], radiance_entries[3],
+            local_entries[0], local_entries[1], local_entries[2],
+    ];
+    entries[..rt_receiver_binding_count(features)].to_vec()
+}
+
+fn rt_receiver_binding_count(features: ReceiverFeatures) -> usize {
+    if features.denoiser { 24 } else { 17 }
 }
 
 impl RayTracedShadowResources {
+    pub(in crate::renderer) fn world_shader_for_variant(
+        &self, key: crate::renderer::WorldShaderVariantKey,
+    ) -> &wgpu::ShaderModule {
+        let enhanced = key.family() == crate::renderer::WorldShaderFamily::Enhanced;
+        match (enhanced, key.rt_receiver_denoiser) {
+            (true, true) => &self.world_shader,
+            (false, true) => &self.world_shader_lean,
+            (true, false) => &self.world_shader_raw,
+            (false, false) => &self.world_shader_lean_raw,
+        }
+    }
+
     pub(in crate::renderer) fn scene(&self) -> RtReceiverScene<'_> {
         RtReceiverScene {
             tlas: &self._tlas,
@@ -2081,10 +2255,7 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
         alpha_textures: alpha_texture_buffer,
         alpha_texels: alpha_texel_buffer,
     } = scene;
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("JKA hardware ray-traced sun/weather receiver bind group"),
-        layout,
-        entries: &[
+    let entries = [
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(shadow_array_view),
@@ -2153,7 +2324,40 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
                 binding: 16,
                 resource: wgpu::BindingResource::TextureView(&sun_shadow_history.published),
             },
-        ],
+            wgpu::BindGroupEntry {
+                binding: 17,
+                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.radiance.published),
+            },
+            wgpu::BindGroupEntry {
+                binding: 18,
+                resource: sun_shadow_history.radiance.sun_uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 19,
+                resource: wgpu::BindingResource::TextureView(sun_shadow_history.radiance.raw_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 20,
+                resource: wgpu::BindingResource::TextureView(sun_shadow_history.radiance.temporal_view()),
+            },
+            wgpu::BindGroupEntry {
+                binding: 21,
+                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local_radiance.filter.published),
+            },
+            wgpu::BindGroupEntry {
+                binding: 22,
+                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local_radiance.raw),
+            },
+            wgpu::BindGroupEntry {
+                binding: 23,
+                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local_radiance.reference),
+            },
+    ];
+    let count = rt_receiver_binding_count(rt_diagnostics::config().receiver);
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("JKA hardware ray-traced sun/weather receiver bind group"),
+        layout,
+        entries: &entries[..count],
     })
 }
 

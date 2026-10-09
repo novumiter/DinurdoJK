@@ -1,6 +1,10 @@
 //! Weather.
-use crate::app::egui_settings::{
-    index_of, percent, segmented_row, theme, ui, App, PuddleQuality, RainIntensity,
+use crate::{
+    app::egui_settings::{
+        index_of, percent, quality_table_row, segmented_row, theme, ui, App, FootprintMode,
+        PuddleQuality,
+    },
+    world_effects::WeatherType,
 };
 
 impl App {
@@ -65,6 +69,19 @@ impl App {
         );
         theme::row(
             ui,
+            "Wind visuals",
+            "Camera-centred airborne dust and sparse gust wisps driven by the same atmospheric wind as rain, grass and ocean. Sheltered areas are suppressed by the weather heightfield.",
+            theme::Reset::Environment(ui::ENV_ROW_WIND_VISUALS),
+            |ui| {
+                let mut value = self.video.wind_visuals;
+                let readout = percent(value);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    self.set_wind_visuals(value);
+                }
+            },
+        );
+        theme::row(
+            ui,
             "Mapper export",
             "Copy the shared weather wind as map entity keys.",
             theme::Reset::None,
@@ -84,44 +101,39 @@ impl App {
 
         theme::section(
             ui,
-            "PRECIPITATION",
-            "Rainfall, wetness and precipitation haze.",
+            "WEATHER",
+            "World weather authored by r_we. Choose one presentation type here; direct r_we/CS_EFFECTS commands still retain OpenJK-style additive compatibility.",
         );
-        self.egui_environment_toggle(
-            ui,
-            "Rain",
-            "Simulated rainfall with splashes, wetness on surfaces and haze. \
-             Follows the shared weather wind.",
-            ui::ENV_ROW_RAIN,
-            self.video.rain,
-        );
-        ui.add_enabled_ui(self.video.rain, |ui| {
-            const RAIN: [(RainIntensity, &str); 3] = [
-                (RainIntensity::Light, "Light"),
-                (RainIntensity::Rain, "Rain"),
-                (RainIntensity::Heavy, "Heavy"),
-            ];
-            if let Some(target) = segmented_row(
-                ui,
-                "Rain intensity",
-                "Particle count, streak length and how much haze the rain adds. \
-             Heavy is noticeably more expensive.",
-                theme::Reset::Environment(ui::ENV_ROW_RAIN_INTENSITY),
-                self.video.rain_intensity,
-                &RAIN,
-            ) {
-                let current = index_of(&RAIN, self.video.rain_intensity, 1);
-                let next = index_of(&RAIN, target, current);
-                self.environment_selected = ui::ENV_ROW_RAIN_INTENSITY;
-                self.change_environment_setting(next as i32 - current as i32);
-            }
 
+        let current_weather = self.effective_weather_type();
+        let mut selected_weather = current_weather;
+        theme::row(
+            ui,
+            "Weather type",
+            "Selects the active particle-weather type using the same world-effect state as r_we. Clear really clears rain, snow, sand and other particle weather.",
+            theme::Reset::Environment(ui::ENV_ROW_RAIN),
+            |ui| {
+                egui::ComboBox::from_id_salt("weather_type")
+                    .selected_text(current_weather.label())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for weather in WeatherType::ALL {
+                            ui.selectable_value(&mut selected_weather, weather, weather.label());
+                        }
+                    });
+            },
+        );
+        if selected_weather != current_weather {
+            self.environment_selected = ui::ENV_ROW_RAIN;
+            self.set_weather_type(selected_weather);
+        }
+
+        let weather = self.effective_weather_type();
+        if weather.is_rain() {
             self.egui_environment_toggle(
                 ui,
                 "Rain on lens",
-                "Droplets and rivulets of water on the camera itself, refracting the \
-             finished scene. Fades out under shelter with the rest of the weather. \
-             HUD and menus are drawn afterwards and stay undistorted.",
+                "Droplets and rivulets of water on the camera itself, refracting the finished scene. Fades out under shelter with the rest of the weather. HUD and menus are drawn afterwards and stay undistorted.",
                 ui::ENV_ROW_RAIN_GLASS,
                 self.video.rain_glass,
             );
@@ -133,9 +145,7 @@ impl App {
             if let Some(target) = segmented_row(
                 ui,
                 "Puddle water",
-                "How puddles and wet ground are shaded. High uses the ocean's water \
-             response (Fresnel, sun and light glints) and streaked reflections \
-             of neon and lit surfaces. The cost is only paid on wet pixels.",
+                "How puddles and wet ground are shaded. High uses the ocean's water response (Fresnel, sun and light glints) and streaked reflections of neon and lit surfaces. The cost is only paid on wet pixels.",
                 theme::Reset::Environment(ui::ENV_ROW_PUDDLE_WATER),
                 self.video.puddle_quality,
                 &PUDDLE_WATER,
@@ -148,8 +158,7 @@ impl App {
             theme::row(
                 ui,
                 "Scattered puddles",
-                "How readily rain collects in small puddles on large, level ground \
-             such as plazas and roads. Enclosed basins flood regardless.",
+                "How readily rain collects in small puddles on large, level ground such as plazas and roads. Enclosed basins flood regardless.",
                 theme::Reset::Environment(ui::ENV_ROW_PUDDLE_SCATTER),
                 |ui| {
                     let mut value = self.video.puddle_scatter;
@@ -162,8 +171,7 @@ impl App {
             theme::row(
                 ui,
                 "Rain color grade",
-                "A wet-weather grade that fades in with the rain: cooler shadows, \
-             warmer highlights and richer neon. 0% leaves the picture untouched.",
+                "A wet-weather grade that fades in with the rain: cooler shadows, warmer highlights and richer neon. 0% leaves the picture untouched.",
                 theme::Reset::Environment(ui::ENV_ROW_RAIN_GRADE),
                 |ui| {
                     let mut value = self.video.rain_grade;
@@ -173,6 +181,34 @@ impl App {
                     }
                 },
             );
-        });
+        }
+
+        if weather.uses_footprints() {
+            const FOOTPRINTS: [(FootprintMode, &str); 3] = [
+                (FootprintMode::Off, "Off"),
+                (FootprintMode::TwoD, "2D stamp"),
+                (FootprintMode::ThreeD, "3D + 2D stamp"),
+            ];
+            if let Some(target) = quality_table_row(
+                ui,
+                "Footprints",
+                "Tracks left in snow and sand. The 2D stamp is a decal; 3D also displaces local snow so prints have real depth.",
+                theme::Reset::Environment(ui::ENV_ROW_FOOTPRINTS),
+                self.video.footprints,
+                &FOOTPRINTS,
+                2,
+            ) {
+                self.set_environment_quality_segment(ui::ENV_ROW_FOOTPRINTS, target);
+            }
+        }
+
+        if matches!(weather, WeatherType::Fog | WeatherType::HeavyRainFog | WeatherType::LightFog) {
+            theme::banner(
+                ui,
+                "This is a legacy r_we particle-cloud mode. Its compatibility state is preserved; use the Fog section above for DinurdoJK's rendered fog controls.",
+                theme::TEXT_DIM,
+            );
+        }
+
     }
 }

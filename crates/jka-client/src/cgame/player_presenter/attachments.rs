@@ -5,7 +5,7 @@ use crate::cgame::player_presenter::{
     Matrix3x4, PlayerModelAsset, PlayerPresenter, PresentedEntity, WP_BRYAR_PISTOL, WP_SABER,
 };
 
-/// One cosmetic MD3 (`CG_DrawCosmeticOnPlayer`): a hat or cape bolted to a player.
+/// One player attachment MD3: a jaPRO cosmetic or a carried powerup flag.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CosmeticDraw {
     pub entity_num: u16,
@@ -20,6 +20,8 @@ pub struct CosmeticDraw {
 /// Force-power visuals CG_Player hands to the FX system / local entities.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerFxRequest {
+    /// CG_PlayerPowerups: a flag carrier or quad light at the player origin.
+    PowerupLight { origin: [f32; 3], rgb: [f32; 3] },
     /// FX_PlayEntityEffectID at a hand bolt (lightning, drain).
     Effect {
         name: &'static str,

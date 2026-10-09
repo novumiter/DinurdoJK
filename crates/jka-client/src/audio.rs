@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         mpsc::{self, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -61,6 +61,11 @@ const STEAM_AUDIO_HRTF_FRAME_SIZE: u32 = 256;
 // most recent atomically published result.
 const STEAM_AUDIO_DIRECT_HZ: u64 = 30;
 const STEAM_AUDIO_DIRECT_MIN_INTERVAL: Duration = Duration::from_micros(1_000_000 / STEAM_AUDIO_DIRECT_HZ);
+// Direct simulation arrives asynchronously. A new positional voice may therefore
+// have already emitted a few dry blocks before its first occlusion/transmission
+// result is available. Never hard-switch that filter into (or out of) the audio
+// stream at a 256-sample boundary: ramp its wet path instead.
+const STEAM_AUDIO_DIRECT_CROSSFADE_SECONDS: f32 = 0.010;
 // AudioNimbus retains Steam Audio's historical `num_transmission_rays` field
 // name, but the value is the maximum number of occluding surfaces whose
 // material transmission coefficients are accumulated along the direct path.
@@ -856,6 +861,7 @@ struct SteamAudioSource {
     binaural_effect: Option<BinauralEffect>,
     direct_effect: DirectEffect,
     binaural_enabled: Arc<AtomicBool>,
+    hrtf_interpolation: Arc<AtomicU8>,
     environmental_enabled: Arc<AtomicBool>,
     output_rate: rodio::SampleRate,
     source_position: f64,
@@ -869,6 +875,9 @@ struct SteamAudioSource {
     finished: bool,
     last_block_hrtf: bool,
     direct_was_active: bool,
+    direct_mix: f32,
+    direct_mix_step: f32,
+    last_direct_params: Option<DirectEffectParams>,
     hrtf_was_active: bool,
     finish_after_block: bool,
     input: Vec<f32>,
@@ -881,12 +890,26 @@ struct SteamAudioSource {
     output: Vec<f32>,
     output_cursor: usize,
 }
+
+fn crossfade_direct_sample(dry: f32, wet: f32, mix: &mut f32, target: f32, step: f32) -> f32 {
+    // Render with the previous mix first so the first sample after a dry/wet
+    // transition is exactly continuous with the block that preceded it.
+    let blend = *mix;
+    if *mix < target {
+        *mix = (*mix + step).min(target);
+    } else if *mix > target {
+        *mix = (*mix - step).max(target);
+    }
+    dry + (wet - dry) * blend
+}
+
 impl SteamAudioSource {
     fn new(
         sound: Arc<RegisteredSound>,
         gains: Arc<Gains>,
         runtime: Arc<SteamAudioSignalRuntime>,
         binaural_enabled: Arc<AtomicBool>,
+        hrtf_interpolation: Arc<AtomicU8>,
         environmental_enabled: Arc<AtomicBool>,
         output_rate: rodio::SampleRate,
     ) -> Result<Self, String> {
@@ -906,6 +929,9 @@ impl SteamAudioSource {
             finished: false,
             last_block_hrtf: false,
             direct_was_active: false,
+            direct_mix: 0.0,
+            direct_mix_step: 1.0 / (STEAM_AUDIO_DIRECT_CROSSFADE_SECONDS * rate).max(1.0),
+            last_direct_params: None,
             hrtf_was_active: false,
             finish_after_block: false,
             input: vec![0.0; frame_size],
@@ -923,6 +949,7 @@ impl SteamAudioSource {
             binaural_effect,
             direct_effect,
             binaural_enabled,
+            hrtf_interpolation,
             environmental_enabled,
             output_rate,
             source_position: 0.0,
@@ -934,6 +961,7 @@ impl SteamAudioSource {
         gains: Arc<Gains>,
         runtime: Arc<SteamAudioSignalRuntime>,
         binaural_enabled: Arc<AtomicBool>,
+        hrtf_interpolation: Arc<AtomicU8>,
         environmental_enabled: Arc<AtomicBool>,
         output_rate: rodio::SampleRate,
         start_frame: usize,
@@ -943,6 +971,7 @@ impl SteamAudioSource {
             gains,
             runtime,
             binaural_enabled,
+            hrtf_interpolation,
             environmental_enabled,
             output_rate,
         )?;
@@ -1050,26 +1079,51 @@ impl SteamAudioSource {
             None
         };
         let direct_active = environment_params.is_some();
-        if direct_active != self.direct_was_active {
-            // A live A/B toggle must not resume filter history from before the
-            // bypass interval (or carry the old map/source state into enable).
+        if direct_active && !self.direct_was_active {
+            // A re-enabled direct path must not resume stale filter history.
+            // The wet crossfade below makes the reset itself inaudible.
             self.direct_effect.reset();
-            self.direct_was_active = direct_active;
         }
-        let direct_applied = if let Some(params) = environment_params {
-            if let Ok(input) = AudioBufferRef::try_from(&self.input[..]) {
-                if let Ok(mut output) = AudioBufferMut::try_new(&mut self.direct[..], 1) {
-                    self.direct_effect.apply(&params, &input, &mut output).is_ok()
+        self.direct_was_active = direct_active;
+        if let Some(params) = environment_params {
+            self.last_direct_params = Some(params);
+        }
+
+        // During fade-out, keep rendering the last valid filtered signal until
+        // the wet contribution reaches zero. During fade-in the Steam filter is
+        // allowed to start at its requested target, but only enters the mix
+        // gradually. This removes the dry -> occluded step when the 30 Hz
+        // simulation worker publishes a new voice's first result.
+        let should_process_direct = direct_active || self.direct_mix > 0.0;
+        let direct_applied = if should_process_direct {
+            if let Some(params) = self.last_direct_params.as_ref() {
+                if let Ok(input) = AudioBufferRef::try_from(&self.input[..]) {
+                    if let Ok(mut output) = AudioBufferMut::try_new(&mut self.direct[..], 1) {
+                        self.direct_effect.apply(params, &input, &mut output).is_ok()
+                    } else { false }
                 } else { false }
-            } else { false }
+            } else {
+                false
+            }
         } else {
             false
         };
-
-        // Build the exact legacy pan fallback from the direct-processed mono
-        // block. Environmental acoustics therefore work even when HRTF is off.
+        let direct_mix_target = if direct_active && direct_applied { 1.0 } else { 0.0 };
         for i in 0..self.input.len() {
-            let processed = if direct_applied { self.direct[i] } else { self.input[i] };
+            let wet = if direct_applied { self.direct[i] } else { self.input[i] };
+            self.direct[i] = crossfade_direct_sample(
+                self.input[i],
+                wet,
+                &mut self.direct_mix,
+                direct_mix_target,
+                self.direct_mix_step,
+            );
+        }
+
+        // Build the exact legacy pan fallback from the smoothly direct-processed
+        // mono block. Environmental acoustics therefore work even when HRTF is off.
+        for i in 0..self.input.len() {
+            let processed = self.direct[i];
             self.output[i * 2] = processed * self.left_gain[i];
             self.output[i * 2 + 1] = processed * self.right_gain[i];
         }
@@ -1085,8 +1139,7 @@ impl SteamAudioSource {
         }
         if use_hrtf {
             for i in 0..self.input.len() {
-                let processed = if direct_applied { self.direct[i] } else { self.input[i] };
-                self.hrtf_input[i] = processed * self.mono_gain[i];
+                self.hrtf_input[i] = self.direct[i] * self.mono_gain[i];
             }
             self.deinterleaved.fill(0.0);
             let applied = if let (Some(effect), Some(hrtf)) =
@@ -1094,9 +1147,13 @@ impl SteamAudioSource {
             {
                 if let Ok(input) = AudioBufferRef::try_from(&self.hrtf_input[..]) {
                     if let Ok(mut output) = AudioBufferMut::try_new(&mut self.deinterleaved[..], 2) {
+                        let interpolation = match self.hrtf_interpolation.load(Ordering::Relaxed) {
+                            1 => HrtfInterpolation::Bilinear,
+                            _ => HrtfInterpolation::Nearest,
+                        };
                         let params = BinauralEffectParams {
                             direction: Direction::new(direction[0], direction[1], direction[2]),
-                            interpolation: HrtfInterpolation::Nearest,
+                            interpolation,
                             spatial_blend: 1.0,
                             hrtf: hrtf.clone(),
                             peak_delays: None,
@@ -1402,6 +1459,7 @@ pub struct AudioBackend {
     steam_audio_binaural_enabled: bool,
     steam_audio_environmental_enabled: bool,
     steam_audio_binaural_switch: Arc<AtomicBool>,
+    steam_audio_hrtf_interpolation: Arc<AtomicU8>,
     steam_audio_environmental_switch: Arc<AtomicBool>,
     steam_audio_signal_runtime: Option<Arc<SteamAudioSignalRuntime>>,
     steam_audio_hrtf_error: Option<String>,
@@ -1447,6 +1505,7 @@ impl AudioBackend {
         // feature is enabled. HRTF is optional inside this runtime; direct wall
         // filtering can still work on a device where HRTF creation fails.
         let steam_audio_binaural_switch = Arc::new(AtomicBool::new(false));
+        let steam_audio_hrtf_interpolation = Arc::new(AtomicU8::new(0));
         let steam_audio_environmental_switch = Arc::new(AtomicBool::new(false));
         let (steam_audio_signal_runtime, steam_audio_hrtf_error) = if steam_audio_enabled {
             let runtime = SteamAudioSignalRuntime::new(output_sample_rate.get());
@@ -1492,6 +1551,7 @@ impl AudioBackend {
             steam_audio_binaural_enabled,
             steam_audio_environmental_enabled,
             steam_audio_binaural_switch,
+            steam_audio_hrtf_interpolation,
             steam_audio_environmental_switch,
             steam_audio_signal_runtime,
             steam_audio_hrtf_error,
@@ -1506,7 +1566,6 @@ impl AudioBackend {
         })
     }
 
-    #[cfg(test)]
     fn from_mixer(mixer: Mixer) -> Self {
         Self {
             voices: Vec::new(),
@@ -1533,6 +1592,7 @@ impl AudioBackend {
             steam_audio_binaural_enabled: true,
             steam_audio_environmental_enabled: true,
             steam_audio_binaural_switch: Arc::new(AtomicBool::new(false)),
+            steam_audio_hrtf_interpolation: Arc::new(AtomicU8::new(0)),
             steam_audio_environmental_switch: Arc::new(AtomicBool::new(false)),
             steam_audio_signal_runtime: None,
             steam_audio_hrtf_error: None,
@@ -1547,10 +1607,25 @@ impl AudioBackend {
         }
     }
 
-    #[cfg(test)]
+    /// Fixed-format software mixer used by deterministic demo/movie export.
+    /// It deliberately bypasses the physical output device: the caller advances
+    /// the source explicitly, so wall-clock render/encode speed cannot affect A/V time.
     pub(crate) fn offline() -> (Self, rodio::mixer::MixerSource) {
         let (mixer, output) = rodio::mixer::mixer(rodio::nz!(2), rodio::nz!(48000));
         (Self::from_mixer(mixer), output)
+    }
+
+    /// Build the offline mixer with the audible mix controls of the current backend.
+    /// Runtime Steam Audio/device state is intentionally not copied: export is a pure
+    /// software 48 kHz stereo path.
+    pub(crate) fn offline_like(&self) -> (Self, rodio::mixer::MixerSource) {
+        let (mut backend, output) = Self::offline();
+        backend.effects_volume = self.effects_volume;
+        backend.voice_volume = self.voice_volume;
+        backend.separation = self.separation;
+        backend.music_level = self.music_level;
+        backend.rate = 1.0;
+        (backend, output)
     }
 
     pub fn info(&self) -> AudioInfo {
@@ -1636,6 +1711,14 @@ impl AudioBackend {
     pub fn set_steam_audio_binaural_enabled(&mut self, enabled: bool) {
         self.steam_audio_binaural_enabled = enabled;
         self.refresh_steam_audio_signal_runtime();
+    }
+
+    /// Select Steam Audio's HRTF direction interpolation live. Existing voices
+    /// read this atomic once per 256-sample DSP block, so no voice/runtime rebuild
+    /// is needed and the game/render thread never performs the interpolation work.
+    pub fn set_steam_audio_hrtf_interpolation(&mut self, interpolation: u8) {
+        self.steam_audio_hrtf_interpolation
+            .store(interpolation.min(1), Ordering::Relaxed);
     }
 
     pub fn set_steam_audio_environmental_enabled(&mut self, enabled: bool) {
@@ -1914,7 +1997,7 @@ impl AudioBackend {
                     // Preserve the old call to spatialize(listener.origin): at
                     // distance zero dot=0, so each ear gets s_separation.
                     stereo: [self.separation; 2],
-                    mono: 1.0,
+                    mono: self.separation,
                     direction: [0.0, 0.0, -1.0],
                     hrtf_spatializable: false,
                 },
@@ -1953,14 +2036,18 @@ impl AudioBackend {
 
             let (mono, direction, spatializable) = if let Some(total) = total {
                 let length = total.direction_sum.iter().map(|v| v * v).sum::<f32>().sqrt();
+                // Match the level of the already-merged/clamped legacy stereo
+                // channel. Summing pre-pan mono gains here can make a merged
+                // Steam Audio loop substantially louder than JKA.
+                let hrtf_level = stereo_rms_gain(next);
                 if total.has_spatial && !total.has_nonspatial && length > 0.0001 {
                     (
-                        total.mono.min(1.0) * self.effects_volume,
+                        hrtf_level,
                         total.direction_sum.map(|component| component / length),
                         true,
                     )
                 } else {
-                    (total.mono.min(1.0) * self.effects_volume, [0.0, 0.0, -1.0], false)
+                    (hrtf_level, [0.0, 0.0, -1.0], false)
                 }
             } else {
                 (0.0, [0.0, 0.0, -1.0], false)
@@ -2015,6 +2102,7 @@ impl AudioBackend {
                         Arc::clone(&gains),
                         runtime,
                         Arc::clone(&self.steam_audio_binaural_switch),
+                        Arc::clone(&self.steam_audio_hrtf_interpolation),
                         Arc::clone(&self.steam_audio_environmental_switch),
                         rodio::SampleRate::new(self.output_sample_rate).expect("audio sample rate is non-zero"),
                         phase,
@@ -2063,6 +2151,10 @@ impl AudioBackend {
             if rate == 0.0 { music.player.pause(); } else { music.player.play(); }
         }
     }
+
+    /// Current presentation rate. `snd_restart` uses this to rebuild the
+    /// physical backend without unpausing or changing demo playback speed.
+    pub fn rate(&self) -> f32 { self.rate }
 
     pub fn play(&mut self, request: SoundRequest, sound: Arc<RegisteredSound>) {
         self.play_scaled(request, sound, 1.0);
@@ -2136,6 +2228,7 @@ impl AudioBackend {
                     Arc::clone(&gains),
                     runtime,
                     Arc::clone(&self.steam_audio_binaural_switch),
+                    Arc::clone(&self.steam_audio_hrtf_interpolation),
                     Arc::clone(&self.steam_audio_environmental_switch),
                     rodio::SampleRate::new(self.output_sample_rate).expect("audio sample rate is non-zero"),
                 ) {
@@ -2204,18 +2297,23 @@ fn channels_stomp(a: i32, b: i32) -> bool {
 #[derive(Clone, Copy, Debug)]
 struct Spatialization {
     stereo: [f32; 2],
-    /// OpenJK distance/channel/master gain before legacy L/R panning. This is
-    /// the mono level fed to Steam Audio's HRTF path.
+    /// Mono level fed to Steam Audio. Keep its RMS equal to the legacy JKA
+    /// stereo gains so enabling HRTF changes localization, not apparent level.
     mono: f32,
     /// Steam Audio listener-local direction: +X right, +Y up, +Z behind.
     direction: [f32; 3],
     hrtf_spatializable: bool,
 }
 
+#[inline]
+fn stereo_rms_gain(stereo: [f32; 2]) -> f32 {
+    ((stereo[0] * stereo[0] + stereo[1] * stereo[1]) * 0.5).sqrt()
+}
+
 /// OpenJK codemp/client/snd_dma.cpp S_SpatializeOrigin. Volume is applied
 /// later in OpenJK's ChannelPaint; multiplying it here is algebraically the
-/// same for our normalized floating-point samples. HRTF reuses the exact same
-/// channel attenuation/master volume but replaces only the final stereo pan.
+/// same for our normalized floating-point samples. HRTF keeps the legacy
+/// stereo RMS as its mono input level and replaces only the localization.
 fn sound_spatialization(
     request: &SoundRequest,
     listener: Listener,
@@ -2261,7 +2359,8 @@ fn sound_gains(
 
 /// S_SpatializeOrigin with master_vol = 1 plus the listener-local direction
 /// needed by Steam Audio. The legacy stereo result remains byte-for-byte the
-/// same formula as before; HRTF consumes `mono` + `direction` instead.
+/// same formula as before. HRTF consumes the RMS-equivalent legacy level plus
+/// `direction`, avoiding the previous pre-pan gain boost for close sounds.
 fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separation: f32) -> Spatialization {
     let delta = std::array::from_fn::<_, 3, _>(|i| origin[i] - listener.origin[i]);
     let distance = delta.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -2301,9 +2400,10 @@ fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separat
         [0.0, 0.0, -1.0]
     };
 
+    let stereo = [distance_gain * left_scale, distance_gain * right_scale];
     Spatialization {
-        stereo: [distance_gain * left_scale, distance_gain * right_scale],
-        mono: distance_gain,
+        stereo,
+        mono: stereo_rms_gain(stereo),
         direction,
         hrtf_spatializable: distance > 0.0001 && distance_gain > 0.0,
     }
@@ -2349,6 +2449,27 @@ mod tests {
     }
 
     #[test]
+    fn steam_direct_filter_crossfade_is_sample_continuous() {
+        let mut mix = 0.0;
+        let step = 1.0 / (STEAM_AUDIO_DIRECT_CROSSFADE_SECONDS * 48_000.0);
+
+        // An intentionally extreme dry/wet difference makes a hard switch easy
+        // to detect. The first activation sample must remain exactly dry and
+        // subsequent samples can move only by the configured ramp step.
+        let first = crossfade_direct_sample(1.0, -1.0, &mut mix, 1.0, step);
+        let second = crossfade_direct_sample(1.0, -1.0, &mut mix, 1.0, step);
+        assert_eq!(first, 1.0);
+        assert!((second - first).abs() <= 2.0 * step + f32::EPSILON);
+
+        // The reverse transition also starts from the existing wet mix rather
+        // than snapping back to dry at the block boundary.
+        mix = 1.0;
+        let first_fade_out = crossfade_direct_sample(1.0, -1.0, &mut mix, 0.0, step);
+        assert_eq!(first_fade_out, -1.0);
+        assert!(mix < 1.0);
+    }
+
+    #[test]
     fn environmental_result_is_atomically_published_without_steam_distance_attenuation() {
         let gains = Gains::new([0.5, 0.5]);
         assert!(gains.environment_params().is_none());
@@ -2382,11 +2503,13 @@ mod tests {
         };
         let right = spatialize_detail([0.0, -100.0, 0.0], listener, CHAN_AUTO, 0.5);
         assert_eq!(right.stereo, [0.0, 1.0]);
+        assert!((right.mono - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
         assert_eq!(right.direction, [1.0, 0.0, 0.0]);
         assert!(right.hrtf_spatializable);
 
         let front = spatialize_detail([100.0, 0.0, 0.0], listener, CHAN_AUTO, 0.5);
         assert_eq!(front.stereo, [0.5, 0.5]);
+        assert_eq!(front.mono, 0.5);
         assert_eq!(front.direction, [0.0, 0.0, -1.0]);
 
         let above = spatialize_detail([0.0, 0.0, 100.0], listener, CHAN_AUTO, 0.5);

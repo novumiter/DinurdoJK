@@ -1,0 +1,81 @@
+// Sanity-check renderer: rasterize a stock GLM's bind pose with no rebind
+// involved at all, to see what an already-correct model's neck looks like
+// unposed - ruling out "this is just what an unposed bind pose looks like"
+// before blaming the Source1 rebind for an elongated neck.
+use image::{Rgb, RgbImage};
+use jka_assets::ghoul2::parse_glm;
+
+struct Tri { p: [[f32; 3]; 3], n: [f32; 3] }
+
+fn face_normal(p: &[[f32; 3]; 3]) -> [f32; 3] {
+    let a = [p[1][0]-p[0][0], p[1][1]-p[0][1], p[1][2]-p[0][2]];
+    let b = [p[2][0]-p[0][0], p[2][1]-p[0][1], p[2][2]-p[0][2]];
+    let c = [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+    let len = (c[0]*c[0]+c[1]*c[1]+c[2]*c[2]).sqrt().max(1e-6);
+    [c[0]/len, c[1]/len, c[2]/len]
+}
+
+fn rasterize(tris: &[Tri], width: u32, height: u32, min: [f32; 2], max: [f32; 2]) -> RgbImage {
+    let mut img = RgbImage::from_pixel(width, height, Rgb([18, 18, 24]));
+    let mut depth = vec![f32::INFINITY; (width * height) as usize];
+    let span_x = (max[0]-min[0]).max(1e-3);
+    let span_y = (max[1]-min[1]).max(1e-3);
+    let scale = (width as f32/span_x).min(height as f32/span_y) * 0.92;
+    let cx = (min[0]+max[0])*0.5;
+    let cy = (min[1]+max[1])*0.5;
+    let to_screen = |p: [f32;3]| -> (f32,f32,f32) {
+        ((p[0]-cx)*scale + width as f32*0.5, (-(p[2]-cy))*scale + height as f32*0.5, p[1])
+    };
+    let light = { let l=[-0.35f32,-1.0,0.55]; let n=(l[0]*l[0]+l[1]*l[1]+l[2]*l[2]).sqrt(); [l[0]/n,l[1]/n,l[2]/n] };
+    for tri in tris {
+        let a = to_screen(tri.p[0]); let b = to_screen(tri.p[1]); let c = to_screen(tri.p[2]);
+        let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as i32;
+        let max_x = a.0.max(b.0).max(c.0).ceil().min(width as f32) as i32;
+        let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as i32;
+        let max_y = a.1.max(b.1).max(c.1).ceil().min(height as f32) as i32;
+        if min_x >= max_x || min_y >= max_y { continue; }
+        let denom = (b.1-c.1)*(a.0-c.0) + (c.0-b.0)*(a.1-c.1);
+        if denom.abs() < 1e-6 { continue; }
+        let ndotl = (tri.n[0]*-light[0]+tri.n[1]*-light[1]+tri.n[2]*-light[2]).max(0.0);
+        let base = 60.0 + 180.0*ndotl;
+        let color = Rgb([base as u8, (base*0.92) as u8, (base*0.85) as u8]);
+        for y in min_y..max_y { for x in min_x..max_x {
+            let (px,py) = (x as f32+0.5, y as f32+0.5);
+            let w0 = ((b.1-c.1)*(px-c.0)+(c.0-b.0)*(py-c.1))/denom;
+            let w1 = ((c.1-a.1)*(px-c.0)+(a.0-c.0)*(py-c.1))/denom;
+            let w2 = 1.0-w0-w1;
+            if w0 < -0.001 || w1 < -0.001 || w2 < -0.001 { continue; }
+            let z = w0*a.2+w1*b.2+w2*c.2;
+            let index = (y as u32*width+x as u32) as usize;
+            if z < depth[index] { depth[index]=z; img.put_pixel(x as u32, y as u32, color); }
+        }}
+    }
+    img
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let glm_path = std::env::args().nth(1).expect("usage: render_glm <model.glm> <out.png>");
+    let out_path = std::env::args().nth(2).unwrap_or_else(|| "glm_preview.png".into());
+    let data = std::fs::read(&glm_path)?;
+    let model = parse_glm(&data)?;
+    let lod = model.lods.first().ok_or("no LOD0")?;
+    let mut tris = Vec::new();
+    for surface in &lod.surfaces {
+        let name = model.hierarchy.get(surface.surface_index).map(|h| h.name.as_str()).unwrap_or("?");
+        if name.starts_with('*') { continue; }
+        for tri in &surface.triangles {
+            let p = tri.map(|i| surface.vertices[i as usize].position);
+            tris.push(Tri { p, n: face_normal(&p) });
+        }
+    }
+    println!("{} triangles", tris.len());
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for t in &tris { for p in &t.p {
+        min[0]=min[0].min(p[0]); min[1]=min[1].min(p[2]);
+        max[0]=max[0].max(p[0]); max[1]=max[1].max(p[2]);
+    }}
+    rasterize(&tris, 700, 900, min, max).save(&out_path)?;
+    println!("wrote {out_path}");
+    Ok(())
+}

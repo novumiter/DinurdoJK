@@ -233,11 +233,11 @@ impl App {
         Ok(true)
     }
 
-    /// A local (solo) game mounts the `fs_game` cvar (default `japro`) over base,
-    /// like `+set fs_game japro`, so jaPRO-only assets resolve as they do on a
-    /// jaPRO server. An explicit `--game` startup directory wins, and a missing
-    /// directory leaves base alone. Must run before the map request so the map
-    /// worker sees the game dir.
+    /// A local (solo) game mounts the `fs_game` cvar over base; the default is
+    /// empty, which leaves the base directory active. `+set fs_game japro` can
+    /// select a mod explicitly. An explicit `--game` startup directory wins,
+    /// and a missing directory leaves base alone. Must run before the map request
+    /// so the map worker sees the game dir.
     pub(in crate::app) fn enter_local_game_dir(&mut self) {
         if self.startup_game.is_some() {
             return;

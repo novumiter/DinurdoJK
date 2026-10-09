@@ -833,7 +833,7 @@ impl Renderer {
                 time,
             ],
             clip_plane: [0.0; 4],
-            render_flags: [0, u32::from(static_bsp_ao), classic_flags, 0],
+            render_flags: [0, (u32::from(static_bsp_ao) | (u32::from(self.sky_fractal_override) << 1)), classic_flags, 0],
             camera_forward: request.camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),

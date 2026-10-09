@@ -25,6 +25,10 @@ impl Renderer {
             auto4_inline_full_start,
             vertex_buffer,
             cull_records_buffer,
+            raster_glass_dynamic,
+            raster_glass_static,
+            dynamic_lights,
+            local_shadows,
             ..
         } = world;
         let stride = std::mem::size_of::<GpuVertex>() as u64;
@@ -35,12 +39,14 @@ impl Renderer {
             inline_models.iter().map(|model| model.model),
             instances,
         );
+        let mut glass_poses_changed = false;
         for model in inline_models.iter_mut() {
             let target = poses.get_mut(model.model as usize).and_then(Vec::pop);
             if model.uploaded == Some(target) {
                 continue;
             }
             model.uploaded = Some(target);
+            glass_poses_changed |= model.rt_mask_sources.iter().any(|source| source.material.glass);
             let (vertices, minimum, maximum) = posed_inline_vertices(&model.base, target);
             self.queue.write_buffer(
                 vertex_buffer,
@@ -78,6 +84,37 @@ impl Renderer {
                 if let Some(batch) = auto4_batches.get_mut(auto4_index) {
                     batch.bounds_min = minimum;
                     batch.bounds_max = maximum;
+                }
+            }
+        }
+        if glass_poses_changed {
+            raster_glass_dynamic.clear();
+            for model in inline_models.iter() {
+                let Some(Some(pose)) = model.uploaded else { continue; };
+                raster_glass_dynamic.extend(model.raster_glass_local.iter().copied().map(|tri| {
+                    crate::renderer::lighting::glass_transmission::transformed_triangle(tri, pose)
+                }));
+            }
+            // Update the directional caster list whenever glass movers change.
+            // Static BSP glass is otherwise uploaded once on map load.
+            let count = crate::renderer::lighting::glass_transmission::upload_raster_sun_glass(
+                &self.queue, &local_shadows.glass_buffer, raster_glass_static, raster_glass_dynamic);
+            if count > crate::renderer::lighting::glass_transmission::RASTER_SUN_GLASS_SLOTS
+                * crate::renderer::lighting::glass_transmission::RASTER_GLASS_PER_LIGHT {
+                // Overflow is conservatively disabled by upload_raster_sun_glass.
+                // Do not emit a warning each frame for moving glass.
+            }
+            // Mover transforms invalidate only the RGB caster list, not the
+            // static opaque depth cubemap. Avoid six shadow redraws each frame.
+            if self.tinted_glass_enabled {
+                for (slot, entry) in local_shadows.cache_entries.iter().enumerate() {
+                    let Some(light_index) = entry.light_index else { continue; };
+                    let Some(light) = dynamic_lights.get(light_index) else { continue; };
+                    let (glass, _) = crate::renderer::lighting::glass_transmission::pack_raster_glass_slot(
+                        light.position, light.radius, raster_glass_static, raster_glass_dynamic);
+                    self.queue.write_buffer(&local_shadows.glass_buffer,
+                        (slot * std::mem::size_of::<crate::renderer::lighting::glass_transmission::RasterGlassSlot>()) as u64,
+                        bytemuck::bytes_of(&glass));
                 }
             }
         }

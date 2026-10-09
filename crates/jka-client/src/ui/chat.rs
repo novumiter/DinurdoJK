@@ -273,6 +273,7 @@ pub(in crate::ui) fn build_chat_input(
     let prompt = match ui.chat_mode {
         ChatMode::Global => "SAY:",
         ChatMode::Team => "TEAM:",
+        ChatMode::Direct(_) => "TELL:",
     };
     let field = format!("{prompt} {}_", ui.chat_input);
     let wrapped = wrap_fixed_chat_text(&field, max_columns);

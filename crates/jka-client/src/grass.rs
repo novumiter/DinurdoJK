@@ -484,7 +484,7 @@ impl GrassRenderer {
 
         let globals = globals_for_environment(
             None,
-            crate::ocean::OceanWind {
+            crate::ocean::AtmosphericWind {
                 speed: DEFAULT_WEATHER_WIND_SPEED,
                 direction: DEFAULT_WEATHER_WIND_DIRECTION,
                 gust: 0.2,
@@ -698,7 +698,7 @@ impl GrassRenderer {
         &self,
         queue: &wgpu::Queue,
         sun: DirectionalSun,
-        weather_wind: crate::ocean::OceanWind,
+        weather_wind: crate::ocean::AtmosphericWind,
         realtime_sun_lighting: bool,
     ) {
         let globals = globals_for_environment(Some(sun), weather_wind, realtime_sun_lighting);
@@ -2055,7 +2055,7 @@ fn alpha_blend_u8(background: u8, foreground: u8, alpha: u8) -> u8 {
 
 fn globals_for_environment(
     sun: Option<DirectionalSun>,
-    weather_wind: crate::ocean::OceanWind,
+    weather_wind: crate::ocean::AtmosphericWind,
     realtime_sun_lighting: bool,
 ) -> GrassGlobals {
     let sun = sun.unwrap_or(DirectionalSun {
