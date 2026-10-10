@@ -1,6 +1,6 @@
 //! Bounded, opt-in CPU frame-encoding capture. No draw-site locks, allocations,
-//! WGPU readbacks, device polls, or per-frame disk IO. The renderer only reads
-//! one relaxed boolean while unarmed. File writing runs after capture on a
+//! WGPU readbacks, device polls, or per-frame disk IO. Frame functions and model
+//! draw phases each read one relaxed boolean while unarmed. File writing runs after capture on a
 //! separate OS thread, never in the render/present critical section.
 use crate::renderer::{active_batch_selection, FrameInfo, Renderer};
 use std::path::PathBuf;
@@ -15,7 +15,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 33] = [
+const FIELDS: [&str; 106] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -49,6 +49,79 @@ const FIELDS: [&str; 33] = [
     "frame_inline_draw_indexed_indirect_calls",
     "frame_inline_multi_draw_indexed_indirect_calls",
     "frame_inline_multi_draw_indexed_indirect_count_calls",
+    "world_cpu_compaction_active",
+    "world_cpu_compact_visible_members",
+    "world_cpu_compact_singleton_groups",
+    "world_cpu_compact_multistage_excluded_batches",
+    "ghoul2_prepared_instances",
+    "ghoul2_prepared_draws",
+    "cpu_model_prepared_ranges",
+    "gpu_fx_prepared_ranges",
+    "model_phase_cpu_draw_indexed_calls",
+    "model_phase_fx_draw_calls",
+    "model_phase_ghoul2_draw_indexed_calls",
+    "model_phase_set_pipeline_calls",
+    "model_phase_set_bind_group_calls",
+    "model_phase_set_vertex_buffer_calls",
+    "model_phase_set_index_buffer_calls",
+    "dynamic_model_prepare_ms",
+    "dynamic_vertex_stream_upload_bytes",
+    "dynamic_index_stream_upload_bytes",
+    "gpu_fx_instance_upload_bytes",
+    "ghoul2_bone_upload_bytes",
+    "ghoul2_draw_upload_bytes",
+    "model_gather_ms",
+    "model_cpu_pack_ms",
+    "model_ghoul2_group_ms",
+    "model_upload_and_pipeline_ms",
+    "model_pack_parallel_used",
+    "model_index_upload_skipped_bytes",
+    "ghoul2_instanced_groups",
+    "ghoul2_singleton_opaque_draws",
+    "ghoul2_ordered_instances",
+    "ghoul2_companion_excluded_instances",
+    "ghoul2_largest_instance_group",
+    "ghoul2_batch_key_cache_hits",
+    "ghoul2_batch_key_cache_misses",
+    "cpu_md3_surfaces",
+    "cpu_md3_vertices",
+    "cpu_md3_indices",
+    "cpu_ghoul2_surfaces",
+    "cpu_ghoul2_vertices",
+    "cpu_ghoul2_indices",
+    "cpu_mesh_fx_surfaces",
+    "cpu_mesh_fx_vertices",
+    "cpu_mesh_fx_indices",
+    "cpu_blob_shadow_surfaces",
+    "cpu_blob_shadow_vertices",
+    "cpu_blob_shadow_indices",
+    "cpu_other_surfaces",
+    "cpu_other_vertices",
+    "cpu_other_indices",
+    "gpu_latest_world_ms",
+    "gpu_latest_depth_ms",
+    "gpu_latest_post_ms",
+    "gpu_latest_models_opaque_ms",
+    "gpu_latest_models_translucent_ms",
+    "gpu_latest_fx_opaque_ms",
+    "gpu_latest_fx_translucent_ms",
+    "gpu_latest_rt_build_ms",
+    "gpu_latest_grass_ms",
+    "gpu_latest_clouds_ms",
+    "client_latest_total_ms",
+    "client_latest_snapshot_ms",
+    "client_latest_entity_present_ms",
+    "client_latest_player_present_ms",
+    "client_latest_fx_ms",
+    "client_latest_fx_tessellate_ms",
+    "client_latest_ghoul2_pose_ms",
+    "client_latest_ghoul2_skin_ms",
+    "client_latest_ghoul2_bolt_ms",
+    "client_latest_fx_cpu_geom_surfaces",
+    "client_latest_fx_cpu_vertices",
+    "client_latest_fx_cpu_indices",
+    "client_latest_fx_gpu_sprite_batches",
+    "client_latest_fx_gpu_sprite_instances",
 ];
 
 #[derive(Clone)]
@@ -58,7 +131,19 @@ struct PerfRow {
 }
 
 impl PerfRow {
-    fn from_frame(info: &FrameInfo) -> Self {
+    fn from_frame(info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf) -> Self {
+        let models = &renderer.dynamic_model_renderer;
+        let model_calls = models.perf_phase_calls.get();
+        let prepare = &models.perf_prepare;
+        let gpu_timing = renderer.gpu_profiler.enabled()
+            .then(|| renderer.gpu_profiler.latest_timing()).flatten();
+        // These retained slices are exactly the full streams passed to
+        // queue.write_buffer in raster/RT preparation. Empty-input raster
+        // frames return before clearing scratch, so never report stale bytes.
+        let has_input = info.dynamic_model_surfaces != 0;
+        fn bytes<T>(values: &[T], has_input: bool) -> f64 {
+            if has_input { std::mem::size_of_val(values) as f64 } else { 0.0 }
+        }
         let categorized_encode = info.perf_encode_setup_ms
             + info.perf_encode_pre_world_ms
             + info.perf_encode_scene_ms
@@ -101,6 +186,79 @@ impl PerfRow {
                 f64::from(info.perf_encode_calls.draw_indexed_indirect),
                 f64::from(info.perf_encode_calls.multi_draw_indexed_indirect),
                 f64::from(info.perf_encode_calls.multi_draw_indexed_indirect_count),
+                f64::from(u8::from(info.world_cpu_compaction_active)),
+                f64::from(info.world_cpu_compact_visible_members),
+                f64::from(info.world_cpu_compact_singleton_groups),
+                f64::from(info.world_cpu_compact_multistage_excluded_batches),
+                f64::from(info.ghoul2_gpu_instances),
+                f64::from(info.ghoul2_gpu_draw_calls),
+                f64::from(models.draws.len() as u32),
+                f64::from(models.fx_sprite_draws.len() as u32),
+                f64::from(model_calls.cpu_draw_indexed),
+                f64::from(model_calls.fx_draw),
+                f64::from(model_calls.skin_draw_indexed),
+                f64::from(model_calls.set_pipeline),
+                f64::from(model_calls.set_bind_group),
+                f64::from(model_calls.set_vertex_buffer),
+                f64::from(model_calls.set_index_buffer),
+                info.dynamic_model_prepare_ms,
+                bytes(models.scratch_vertices.as_slice(), has_input),
+                prepare.index_upload_bytes as f64,
+                bytes(models.scratch_fx_sprite_instances.as_slice(), has_input),
+                bytes(models.scratch_bones.as_slice(), has_input),
+                bytes(models.scratch_draw_data.as_slice(), has_input),
+                prepare.gather_ms,
+                prepare.cpu_pack_ms,
+                prepare.ghoul2_group_ms,
+                prepare.upload_ms,
+                u8::from(prepare.parallel_used) as f64,
+                prepare.index_skipped_bytes as f64,
+                prepare.ghoul2_instanced_groups as f64,
+                prepare.ghoul2_singleton_groups as f64,
+                prepare.ghoul2_ordered_instances as f64,
+                prepare.ghoul2_excluded_instances as f64,
+                prepare.ghoul2_largest_group as f64,
+                prepare.batch_key_hits as f64,
+                prepare.batch_key_misses as f64,
+                prepare.cpu_sources[0].surfaces as f64,
+                prepare.cpu_sources[0].vertices as f64,
+                prepare.cpu_sources[0].indices as f64,
+                prepare.cpu_sources[1].surfaces as f64,
+                prepare.cpu_sources[1].vertices as f64,
+                prepare.cpu_sources[1].indices as f64,
+                prepare.cpu_sources[2].surfaces as f64,
+                prepare.cpu_sources[2].vertices as f64,
+                prepare.cpu_sources[2].indices as f64,
+                prepare.cpu_sources[3].surfaces as f64,
+                prepare.cpu_sources[3].vertices as f64,
+                prepare.cpu_sources[3].indices as f64,
+                prepare.cpu_sources[4].surfaces as f64,
+                prepare.cpu_sources[4].vertices as f64,
+                prepare.cpu_sources[4].indices as f64,
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::World.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::Depth.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::Post.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::DynamicModels.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::DynamicModelsTranslucent.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::FxSpritesOpaque.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::FxSpritesTranslucent.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::RtBuild.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::Grass.index()]).unwrap_or(f64::NAN),
+                gpu_timing.and_then(|timing| timing.milliseconds[crate::renderer::GpuPass::Clouds.index()]).unwrap_or(f64::NAN),
+                client.total_ms,
+                client.snapshot_ms,
+                client.entity_present_ms,
+                client.player_present_ms,
+                client.fx_ms,
+                client.fx_tessellate_ms,
+                client.ghoul2_pose_ms,
+                client.ghoul2_skin_ms,
+                client.ghoul2_bolt_ms,
+                client.fx_cpu_geom_surfaces as f64,
+                client.fx_cpu_vertices as f64,
+                client.fx_cpu_indices as f64,
+                client.fx_gpu_sprite_batches as f64,
+                client.fx_gpu_sprite_instances as f64,
 
             ],
         }
@@ -151,7 +309,7 @@ impl PerfCapture {
             pvs_candidate_batches: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             pvs_candidate_indices: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             fingerprint: format!(
-                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?}",
+                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={}",
                 renderer.config.width,
                 renderer.config.height,
                 renderer.config.present_mode,
@@ -160,6 +318,18 @@ impl PerfCapture {
                 renderer.gpu_profiler.enabled(),
                 renderer.pvs_mode,
                 renderer.frame_plan.world_path,
+                renderer.dynamic_model_renderer.ghoul2_batch_draws.config_value(),
+                renderer.dynamic_model_renderer.model_state_cache,
+                renderer.dynamic_model_renderer.dynamic_batch_draws,
+                renderer.world_compact_min_draws,
+                renderer.dynamic_model_renderer.fx_zero_alpha_discard,
+                renderer.gpu_driven_enabled,
+                renderer.hiz_occlusion_enabled,
+                renderer.weather.fog.legacy_drawfog_value(),
+                renderer.dynamic_lights_mode,
+                renderer.dynamic_model_renderer.model_prepare_threads,
+                renderer.dynamic_model_renderer.model_index_upload_cache,
+                renderer.dynamic_model_renderer.ghoul2_batch_key_cache,
             ),
         }
     }
@@ -168,7 +338,7 @@ impl PerfCapture {
     /// users can close the console; then skip 120 additional successful frames
     /// to avoid measuring the first dynamic resource/path warmup. This does not
     /// pretend pipelines are fully prewarmed: repeat the scene before capture.
-    pub(in crate::renderer) fn record(&mut self, info: &FrameInfo, renderer: &Renderer) -> bool {
+    pub(in crate::renderer) fn record(&mut self, info: &FrameInfo, renderer: &Renderer, client: &crate::renderer::ClientFramePerf) -> bool {
         if self.armed_at.elapsed() < Duration::from_secs(2)
             || info.perf_primary_command_buffers == 0
         {
@@ -200,7 +370,7 @@ impl PerfCapture {
                 }
             }
         }
-        self.frames.push(PerfRow::from_frame(info));
+        self.frames.push(PerfRow::from_frame(info, renderer, client));
         self.frames.len() >= self.target_frames
     }
 
@@ -294,7 +464,7 @@ impl PerfCapture {
             });
         }
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "dinurdojk-cpu-renderperf-v1",
+            "schema": "dinurdojk-cpu-renderperf-v3",
             "sample_count": self.frames.len(),
             "warmup_seconds_before_frame_skip": 2,
             "warmup_skipped_frames": self.warmup_frames,
@@ -313,6 +483,18 @@ impl PerfCapture {
                 "primary_command_buffers counts the principal frame command buffer and optional profiler-readback command buffer ONLY",
                 "world_multidraw_groups counts API groups, not executed per-surface indexed draws",
                 "frame_inline_* counters are exact call-site counts for instrumented frame functions, not all nested renderer modules and not executed GPU indirect draw totals",
+                "model_phase_* are actual API calls in DynamicModelRenderer::draw_phase, including secondary/glow views; exclude wireframe, shadow helper and compute commands",
+                "ghoul2_prepared_* and *_prepared_ranges describe prepared main-view geometry, not actual per-pass calls; cpu_model includes MD3, CPU-skinned models, mesh FX and RT-skinned indexed streams",
+                "world_cpu_compact_* audit only the CPU main-view compaction path, not GPU-driven visibility; singleton counts are eligible visible groups before the minimum-size test",
+                "*_upload_bytes cover the five full dynamic vertex/index, GPU FX instance and Ghoul2 bone/draw streams written during preparation; exclude cache-miss mesh creation, textures and extra RT metadata/raw-color streams; dynamic streams include MD3 and mesh FX, not MD3-only costs",
+                "world_cpu_compact_multistage_excluded_batches counts visible grouped opaque/masked batches rejected due to adjacent sibling stages, not all multistage or transparent geometry",
+                "model_gather includes serial CPU lighting/rebasing in threads=0; modes 1/2/4 move that work to model_cpu_pack; compare their sum rather than either interval alone; RT uses its original preparation path",
+                "model_upload_and_pipeline includes capacity checks, lazy pipeline readiness, queue writes and optional index comparisons; it is not a pure PCIe transfer timer",
+                "cpu_* source counts describe indexed CPU input geometry including clipped blob output, not GPU skin/sprite inputs or actual replay draw counts",
+                "ghoul2_singleton_opaque_draws includes opaque/masked draws not instanced by the current batching threshold; ordered and companion-excluded inputs stay conservative",
+                "dynamic_index_stream_upload_bytes now records actual index writes; index cache may skip or update a span; other stream sizes exclude cache-miss resource creation and RT metadata",
+                "gpu_latest_* use asynchronous resolved pass timings, not matching the CPU CSV frame; model/FX/grass intervals nest inside world and must not be summed with world/frame totals",
+                "client_latest_* are telemetry from the consumed client snapshot, may repeat across renderer frames, include overlapping/nested intervals and exclude waits; never add client total to renderer frame time",
                 "no image parity or hardware benchmarks are implied by this capture"
             ],
             "metrics": stats,
@@ -345,6 +527,10 @@ fn material_audit(renderer: &Renderer) -> serde_json::Value {
         full_batches: u64,
         full_indices: u64,
         coarse_inline_batches: u64,
+        coarse_grouped_batches: u64,
+        full_grouped_batches: u64,
+        coarse_lightmap_pages: std::collections::HashSet<Option<usize>>,
+        full_lightmap_pages: std::collections::HashSet<Option<usize>>,
     }
     let mut counts: Vec<Counts> = (0..world.material_debug.entries.len())
         .map(|_| Counts::default()).collect();
@@ -357,9 +543,13 @@ fn material_audit(renderer: &Renderer) -> serde_json::Value {
                 count.coarse_batches += 1;
                 count.coarse_indices += indices;
                 if batch.is_inline_entity { count.coarse_inline_batches += 1; }
+                count.coarse_grouped_batches += u64::from(batch.compact_group.is_some());
+                count.coarse_lightmap_pages.insert(batch.source.lightmap);
             } else {
                 count.full_batches += 1;
                 count.full_indices += indices;
+                count.full_grouped_batches += u64::from(batch.compact_group.is_some());
+                count.full_lightmap_pages.insert(batch.source.lightmap);
             }
         }
     }
@@ -379,6 +569,10 @@ fn material_audit(renderer: &Renderer) -> serde_json::Value {
                 "coarse_inline_batches": count.coarse_inline_batches,
                 "full_batches": count.full_batches,
                 "full_triangle_indices": count.full_indices,
+                "coarse_compaction_group_members": count.coarse_grouped_batches,
+                "full_compaction_group_members": count.full_grouped_batches,
+                "coarse_distinct_lightmap_bindings": count.coarse_lightmap_pages.len(),
+                "full_distinct_lightmap_bindings": count.full_lightmap_pages.len(),
             })
         }).collect();
     entries.sort_unstable_by(|a,b| {
@@ -392,6 +586,17 @@ fn material_audit(renderer: &Renderer) -> serde_json::Value {
     let offenders: Vec<_> = entries.iter()
         .filter(|v| v["resolved_stages"].as_u64().unwrap_or(0) >= 2)
         .take(20).cloned().collect();
+    let groups = world.compact_groups.iter().map(|group| {
+        let (set, batch) = match group.representative_set {
+            crate::renderer::WorldBatchSet::Coarse =>
+                ("coarse", &world.coarse_batches[group.representative_index]),
+            crate::renderer::WorldBatchSet::Full =>
+                ("full", &world.full_batches[group.representative_index]),
+        };
+        let material = world.material_debug.entries.get(batch.source.material_debug_index as usize)
+            .map(|entry| entry.name.as_str());
+        serde_json::json!({ "set": set, "material": material, "map_load_members": group.max_count })
+    }).collect::<Vec<_>>();
     serde_json::json!({
         "available": true,
         "method": "map-loaded source draw batches, ranked by coarse triangle-index spans (NOT shader GPU time, visible pixels or true per-frame draw calls)",
@@ -399,6 +604,7 @@ fn material_audit(renderer: &Renderer) -> serde_json::Value {
         "ranked_materials_total": total,
         "top20_multistage_static_candidates": offenders,
         "all_materials_by_static_indices": entries,
+        "compaction_groups_static_not_visible": groups,
     })
 }
 

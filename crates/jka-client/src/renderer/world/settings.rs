@@ -6,7 +6,8 @@ use crate::renderer::{
     AssetSearchPath, CullDebugMode, DynamicLightsMode, DynamicShadowsMode,
     GrassPreparedDraw, HashMap, Instant, JumpShadeState, Path, PipelineJobKey,
     PlanarReflectionDebugMode, PreparedSurfaceSpriteEffects, PvsMode, Renderer,
-    WorldPipelineCompilePlan, WorldPipelineVariant, WorldRenderPath, WorldShaderFamily,
+    WorldPipelineCompilePlan, WorldPipelineReuseCatalog, WorldPipelineVariant,
+    WorldRenderPath, WorldShaderFamily,
     WorldShaderVariantKey, AUTO_DETAIL_TEXTURE_FILES, PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR,
     PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION, PBR_PROFILE_POM_ADAPTIVE_STEPS,
     PBR_PROFILE_POM_MIP_AWARE, PBR_PROFILE_SHARED_MATERIAL_EVAL, PBR_PROFILE_SHARED_TANGENT_FRAME,
@@ -580,6 +581,11 @@ impl Renderer {
             return;
         };
         if current_key == key {
+            // The user may have returned to the active variant while a costly
+            // earlier request is still compiling. Cancel its remaining PSOs.
+            if self.world_variant_pending.is_some() {
+                self.pipeline_jobs.cancel_slot("world-variant", 0);
+            }
             self.world_variant_pending = None;
             return;
         }
@@ -589,6 +595,7 @@ impl Renderer {
             .as_ref()
             .is_some_and(|world| world.pipeline_variants.contains_key(&key))
         {
+            self.pipeline_jobs.cancel_slot("world-variant", 0);
             if let Some(world) = &mut self.world {
                 world.active_pipeline_variant = key;
                 self.world_variant_pending = None;
@@ -600,6 +607,7 @@ impl Renderer {
                     world.pipeline_variants.len()
                 );
             }
+            self.log_rt_dynamic_lighting_status();
             return;
         }
 
@@ -642,9 +650,9 @@ impl Renderer {
             0,
             pipeline_hash(&(key, scene_format, samples, &plan)),
         );
-        if let Some(variant) = self
+        if let Some(Some(variant)) = self
             .pipeline_jobs
-            .take_ready::<WorldPipelineVariant>(job_key)
+            .take_ready::<Option<WorldPipelineVariant>>(job_key)
         {
             if let Some(world) = &mut self.world {
                 world.pipeline_variants.insert(key, variant);
@@ -658,13 +666,31 @@ impl Renderer {
                     world.pipeline_variants.len(),
                 );
             }
+            self.log_rt_dynamic_lighting_status();
             return;
         }
 
+        // This function is polled on every frame until compilation finishes.
+        // Do not clone existing GPU PSO handles or rebuild a captured compile
+        // plan repeatedly while the exact same async job is already running.
+        if self.pipeline_jobs.is_compiling(job_key) {
+            self.world_variant_pending = Some(key);
+            return;
+        }
+        // Different settings can share native PSOs for individual passes.
+        // The catalog keys each pass by its *effective* shader specialization,
+        // pipeline state, render-target format and MSAA configuration.
+        // Compile-only catalog: complete, exact pass/PSO identities captured
+        // once from prior variants. Nothing is cloned during steady-state frames.
+        let reusable_pipelines = self.world.as_ref().map(|world| {
+            WorldPipelineReuseCatalog::from_variants(
+                &world.pipeline_variants, scene_format, samples,
+            )
+        }).unwrap_or_default();
         let device = self.device.clone();
         let queued =
             self.pipeline_jobs
-                .request(job_key, "specialized BSP world variant", move || {
+                .request_with_cancel(job_key, "specialized BSP world variant", move |cancel| {
                     create_world_pipeline_variant_from_plan(
                         &device,
                         &layout,
@@ -673,6 +699,8 @@ impl Renderer {
                         samples,
                         key,
                         &plan,
+                        &reusable_pipelines,
+                        cancel,
                     )
                 });
         if queued {

@@ -88,6 +88,7 @@ impl App {
             ui_vgs: self.ui_vgs,
             jump_height_shade: self.jump_height_shade,
             screen_shake: self.screen_shake,
+            head_look: self.head_look,
             zoom_fov: self.japro_zoom_fov,
             fk_duration: self.japro_fk_duration,
             fk_first_jump_duration: self.japro_fk_first_jump_duration,

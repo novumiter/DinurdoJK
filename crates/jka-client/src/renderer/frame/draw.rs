@@ -1056,6 +1056,8 @@ impl Renderer {
                     .collect();
                 ocean.set_surfaces(&self.queue, &fallback);
                 let promoted: Vec<_> = promoted.iter().filter(|p| fallback.contains(&p.surface)).cloned().collect();
+                ocean.configure_coastal(&self.device, &self.queue, self.coastal_enabled,
+                    self.coastal_pool, self.coastal_atlas.as_ref(), &promoted, &self.promoted_ocean_overrides);
                 ocean.set_promoted_surfaces(&self.device, &self.queue, &promoted, &self.promoted_ocean_overrides);
             }
             // Re-centre the clipmap before the wave step so the geometry the
@@ -1105,6 +1107,14 @@ impl Renderer {
         }
         info.ocean.authored_oceans =
             u32::try_from(self.authored_oceans.len()).unwrap_or(u32::MAX);
+        // Coastal compute has its own GPU interval, separate from FFT work.
+        if render_ocean && !ocean_sim_hidden {
+            if let Some(ocean)=self.ocean.as_mut().filter(|o|o.coastal.is_some()) {
+                self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::CoastalSim,false);
+                ocean.encode_coastal(&self.queue,&mut encoder,frame_delta);
+                self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::CoastalSim,true);
+            }
+        }
         info.ocean.promoted_surfaces = self
             .world
             .as_ref()
@@ -2345,6 +2355,7 @@ impl Renderer {
                 && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
                 && !world.compact_groups.is_empty();
             if use_cpu_compaction {
+                info.world_cpu_compaction_active = true;
                 let compact_capacity = world
                     .compact_groups
                     .iter()
@@ -2385,6 +2396,9 @@ impl Renderer {
                             same_world_surface(batch, &active.batches[next_index])
                         });
                     if previous_same || next_same {
+                        if capture_api_calls {
+                            info.world_cpu_compact_multistage_excluded_batches += 1;
+                        }
                         continue;
                     }
                     let Some(group) = world.compact_groups.get(group_index) else {
@@ -2409,8 +2423,15 @@ impl Renderer {
                         first_instance: 0,
                     };
                     self.cpu_compact_count_scratch[group_index] = count.saturating_add(1);
+                    if capture_api_calls {
+                        info.world_cpu_compact_visible_members += 1;
+                    }
                 }
 
+                if capture_api_calls {
+                    info.world_cpu_compact_singleton_groups = self.cpu_compact_count_scratch
+                        .iter().filter(|&&count| count == 1).count() as u32;
+                }
                 if compact_capacity != 0 {
                     self.queue.write_buffer(
                         &world.compact_indirect_buffer,
@@ -2833,20 +2854,30 @@ impl Renderer {
                                 }
                                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                                 pass.set_bind_group(1, &representative.bind_group, &[]);
-                                if capture_api_calls { info.perf_encode_calls.multi_draw_indexed_indirect_count = info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1); }
-                                pass.multi_draw_indexed_indirect_count(
-                                    &world.compact_indirect_buffer,
-                                    u64::from(group.output_base)
-                                        * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
-                                    &world.compact_count_buffer,
-                                    group_index as u64 * std::mem::size_of::<u32>() as u64,
-                                    group.max_count,
-                                );
                                 let compacted_count = self.cpu_compact_count_scratch[group_index];
-                                info.world_multidraw_groups =
-                                    info.world_multidraw_groups.saturating_add(1);
-                                info.world_multidraw_batches =
-                                    info.world_multidraw_batches.saturating_add(compacted_count);
+                                let direct_singleton = compacted_count < self.world_compact_min_draws;
+                                // Keep the exact representative bindings and fog
+                                // replay even for singleton direct submission.
+                                // Falling through to per-batch state could change
+                                // legacy per-surface dlight metadata.
+                                if direct_singleton {
+                                    if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed += 1; }
+                                    draw_world_batch(&mut pass, batch, 0..1, None);
+                                } else {
+                                    if capture_api_calls { info.perf_encode_calls.multi_draw_indexed_indirect_count = info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1); }
+                                    pass.multi_draw_indexed_indirect_count(
+                                        &world.compact_indirect_buffer,
+                                        u64::from(group.output_base)
+                                            * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
+                                        &world.compact_count_buffer,
+                                        group_index as u64 * std::mem::size_of::<u32>() as u64,
+                                        group.max_count,
+                                    );
+                                    info.world_multidraw_groups =
+                                        info.world_multidraw_groups.saturating_add(1);
+                                    info.world_multidraw_batches =
+                                        info.world_multidraw_batches.saturating_add(compacted_count);
+                                }
 
                                 // A single-stage surface can carry its Legacy fog
                                 // redraw as the same multi-draw immediately after
@@ -2872,16 +2903,21 @@ impl Renderer {
                                         pass.set_pipeline(fog_pipeline);
                                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                                         pass.set_bind_group(1, &representative.bind_group, &[]);
-                                        if capture_api_calls { info.perf_encode_calls.multi_draw_indexed_indirect_count = info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1); }
-                                        pass.multi_draw_indexed_indirect_count(
-                                            &world.compact_indirect_buffer,
-                                            u64::from(group.output_base)
-                                                * std::mem::size_of::<DrawIndexedIndirectArgs>()
-                                                    as u64,
-                                            &world.compact_count_buffer,
-                                            group_index as u64 * std::mem::size_of::<u32>() as u64,
-                                            group.max_count,
-                                        );
+                                        if direct_singleton {
+                                            if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed += 1; }
+                                            draw_world_batch(&mut pass, batch, 0..1, None);
+                                        } else {
+                                            if capture_api_calls { info.perf_encode_calls.multi_draw_indexed_indirect_count = info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1); }
+                                            pass.multi_draw_indexed_indirect_count(
+                                                &world.compact_indirect_buffer,
+                                                u64::from(group.output_base)
+                                                    * std::mem::size_of::<DrawIndexedIndirectArgs>()
+                                                        as u64,
+                                                &world.compact_count_buffer,
+                                                group_index as u64 * std::mem::size_of::<u32>() as u64,
+                                                group.max_count,
+                                            );
+                                        }
                                         current_pipeline = None;
                                     }
                                 }

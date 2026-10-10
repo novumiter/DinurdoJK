@@ -623,6 +623,9 @@ impl App {
                 .set_collision_world(self.map_collision.clone());
             session
                 .player_presenter
+                .set_head_look_mode(self.head_look);
+            session
+                .player_presenter
                 .set_saber_team_colors(self.saber_team_colors);
             session
                 .player_presenter

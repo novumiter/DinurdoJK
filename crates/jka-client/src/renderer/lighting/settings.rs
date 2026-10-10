@@ -93,15 +93,38 @@ impl Renderer {
         self.activate_world_pipeline_variant();
         rverbose!(1, "Dynamic lighting requested={mode:?}; world shaders {}; enable r_verbose 1 to see activation", if self.world_variant_pending.is_some() { "compiling" } else { "active" });
         if mode == DynamicLightsMode::RayTracedHardware {
+            self.log_rt_dynamic_lighting_status();
+        }
+    }
+
+    /// Report the *installed* lighting state, not just the requested cvar.  A
+    /// background world-variant compile can leave the previous raster shader
+    /// active for several frames after switching to RayTracedHardware.
+    pub(in crate::renderer) fn log_rt_dynamic_lighting_status(&self) {
+        if self.dynamic_lights_mode != DynamicLightsMode::RayTracedHardware {
+            return;
+        }
+        if self.world_variant_pending.is_some() {
             rverbose!(
                 1,
-                "Hardware RT Lighting: {}",
-                if self.hardware_rt_active() {
-                    "direct local-light visibility active; sun shadows remain independently selected"
-                } else {
-                    "RT unavailable for this adapter/map; using Forward+ lighting"
-                }
+                "Hardware RT Lighting: pending shader activation (previous compatible world variant remains active)"
             );
+        } else if self.hardware_rt_active() && self.ray_traced_shadows.is_some() {
+            rverbose!(
+                1,
+                "Hardware RT Lighting: ACTIVE; static={} transient={} total={} brightness={:.2} vertex_light={} (sun shadow mode independent)",
+                self.active_static_light_count(),
+                self.active_transient_light_count(),
+                self.active_light_count(),
+                self.dynamic_light_brightness,
+                self.classic_vertex_light,
+            );
+        } else if !self.ray_tracing_supported {
+            rverbose!(1, "Hardware RT Lighting: unavailable - GPU/backend lacks hardware ray-query support; using Forward+");
+        } else if self.ray_traced_shadows.is_none() {
+            rverbose!(1, "Hardware RT Lighting: unavailable - no RT acceleration structures for this map; using Forward+");
+        } else {
+            rverbose!(1, "Hardware RT Lighting: not active - renderer is using a non-RT shader variant");
         }
     }
 

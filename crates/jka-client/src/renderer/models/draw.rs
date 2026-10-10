@@ -8,6 +8,9 @@ use crate::renderer::{
     DYNAMIC_MODEL_ALPHA_ORDER,
 };
 use wgpu::util::DeviceExt;
+use super::submission::{fx_runs, model_runs, ModelPhaseCalls};
+use super::prepare::{pack_jobs, CpuPackJob, PreparePerf};
+use std::time::Instant;
 
 impl DynamicModelRenderer {
     /// Preserve the same packed FX and clipped blob streams in raster and RT preparation.
@@ -27,6 +30,8 @@ impl DynamicModelRenderer {
             // Requests were clipped onto the rendered floor by the renderer
             // and arrive as an ordinary mesh drawn through the CPU path.
             if !self.blob_mesh_indices.is_empty() {
+                self.record_cpu_geometry(crate::renderer::ModelGeometrySource::BlobShadow,
+                    self.blob_mesh_vertices.len(), self.blob_mesh_indices.len());
                 let base_vertex = vertices.len() as u32;
                 let first_index = indices.len() as u32;
                 vertices.extend_from_slice(self.blob_mesh_vertices.as_slice());
@@ -115,6 +120,9 @@ impl DynamicModelRenderer {
         prepare_authored_glow: bool,
     ) {
         self.rt_prepared = false;
+        self.perf_phase_calls.set(ModelPhaseCalls::default());
+        self.capture_prepare = crate::renderer::diagnostics::perf_capture::enabled();
+        self.perf_prepare = PreparePerf::default();
         if ray_traced_shadows
             && self.prepare_rt_skinned(
                 brightness,
@@ -140,6 +148,7 @@ impl DynamicModelRenderer {
             return;
         }
 
+        let gather_started = self.capture_prepare.then(Instant::now);
         let total_vertices = surfaces
             .iter()
             .filter(|surface| surface.ghoul2_gpu.is_none() && surface.fx_gpu_sprites.is_none())
@@ -170,6 +179,9 @@ impl DynamicModelRenderer {
         skin_pending.clear();
         skin_pending.reserve(surfaces.len());
         let mut light_memo = EntityLightMemo::default();
+        let mut cpu_jobs = std::mem::take(&mut self.scratch_cpu_pack_jobs);
+        cpu_jobs.clear();
+        if self.model_prepare_threads != 0 { cpu_jobs.reserve(surfaces.len()); }
 
         for surface in surfaces {
             let source_material = surface
@@ -216,7 +228,7 @@ impl DynamicModelRenderer {
                     continue;
                 }
                 let mesh_key = Arc::clone(&skin.mesh_key);
-                if let Entry::Vacant(entry) = self.ghoul2_meshes.entry(Arc::clone(&mesh_key)) {
+                let mesh = self.ghoul2_meshes.entry(Arc::clone(&mesh_key)).or_insert_with(|| {
                     let vertex_buffer =
                         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some(&format!("JKA Ghoul2 bind-pose vertices {mesh_key}")),
@@ -229,12 +241,13 @@ impl DynamicModelRenderer {
                             contents: bytemuck::cast_slice(skin.indices.as_slice()),
                             usage: wgpu::BufferUsages::INDEX,
                         });
-                    entry.insert(Ghoul2GpuMesh {
+                    Ghoul2GpuMesh {
                         vertex_buffer,
                         index_buffer,
                         index_count: u32::try_from(skin.indices.len()).unwrap_or(u32::MAX),
-                    });
-                }
+                        batch_keys: Default::default(),
+                    }
+                });
 
                 let pose_key = Arc::as_ptr(&skin.bones) as usize;
                 let bone_base = match bone_offsets.entry(pose_key) {
@@ -304,7 +317,7 @@ impl DynamicModelRenderer {
                     source_phong: source_phong(source_material),
                     source_fresnel: source_fresnel(source_material),
                 };
-                skin_pending.push(Ghoul2PendingDraw {
+                let mut pending = Ghoul2PendingDraw {
                     entity_num: surface.entity_num,
                     mesh_key,
                     texture_key,
@@ -315,7 +328,21 @@ impl DynamicModelRenderer {
                     uniform,
                     sequence: u32::try_from(skin_pending.len()).unwrap_or(u32::MAX),
                     batch_hash: None,
-                });
+                };
+                if self.ghoul2_batch_key_cache && self.ghoul2_batch_draws != Ghoul2BatchMode::Off
+                    && matches!(pending.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                    && Some(pending.entity_num) != self.companion_excluded_entity
+                {
+                    let texture_id = pending.texture_key.as_ref()
+                        .and_then(|key| self.textures.get(key)).map_or(0, |texture| texture.binding_id);
+                    let (hash, hit) = mesh.batch_keys.resolve(&pending, texture_id, prepare_authored_glow);
+                    pending.batch_hash = Some(hash);
+                    if self.capture_prepare {
+                        if hit { self.perf_prepare.batch_key_hits += 1; }
+                        else { self.perf_prepare.batch_key_misses += 1; }
+                    }
+                }
+                skin_pending.push(pending);
                 continue;
             }
 
@@ -324,25 +351,36 @@ impl DynamicModelRenderer {
             }
             let base_vertex = vertices.len() as u32;
             let first_index = indices.len() as u32;
-            if let Some(light) = classic_light {
-                for source in surface.vertices.iter() {
-                    let normal = Vec3::from_array(source.normal).normalize_or_zero();
-                    let illumination = classic_vertex_illumination(&light, normal);
-                    let mut vertex = *source;
-                    for channel in 0..3 {
-                        vertex.color[channel] *= illumination[channel];
-                    }
-                    vertices.push(vertex);
-                }
-            } else {
+            self.record_cpu_geometry(surface.geometry_source, surface.vertices.len(), surface.indices.len());
+            if self.model_prepare_threads != 0 {
                 vertices.extend_from_slice(surface.vertices.as_slice());
+                indices.extend_from_slice(surface.indices.as_slice());
+                cpu_jobs.push(CpuPackJob {
+                    vertices: base_vertex as usize..vertices.len(),
+                    indices: first_index as usize..indices.len(),
+                    light: classic_light,
+                });
+            } else {
+                if let Some(light) = classic_light {
+                    for source in surface.vertices.iter() {
+                        let normal = Vec3::from_array(source.normal).normalize_or_zero();
+                        let illumination = classic_vertex_illumination(&light, normal);
+                        let mut vertex = *source;
+                        for channel in 0..3 {
+                            vertex.color[channel] *= illumination[channel];
+                        }
+                        vertices.push(vertex);
+                    }
+                } else {
+                    vertices.extend_from_slice(surface.vertices.as_slice());
+                }
+                indices.extend(
+                    surface
+                        .indices
+                        .iter()
+                        .map(|index| base_vertex.saturating_add(*index)),
+                );
             }
-            indices.extend(
-                surface
-                    .indices
-                    .iter()
-                    .map(|index| base_vertex.saturating_add(*index)),
-            );
             self.draws.push(DynamicPreparedDraw {
                 entity_num: surface.entity_num,
                 first_index,
@@ -355,6 +393,23 @@ impl DynamicModelRenderer {
             });
         }
 
+        if let Some(started) = gather_started { self.perf_prepare.gather_ms = started.elapsed().as_secs_f64() * 1000.0; }
+        let pack_started = self.capture_prepare.then(Instant::now);
+        if !cpu_jobs.is_empty() {
+            let parallel = self.cpu_pack_pool.is_some()
+                && (vertices.len() >= 4096 || indices.len() >= 8192) && cpu_jobs.len() >= 2;
+            if parallel {
+                let splits = if self.model_prepare_threads == 4 { 3 } else { 2 };
+                self.cpu_pack_pool.as_ref().unwrap().install(||
+                    pack_jobs(&cpu_jobs, &mut vertices, &mut indices, 0, 0, splits));
+            } else {
+                pack_jobs(&cpu_jobs, &mut vertices, &mut indices, 0, 0, 0);
+            }
+            self.perf_prepare.parallel_used = parallel;
+        }
+        self.scratch_cpu_pack_jobs = cpu_jobs;
+        if let Some(started) = pack_started { self.perf_prepare.cpu_pack_ms = started.elapsed().as_secs_f64() * 1000.0; }
+        let group_started = self.capture_prepare.then(Instant::now);
         self.ghoul2_input_instances = u32::try_from(skin_pending.len()).unwrap_or(u32::MAX);
         let batching_active = match self.ghoul2_batch_draws {
             Ghoul2BatchMode::Off => false,
@@ -452,6 +507,19 @@ impl DynamicModelRenderer {
                     Ghoul2BatchMode::Force => group_len >= 2,
                 };
 
+            if self.capture_prepare {
+                if instance_group {
+                    self.perf_prepare.ghoul2_instanced_groups += 1;
+                    self.perf_prepare.ghoul2_largest_group = self.perf_prepare.ghoul2_largest_group.max(group_len as u32);
+                } else if Some(pending.entity_num) == self.companion_excluded_entity {
+                    self.perf_prepare.ghoul2_excluded_instances += group_len as u32;
+                } else if !matches!(pending.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask) {
+                    self.perf_prepare.ghoul2_ordered_instances += group_len as u32;
+                } else {
+                    self.perf_prepare.ghoul2_singleton_groups += group_len as u32;
+                }
+            }
+
             if instance_group {
                 let first_instance = u32::try_from(gpu_draw_data.len()).unwrap_or(u32::MAX);
                 for item in &skin_pending[pending_index..group_end] {
@@ -490,6 +558,8 @@ impl DynamicModelRenderer {
             pending_index = group_end;
         }
         self.ghoul2_encoded_draws = u32::try_from(self.skin_draws.len()).unwrap_or(u32::MAX);
+        if let Some(started) = group_started { self.perf_prepare.ghoul2_group_ms = started.elapsed().as_secs_f64() * 1000.0; }
+        let upload_started = self.capture_prepare.then(Instant::now);
 
         let vertex_bytes = bytemuck::cast_slice(vertices.as_slice());
         let index_bytes = bytemuck::cast_slice(indices.as_slice());
@@ -498,8 +568,16 @@ impl DynamicModelRenderer {
         if !vertex_bytes.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
         }
-        if !index_bytes.is_empty() {
+        if self.model_index_upload_cache {
+            if let Some(span) = self.index_upload_cache.update(&indices) {
+                let bytes = bytemuck::cast_slice(&indices[span.clone()]);
+                queue.write_buffer(&self.index_buffer, span.start as u64 * 4, bytes);
+                self.perf_prepare.index_upload_bytes = bytes.len() as u64;
+            }
+            self.perf_prepare.index_skipped_bytes = index_bytes.len() as u64 - self.perf_prepare.index_upload_bytes;
+        } else if !index_bytes.is_empty() {
             queue.write_buffer(&self.index_buffer, 0, index_bytes);
+            self.perf_prepare.index_upload_bytes = index_bytes.len() as u64;
         }
 
         self.ensure_model_pipelines(jobs, device, prepare_authored_glow);
@@ -522,6 +600,7 @@ impl DynamicModelRenderer {
         self.scratch_draw_data = gpu_draw_data;
         self.scratch_bone_offsets = bone_offsets;
         self.scratch_skin_pending = skin_pending;
+        if let Some(started) = upload_started { self.perf_prepare.upload_ms = started.elapsed().as_secs_f64() * 1000.0; }
     }
 
     pub(in crate::renderer) fn prepared_dynamic_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer) {
@@ -543,6 +622,8 @@ impl DynamicModelRenderer {
         excluded_entity: Option<u16>,
         authored_glow_only: bool,
     ) {
+        let capture_calls = crate::renderer::diagnostics::perf_capture::enabled();
+        let mut calls = self.perf_phase_calls.get();
         // Match the renderer-wide opaque-before-blended contract across both
         // dynamic geometry backends. The phase split is also used by water:
         // opaque/masked entities establish depth before the pre-water scene
@@ -550,8 +631,11 @@ impl DynamicModelRenderer {
         // draw after the ocean surface/spray so water cannot paint over them.
         if !self.draws.is_empty() {
             let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
+            if capture_calls { calls.set_vertex_buffer += 1; }
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+            if capture_calls { calls.set_index_buffer += 1; }
             pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            if capture_calls { calls.set_bind_group += 1; }
             pass.set_bind_group(0, camera, &[]);
 
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
@@ -578,6 +662,7 @@ impl DynamicModelRenderer {
                             _ => None,
                         };
                         if let Some(receiver_pipeline) = receiver_pipeline {
+                            if capture_calls { calls.set_vertex_buffer += 1; }
                             pass.set_vertex_buffer(
                                 1,
                                 self.rt_raw_color_buffer
@@ -585,7 +670,9 @@ impl DynamicModelRenderer {
                                     .expect("RT receiver colors prepared")
                                     .slice(..),
                             );
+                            if capture_calls { calls.set_bind_group += 1; }
                             pass.set_bind_group(2, &models.lights, &[]);
+                            if capture_calls { calls.set_bind_group += 1; }
                             pass.set_bind_group(3, scene, &[]);
                             receiver_pipeline
                         } else {
@@ -594,23 +681,30 @@ impl DynamicModelRenderer {
                     } else {
                         pipeline
                     };
+                if capture_calls { calls.set_pipeline += 1; }
                 pass.set_pipeline(pipeline);
-                for draw in self.draws.iter().filter(|draw| {
+                // Track only this pipeline's bindings: subsequent pipelines,
+                // draw_phase invocations and passes always start afresh.
+                let mut current_texture = None;
+                for (draw, indices) in model_runs(self.draws.iter().filter(|draw| {
                     draw.alpha_mode == alpha_mode
                         && Some(draw.entity_num) != excluded_entity
                         && (!authored_glow_only || draw.authored_glow)
-                }) {
+                }), self.dynamic_batch_draws) {
                     let bind_group = draw
                         .texture_key
                         .as_ref()
                         .and_then(|key| self.textures.get(key))
                         .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                    pass.set_bind_group(1, bind_group, &[]);
-                    pass.draw_indexed(
-                        draw.first_index..draw.first_index.saturating_add(draw.index_count),
-                        draw.base_vertex,
-                        0..1,
-                    );
+                    if !self.model_state_cache
+                        || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
+                    {
+                        if capture_calls { calls.set_bind_group += 1; }
+                        pass.set_bind_group(1, bind_group, &[]);
+                        current_texture = Some(bind_group);
+                    }
+                    if capture_calls { calls.cpu_draw_indexed += 1; }
+                    pass.draw_indexed(indices, draw.base_vertex, 0..1);
                 }
             }
         }
@@ -629,7 +723,9 @@ impl DynamicModelRenderer {
             if let Some(profiler) = gpu_profiler.as_deref_mut() {
                 profiler.write_render_pass_timestamp(pass, timed_pass, false);
             }
+            if capture_calls { calls.set_vertex_buffer += 1; }
             pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
+            if capture_calls { calls.set_bind_group += 1; }
             pass.set_bind_group(0, camera, &[]);
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
                 .into_iter()
@@ -656,23 +752,28 @@ impl DynamicModelRenderer {
                     // the handful of frames needed to finish rather than hitch.
                     continue;
                 };
+                if capture_calls { calls.set_pipeline += 1; }
                 pass.set_pipeline(pipeline);
-                for draw in self.fx_sprite_draws.iter().filter(|draw| {
+                let mut current_texture = None;
+                for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().filter(|draw| {
                     draw.alpha_mode == alpha_mode
                         && Some(draw.entity_num) != excluded_entity
                         && (!authored_glow_only || draw.authored_glow)
-                }) {
+                }), self.dynamic_batch_draws) {
                     let bind_group = draw
                         .texture_key
                         .as_ref()
                         .and_then(|key| self.textures.get(key))
                         .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                    pass.set_bind_group(1, bind_group, &[]);
-                    pass.draw(
-                        0..6,
-                        draw.first_instance
-                            ..draw.first_instance.saturating_add(draw.instance_count),
-                    );
+                    if !self.model_state_cache
+                        || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
+                    {
+                        if capture_calls { calls.set_bind_group += 1; }
+                        pass.set_bind_group(1, bind_group, &[]);
+                        current_texture = Some(bind_group);
+                    }
+                    if capture_calls { calls.fx_draw += 1; }
+                    pass.draw(0..6, instances);
                 }
             }
             if let Some(profiler) = gpu_profiler.as_deref_mut() {
@@ -681,6 +782,7 @@ impl DynamicModelRenderer {
         }
 
         if !self.skin_draws.is_empty() {
+            if capture_calls { calls.set_bind_group += 1; }
             pass.set_bind_group(0, camera, &[]);
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
                 .into_iter()
@@ -709,8 +811,12 @@ impl DynamicModelRenderer {
                     let Some(pipeline) = pipeline else {
                         continue;
                     };
+                    if capture_calls { calls.set_pipeline += 1; }
                     pass.set_pipeline(pipeline);
+                    if capture_calls { calls.set_bind_group += 1; }
                     pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                    let mut current_texture = None;
+                    let mut current_mesh = None;
                     for draw in self.skin_draws.iter().filter(|draw| {
                         draw.alpha_mode == alpha_mode
                             && draw.source_material == source_material
@@ -725,12 +831,26 @@ impl DynamicModelRenderer {
                             .as_ref()
                             .and_then(|key| self.textures.get(key))
                             .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
-                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        pass.set_index_buffer(
-                            mesh.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        pass.set_bind_group(1, bind_group, &[]);
+                        if !self.model_state_cache
+                            || !current_mesh.is_some_and(|current| std::ptr::eq(current, mesh))
+                        {
+                            if capture_calls { calls.set_vertex_buffer += 1; }
+                            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                            if capture_calls { calls.set_index_buffer += 1; }
+                            pass.set_index_buffer(
+                                mesh.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
+                            current_mesh = Some(mesh);
+                        }
+                        if !self.model_state_cache
+                            || !current_texture.is_some_and(|current| std::ptr::eq(current, bind_group))
+                        {
+                            if capture_calls { calls.set_bind_group += 1; }
+                            pass.set_bind_group(1, bind_group, &[]);
+                            current_texture = Some(bind_group);
+                        }
+                        if capture_calls { calls.skin_draw_indexed += 1; }
                         pass.draw_indexed(
                             0..mesh.index_count,
                             0,
@@ -741,6 +861,7 @@ impl DynamicModelRenderer {
                 }
             }
         }
+        if capture_calls { self.perf_phase_calls.set(calls); }
     }
 
     pub(in crate::renderer) fn draw<'a>(

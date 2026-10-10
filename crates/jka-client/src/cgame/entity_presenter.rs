@@ -617,6 +617,7 @@ impl EntityPresenter {
                     })
                     .collect::<Vec<_>>();
                 draws.push(DynamicModelSurface {
+                    geometry_source: crate::renderer::ModelGeometrySource::Md3,
                     entity_num,
                     wireframe_class: DynamicWireframeClass::Entity,
                     raster_visible: true,
@@ -878,6 +879,7 @@ impl EntityPresenter {
                 )
             });
             draws.push(DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
@@ -970,6 +972,7 @@ impl EntityPresenter {
                 triangle.swap(1, 2);
             }
             draws.push(DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 entity_num: entity.number,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
@@ -1160,6 +1163,7 @@ impl EntityPresenter {
                 triangle.swap(1, 2);
             }
             draws.push(DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
@@ -1221,6 +1225,7 @@ impl EntityPresenter {
                 triangle.swap(1, 2);
             }
             draws.push(DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,

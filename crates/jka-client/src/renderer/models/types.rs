@@ -199,6 +199,7 @@ pub(in crate::renderer) struct Ghoul2GpuMesh {
     pub(in crate::renderer) vertex_buffer: wgpu::Buffer,
     pub(in crate::renderer) index_buffer: wgpu::Buffer,
     pub(in crate::renderer) index_count: u32,
+    pub(in crate::renderer) batch_keys: super::prepare::BatchKeyCache,
 }
 
 pub(in crate::renderer) struct Ghoul2RtComputeMesh {
@@ -352,6 +353,7 @@ pub(in crate::renderer) const BLOB_MARK_PROJECTION: f32 = 20.0;
 pub(in crate::renderer) const BLOB_MARK_SURFACE_LIFT: f32 = 0.25;
 
 pub(in crate::renderer) struct DynamicGpuTexture {
+    pub(in crate::renderer) binding_id: u64,
     pub(in crate::renderer) _image: GpuImage,
     /// The surface's `$bumpmap`, kept alive for as long as its bind group. Not
     /// registered with baked brightness: it is linear, which `register` skips.
@@ -504,6 +506,18 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// when Ghoul2 surfaces are instanced across multiple players.
     pub(in crate::renderer) skin_instance_entities: Vec<u16>,
     pub(in crate::renderer) ghoul2_batch_draws: Ghoul2BatchMode,
+    pub(in crate::renderer) model_state_cache: bool,
+    pub(in crate::renderer) dynamic_batch_draws: bool,
+    pub(in crate::renderer) model_prepare_threads: u32,
+    pub(in crate::renderer) cpu_pack_pool: Option<rayon::ThreadPool>,
+    pub(in crate::renderer) scratch_cpu_pack_jobs: Vec<super::prepare::CpuPackJob>,
+    pub(in crate::renderer) model_index_upload_cache: bool,
+    pub(in crate::renderer) index_upload_cache: super::prepare::IndexUploadCache,
+    pub(in crate::renderer) ghoul2_batch_key_cache: bool,
+    pub(in crate::renderer) next_texture_binding_id: u64,
+    pub(in crate::renderer) capture_prepare: bool,
+    pub(in crate::renderer) perf_prepare: super::prepare::PreparePerf,
+    pub(in crate::renderer) perf_phase_calls: std::cell::Cell<super::submission::ModelPhaseCalls>,
     /// Entity hidden only when drawing the secondary first-person spectator view.
     /// `prepare` keeps this entity out of cross-entity Ghoul2 instance batches so
     /// the companion draw can reject it without changing the primary draw list.

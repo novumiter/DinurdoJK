@@ -830,3 +830,83 @@ fn every_declared_world_override_is_supplied_by_the_variant_key() {
         missing.join("\n  ")
     );
 }
+
+/// Regression: toggling the isolated OpenJK Legacy projected-dlight pass must
+/// not create a distinct *base-world* shader program. In contrast, the Legacy
+/// projected-light entry point still has the authored feature enabled.
+#[test]
+fn legacy_light_per_pass_specialization_key() {
+    let mut legacy = minimal_key();
+    legacy.legacy_dlights = true;
+    let off = legacy.base_pass_key();
+    assert_eq!(off, minimal_key());
+    assert_eq!(off.compilation_constants(), minimal_key().compilation_constants());
+    assert_ne!(legacy.compilation_constants(), off.compilation_constants());
+    assert_eq!(
+        legacy.compilation_constants().into_iter()
+            .find(|(name, _)| *name == "ENABLE_LEGACY_DLIGHTS").map(|(_, value)| value),
+        Some(1.0),
+    );
+    assert_eq!(
+        off.compilation_constants().into_iter()
+            .find(|(name, _)| *name == "ENABLE_LEGACY_DLIGHTS").map(|(_, value)| value),
+        Some(0.0),
+    );
+    // Other visual features, and in particular ray-tracing and planar
+    // reflection specialization, MUST still require distinct shaders.
+    let mut with_gi = legacy;
+    with_gi.voxel_gi = true;
+    assert_ne!(with_gi.base_pass_key(), off);
+    let mut with_rt = legacy;
+    with_rt.ray_traced_shadows = true;
+    assert_ne!(with_rt.base_pass_key(), off);
+    let mut with_reflections = legacy;
+    with_reflections.planar_reflections = true;
+    assert_ne!(with_reflections.base_pass_key(), off);
+}
+
+/// Effective per-pass PSO identities are stricter than the user-settings key:
+/// only the *separate* Legacy additive pass may differ while the base shader
+/// remains identical. The new cache must never alias changed shaders, formats,
+/// sample counts, or blend/depth/cull state.
+#[test]
+fn world_pass_pipeline_dependencies_are_exact() {
+    use super::{WorldPassPipelineIdentity, WorldPipelinePass};
+    let minimal = minimal_key();
+    let mut legacy = minimal;
+    legacy.legacy_dlights = true;
+    let native = super::ocean_pipeline_key();
+    let format = wgpu::TextureFormat::Rgba16Float;
+    let make = |variant, pass, key, f, msaa| {
+        WorldPassPipelineIdentity::new(variant, pass, key, f, msaa)
+    };
+    let base = WorldPipelinePass::Base { authored_fog: false };
+    assert_eq!(make(minimal, base, native, format, 1),
+               make(legacy, base, native, format, 1));
+    assert_ne!(make(minimal, WorldPipelinePass::LegacyDlight, native, format, 1),
+               make(legacy, WorldPipelinePass::LegacyDlight, native, format, 1));
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(minimal, WorldPipelinePass::Reflection { authored_fog: false }, native, format, 1));
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(minimal, base, native, wgpu::TextureFormat::Bgra8UnormSrgb, 1));
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(minimal, base, native, format, 4));
+    let mut other_key = native;
+    other_key.depth_equal = !other_key.depth_equal;
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(minimal, base, other_key, format, 1));
+    let mut gi = minimal;
+    gi.voxel_gi = true;
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(gi, base, native, format, 1));
+    let mut rt = minimal;
+    rt.ray_traced_shadows = true;
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(rt, base, native, format, 1));
+    let mut deluxe = minimal;
+    deluxe.deluxe = true;
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(deluxe, base, native, format, 1));
+    assert_ne!(make(minimal, base, native, format, 1),
+               make(minimal, WorldPipelinePass::Base { authored_fog: true }, native, format, 1));
+}

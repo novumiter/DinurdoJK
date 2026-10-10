@@ -2,6 +2,30 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_COASTAL {
+        runtime: CvarDef::new("r_coastal", "0", "0|1",
+            "Opt-in GPU shallow-bank solver for one promoted pool; r_coastalPool selects its 1-based pool number (0 automatic).",
+            CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.coastal_enabled),
+            |app, value| {
+                let CvarValue::Bool(enabled)=value else {unreachable!()};
+                app.coastal_enabled=enabled;app.coastal_live_sent=None;Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_COASTALPOOL {
+        runtime: CvarDef::new("r_coastalPool", "0", "0..8",
+            "Live coastal pool: 0 selects an eligible shallow-bank pool automatically; 1..8 match the debug Pool numbers.",
+            CvarType::Int {min:0,max:8}, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.coastal_pool.into()),
+            |app, value| {
+                let CvarValue::Int(pool)=value else {unreachable!()};
+                app.coastal_pool=pool as u8;app.coastal_live_sent=None;Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_R_COASTALDEBUG {
         runtime: CvarDef::new(
                 "r_coastalDebug",

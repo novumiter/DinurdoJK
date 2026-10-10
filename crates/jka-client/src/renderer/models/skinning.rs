@@ -547,6 +547,7 @@ impl DynamicModelRenderer {
             if surface.vertices.is_empty() || surface.indices.is_empty() {
                 continue;
             }
+            self.record_cpu_geometry(surface.geometry_source, surface.vertices.len(), surface.indices.len());
             let base_vertex = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
             let first_index = u32::try_from(indices.len()).unwrap_or(u32::MAX);
             if rt_receivers {
@@ -658,6 +659,7 @@ impl DynamicModelRenderer {
         }
         if !index_bytes.is_empty() {
             queue.write_buffer(&rt.index_buffer, 0, index_bytes);
+            self.perf_prepare.index_upload_bytes = index_bytes.len() as u64;
         }
         if !bone_bytes.is_empty() {
             queue.write_buffer(&self.skin_bone_buffer, 0, bone_bytes);

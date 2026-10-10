@@ -344,6 +344,18 @@ impl DynamicModelRenderer {
             skin_draws: Vec::new(),
             skin_instance_entities: Vec::new(),
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
+            model_state_cache: false,
+            dynamic_batch_draws: false,
+            model_prepare_threads: 0,
+            cpu_pack_pool: None,
+            scratch_cpu_pack_jobs: Vec::new(),
+            model_index_upload_cache: false,
+            index_upload_cache: super::prepare::IndexUploadCache::default(),
+            ghoul2_batch_key_cache: false,
+            next_texture_binding_id: 1,
+            capture_prepare: false,
+            perf_prepare: super::prepare::PreparePerf::default(),
+            perf_phase_calls: std::cell::Cell::new(super::submission::ModelPhaseCalls::default()),
             companion_excluded_entity: None,
             ghoul2_input_instances: 0,
             ghoul2_encoded_draws: 0,
@@ -363,6 +375,36 @@ impl DynamicModelRenderer {
 
     pub(in crate::renderer) fn set_ghoul2_batch_draws(&mut self, mode: Ghoul2BatchMode) {
         self.ghoul2_batch_draws = mode;
+    }
+
+    pub(in crate::renderer) fn set_model_prepare_threads(&mut self, threads: u32) -> Result<(), String> {
+        if !matches!(threads, 0 | 1 | 2 | 4) { return Err("expected 0|1|2|4".into()); }
+        if threads == self.model_prepare_threads { return Ok(()); }
+        let pool = if threads > 1 {
+            Some(rayon::ThreadPoolBuilder::new().num_threads(threads as usize)
+                .thread_name(|i| format!("jka-model-pack-{i}"))
+                .build().map_err(|error| error.to_string())?)
+        } else { None };
+        self.cpu_pack_pool = pool;
+        self.model_prepare_threads = threads;
+        Ok(())
+    }
+
+    pub(in crate::renderer) fn set_model_index_upload_cache(&mut self, enabled: bool) {
+        if self.model_index_upload_cache != enabled {
+            self.index_upload_cache.clear();
+            self.model_index_upload_cache = enabled;
+        }
+    }
+
+    pub(in crate::renderer) fn record_cpu_geometry(&mut self,
+        source: crate::renderer::ModelGeometrySource, vertices: usize, indices: usize) {
+        if self.capture_prepare {
+            let count = &mut self.perf_prepare.cpu_sources[source as usize];
+            count.surfaces += 1;
+            count.vertices += vertices as u64;
+            count.indices += indices as u64;
+        }
     }
 
     pub(in crate::renderer) fn ghoul2_batch_hash(
@@ -461,6 +503,7 @@ impl DynamicModelRenderer {
             return;
         }
         self.index_capacity = required.next_power_of_two().max(4096);
+        self.index_upload_cache.clear();
         self.index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JKA dynamic model index buffer"),
             size: self.index_capacity,
@@ -593,6 +636,8 @@ impl DynamicModelRenderer {
             ),
         });
         if let Entry::Vacant(entry) = self.textures.entry(Arc::clone(&key)) {
+            let binding_id = self.next_texture_binding_id;
+            self.next_texture_binding_id += 1;
             let image = upload_texture(device, queue, texture);
             brightness.register(&image._texture);
             // Deliberately not registered with baked brightness: a normal map is
@@ -630,6 +675,7 @@ impl DynamicModelRenderer {
                 ],
             });
             entry.insert(DynamicGpuTexture {
+                binding_id,
                 _image: image,
                 _normal_image: normal_image,
                 bind_group,

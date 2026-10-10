@@ -7,7 +7,7 @@ use crate::cgame::player_presenter::{
     model_bolt_origin_timed, multiply_3x4, openjk_look_target_origin,
     openjk_player_entity_needs_reset, openjk_vectoangles, player_angle_entity, player_entity_rgb,
     record_motion_pose_eval, record_pose_eval, reset_remote_player_saber_attachment,
-    smooth_ghoul2_pose, source_dismember_surface_set, suppressed_during_intermission,
+    smooth_ghoul2_pose, smooth_head_look_yaw, source_dismember_surface_set, suppressed_during_intermission,
     transform_jka_model_point, update_weapon_attachment, viewer_style_from, weapon_world_model,
     Arc, ClientGameState, DismemberPart, DismemberSourceSnap, DynamicModelAlphaMode,
     DynamicModelSurface, EntityPlayerState, FootstepStages, ForcedPlayerModels, Ghoul2Animator,
@@ -634,6 +634,7 @@ impl PlayerPresenter {
                     animation,
                     player_angles: PlayerAngleState::reset_from_angles(entity.angles),
                     last_angle_time: current_time,
+                    head_look_yaw: None,
                     last_e_flags: entity.state.field_i32("eFlags").unwrap_or(0),
                     last_client_num: entity
                         .state
@@ -665,6 +666,7 @@ impl PlayerPresenter {
             .state
             .field_i32("clientNum")
             .unwrap_or(i32::from(entity.number));
+        let head_look_mode = self.head_look_mode;
         let runtime = self
             .entities
             .get_mut(&entity.number)
@@ -712,6 +714,7 @@ impl PlayerPresenter {
             if time_rewound {
                 runtime.last_angle_time = current_time;
             }
+            runtime.head_look_yaw = None;
         }
         runtime.last_e_flags = e_flags;
         runtime.last_client_num = client_num;
@@ -925,21 +928,48 @@ impl PlayerPresenter {
                 multiply_3x4(&motion_pose, &model.gla.skeleton[motion_index].base_pose);
             let motion_matrix = flatten_matrix3x4(&motion_bolt);
 
+            let frametime = current_time.saturating_sub(runtime.last_angle_time);
             let mut look_angles = entity.angles;
-            if entity.state.field_i32("hasLookTarget").unwrap_or(0) != 0 {
-                if let Some(target_origin) = look_target_origin {
-                    look_angles = openjk_vectoangles([
-                        target_origin[0] - entity.origin[0],
-                        target_origin[1] - entity.origin[1],
-                        target_origin[2] - entity.origin[2],
-                    ]);
-                    runtime.player_angles.look_time = current_time.saturating_add(1000);
+            if head_look_mode == 0 {
+                // Disable *only* server-provided automatic head targeting. Stop
+                // the BG_UpdateLookAngles debounce and its previous target so
+                // an immediate Off switch actually returns the head to neutral.
+                runtime.player_angles.look_time = current_time;
+                runtime.player_angles.last_head_angles = [0.0; 3];
+                runtime.head_look_yaw = None;
+            } else {
+                let mut has_look_target = false;
+                if entity.state.field_i32("hasLookTarget").unwrap_or(0) != 0 {
+                    if let Some(target_origin) = look_target_origin {
+                        look_angles = openjk_vectoangles([
+                            target_origin[0] - entity.origin[0],
+                            target_origin[1] - entity.origin[1],
+                            target_origin[2] - entity.origin[2],
+                        ]);
+                        runtime.player_angles.look_time = current_time.saturating_add(1000);
+                        has_look_target = true;
+                    }
+                }
+                if head_look_mode == 2 && (has_look_target || runtime.player_angles.look_time > current_time) {
+                    // World-space yaw, shortest arc, independent of render FPS.
+                    // Keep easing toward forward for the normal OpenJK one-second
+                    // look debounce after the target disappears. Don't smooth
+                    // ordinary player facing when there is no look target.
+                    let start = runtime.head_look_yaw.unwrap_or_else(|| {
+                        entity.angles[1] + runtime.player_angles.last_head_angles[1]
+                    });
+                    let yaw = smooth_head_look_yaw(start, look_angles[1], frametime);
+                    runtime.head_look_yaw = Some(yaw);
+                    look_angles[1] = yaw;
+                } else {
+                    // Mode 1 remains the exact OpenJK look path. In mode 2
+                    // without an active/recent target the head is also neutral.
+                    runtime.head_look_yaw = None;
                 }
             }
             // Exact CG_Player behavior immediately before BG_G2PlayerAngles.
             look_angles[0] = 0.0;
 
-            let frametime = current_time.saturating_sub(runtime.last_angle_time);
             let (ci_legs, ci_torso) = runtime.animation.client_animation_ids();
             let model_scale_int = entity.state.field_i32("iModelScale").unwrap_or(0);
             let model_scale = if model_scale_int != 0 {

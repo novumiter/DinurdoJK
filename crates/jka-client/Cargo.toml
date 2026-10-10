@@ -35,6 +35,7 @@ wgpu = { version = "=29.0.4", default-features = false, features = ["std", "wgsl
 winit = "=0.30.13"
 
 [dev-dependencies]
+jka-water = { path = "../jka-water" }
 # Offline WGSL parsing/validation for the shader tests. Pinned to the same
 # version wgpu 29 uses so the tests accept exactly what the runtime will.
 naga = { version = "=29.0.4", features = ["wgsl-in"] }

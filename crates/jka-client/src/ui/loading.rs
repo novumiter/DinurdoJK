@@ -370,11 +370,12 @@ pub(in crate::ui) const LOAD_FAINT: [f32; 4] = [0.38, 0.46, 0.58, 1.0];
 pub(in crate::ui) fn build_shader_compile_progress(
     out: &mut Vec<UiVertex>,
     progress: &MapLoadingBar,
+    stage: Option<&str>,
     w: u32,
     h: u32,
 ) {
-    let panel_w = 300.0;
-    let panel_h = 43.0;
+    let panel_w = 340.0;
+    let panel_h = if stage.is_some() { 61.0 } else { 43.0 };
     let x = (w as f32 - panel_w - 16.0).max(8.0);
     // Below the top-right FPS/timer readouts rather than on top of them.
     let y = 60.0;
@@ -388,8 +389,13 @@ pub(in crate::ui) fn build_shader_compile_progress(
     let value = format!("{}/{}", progress.completed, progress.total);
     let value_w = value.len() as f32 * 6.0 * 1.1;
     text(out, &value, x + panel_w - 12.0 - value_w, y + 9.0, 1.1, HUD_VALUE, w, h);
+    if let Some(stage) = stage {
+        // Width-limited so diagnostic labels cannot run into the game view.
+        let short = stage.chars().take(52).collect::<String>();
+        text(out, &short, x + 12.0, y + 27.0, 0.82, LOAD_LABEL, w, h);
+    }
     progress_track(
-        out, x + 12.0, y + 28.0, panel_w - 24.0, 5.0,
+        out, x + 12.0, y + panel_h - 15.0, panel_w - 24.0, 5.0,
         loading_fraction(progress), with_alpha(LOAD_CYAN, 0.6), LOAD_CYAN, w, h,
     );
 }

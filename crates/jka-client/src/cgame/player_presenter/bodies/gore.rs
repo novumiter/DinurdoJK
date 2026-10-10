@@ -166,6 +166,7 @@ impl PlayerPresenter {
                 };
                 let color = [1.0, 1.0, 1.0, fade];
                 extra.push(DynamicModelSurface {
+                    geometry_source: crate::renderer::ModelGeometrySource::Ghoul2,
                     entity_num: body.entity_num,
                     wireframe_class: DynamicWireframeClass::Player,
                     raster_visible: body.raster_visible,

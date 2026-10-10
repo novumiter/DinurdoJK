@@ -706,6 +706,44 @@ app_cvars! {
         ]
     }
 
+    APP_CG_HEADLOOK {
+        runtime: CvarDef::new(
+            "cg_headLook", "", "0|1|2",
+            "Client-only automatic player head look targets: 0 off, 1 original OpenJK/TaystJK tracking, 2 gradual tracking with frame-rate-independent yaw smoothing. Does not change server target selection or player aim.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_cg_headlook(app)),
+            |app, value| App::cvar_set_cg_headlook(app, APP_CG_HEADLOOK.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_headlook, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    if mode <= 2 { settings.head_look = mode; }
+                }
+            }),
+            archive: Some((499, |state| state.presentation.head_look.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_cg_headlook(&self) -> String {
+                    self.head_look.to_string()
+                }
+                fn cvar_set_cg_headlook(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>()
+                        .map_err(|_| "cg_headLook expects 0, 1, or 2".to_owned())?;
+                    if mode > 2 { return Err("cg_headLook expects 0, 1, or 2".to_owned()); }
+                    self.head_look = mode;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.player_presenter.set_head_look_mode(mode);
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_SPECCAMERAMOTION {
         runtime: CvarDef::new("cg_specCameraMotion", "", "0|1", "Third-person spectator camera faces the current presented direction of motion (TaystJK cg_thirdPersonAngle -1 behavior).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_speccameramotion(app)), |app, value| App::cvar_set_cg_speccameramotion(app, APP_CG_SPECCAMERAMOTION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_speccameramotion, None),
         config: CvarBinding {

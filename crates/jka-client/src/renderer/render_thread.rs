@@ -509,6 +509,14 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.set_ocean_enabled(initial_ui.video.ocean);
     renderer.set_gpu_timings(initial_ui.video.gpu_timings);
     renderer.set_ghoul2_batch_draws(initial_ui.video.ghoul2_batch_draws);
+    renderer.dynamic_model_renderer.model_state_cache = initial_ui.video.model_state_cache;
+    renderer.dynamic_model_renderer.dynamic_batch_draws = initial_ui.video.dynamic_batch_draws;
+    renderer.world_compact_min_draws = initial_ui.video.world_compact_min_draws;
+    if let Err(error) = renderer.dynamic_model_renderer.set_model_prepare_threads(initial_ui.video.model_prepare_threads) {
+        eprintln!("Model packing workers: {error}");
+    }
+    renderer.dynamic_model_renderer.set_model_index_upload_cache(initial_ui.video.model_index_upload_cache);
+    renderer.dynamic_model_renderer.ghoul2_batch_key_cache = initial_ui.video.ghoul2_batch_key_cache;
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
     renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
     renderer.set_rt_samples(initial_ui.video.rt_samples);
@@ -623,9 +631,10 @@ pub(in crate::renderer) fn render_thread_main(
     // sample cannot tell a ~3ms cascade frame from a ~0.04ms idle frame, and
     // either one read alone gives the wrong answer about what the ocean costs.
     // Accumulate min/avg/max across the trace window for those passes instead.
-    const TRACE_GPU_PASSES: [GpuPass; 4] = [
+    const TRACE_GPU_PASSES: [GpuPass; 5] = [
         GpuPass::Frame,
         GpuPass::OceanSim,
+        GpuPass::CoastalSim,
         GpuPass::OceanSurface,
         GpuPass::OceanOptics,
     ];
@@ -755,6 +764,11 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetCoastalDebugMesh(mesh)) => {
                         renderer.set_coastal_debug_mesh(mesh);
                     }
+                    Ok(RenderCommand::SetCoastalWater { enabled, pool, atlas }) => {
+                        renderer.coastal_enabled = enabled;
+                        renderer.coastal_pool = pool;
+                        renderer.coastal_atlas = atlas;
+                    }
                     Ok(RenderCommand::SetSunRayPreview(enabled)) => {
                         renderer.debug_volumes.sun_ray_enabled = enabled;
                     }
@@ -878,6 +892,26 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetGhoul2BatchDraws(mode)) => {
                         renderer.set_ghoul2_batch_draws(mode)
+                    }
+                    Ok(RenderCommand::SetModelStateCache(enabled)) => {
+                        renderer.dynamic_model_renderer.model_state_cache = enabled;
+                    }
+                    Ok(RenderCommand::SetDynamicBatchDraws(enabled)) => {
+                        renderer.dynamic_model_renderer.dynamic_batch_draws = enabled;
+                    }
+                    Ok(RenderCommand::SetWorldCompactMinDraws(minimum)) => {
+                        renderer.world_compact_min_draws = minimum.clamp(1, 2);
+                    }
+                    Ok(RenderCommand::SetModelPrepareThreads(threads)) => {
+                        if let Err(error) = renderer.dynamic_model_renderer.set_model_prepare_threads(threads) {
+                            eprintln!("Model packing workers: {error}");
+                        }
+                    }
+                    Ok(RenderCommand::SetModelIndexUploadCache(enabled)) => {
+                        renderer.dynamic_model_renderer.set_model_index_upload_cache(enabled);
+                    }
+                    Ok(RenderCommand::SetGhoul2BatchKeyCache(enabled)) => {
+                        renderer.dynamic_model_renderer.ghoul2_batch_key_cache = enabled;
                     }
                     Ok(RenderCommand::SetGpuVisibility {
                         gpu_driven,
@@ -1376,7 +1410,7 @@ pub(in crate::renderer) fn render_thread_main(
         }
         match render_result {
             Ok(info) => {
-                if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer)) {
+                if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer, &snapshot.client_perf)) {
                     if let Some(completed) = perf_capture.take() {
                         completed.finish();
                     }
@@ -1817,7 +1851,7 @@ pub(in crate::renderer) fn render_thread_main(
                 );
             }
             println!(
-                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_sim={}ms ocean_surface={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms rain_sim={}ms rain_draw={}ms rain_haze={}ms rain_froxel={}ms rain_lens={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms ssr_visibility={}ms ssr_trace={}ms",
+"[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_sim={}ms coastal_sim={}ms ocean_surface={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms rain_sim={}ms rain_draw={}ms rain_haze={}ms rain_froxel={}ms rain_lens={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms ssr_visibility={}ms ssr_trace={}ms",
                 gpu_ms(GpuPass::Frame),
                 gpu_ms(GpuPass::RtBuild),
                 gpu_ms(GpuPass::World),
@@ -1825,6 +1859,7 @@ pub(in crate::renderer) fn render_thread_main(
                 dynamic_model_ms,
                 fx_sprite_ms,
                 gpu_ms(GpuPass::OceanSim),
+                gpu_ms(GpuPass::CoastalSim),
                 gpu_ms(GpuPass::OceanSurface),
                 gpu_ms(GpuPass::OceanOptics),
                 grass_total_ms,

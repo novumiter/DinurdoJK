@@ -52,6 +52,7 @@ use effects::{
     angles_to_axis, blade_color, flatten_matrix3x4, force_grip_target_alive,
     force_grip_target_still_valid, impulse_weapon_is_explosive, infer_force_grip_target,
     normalize_vec3, openjk_look_target_origin, openjk_player_entity_needs_reset,
+    smooth_head_look_yaw,
     player_angle_entity, player_entity_rgb, presented_entity_in_knockdown,
     presented_entity_velocity, saber_blade_fx_request, transform_jka_model_point,
     transform_jka_model_vector, transform_model_normal, transform_model_point, viewer_style_from,
@@ -185,6 +186,8 @@ pub struct PlayerPresenter {
     /// particular WTTRIBES swaps the stock Boba jet nozzles for the Tribes
     /// thrust presentation.
     japro_cinfo2: i32,
+    /// cg_headLook (0 off, 1 exact OpenJK, 2 extra visual smoothing).
+    head_look_mode: u8,
     /// TaystJK cg_saberTeamColors (archive, default 1). Skin forcing is unconditional
     /// in ordinary team games; this only controls saber normalization.
     saber_team_colors: bool,

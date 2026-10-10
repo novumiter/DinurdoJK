@@ -1015,6 +1015,8 @@ pub struct UiSnapshot {
     pub static_ao_progress: Option<MapLoadingBar>,
     /// Renderer-owned status of asynchronously compiled shader/PSO pipelines.
     pub shader_compile_progress: Option<MapLoadingBar>,
+    /// Dedicated world worker: current individual BSP PSO and elapsed time.
+    pub shader_compile_stage: Option<String>,
 }
 impl Default for UiSnapshot {
     fn default() -> Self {
@@ -1078,6 +1080,7 @@ impl Default for UiSnapshot {
             loading: None,
             static_ao_progress: None,
             shader_compile_progress: None,
+            shader_compile_stage: None,
         }
     }
 }

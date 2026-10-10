@@ -1705,6 +1705,7 @@ pub(in crate::renderer) fn create_world_pipeline(
         println!("[{kind} pipeline BEGIN] id={id} hash={fingerprint:016x} source_hash={source_hash:?} thread={:?} key={key:?} variant={shader_variant:?} vs={vertex_entry_point} fs={fragment_entry_point} format={surface_format:?} msaa={msaa_samples} legacy_fog={legacy_fog} fog_pass={fog_pass} legacy_dlight_pass={legacy_dlight_pass}", current_thread.name());
         Some(id)
     } else { None };
+    let native_compile_started = std::time::Instant::now();
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if legacy_dlight_pass {
             "JKA BSP Legacy projected-dlight pass pipeline"
@@ -1771,7 +1772,8 @@ pub(in crate::renderer) fn create_world_pipeline(
     });
     if let Some(id) = compile_id {
         let kind = if is_rt { "RT" } else { "BSP" };
-        println!("[{kind} pipeline END] id={id} hash={fingerprint:016x}");
+        println!("[{kind} pipeline END] id={id} hash={fingerprint:016x} elapsed_ms={:.2}",
+            native_compile_started.elapsed().as_secs_f64() * 1000.0);
     }
     pipeline
 }

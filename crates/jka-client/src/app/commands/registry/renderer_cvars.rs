@@ -1911,6 +1911,121 @@ app_cvars! {
         ]
     }
 
+    APP_R_MODELSTATECACHE {
+        runtime: CvarDef::new("r_modelStateCache", "", "0..1", "A/B repeated texture and Ghoul2 mesh binding suppression in model/FX draw phases. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.model_state_cache)),
+            |app, value| App::cvar_set_r_modelstatecache(app, APP_R_MODELSTATECACHE.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_modelstatecache, None),
+        config: CvarBinding {
+            default: Some(|state| bool_value(state.video.model_state_cache)),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_modelstatecache(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.model_state_cache = Self::parse_cvar_bool(name, value)?;
+                    self.render_command(RenderCommand::SetModelStateCache(self.video.model_state_cache));
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DYNAMICBATCHDRAWS {
+        runtime: CvarDef::new("r_dynamicBatchDraws", "", "0..1", "A/B merging adjacent compatible CPU model index ranges and GPU FX instance ranges without reordering. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.dynamic_batch_draws)),
+            |app, value| App::cvar_set_r_dynamicbatchdraws(app, APP_R_DYNAMICBATCHDRAWS.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_dynamicbatchdraws, None),
+        config: CvarBinding {
+            default: Some(|state| bool_value(state.video.dynamic_batch_draws)),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_dynamicbatchdraws(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.dynamic_batch_draws = Self::parse_cvar_bool(name, value)?;
+                    self.render_command(RenderCommand::SetDynamicBatchDraws(self.video.dynamic_batch_draws));
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WORLDCOMPACTMINDRAWS {
+        runtime: CvarDef::new("r_worldCompactMinDraws", "", "1|2", "CPU world compaction: 1 baseline, 2 draws singleton visible groups directly. Keeps map-load packing and GPU-driven behavior. Session-only; default 1.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.world_compact_min_draws.to_string()),
+            |app, value| App::cvar_set_r_worldcompactmindraws(app, APP_R_WORLDCOMPACTMINDRAWS.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_worldcompactmindraws, None),
+        config: CvarBinding {
+            default: Some(|state| state.video.world_compact_min_draws.to_string()),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_worldcompactmindraws(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let minimum = value.trim().parse::<u32>().ok().filter(|value| (1..=2).contains(value))
+                        .ok_or_else(|| format!("{name}: expected 1|2"))?;
+                    self.video.world_compact_min_draws = minimum;
+                    self.render_command(RenderCommand::SetWorldCompactMinDraws(minimum));
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_MODELINDEXUPLOADCACHE {
+        runtime: CvarDef::new("r_modelIndexUploadCache", "", "0..1", "A/B skip unchanged index uploads and upload only a changed span on the raster CPU-model path. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.model_index_upload_cache)),
+            |app, value| App::cvar_set_r_modelindexuploadcache(app, APP_R_MODELINDEXUPLOADCACHE.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_modelindexuploadcache, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.model_index_upload_cache)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_modelindexuploadcache(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.model_index_upload_cache = Self::parse_cvar_bool(name, value)?;
+                self.render_command(RenderCommand::SetModelIndexUploadCache(self.video.model_index_upload_cache));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_GHOUL2BATCHKEYCACHE {
+        runtime: CvarDef::new("r_ghoul2BatchKeyCache", "", "0..1", "A/B cached Ghoul2 preparation hashes with identical grouping and ordering. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.ghoul2_batch_key_cache)),
+            |app, value| App::cvar_set_r_ghoul2batchkeycache(app, APP_R_GHOUL2BATCHKEYCACHE.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_ghoul2batchkeycache, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.ghoul2_batch_key_cache)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_ghoul2batchkeycache(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ghoul2_batch_key_cache = Self::parse_cvar_bool(name, value)?;
+                self.render_command(RenderCommand::SetGhoul2BatchKeyCache(self.video.ghoul2_batch_key_cache));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_MODELPREPARETHREADS {
+        runtime: CvarDef::new("r_modelPrepareThreads", "", "0|1|2|4", "CPU model packing: 0 original serial path, 1 serial prepared jobs, 2/4 bounded worker threads for vertex lighting/index rebasing. Raster path only. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.model_prepare_threads.to_string()),
+            |app, value| App::cvar_set_r_modelpreparethreads(app, APP_R_MODELPREPARETHREADS.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_modelpreparethreads, None),
+        config: CvarBinding { default: Some(|state| state.video.model_prepare_threads.to_string()), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_modelpreparethreads(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let threads = value.trim().parse::<u32>().ok().filter(|value| matches!(value, 0 | 1 | 2 | 4))
+                    .ok_or_else(|| format!("{name}: expected 0|1|2|4"))?;
+                self.video.model_prepare_threads = threads;
+                self.render_command(RenderCommand::SetModelPrepareThreads(threads));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_GHOUL2EARLYCULL {
         runtime: CvarDef::new("r_ghoul2EarlyCull", "", "0..1", "Skip full Ghoul2 pose evaluation and render submission for models outside the view frustum while preserving lightweight animation state.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_ghoul2earlycull(app)), |app, value| App::cvar_set_r_ghoul2earlycull(app, APP_R_GHOUL2EARLYCULL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ghoul2earlycull, None),
         config: CvarBinding {
@@ -3350,8 +3465,8 @@ app_cvars! {
 
     APP_R_PIPELINE_TRACE {
         runtime: CvarDef::new("r_pipelineTrace", "0", "0|1", "Log native BSP/RT pipeline BEGIN/END and background shader job progress. Session-only; enable before the slow settings change.", CvarType::String, CvarFlags::NONE, LatchScope::None,
-            |app| CvarValue::String(bool_value(app.video.pipeline_trace)),
-            |app, value| App::cvar_set_r_pipeline_trace(app, APP_R_PIPELINE_TRACE.entry.name, &value.to_string()))
+            |app: &App| CvarValue::String(bool_value(app.video.pipeline_trace)),
+            |app: &mut App, value| App::cvar_set_r_pipeline_trace(app, APP_R_PIPELINE_TRACE.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_pipeline_trace, None),
         config: CvarBinding {
             default: Some(|state| bool_value(state.video.pipeline_trace)),

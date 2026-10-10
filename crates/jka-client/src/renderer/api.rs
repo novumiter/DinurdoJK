@@ -365,8 +365,20 @@ pub struct FxGpuSprites {
     pub blob_shadow: bool,
 }
 
+/// Presentation provenance. This is diagnostic metadata, not material state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ModelGeometrySource {
+    Md3,
+    Ghoul2,
+    Fx,
+    BlobShadow,
+    Other,
+}
+
 #[derive(Clone)]
 pub struct DynamicModelSurface {
+    pub geometry_source: ModelGeometrySource,
     /// Presentation identity retained for diagnostics/culling work and dynamic
     /// RT BLAS ownership.
     pub entity_num: u16,
@@ -886,6 +898,11 @@ pub enum RenderCommand {
     SetEntityMarkers(Option<jka_assets::bsp::DebugVolumeMesh>),
     /// `r_coastalDebug`: static Phase 2.5 classification/boundary/cell overlay.
     SetCoastalDebugMesh(Option<jka_assets::bsp::DebugVolumeMesh>),
+    SetCoastalWater {
+        enabled: bool,
+        pool: u8,
+        atlas: Option<Arc<jka_assets::bsp::bathymetry::Atlas>>,
+    },
     /// Draw a beam from the sun to the camera (player head) while sun angles are edited.
     SetSunRayPreview(bool),
     SetPvsMode(PvsMode),
@@ -928,6 +945,12 @@ pub enum RenderCommand {
     SetGpuTimings(bool),
     SetFxZeroAlphaDiscard(bool),
     SetGhoul2BatchDraws(Ghoul2BatchMode),
+    SetModelStateCache(bool),
+    SetDynamicBatchDraws(bool),
+    SetWorldCompactMinDraws(u32),
+    SetModelPrepareThreads(u32),
+    SetModelIndexUploadCache(bool),
+    SetGhoul2BatchKeyCache(bool),
     SetGpuVisibility {
         gpu_driven: bool,
         hiz_occlusion: bool,
@@ -1099,6 +1122,11 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) perf_followup_ms: f64,
     pub(in crate::renderer) perf_primary_command_buffers: u32,
     pub(in crate::renderer) perf_encode_calls: PerfEncodeCallCounts,
+    /// Main-view CPU compaction audit; zero if that path was inactive.
+    pub(in crate::renderer) world_cpu_compaction_active: bool,
+    pub(in crate::renderer) world_cpu_compact_visible_members: u32,
+    pub(in crate::renderer) world_cpu_compact_singleton_groups: u32,
+    pub(in crate::renderer) world_cpu_compact_multistage_excluded_batches: u32,
     /// Which world renderer produced this frame ("fast-baseline" / "unified").
     pub(in crate::renderer) world_path: &'static str,
     /// Advanced-path breakdown of `cpu_prepare_ms`. All zero on FastBaseline,

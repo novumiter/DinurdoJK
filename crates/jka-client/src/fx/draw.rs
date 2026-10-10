@@ -277,6 +277,7 @@ pub fn tessellate(
         .into_iter()
         .filter(|(_, (_, batch))| !batch.indices.is_empty())
         .map(|(_, (mat, batch))| DynamicModelSurface {
+            geometry_source: crate::renderer::ModelGeometrySource::Fx,
             entity_num: FX_ENTITY_NUM,
             wireframe_class: DynamicWireframeClass::Effect,
             raster_visible: true,
@@ -384,6 +385,7 @@ pub fn tessellate_workers(
             };
 
             (!batch.indices.is_empty()).then(|| DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Fx,
                 entity_num: FX_ENTITY_NUM,
                 wireframe_class: DynamicWireframeClass::Effect,
                 raster_visible: true,
@@ -478,6 +480,7 @@ pub fn tessellate_gpu_particles(
         .into_iter()
         .filter(|(_, (_, batch))| !batch.indices.is_empty())
         .map(|(_, (mat, batch))| DynamicModelSurface {
+            geometry_source: crate::renderer::ModelGeometrySource::Fx,
             entity_num: FX_ENTITY_NUM,
             wireframe_class: DynamicWireframeClass::Effect,
             raster_visible: true,
@@ -499,6 +502,7 @@ pub fn tessellate_gpu_particles(
             .into_iter()
             .filter(|(_, (_, instances))| !instances.is_empty())
             .map(|(_, (mat, instances))| DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Fx,
                 entity_num: FX_ENTITY_NUM,
                 wireframe_class: DynamicWireframeClass::Effect,
                 raster_visible: true,
@@ -559,6 +563,7 @@ fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
         .copied()
         .collect();
     (!indices.is_empty()).then(|| DynamicModelSurface {
+        geometry_source: crate::renderer::ModelGeometrySource::Fx,
         entity_num: FX_ENTITY_NUM,
         wireframe_class: DynamicWireframeClass::Effect,
         raster_visible: true,

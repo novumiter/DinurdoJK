@@ -26,6 +26,7 @@ impl Renderer {
         // The app is not the owner of pipeline jobs; preserve the render-thread
         // status when a gameplay/menu UI snapshot arrives between samples.
         ui_state.shader_compile_progress = self.ui_state.shader_compile_progress;
+        ui_state.shader_compile_stage = self.ui_state.shader_compile_stage.clone();
         self.ui_state = ui_state;
         if needs_key_atlas {
             self.load_ui_key_atlas_now();
@@ -45,11 +46,22 @@ impl Renderer {
             total: progress.total,
             skipped: false,
         });
+        let stage = if status.is_some() {
+            crate::pipeline_jobs::world_pipeline_stage().map(|stage| format!(
+                "BSP {}/{} {} ({}s)", stage.pipeline, stage.total,
+                stage.description, stage.elapsed_seconds
+            ))
+        } else {
+            None
+        };
         let signature = |bar: &Option<ui::MapLoadingBar>| {
             bar.as_ref().map(|bar| (bar.completed, bar.total))
         };
-        if signature(&self.ui_state.shader_compile_progress) != signature(&status) {
+        if signature(&self.ui_state.shader_compile_progress) != signature(&status)
+            || self.ui_state.shader_compile_stage != stage
+        {
             self.ui_state.shader_compile_progress = status;
+            self.ui_state.shader_compile_stage = stage;
             self.rebuild_retained_ui();
         }
     }

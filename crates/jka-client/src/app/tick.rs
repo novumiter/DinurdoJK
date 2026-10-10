@@ -51,6 +51,7 @@ impl App {
         self.poll_race_ghost_loads();
         self.poll_race_ghost_web();
         self.sync_coastal_debug();
+        self.sync_coastal_live();
         let trail_lines = self.strafe_trails.poll();
         let trail_changed = !trail_lines.is_empty();
         for line in trail_lines {
@@ -406,5 +407,28 @@ impl App {
         for line in lines {
             self.push_console_line(line);
         }
+    }
+
+    fn sync_coastal_live(&mut self) {
+        let job=self.prepared_map_cache.as_ref().and_then(|c|c.map.coastal_bathymetry.as_ref()).cloned();
+        let pointer=job.as_ref().map_or(0,|j|std::sync::Arc::as_ptr(j) as usize);
+        let status=job.as_ref().map_or(2,|j|j.debug_status_tag());
+        let key=(pointer,status,self.coastal_enabled,self.coastal_pool);
+        if self.coastal_live_sent==Some(key) {return;}
+        let atlas=job.as_ref().and_then(|j| {
+            let result=j.status.try_lock().ok()?;
+            if let crate::ocean::bathymetry::Status::Ready {atlas,..}=&*result {Some(std::sync::Arc::clone(atlas))} else {None}
+        });
+        // Retry publication if the terminal result was temporarily locked.
+        if status==1 && atlas.is_none() {return;}
+        self.coastal_live_sent=Some(key);
+        if self.coastal_enabled {
+            self.push_console_line(if atlas.is_some() {
+                format!("Coastal GPU solver requested: pool {}. See COASTAL LIVE in latest.log for selection/fallback; r_coastal 0 restores FFT.",
+                    if self.coastal_pool==0 {"automatic".to_owned()} else {self.coastal_pool.to_string()})
+            } else if status==0 {"Coastal GPU solver waiting for bathymetry bake.".into()}
+                else {"Coastal unavailable: load a BSP with r_ocean 1 so its bathymetry can be prepared.".into()});
+        }
+        self.render_command(RenderCommand::SetCoastalWater {enabled:self.coastal_enabled,pool:self.coastal_pool,atlas});
     }
 }

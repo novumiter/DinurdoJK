@@ -625,6 +625,21 @@ pub(in crate::cgame::player_presenter) fn openjk_look_target_origin(
     entity_origins.get(&target).copied()
 }
 
+/// Exponential interpolation on an angular circle, for cg_headLook 2 only.
+/// A 180 ms time constant eases transitions without changing target selection;
+/// shortest-arc normalization handles -180/180 wraparound. Frame-time based,
+/// unlike the original OpenJK BG_UpdateLookAngles per-call smoothing.
+pub(in crate::cgame::player_presenter) fn smooth_head_look_yaw(
+    previous: f32,
+    target: f32,
+    elapsed_ms: i32,
+) -> f32 {
+    let dt = elapsed_ms.clamp(0, 50) as f32;
+    let fraction = 1.0 - (-dt / 180.0).exp();
+    let delta = (target - previous + 180.0).rem_euclid(360.0) - 180.0;
+    (previous + delta * fraction).rem_euclid(360.0)
+}
+
 /// Exact q_math.c `vectoangles` convention used by CG_Player look targets.
 pub(in crate::cgame) fn openjk_vectoangles(value: [f32; 3]) -> [f32; 3] {
     let (yaw, pitch) = if value[1] == 0.0 && value[0] == 0.0 {

@@ -211,6 +211,7 @@ impl App {
             startup_splash: !self.startup_first_frame_seen,
             loading: self.loading.as_ref().map(MapLoadingState::ui),
             shader_compile_progress: None, // Render thread owns worker progress.
+            shader_compile_stage: None,
             static_ao_progress: self
                 .static_ao_progress
                 .map(|(completed, total)| MapLoadingBar {

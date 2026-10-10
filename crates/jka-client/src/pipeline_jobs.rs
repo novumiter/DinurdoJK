@@ -12,7 +12,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -54,6 +54,65 @@ pub(crate) fn set_pipeline_trace(enabled: bool) {
     println!("Renderer pipeline trace: {} (new compilations only)", if enabled { "ON" } else { "OFF" });
 }
 
+/// The BSP variant is one outer job containing up to dozens of native PSOs.
+/// Expose its current inner pipeline so a 10-second driver compile doesn't
+/// look like a frozen 2/8 outer-job progress bar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorldPipelineStageSnapshot {
+    pub pipeline: u32,
+    pub total: u32,
+    pub description: String,
+    pub elapsed_seconds: u64,
+}
+
+struct WorldPipelineStage {
+    pipeline: u32,
+    total: u32,
+    description: String,
+    started: Instant,
+}
+
+static WORLD_PIPELINE_STAGE: OnceLock<Mutex<Option<WorldPipelineStage>>> = OnceLock::new();
+
+fn world_pipeline_stage_slot() -> &'static Mutex<Option<WorldPipelineStage>> {
+    WORLD_PIPELINE_STAGE.get_or_init(|| Mutex::new(None))
+}
+
+/// Begin an inner world PSO compilation. Only the dedicated world worker uses
+/// this slot; regular model/FX workers never interfere with its readout.
+pub(crate) struct WorldPipelineStageGuard;
+
+impl WorldPipelineStageGuard {
+    pub fn begin(pipeline: u32, total: u32, description: String) -> Self {
+        if let Ok(mut stage) = world_pipeline_stage_slot().lock() {
+            *stage = Some(WorldPipelineStage {
+                pipeline, total, description, started: Instant::now(),
+            });
+        }
+        Self
+    }
+}
+
+impl Drop for WorldPipelineStageGuard {
+    fn drop(&mut self) {
+        if let Ok(mut stage) = world_pipeline_stage_slot().lock() {
+            *stage = None;
+        }
+    }
+}
+
+pub(crate) fn world_pipeline_stage() -> Option<WorldPipelineStageSnapshot> {
+    // Never make the render/UI thread wait for a diagnostic mutex.
+    let stage = world_pipeline_stage_slot().try_lock().ok()?;
+    let active = stage.as_ref()?;
+    Some(WorldPipelineStageSnapshot {
+        pipeline: active.pipeline,
+        total: active.total,
+        description: active.description.clone(),
+        elapsed_seconds: active.started.elapsed().as_secs(),
+    })
+}
+
 type PipelineJobValue = Box<dyn std::any::Any + Send>;
 type BuildPipeline = Box<dyn FnOnce() -> PipelineJobValue + Send + 'static>;
 
@@ -63,6 +122,8 @@ enum WorkMessage {
         key: PipelineJobKey,
         label: &'static str,
         build: BuildPipeline,
+        /// Set when a newer key supersedes this logical pipeline slot.
+        cancelled: Arc<AtomicBool>,
     },
     Shutdown,
 }
@@ -76,7 +137,7 @@ struct CompletedJob {
 }
 
 enum JobState {
-    Compiling { id: u64 },
+    Compiling { id: u64, cancelled: Arc<AtomicBool> },
     Ready(PipelineJobValue),
     Failed,
 }
@@ -168,10 +229,24 @@ impl PipelineJobManager {
                         key,
                         label,
                         build,
+                        cancelled,
                     } => {
-                        // Renderer teardown/vid_restart should not grind through jobs that
-                        // were only queued speculatively. An in-flight driver compile cannot
-                        // be cancelled safely, but queued work can be dropped immediately.
+                        // Check before invoking the native compiler: changing settings
+                        // supersedes old logical slots but previously those queued jobs
+                        // still compiled every expensive PSO before being discarded.
+                        // Do NOT attempt to cancel a native create_render_pipeline call
+                        // already executing on this worker.
+                        if cancelled.load(Ordering::Acquire) {
+                            if pipeline_trace_enabled() {
+                                println!("[pipeline job SKIPPED] id={id} family={} slot={} superseded before start",
+                                    key.family, key.slot);
+                            }
+                            let _ = done_tx.send(CompletedJob {
+                                id, key, label, elapsed: Duration::ZERO,
+                                result: Err("superseded before compile".into()),
+                            });
+                            continue;
+                        }
                         if stopping_worker.load(Ordering::Acquire) {
                             continue;
                         }
@@ -230,16 +305,36 @@ impl PipelineJobManager {
         label: &'static str,
         build: impl FnOnce() -> T + Send + 'static,
     ) -> bool {
+        self.request_with_cancel(key, label, move |_| build())
+    }
+
+    /// A compile burst can last tens of seconds. The worker checks this token
+    /// BETWEEN native pipeline creations, never while the driver is inside one.
+    /// Superseded shader variants can therefore stop after their current PSO.
+    pub fn request_with_cancel<T: Send + 'static>(
+        &mut self,
+        key: PipelineJobKey,
+        label: &'static str,
+        build: impl FnOnce(&AtomicBool) -> T + Send + 'static,
+    ) -> bool {
         self.poll();
-        self.states.retain(|other, _| {
-            other.family != key.family || other.slot != key.slot || *other == key
+        self.states.retain(|other, state| {
+            let keep = other.family != key.family || other.slot != key.slot || *other == key;
+            if !keep {
+                if let JobState::Compiling { cancelled, .. } = state {
+                    cancelled.store(true, Ordering::Release);
+                }
+            }
+            keep
         });
         if self.states.contains_key(&key) {
             return false;
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        self.states.insert(key, JobState::Compiling { id });
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let build_cancelled = Arc::clone(&cancelled);
+        self.states.insert(key, JobState::Compiling { id, cancelled: Arc::clone(&cancelled) });
         let work_tx = if key.family == "world-variant" {
             &self.world_work_tx
         } else {
@@ -254,7 +349,8 @@ impl PipelineJobManager {
                 id,
                 key,
                 label,
-                build: Box::new(move || Box::new(build()) as PipelineJobValue),
+                build: Box::new(move || Box::new(build(build_cancelled.as_ref())) as PipelineJobValue),
+                cancelled,
             })
             .is_ok()
         {
@@ -272,6 +368,29 @@ impl PipelineJobManager {
             self.failed = self.failed.saturating_add(1);
             false
         }
+    }
+
+    /// Returning to an already compiled variant must also cancel any obsolete
+    /// worker job. Otherwise a 30-second compile continues despite a cache hit.
+    pub fn cancel_slot(&mut self, family: &'static str, slot: u32) {
+        self.poll();
+        self.states.retain(|key, state| {
+            let keep = key.family != family || key.slot != slot;
+            if !keep {
+                if let JobState::Compiling { cancelled, .. } = state {
+                    cancelled.store(true, Ordering::Release);
+                }
+            }
+            keep
+        });
+    }
+
+    /// Cheap cold-path check before building any expensive capture for a job.
+    /// `activate_world_pipeline_variant` polls an in-flight variant every frame,
+    /// so it must not clone a map of GPU pipeline handles on every poll.
+    pub fn is_compiling(&mut self, key: PipelineJobKey) -> bool {
+        self.poll();
+        matches!(self.states.get(&key), Some(JobState::Compiling { .. }))
     }
 
     /// Returns a finished pipeline without ever waiting for a worker.
@@ -346,7 +465,7 @@ impl PipelineJobManager {
             }
             let current = matches!(
                 self.states.get(&done.key),
-                Some(JobState::Compiling { id }) if *id == done.id
+                Some(JobState::Compiling { id, .. }) if *id == done.id
             );
             if !current {
                 self.stale = self.stale.saturating_add(1);
@@ -462,4 +581,70 @@ mod tests {
         assert_eq!(jobs.progress(), None);
     }
 
+}
+
+#[cfg(test)]
+mod queued_cancel_tests {
+    use super::*;
+
+    #[test]
+    fn cancelling_active_world_slot_is_observed_between_pipelines() {
+        let mut jobs = PipelineJobManager::new();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_worker = Arc::clone(&observed);
+        let key = PipelineJobKey::new("world-variant", 0, 666);
+        jobs.request_with_cancel(key, "cancellable world", move |cancel| {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            observed_worker.store(cancel.load(Ordering::Acquire), Ordering::Release);
+            1u32
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        jobs.cancel_slot("world-variant", 0);
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !observed.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(observed.load(Ordering::Acquire));
+        assert_eq!(jobs.take_ready::<u32>(key), None,
+            "cancelled shader variant must never be installed");
+    }
+
+    #[test]
+    fn superseded_queued_world_job_does_not_compile() {
+        let mut jobs = PipelineJobManager::new();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        // Occupy the dedicated world worker, then queue two generations for
+        // the same slot. The stale generation must never execute its closure.
+        let blocker = PipelineJobKey::new("world-variant", 9, 1);
+        jobs.request(blocker, "blocking world", move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            1u32
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let ran_stale = Arc::new(AtomicBool::new(false));
+        let stale_marker = Arc::clone(&ran_stale);
+        let stale = PipelineJobKey::new("world-variant", 0, 100);
+        let fresh = PipelineJobKey::new("world-variant", 0, 101);
+        assert!(jobs.request(stale, "stale world", move || {
+            stale_marker.store(true, Ordering::Release);
+            2u32
+        }));
+        assert!(jobs.request(fresh, "fresh world", || 3u32));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut result = None;
+        while Instant::now() < deadline {
+            result = jobs.take_ready::<u32>(fresh);
+            if result.is_some() { break; }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(result, Some(3));
+        assert!(!ran_stale.load(Ordering::Acquire), "superseded PSO compilation should be skipped");
+    }
 }

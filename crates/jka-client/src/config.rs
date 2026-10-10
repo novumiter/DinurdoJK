@@ -91,6 +91,8 @@ pub struct ClientPresentationSettings {
     pub jump_height_shade: bool,
     /// cg_screenShake: 0 off, 1 effect-driven shake (explosions, stomps), 2 also weapon-fire shake.
     pub screen_shake: u8,
+    /// cg_headLook: 0 no automatic head tracking, 1 OpenJK, 2 gradual tracking.
+    pub head_look: u8,
     /// Userinfo / network cvars (name, rate, snaps, cl_maxpackets, ...).
     pub network: crate::net::NetworkSettings,
     /// jaPRO cgame options: `cg_stylePlayer`, the race timer, spectator aids.
@@ -298,6 +300,7 @@ impl Default for ClientPresentationSettings {
             ui_vgs: 1,
             jump_height_shade: true,
             screen_shake: 1,
+            head_look: 1,
             network: crate::net::NetworkSettings::default(),
             japro: crate::japro_cg::JaproCgame::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),

@@ -269,10 +269,22 @@ impl Renderer {
         // Post-resource changes (bloom, SSAO, SSR, DOF, cloud resolution) do NOT
         // invalidate render pipelines that still target the same format/MSAA.
         // In particular, avoid recompiling expensive RT BSP variants here.
-        let pipeline_compat_changed = self.targets._scene_texture.format() != scene_format
+        // A resize / surface reconfigure may have recreated `targets` using
+        // the new HDR scene format *before* the pending rebuild is processed.
+        // Therefore target texture compatibility alone cannot prove that the
+        // BSP, Ghoul2, MD3, grass and weather PSOs also match. Compare against
+        // the last completed PIPELINE rebuild, not just the current texture.
+        let target_compat_changed = self.targets._scene_texture.format() != scene_format
             || self.targets._msaa_texture.as_ref().map_or(1, |texture| texture.sample_count()) != samples;
+        let pipeline_compat_changed = target_compat_changed
+            || self.scene_pipeline_compat != (scene_format, samples)
+            || self.dynamic_model_renderer.fx_sprite_surface_format != scene_format
+            || self.dynamic_model_renderer.fx_sprite_samples != samples;
         if crate::pipeline_jobs::pipeline_trace_enabled() {
-            println!("[scene rebuild] format={scene_format:?} samples={samples} pipeline_compat_changed={pipeline_compat_changed}");
+            println!("[scene rebuild] format={scene_format:?} samples={samples} target_changed={target_compat_changed} last_pipeline_compat={:?} model_format={:?} model_samples={} rebuild_pipelines={pipeline_compat_changed}",
+                self.scene_pipeline_compat,
+                self.dynamic_model_renderer.fx_sprite_surface_format,
+                self.dynamic_model_renderer.fx_sprite_samples);
         }
         self.invalidate_rt_sun_shadow_depth();
         // Companion scene textures/pipelines share the gameplay scene format and
@@ -361,6 +373,10 @@ impl Renderer {
             self.fast_world_wireframe_pipeline = None;
             self.debug_volumes.clear_pipelines();
             self.surface_inspector_pipeline = None;
+            // Commit compatibility only after every format-sensitive pipeline
+            // cache has been invalidated/rebuilt. Async variants include their
+            // format in the job key and are installed when ready.
+            self.scene_pipeline_compat = (scene_format, samples);
         } else {
             // In a resource-only rebuild, keep the old GPU pipelines cached,
             // but pick up any shader-key change (e.g. legacy fog) asynchronously.
@@ -701,6 +717,168 @@ pub(in crate::renderer) fn material_uniform(
     out
 }
 
+/// Effective native identity of a BSP pass. Cache keys live at the native PSO
+/// level, not at the menu/preset level. Shader-specialization constants remain
+/// compile-time WGSL overrides; this is NOT a universal shader or runtime branch.
+///
+/// Each pass declares its dependency boundary here. Base rendering excludes
+/// Legacy dlights because those execute in their own additional pass; fog and
+/// reflection passes keep their distinct entry points and vertex formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::renderer) enum WorldPipelinePass {
+    Base { authored_fog: bool },
+    LegacyDlight,
+    LegacyFog,
+    Reflection { authored_fog: bool },
+    ReflectionFog,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::renderer) struct WorldPassPipelineIdentity {
+    pub variant: WorldShaderVariantKey,
+    pub pass: WorldPipelinePass,
+    pub native_key: PipelineKey,
+    pub target_format: wgpu::TextureFormat,
+    pub samples: u32,
+}
+
+impl WorldPassPipelineIdentity {
+    pub(in crate::renderer) fn new(
+        variant: WorldShaderVariantKey, pass: WorldPipelinePass,
+        native_key: PipelineKey, target_format: wgpu::TextureFormat, samples: u32,
+    ) -> Self {
+        // Per-pass normalization is explicit and centralized. Other features
+        // must NEVER be stripped unless their pipeline code actually disables
+        // them; keeping an extra permutation is safer than aliasing wrong code.
+        let variant = match pass {
+            WorldPipelinePass::Base { .. } => variant.base_pass_key(),
+            _ => variant,
+        };
+        Self { variant, pass, native_key, target_format, samples }
+    }
+}
+
+/// A cold-path snapshot of the compiled pass identities currently retained by
+/// the map. The scene-format/MSAA rebuild replaces the complete variant set;
+/// include both in identity anyway to protect future cache refactors.
+#[derive(Default)]
+pub(in crate::renderer) struct WorldPipelineReuseCatalog {
+    pipelines: std::collections::HashMap<WorldPassPipelineIdentity, wgpu::RenderPipeline>,
+}
+
+impl WorldPipelineReuseCatalog {
+    pub fn from_variants(
+        variants: &BTreeMap<WorldShaderVariantKey, WorldPipelineVariant>,
+        format: wgpu::TextureFormat, samples: u32,
+    ) -> Self {
+        let mut catalog = Self::default();
+        for (&variant, set) in variants {
+            for (&key, pipeline) in &set.pipelines {
+                let fog = variant.legacy_fog
+                    && !(variant.ocean && key == ocean_pipeline_key());
+                catalog.insert(WorldPassPipelineIdentity::new(
+                    variant, WorldPipelinePass::Base { authored_fog: fog },
+                    key, format, samples,
+                ), pipeline);
+            }
+            for (&original, pipeline) in &set.legacy_dlight_pipelines {
+                let mut key = original;
+                key.depth_write = false;
+                key.depth_equal = true;
+                catalog.insert(WorldPassPipelineIdentity::new(
+                    variant, WorldPipelinePass::LegacyDlight, key, format, samples,
+                ), pipeline);
+            }
+            for (&(original, writes_depth), pipeline) in &set.fog_pass_pipelines {
+                catalog.insert(WorldPassPipelineIdentity::new(
+                    variant, WorldPipelinePass::LegacyFog,
+                    legacy_fog_pass_pipeline_key(original, writes_depth), format, samples,
+                ), pipeline);
+            }
+            for (&original, pipeline) in &set.reflection_pipelines {
+                catalog.insert(WorldPassPipelineIdentity::new(
+                    variant, WorldPipelinePass::Reflection { authored_fog: variant.legacy_fog },
+                    reflected_pipeline_key(original), format, 1,
+                ), pipeline);
+            }
+            for (&(original, writes_depth), pipeline) in &set.reflection_fog_pass_pipelines {
+                catalog.insert(WorldPassPipelineIdentity::new(
+                    variant, WorldPipelinePass::ReflectionFog,
+                    reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
+                    format, 1,
+                ), pipeline);
+            }
+        }
+        catalog
+    }
+
+    fn insert(&mut self, identity: WorldPassPipelineIdentity, pipeline: &wgpu::RenderPipeline) {
+        self.pipelines.entry(identity).or_insert_with(|| pipeline.clone());
+    }
+}
+
+fn reflected_pipeline_key(mut original: PipelineKey) -> PipelineKey {
+    original.cull = match original.cull {
+        CullMode::None => CullMode::None,
+        CullMode::Front => CullMode::Back,
+        CullMode::Back => CullMode::Front,
+    };
+    original
+}
+
+/// Runtime compilations always execute on the one dedicated world worker.
+/// Checking cancellation between actual native PSOs avoids spending another
+/// minute finishing an obsolete settings permutation. Native driver calls
+/// cannot be interrupted, and a cancelled partial variant is never activated.
+fn compile_cached_world_pass<K: Sync + std::fmt::Debug>(
+    label: &str,
+    jobs: &[K],
+    catalog: &WorldPipelineReuseCatalog,
+    cancelled: &std::sync::atomic::AtomicBool,
+    identity: impl Fn(&K) -> WorldPassPipelineIdentity,
+    create: impl Fn(&K) -> wgpu::RenderPipeline,
+) -> Option<Vec<wgpu::RenderPipeline>> {
+    let start = Instant::now();
+    let mut reused = 0usize;
+    let mut created = 0usize;
+    let mut outputs = Vec::with_capacity(jobs.len());
+    let mut created_cache = std::collections::HashMap::new();
+    for (i, job) in jobs.iter().enumerate() {
+        if cancelled.load(Ordering::Acquire) {
+            rverbose!(1, "Renderer pipeline compile [{label}]: cancelled after {created} new / {reused} reused PSO(s)");
+            return None;
+        }
+        let key = identity(job);
+        if let Some(existing) = catalog.pipelines.get(&key)
+            .or_else(|| created_cache.get(&key))
+        {
+            reused += 1;
+            outputs.push(existing.clone());
+            continue;
+        }
+        let detail = format!("{job:?}");
+        let concise = detail.split("class: ").nth(1)
+            .and_then(|rest| rest.split(", cull:").next())
+            .unwrap_or("world pipeline");
+        let _stage = crate::pipeline_jobs::WorldPipelineStageGuard::begin(
+            (i + 1) as u32, jobs.len() as u32, format!("{label}: {concise}"),
+        );
+        let began = Instant::now();
+        let pipeline = create(job);
+        let elapsed = began.elapsed();
+        if elapsed.as_secs_f32() >= 1.0 {
+            eprintln!("[SLOW WORLD PIPELINE] {label} {}/{} {} {:.1} ms",
+                i + 1, jobs.len(), concise, elapsed.as_secs_f64() * 1000.0);
+        }
+        created_cache.insert(key, pipeline.clone());
+        outputs.push(pipeline);
+        created += 1;
+    }
+    rverbose!(1, "Renderer pipeline compile [{label}]: {} new / {} reused in {:.1} ms wall",
+        created, reused, start.elapsed().as_secs_f64() * 1000.0);
+    Some(outputs)
+}
+
 pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -709,154 +887,93 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
     msaa_samples: u32,
     shader_variant: WorldShaderVariantKey,
     plan: &WorldPipelineCompilePlan,
-) -> WorldPipelineVariant {
-    let mut base_shader_variant = shader_variant;
-    base_shader_variant.legacy_dlights = false;
-    let mut base_jobs = plan
-        .base_keys
-        .iter()
-        .copied()
-        .map(|key| (key, shader_variant.legacy_fog))
-        .collect::<Vec<_>>();
+    reusable: &WorldPipelineReuseCatalog,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Option<WorldPipelineVariant> {
+    let mut base_jobs = plan.base_keys.iter().copied()
+        .map(|key| (key, shader_variant.legacy_fog)).collect::<Vec<_>>();
     if shader_variant.ocean {
         base_jobs.push((ocean_pipeline_key(), false));
     }
-    let base_keys = base_jobs.iter().map(|&(key, _)| key).collect::<Vec<_>>();
-    let pipelines = compile_pipeline_jobs("world-runtime", base_jobs, |&(key, fog)| {
-        create_world_pipeline(
-            device,
-            layout,
-            shader,
-            surface_format,
-            key,
-            msaa_samples,
-            fog,
-            false,
-            Some(base_shader_variant),
-            false,
-        )
-    });
-    let pipelines = base_keys.into_iter().zip(pipelines).collect();
+    let pipelines = compile_cached_world_pass("world-runtime", &base_jobs, reusable, cancelled,
+        |&(key, fog)| WorldPassPipelineIdentity::new(
+            shader_variant, WorldPipelinePass::Base { authored_fog: fog },
+            key, surface_format, msaa_samples),
+        |&(key, fog)| create_world_pipeline(
+            device, layout, shader, surface_format, key, msaa_samples,
+            fog, false, Some(shader_variant.base_pass_key()), false))?
+        .into_iter().zip(base_jobs).map(|(pipeline,(key,_))| (key,pipeline)).collect();
 
     let legacy_dlight_pipelines = if shader_variant.legacy_dlights {
-        let originals = plan.legacy_dlight_keys.clone();
-        let compiled =
-            compile_pipeline_jobs("legacy-dlight-runtime", originals.clone(), |&original| {
-                let mut dlight_key = original;
-                dlight_key.depth_write = false;
-                dlight_key.depth_equal = true;
-                create_world_pipeline(
-                    device,
-                    layout,
-                    shader,
-                    surface_format,
-                    dlight_key,
-                    msaa_samples,
-                    false,
-                    false,
-                    Some(shader_variant),
-                    true,
-                )
-            });
-        originals.into_iter().zip(compiled).collect()
-    } else {
-        BTreeMap::new()
-    };
+        let originals = &plan.legacy_dlight_keys;
+        compile_cached_world_pass("legacy-dlight-runtime", originals, reusable, cancelled,
+            |&original| {
+                let mut key = original;
+                key.depth_write = false;
+                key.depth_equal = true;
+                WorldPassPipelineIdentity::new(shader_variant,
+                    WorldPipelinePass::LegacyDlight, key, surface_format, msaa_samples)
+            },
+            |&original| {
+                let mut key = original;
+                key.depth_write = false;
+                key.depth_equal = true;
+                create_world_pipeline(device, layout, shader, surface_format,
+                    key, msaa_samples, false, false, Some(shader_variant), true)
+            })?.into_iter().zip(originals.iter().copied())
+            .map(|(pipeline,key)| (key,pipeline)).collect()
+    } else { BTreeMap::new() };
 
     let fog_pass_pipelines = if shader_variant.legacy_fog {
-        let jobs = plan.fog_jobs.clone();
-        let compiled = compile_pipeline_jobs(
-            "legacy-fog-runtime",
-            jobs.clone(),
-            |&(original, writes_depth)| {
-                create_world_pipeline(
-                    device,
-                    layout,
-                    shader,
-                    surface_format,
-                    legacy_fog_pass_pipeline_key(original, writes_depth),
-                    msaa_samples,
-                    true,
-                    true,
-                    Some(shader_variant),
-                    false,
-                )
-            },
-        );
-        jobs.into_iter().zip(compiled).collect()
-    } else {
-        BTreeMap::new()
-    };
+        let jobs = &plan.fog_jobs;
+        compile_cached_world_pass("legacy-fog-runtime", jobs, reusable, cancelled,
+            |&(original, writes_depth)| WorldPassPipelineIdentity::new(
+                shader_variant, WorldPipelinePass::LegacyFog,
+                legacy_fog_pass_pipeline_key(original, writes_depth), surface_format, msaa_samples),
+            |&(original, writes_depth)| create_world_pipeline(
+                device, layout, shader, surface_format,
+                legacy_fog_pass_pipeline_key(original, writes_depth),
+                msaa_samples, true, true, Some(shader_variant), false))?
+            .into_iter().zip(jobs.iter().copied())
+            .map(|(pipeline,key)| (key,pipeline)).collect()
+    } else { BTreeMap::new() };
 
     let reflection_pipelines = if plan.has_planar_reflectors && shader_variant.planar_reflections {
-        let originals = plan.base_keys.clone();
-        let compiled =
-            compile_pipeline_jobs("reflection-runtime", originals.clone(), |&original| {
-                let mut reflected = original;
-                reflected.cull = match reflected.cull {
-                    CullMode::None => CullMode::None,
-                    CullMode::Front => CullMode::Back,
-                    CullMode::Back => CullMode::Front,
-                };
-                create_world_pipeline(
-                    device,
-                    layout,
-                    shader,
-                    surface_format,
-                    reflected,
-                    1,
-                    shader_variant.legacy_fog,
-                    false,
-                    Some(shader_variant),
-                    false,
-                )
-            });
-        originals.into_iter().zip(compiled).collect()
-    } else {
-        BTreeMap::new()
-    };
+        let originals = &plan.base_keys;
+        compile_cached_world_pass("reflection-runtime", originals, reusable, cancelled,
+            |&original| WorldPassPipelineIdentity::new(
+                shader_variant, WorldPipelinePass::Reflection { authored_fog: shader_variant.legacy_fog },
+                reflected_pipeline_key(original), surface_format, 1),
+            |&original| create_world_pipeline(
+                device, layout, shader, surface_format, reflected_pipeline_key(original),
+                1, shader_variant.legacy_fog, false, Some(shader_variant), false))?
+            .into_iter().zip(originals.iter().copied())
+            .map(|(pipeline,key)| (key,pipeline)).collect()
+    } else { BTreeMap::new() };
 
     let reflection_fog_pass_pipelines = if shader_variant.legacy_fog
-        && plan.has_planar_reflectors
-        && shader_variant.planar_reflections
-    {
-        let jobs = plan.fog_jobs.clone();
-        let compiled = compile_pipeline_jobs(
-            "reflection-fog-runtime",
-            jobs.clone(),
-            |&(original, writes_depth)| {
-                let mut reflected = legacy_fog_pass_pipeline_key(original, writes_depth);
-                reflected.cull = match reflected.cull {
-                    CullMode::None => CullMode::None,
-                    CullMode::Front => CullMode::Back,
-                    CullMode::Back => CullMode::Front,
-                };
-                create_world_pipeline(
-                    device,
-                    layout,
-                    shader,
-                    surface_format,
-                    reflected,
-                    1,
-                    true,
-                    true,
-                    Some(shader_variant),
-                    false,
-                )
-            },
-        );
-        jobs.into_iter().zip(compiled).collect()
-    } else {
-        BTreeMap::new()
-    };
+        && plan.has_planar_reflectors && shader_variant.planar_reflections {
+        let jobs = &plan.fog_jobs;
+        compile_cached_world_pass("reflection-fog-runtime", jobs, reusable, cancelled,
+            |&(original, writes_depth)| WorldPassPipelineIdentity::new(
+                shader_variant, WorldPipelinePass::ReflectionFog,
+                reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
+                surface_format, 1),
+            |&(original, writes_depth)| create_world_pipeline(
+                device, layout, shader, surface_format,
+                reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
+                1, true, true, Some(shader_variant), false))?
+            .into_iter().zip(jobs.iter().copied())
+            .map(|(pipeline,key)| (key,pipeline)).collect()
+    } else { BTreeMap::new() };
 
-    WorldPipelineVariant {
+    Some(WorldPipelineVariant {
         pipelines,
         legacy_dlight_pipelines,
         fog_pass_pipelines,
         reflection_pipelines,
         reflection_fog_pass_pipelines,
-    }
+    })
 }
 
 pub(in crate::renderer) fn create_world_pipelines(
@@ -872,10 +989,7 @@ pub(in crate::renderer) fn create_world_pipelines(
     // OpenJK projects Legacy dlights in a separate additive pass. Keep the base
     // material variant free of the dlight loop even when the user selected
     // Legacy; the dedicated pass below compiles the original key.
-    let base_shader_variant = shader_variant.map(|mut key| {
-        key.legacy_dlights = false;
-        key
-    });
+    let base_shader_variant = shader_variant.map(WorldShaderVariantKey::base_pass_key);
     let mut jobs = batches
         .iter()
         .map(|batch| batch.source.pipeline)
@@ -936,7 +1050,7 @@ pub(in crate::renderer) fn compile_pipeline_jobs<K, T>(
     create: impl Fn(&K) -> T + Sync,
 ) -> Vec<T>
 where
-    K: Sync,
+    K: Sync + std::fmt::Debug,
     T: Send,
 {
     if jobs.is_empty() {
@@ -965,8 +1079,26 @@ where
                 break;
             };
             let job_started = Instant::now();
+            // The single world worker compiles a whole set of native PSOs as
+            // one outer job. Publish the inner index and material class while
+            // the driver is inside create_render_pipeline. This is diagnostics
+            // only: it never changes the shader, ordering or pipeline key.
+            let detail = format!("{job:?}");
+            let concise = detail.split("class: ").nth(1)
+                .and_then(|rest| rest.split(", cull:").next())
+                .unwrap_or("world pipeline");
+            let _stage_guard = (current_thread.name() == Some("pipeline-compile-world"))
+                .then(|| crate::pipeline_jobs::WorldPipelineStageGuard::begin(
+                    (index + 1) as u32, jobs.len() as u32,
+                    format!("{label}: {concise}"),
+                ));
             let value = create(job);
-            done.push((index, value, job_started.elapsed()));
+            let elapsed = job_started.elapsed();
+            if on_runtime_pipeline_worker && elapsed.as_secs_f32() >= 1.0 {
+                eprintln!("[SLOW WORLD PIPELINE] {label} {}/{} {} {:.1} ms",
+                    index + 1, jobs.len(), concise, elapsed.as_secs_f64() * 1000.0);
+            }
+            done.push((index, value, elapsed));
         }
         done
     };

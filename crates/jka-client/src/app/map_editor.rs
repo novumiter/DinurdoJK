@@ -580,6 +580,7 @@ impl MapEditor {
             }
         }
         (!indices.is_empty()).then(|| DynamicModelSurface {
+            geometry_source: crate::renderer::ModelGeometrySource::Other,
             entity_num: u16::MAX,
             wireframe_class: DynamicWireframeClass::Entity,
             raster_visible: true,

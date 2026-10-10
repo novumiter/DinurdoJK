@@ -43,7 +43,7 @@ use api::{
 };
 pub use api::{
     ClientFramePerf, CloudForegroundBlade, CompanionId, CompanionSceneView, DynamicModelAlphaMode,
-    DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData,
+    DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
     FxGpuSpriteInstance, FxGpuSprites, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand,
     RenderSnapshot, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
@@ -256,8 +256,11 @@ use world::pipelines::{
     create_legacy_dlight_pass_pipelines, create_legacy_fog_pass_pipelines,
     create_reflection_fog_pass_pipelines, create_reflection_pipelines,
     create_world_pipeline_variant_from_plan, create_world_pipelines, legacy_dlight_receives,
+    WorldPipelineReuseCatalog,
     legacy_fog_pass_jobs, material_uniform, ocean_pipeline_key, same_world_surface,
 };
+#[cfg(test)]
+use world::pipelines::{WorldPassPipelineIdentity, WorldPipelinePass};
 use world::types::{
     GpuReflectionProbe, InlineModelGpu, LegacyDlightRun, PlanarReflectionResources,
     PlanarReflectionView, PlanarReflector, PlanarReflectorKind, ReflectionProbeGpuSet,
@@ -563,6 +566,10 @@ struct Renderer {
     present_modes: Vec<wgpu::PresentMode>,
     /// Set by [`Renderer::request_scene_rebuild`], consumed once per frame.
     scene_rebuild_pending: bool,
+    /// Format/sample count for which the complete scene pipeline set was last
+    /// rebuilt. Unlike `targets`, this is NOT advanced by resize/reconfigure:
+    /// those can recreate textures without updating render pipelines.
+    scene_pipeline_compat: (wgpu::TextureFormat, u32),
     supported_msaa: Vec<u32>,
     hdr_supported_msaa: Vec<u32>,
     vsync: VsyncMode,
@@ -620,6 +627,9 @@ struct Renderer {
     /// Top of the water volume the camera is inside, or NO_WATER_SURFACE.
     camera_water_surface: f32,
     ocean_enabled: bool,
+    coastal_enabled: bool,
+    coastal_pool: u8,
+    coastal_atlas: Option<Arc<jka_assets::bsp::bathymetry::Atlas>>,
     /// GPU occlusion query: how many ocean samples actually survived depth.
     ocean_visibility: OceanVisibility,
     /// Seconds since an ocean surface was last drawn (or the camera was last
@@ -846,6 +856,7 @@ struct Renderer {
     force_unified_world: bool,
     indirect_supported: bool,
     gpu_compaction_supported: bool,
+    world_compact_min_draws: u32,
     compact_group_scratch: Vec<bool>,
     // CPU-culling counterpart to the GPU compactor. These retained vectors let
     // the ordinary PVS + frustum path pack same-state visible draws into the

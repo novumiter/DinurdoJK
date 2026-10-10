@@ -1033,6 +1033,7 @@ fn all_renderer_shaders_validate() {
         ("froxel_fog", include_str!("../../froxel_fog.wgsl")),
         ("ocean_windrow", include_str!("../../ocean_windrow.wgsl")),
         ("ocean_interaction", include_str!("../../ocean_interaction.wgsl")),
+        ("coastal_compute", include_str!("../../coastal_compute.wgsl")),
         ("ocean_spray", include_str!("../../ocean_spray.wgsl")),
         ("md3", md3.as_str()),
         ("ghoul2_skin", ghoul2_skin.as_str()),
@@ -1166,6 +1167,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             depth_hack: 0.0,
         };
         let surface = DynamicModelSurface {
+            geometry_source: crate::renderer::ModelGeometrySource::Fx,
             entity_num: 1,
             wireframe_class: DynamicWireframeClass::Entity,
             raster_visible: true,
@@ -1496,6 +1498,7 @@ fn ocean_render_uniform_matches_water_and_spray_layouts() {
     use crate::weather::rain_layout::{offset_of_member,wgsl_struct_layout};
     use std::mem::{offset_of,size_of};
     for shader in [compose_world_shader(include_str!("../../bsp.wgsl")),
+        include_str!("../../coastal_compute.wgsl").to_string(),
         include_str!("../../ocean_spray.wgsl").to_string()] {
         let (size,members) = wgsl_struct_layout(&shader,"OceanRenderSettings");
         assert_eq!(size as usize,size_of::<OceanRenderUniform>());

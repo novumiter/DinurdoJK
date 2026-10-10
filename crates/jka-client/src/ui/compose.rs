@@ -29,7 +29,7 @@ pub fn build_vertices(
     if let Some(loading) = &ui.loading {
         build_loading_screen(&mut out, loading, width, height, splash_size);
         if let Some(progress) = &ui.shader_compile_progress {
-            build_shader_compile_progress(&mut out, progress, width, height);
+            build_shader_compile_progress(&mut out, progress, ui.shader_compile_stage.as_deref(), width, height);
         }
         // Keep the console usable during background map preparation/upload.
         // It is intentionally layered over the loading screen rather than
@@ -78,7 +78,7 @@ pub fn build_vertices(
         build_background_progress(&mut out, progress, width, height);
     }
     if let Some(progress) = &ui.shader_compile_progress {
-        build_shader_compile_progress(&mut out, progress, width, height);
+        build_shader_compile_progress(&mut out, progress, ui.shader_compile_stage.as_deref(), width, height);
     }
     out
 }

@@ -27,6 +27,22 @@ impl App {
 
                 theme::section(
                     ui,
+                    "PLAYER ANIMATIONS",
+                    "Local rendering preferences; server gameplay and target selection are unchanged.",
+                );
+                if let Some(mode) = segmented_row(
+                    ui,
+                    "Automatic head tracking",
+                    "cg_headLook. Off: no automatic look-target head turns. On: unchanged TaystJK/OpenJK behavior. Smoothed: gradually rotate toward new targets, without changing their selection or gameplay aim.",
+                    theme::Reset::None,
+                    self.head_look,
+                    &[(0, "Off"), (1, "On"), (2, "Smoothed")],
+                ) {
+                    let _ = self.set_console_cvar("cg_headLook", &mode.to_string());
+                }
+
+                theme::section(
+                    ui,
                     "SPECTATING & DEMOS",
                     "Presentation options shared by every server/mod and demo playback.",
                 );

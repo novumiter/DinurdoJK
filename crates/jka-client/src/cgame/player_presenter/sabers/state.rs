@@ -116,6 +116,8 @@ pub(in crate::cgame::player_presenter) struct EntityPlayerState {
     // OpenJK cent->pe + clientInfo angle state consumed by BG_G2PlayerAngles.
     pub(in crate::cgame::player_presenter) player_angles: PlayerAngleState,
     pub(in crate::cgame::player_presenter) last_angle_time: i32,
+    /// Optional filtered world-space look yaw for cg_headLook 2.
+    pub(in crate::cgame::player_presenter) head_look_yaw: Option<f32>,
     pub(in crate::cgame::player_presenter) last_e_flags: i32,
     pub(in crate::cgame::player_presenter) last_client_num: i32,
     /// `cent->ghoul2weapon`: which g2WeaponInstances entry was last copied.

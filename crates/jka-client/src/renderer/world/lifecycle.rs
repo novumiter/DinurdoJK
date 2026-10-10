@@ -359,6 +359,7 @@ impl Renderer {
         // overlay over the last gameplay frame. Drop all map-owned GPU state so
         // the renderer returns to the same world-less state used at startup.
         self.world = None;
+        self.coastal_atlas = None;
         self.world_flares.load(&[]);
         self.world_flares_sky.load(&[]);
         for flare_view in &mut self.world_flares_planar { flare_view.load(&[]); }

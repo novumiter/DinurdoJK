@@ -21,6 +21,7 @@ pub mod appearance;
 pub mod interaction;
 pub mod surfaces;
 pub mod bathymetry;
+pub mod coastal;
 pub use authoring::{AtmosphericWind, OceanAuthoring, OceanWind};
 pub const OCEAN_CASCADES: usize = 3;
 pub const OCEAN_DEFAULT_MAP_SIZE: u32 = 1024;
@@ -1437,6 +1438,9 @@ struct PromotedRenderSurface {
 }
 
 pub struct OceanGpu {
+    pub coastal: Option<coastal::Gpu>,
+    coastal_render: std::sync::Arc<coastal::RenderResources>,
+    coastal_key: Option<(usize, u8, bool, u32, u32)>,
     enabled: bool,
     settings: OceanSettings,
     clipmap_center: [f32; 4],
@@ -1608,6 +1612,7 @@ impl OceanGpu {
             ..Default::default()
         });
         let interaction = interaction::RenderResources::inert(device);
+        let coastal = coastal::RenderResources::inert(device);
         let settings = OceanSettings::default();
         let render_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Ocean inert render uniform"),
@@ -1627,6 +1632,9 @@ impl OceanGpu {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&interaction.view) },
                 bg_buffer(7, &interaction.uniform),
                 bg_buffer(8, &interaction.splash_uniform),
+                bg_buffer(9, &coastal.params),
+                bg_buffer(10, &coastal.lookup),
+                bg_buffer(11, &coastal.surface),
             ],
         })
     }
@@ -1643,6 +1651,9 @@ impl OceanGpu {
                 wgpu::BindGroupLayoutEntry{binding:6,visibility:wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Texture{sample_type:wgpu::TextureSampleType::Float{filterable:true},view_dimension:wgpu::TextureViewDimension::D2Array,multisampled:false},count:None},
                 uniform_layout_entry(7,wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT),
                 uniform_layout_entry(8,wgpu::ShaderStages::VERTEX),
+                uniform_layout_entry(9,wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT),
+                wgpu::BindGroupLayoutEntry{binding:10,visibility:wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Buffer{ty:wgpu::BufferBindingType::Storage{read_only:true},has_dynamic_offset:false,min_binding_size:None},count:None},
+                wgpu::BindGroupLayoutEntry{binding:11,visibility:wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Buffer{ty:wgpu::BufferBindingType::Storage{read_only:true},has_dynamic_offset:false,min_binding_size:None},count:None},
             ]
         })
     }
@@ -1770,6 +1781,7 @@ impl OceanGpu {
         });
 
         let render_uniform = make_render_uniform(false,&settings);
+        let coastal_render = coastal::RenderResources::inert(device);
         let render_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label:Some("Ocean render uniform"), contents:bytemuck::bytes_of(&render_uniform), usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label:Some("Ocean repeat sampler"), address_mode_u:wgpu::AddressMode::Repeat,address_mode_v:wgpu::AddressMode::Repeat,address_mode_w:wgpu::AddressMode::ClampToEdge,mag_filter:wgpu::FilterMode::Linear,min_filter:wgpu::FilterMode::Linear,mipmap_filter:wgpu::MipmapFilterMode::Linear,..Default::default() });
         let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label:Some("Ocean render bind group"), layout:render_layout, entries:&[
@@ -1782,6 +1794,9 @@ impl OceanGpu {
             wgpu::BindGroupEntry{binding:6,resource:wgpu::BindingResource::TextureView(&interaction.view)},
             bg_buffer(7, &interaction.uniform),
             bg_buffer(8, &interaction.splash_uniform),
+            bg_buffer(9, &coastal_render.params),
+            bg_buffer(10, &coastal_render.lookup),
+            bg_buffer(11, &coastal_render.surface),
         ]});
         let windrow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Ocean wind foam streak compute bind group"),
@@ -1798,7 +1813,8 @@ impl OceanGpu {
             render_displacement_view:displacement_view, render_normal_view:normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
-            interaction_splash_uniform: interaction.splash_uniform.clone() };
+            interaction_splash_uniform: interaction.splash_uniform.clone(),
+            coastal: None, coastal_render, coastal_key: None };
         ocean.upload_params(queue,0.0);
         let mut encoder=device.create_command_encoder(&wgpu::CommandEncoderDescriptor{label:Some("Ocean FFT init")});
         {
@@ -1857,6 +1873,81 @@ impl OceanGpu {
             .iter()
             .find(|s| s.descriptor.index == index)
             .map_or(&self.render_bind_group, |s| &s.bind_group)
+    }
+
+    /// Rebuild only when the map/selection/amplitude changes. Failed selections
+    /// are remembered so unsupported pools do not retry every render frame.
+    pub fn configure_coastal(
+        &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        enabled: bool, pool: u8,
+        atlas: Option<&std::sync::Arc<jka_assets::bsp::bathymetry::Atlas>>,
+        promoted: &[appearance::PromotedOcean], overrides: &[(usize, OceanSettings)],
+    ) {
+        let pointer=atlas.map_or(0,|a|std::sync::Arc::as_ptr(a) as usize);
+        let mut candidates:Vec<_>=promoted.iter().filter(|p|pool==0 || p.index+1==pool as usize).collect();
+        let amplitude=|p:&appearance::PromotedOcean|overrides.iter().find(|(slot,_)|*slot==p.index)
+            .map_or(p.heuristic.amplitude,|(_,s)|s.authored.amplitude);
+        let signature=candidates.iter().fold(0u32,|h,p| {
+            let wavelength=overrides.iter().find(|(slot,_)|*slot==p.index)
+                .map_or(p.heuristic.wavelength,|(_,s)|s.authored.wavelength);
+            h.wrapping_mul(31)^amplitude(p).to_bits()^wavelength.to_bits()
+        });
+        let key=(pointer,pool,enabled,signature,self.settings.map_size);
+        if self.coastal_key==Some(key) {return;}
+        self.coastal_key=Some(key);
+        self.coastal=None;
+        queue.write_buffer(&self.coastal_render.params,16,bytemuck::cast_slice(&[0u32]));
+        if !enabled || pointer==0 {return;}
+        if pool==0 {
+            candidates.sort_by_key(|p| std::cmp::Reverse(atlas.map_or(0,|a| a.grids.iter()
+                .filter(|g|g.slot as usize==p.index)
+                .flat_map(|g|g.cells.iter().filter(|c|c.class==jka_assets::bsp::bathymetry::Class::Wet
+                    && c.depth/p.heuristic.wavelength.max(1.0)<=0.05))
+                .count())));
+        }
+        let mut rejection="no matching promoted pool".to_owned();
+        for descriptor in candidates {
+            // Use the effective per-pool wavelength for regime eligibility.
+            let settings=appearance::surface_settings(self.settings,descriptor,
+                overrides.iter().find(|(slot,_)|*slot==descriptor.index).map(|(_,s)|*s));
+            let mut effective=descriptor.clone();
+            effective.heuristic.wavelength=settings.authored.wavelength;
+            match coastal::prepare(atlas.unwrap(),&effective) {
+                Ok(prepared)=> {
+                    let gpu=coastal::Gpu::new(device,prepared,&self.render_displacement_view,&self.render_sampler,amplitude(descriptor));
+                    eprintln!("COASTAL LIVE: {}",gpu.summary);
+                    self.coastal_render=std::sync::Arc::clone(&gpu.render);
+                    self.coastal=Some(gpu);
+                    // Existing promoted groups reference the old field buffers.
+                    // The following set_promoted_surfaces rebuilds them once.
+                    self.promoted_surfaces.clear();
+                    self.render_bind_group=device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label:Some("Ocean render with coastal field"),layout:&self.render_layout,entries:&[
+                            wgpu::BindGroupEntry{binding:0,resource:wgpu::BindingResource::TextureView(&self.render_displacement_view)},
+                            wgpu::BindGroupEntry{binding:1,resource:wgpu::BindingResource::TextureView(&self.render_normal_view)},
+                            wgpu::BindGroupEntry{binding:2,resource:wgpu::BindingResource::Sampler(&self.render_sampler)},
+                            bg_buffer(3,&self.render_buffer),
+                            wgpu::BindGroupEntry{binding:4,resource:wgpu::BindingResource::TextureView(&self.spray_view)},
+                            bg_buffer(5,&self._windrow_field_buffer),
+                            wgpu::BindGroupEntry{binding:6,resource:wgpu::BindingResource::TextureView(&self.interaction_view)},
+                            bg_buffer(7,&self.interaction_uniform),bg_buffer(8,&self.interaction_splash_uniform),
+                            bg_buffer(9,&self.coastal_render.params),bg_buffer(10,&self.coastal_render.lookup),bg_buffer(11,&self.coastal_render.surface),
+                        ]});
+                    return;
+                }
+                Err(reason)=>rejection=format!("pool {}: {reason}",descriptor.index+1),
+            }
+        }
+        eprintln!("COASTAL LIVE: FFT fallback; {rejection}");
+    }
+
+    pub fn encode_coastal(&mut self,queue:&wgpu::Queue,encoder:&mut wgpu::CommandEncoder,delta:f32) {
+        let Some(coastal)=self.coastal.as_mut() else {return;};
+        let Some(surface)=self.promoted_surfaces.iter().find(|s|s.descriptor.index==coastal.slot) else {return;};
+        let mut shared=make_render_uniform(self.enabled,&self.settings);
+        shared.swell_motion[3]=self.elapsed;
+        let wave=make_promoted_render_uniform(&shared,&surface.settings,&surface.descriptor,surface.manual,self.promoted_surfaces.len());
+        coastal.encode(queue,encoder,delta,&wave);
     }
 
     pub fn set_promoted_surfaces(
@@ -1930,6 +2021,9 @@ impl OceanGpu {
                         wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.interaction_view) },
                         bg_buffer(7, &self.interaction_uniform),
                         bg_buffer(8, &self.interaction_splash_uniform),
+                        bg_buffer(9, &self.coastal_render.params),
+                        bg_buffer(10, &self.coastal_render.lookup),
+                        bg_buffer(11, &self.coastal_render.surface),
                     ],
                 });
                 PromotedRenderSurface {

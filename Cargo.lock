@@ -19,6 +19,7 @@ dependencies = [
  "jka-assets",
  "jka-movement",
  "jka-protocol",
+ "jka-water",
  "libjpeg-turbo-rs",
  "log",
  "naga",
@@ -1564,6 +1565,7 @@ name = "jka-assets"
 version = "0.1.0"
 dependencies = [
  "image",
+ "log",
  "zip 8.6.0",
 ]
 

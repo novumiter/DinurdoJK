@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 30;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 31;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -73,6 +73,7 @@ pub(in crate::renderer) enum GpuPass {
     // Sub-timings inside Post: these never contribute again to frame_ms.
     SsrVisibility = 28,
     SsrTrace = 29,
+    CoastalSim = 30,
 }
 
 impl GpuPass {
@@ -113,6 +114,7 @@ impl GpuPass {
         Self::OceanSim,
         Self::SsrVisibility,
         Self::SsrTrace,
+        Self::CoastalSim,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -147,6 +149,7 @@ impl GpuPass {
             Self::OceanSim => "ocean_sim",
             Self::SsrVisibility => "ssr_visibility",
             Self::SsrTrace => "ssr_trace",
+            Self::CoastalSim => "coastal_sim",
         }
     }
 }
@@ -192,6 +195,7 @@ impl GpuTiming {
             GpuPass::RainSim,
             GpuPass::WeatherFog,
             GpuPass::OceanSim,
+            GpuPass::CoastalSim,
             GpuPass::RtBuild,
             GpuPass::RtVisibility,
             GpuPass::World,

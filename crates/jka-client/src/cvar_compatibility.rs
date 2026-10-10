@@ -31,6 +31,11 @@ pub(crate) fn digest(text: &str) -> String {
     // compatibility digest focused on pre-existing behavior; each addition has
     // a dedicated load/archive test below.
     let projected = text
+        // Session-only encoding experiments default to baseline and did not
+        // exist in the frozen settings Debug layout. Their live setters are
+        // verified in the headless runtime test, without changing old hashes.
+        .replace(", model_state_cache: false, dynamic_batch_draws: false, world_compact_min_draws: 1", "")
+        .replace(", model_prepare_threads: 0, model_index_upload_cache: false, ghoul2_batch_key_cache: false", "")
         .replace(", dynamic_light_falloff: ", ", rt_denoiser_mode: 0, dynamic_light_falloff: ")
         .replace("OceanSettings { interaction: false, interaction_strength: 1.0, interaction_splash_mode: 3, interaction_debug: false, ", "OceanSettings { ")
         .replace("interaction_splash_mode: 3, ", "")

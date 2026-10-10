@@ -62,6 +62,11 @@ impl Renderer {
         self.ssr_frame_index = 0;
         self.update_post_uniform();
         self.update_lighting_settings();
+        // If resize recreated the target while a format/MSAA setting was still
+        // pending, schedule the matching pipeline rebuild before the next frame.
+        if self.scene_pipeline_compat != (self.scene_format(), self.msaa_samples) {
+            self.request_scene_rebuild();
+        }
         self.rebuild_ui();
     }
 
@@ -116,6 +121,11 @@ impl Renderer {
         self.ssr_frame_index = 0;
         self.update_post_uniform();
         self.update_lighting_settings();
+        // Surface loss/reconfiguration is also allowed to recreate textures;
+        // never mistake that for recompiling pipelines for a new scene format.
+        if self.scene_pipeline_compat != (self.scene_format(), self.msaa_samples) {
+            self.request_scene_rebuild();
+        }
     }
 
     /// Reconfigure only the presentation surface. Present mode and frame-queue

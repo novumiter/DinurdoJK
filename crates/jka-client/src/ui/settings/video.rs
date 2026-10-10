@@ -91,6 +91,14 @@ pub struct VideoSettings {
     pub ghoul2_early_cull: bool,
     pub ghoul2_lod_bias: i32,
     pub ghoul2_batch_draws: Ghoul2BatchMode,
+    /// Session-only command-encoding A/B controls; preserve baseline by default.
+    pub model_state_cache: bool,
+    pub dynamic_batch_draws: bool,
+    /// Minimum visible members for CPU world compaction (1 baseline, 2 experimental).
+    pub world_compact_min_draws: u32,
+    pub model_prepare_threads: u32,
+    pub model_index_upload_cache: bool,
+    pub ghoul2_batch_key_cache: bool,
     /// `r_ghoul2animsmooth`: jaPRO `CBoneCache::SmoothLow` renderer bone-history
     /// filter factor. Matches jaPRO's own default of 0.3; only active strictly
     /// between 0 and 1 (0 or >=1 disables it).
@@ -537,6 +545,12 @@ impl Default for VideoSettings {
             ghoul2_early_cull: true,
             ghoul2_lod_bias: 0,
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
+            model_state_cache: false,
+            dynamic_batch_draws: false,
+            world_compact_min_draws: 1,
+            model_prepare_threads: 0,
+            model_index_upload_cache: false,
+            ghoul2_batch_key_cache: false,
             ghoul2_anim_smooth: 0.3,
             timer_resolution_1ms: false,
             input_latelatch: false,

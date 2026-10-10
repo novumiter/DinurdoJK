@@ -74,7 +74,10 @@ impl Atlas {
         }
         let count = reader.u32()? as usize;
         let warnings = reader.u32()? as usize;
-        if count > 64 || warnings > 64 {
+        // Sparse 16x16 tiles can legitimately number in the thousands. Total
+        // decoded cells/bytes remain bounded below; the old dense-grid cap
+        // caused every v3 tiled map to rebake on every load.
+        if count > 8192 || warnings > 64 {
             return Err(fail());
         }
         let mut atlas = Atlas {

@@ -198,6 +198,7 @@ impl PlayerPresenter {
             viewer_style: crate::japro_cg::StyleViewer::default(),
             look: crate::japro_cg::Appearance::NORMAL,
             japro_cinfo2: 0,
+            head_look_mode: 1,
             saber_team_colors: true,
             saber_staff_multi_color: false,
             duel_shell_gray: None,
@@ -260,6 +261,12 @@ impl PlayerPresenter {
         };
         presenter.prime_default_player_models();
         Ok(presenter)
+    }
+
+    /// Applies to player models in live games, demo playback and solo sessions.
+    /// Only the visual look vector is changed, not entityState or Pmove.
+    pub fn set_head_look_mode(&mut self, mode: u8) {
+        self.head_look_mode = mode.min(2);
     }
 
     /// TaystJK `CG_MapTorsoToWeaponFrame`: sample the already-advanced local

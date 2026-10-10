@@ -250,6 +250,69 @@ struct OceanInteractionDomain {
 struct OceanInteractionDomains { domains: array<OceanInteractionDomain, 4> };
 @group(6) @binding(6) var ocean_interaction_field: texture_2d_array<f32>;
 @group(6) @binding(7) var<uniform> ocean_interaction: OceanInteractionDomains;
+struct CoastalParams { grid:vec4<f32>, control:vec4<u32>, limits:vec4<f32> };
+struct CoastalPresentation { previous:vec4<f32>, current:vec4<f32>, slopes:vec4<f32>, accounting:vec4<f32> };
+struct CoastalSurface { failed:u32, pad0:u32, pad1:u32, pad2:u32, cells:array<CoastalPresentation> };
+struct CoastalSample { field:vec4<f32>, slope:vec2<f32> };
+@group(6) @binding(9) var<uniform> coastal_params:CoastalParams;
+@group(6) @binding(10) var<storage,read> coastal_lookup:array<vec4<i32>>;
+@group(6) @binding(11) var<storage,read> coastal_surface:CoastalSurface;
+fn coastal_hash(coordinate:vec2<i32>)->u32 {
+    return (u32(coordinate.x)*73856093u)^(u32(coordinate.y)*19349663u);
+}
+fn coastal_cell(coordinate:vec2<i32>)->u32 {
+    let tile=vec2<i32>(floor(vec2<f32>(coordinate)/16.0));
+    let local=coordinate-tile*16;
+    var index=coastal_hash(tile)&coastal_params.control.y;
+    for (var probe=0u;probe<=coastal_params.control.y;probe++) {
+        let record=coastal_lookup[index];
+        if (record.w==0) {return 0xffffffffu;}
+        if (all(record.xy==tile)) {return u32(record.z+local.y*16+local.x);}
+        index=(index+1u)&coastal_params.control.y;
+    }
+    return 0xffffffffu;
+}
+fn coastal_open_at(coordinate:vec2<i32>,axis:u32)->bool {
+    let k=coastal_cell(coordinate);if (k==0xffffffffu) {return false;}
+    return (u32(coastal_surface.cells[k].accounting.w)&(1u<<axis))!=0u;
+}
+fn coastal_connected(a:vec2<i32>,b:vec2<i32>)->bool {
+    let delta=b-a;if (all(delta==vec2<i32>(0))) {return true;}
+    let x=select(0u,1u,delta.x>0);let y=select(2u,3u,delta.y>0);
+    if (delta.x==0) {return coastal_open_at(a,y);}
+    if (delta.y==0) {return coastal_open_at(a,x);}
+    return (coastal_open_at(a,x)&&coastal_open_at(vec2<i32>(b.x,a.y),y))
+        ||(coastal_open_at(a,y)&&coastal_open_at(vec2<i32>(a.x,b.y),x));
+}
+fn sample_coastal(position:vec3<f32>)->CoastalSample {
+    var result:CoastalSample;
+    result.field=vec4<f32>(0.0);result.slope=vec2<f32>(0.0);
+    // Scope by stable slot and still-water plane so stacked pools cannot alias.
+    if (coastal_params.control.x==0u || coastal_surface.failed!=0u || ocean.authored_plane.w<0.5
+        || abs(ocean.spray_planes[0].z-coastal_params.grid.w)>0.1
+        || abs(position.y-coastal_params.grid.z)>0.5) {return result;}
+    let cell=position.xz*vec2<f32>(1.0,-1.0)/coastal_params.grid.x-vec2<f32>(0.5);
+    let base=vec2<i32>(floor(cell));let blend=fract(cell);
+    let anchor=vec2<i32>(floor(cell+vec2<f32>(0.5)));
+    let alpha=coastal_params.limits.x;
+    var total=0.0;var retained=0.0;
+    for (var corner=0u;corner<4u;corner++) {
+        let offset=vec2<i32>(i32(corner&1u),i32(corner>>1u));
+        if (!coastal_connected(anchor,base+offset)) {continue;}
+        let k=coastal_cell(base+offset);if (k==0xffffffffu) {continue;}
+        let record=coastal_surface.cells[k];
+        let sample=mix(record.previous,record.current,alpha);
+        let geometric_weight=select(1.0-blend.x,blend.x,offset.x==1)*select(1.0-blend.y,blend.y,offset.y==1);
+        retained+=geometric_weight;
+        let w=geometric_weight*sample.w;
+        result.field=vec4<f32>(result.field.xyz+sample.xyz*w,result.field.w);
+        result.slope+=mix(record.slopes.xy,record.slopes.zw,alpha)*w;
+        total+=w;
+    }
+    if (total>0.00001) {result.field=vec4<f32>(result.field.xyz/total,result.field.w);result.slope/=total;}
+    result.field.w=total/max(retained,0.00001);
+    return result;
+}
 
 // Bind the persistent field to the actual draw's body, not to a compacted
 // surface-list index. Identical XZ on different planes cannot share ripples.
@@ -563,6 +626,10 @@ fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool) -> vec4<f32> {
     let phase = dot(world_m, ocean.swell.xy) * ocean.swell.z - ocean.swell_motion.x * ocean.swell_motion.w;
     let horizontal = ocean.swell.w * ocean.swell_motion.y * cos(phase);
     displacement_m += vec3<f32>(ocean.swell.x * horizontal, ocean.swell.w * sin(phase), ocean.swell.y * horizontal);
+    let coastal=sample_coastal(position);
+    // Incoming FFT has already forced the coastal solution. Replace that wave
+    // field here; adding both elevations would count the incoming wave twice.
+    displacement_m=mix(displacement_m,vec3<f32>(0.0,coastal.field.x/units_per_meter,0.0),coastal.field.w);
     // The selected pool's render uniform carries its effective amplitude;
     // no material multiplier attenuates the wave controls a second time.
     let interaction = sample_ocean_interaction(position);
@@ -2934,6 +3001,8 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     let interaction_lod = 1.0-smoothstep(0.75,2.0,metres_per_pixel/(4.0/units_per_meter));
     var n = normalize(vec3<f32>(-gradient_foam.x*normal_fade-interaction.y*interaction_lod,
         1.0, -gradient_foam.y*normal_fade-interaction.z*interaction_lod));
+    let coastal=sample_coastal(vec3<f32>(world_m.x*units_per_meter,interaction_plane,world_m.y*units_per_meter));
+    n=normalize(mix(n,normalize(vec3<f32>(-coastal.slope.x,1.0,-coastal.slope.y)),coastal.field.w));
     let view_dir = normalize(camera.camera_pos_time.xyz - input.world_position);
     n = select(n, -n, below);
     let dot_nv = max(dot(n, view_dir), 2e-5);
@@ -3072,6 +3141,9 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
             return vec4<f32>(vec3<f32>(0.035) + runtime_dynamic_light_debug(input), 1.0);
         }
         let units_per_meter = max(ocean.ocean_info.z, 0.001);
+        let coastal=sample_coastal(vec3<f32>(input.ocean_uv_m.x*units_per_meter,
+            ocean.spray_planes[0].x,input.ocean_uv_m.y*units_per_meter));
+        if (coastal.field.w>0.999 && coastal.field.y<0.02) {discard;}
         if (!ocean_mask_contains(i32(round(input.ocean_vertex)) - 2, input.ocean_uv_m * units_per_meter)) {
             discard;
         }

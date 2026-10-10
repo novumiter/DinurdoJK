@@ -1735,3 +1735,16 @@ models/players/test/ordinary_blend
     assert_eq!(ordinary.stages[0].1, DynamicModelAlphaMode::Blend);
     assert!(resolved_stage(ordinary.stages[0].0, ordinary.stages[0].1, None).alpha_wave.is_some());
 }
+
+#[test]
+fn head_look_smoothing_is_shortest_arc_and_frame_rate_independent() {
+    // 170 -> -170 rotates 20 degrees forward, never the long way around.
+    let next = super::effects::smooth_head_look_yaw(170.0, -170.0, 16);
+    assert!(next > 170.0 && next < 190.0, "short arc: {next}");
+    let one = super::effects::smooth_head_look_yaw(0.0, 90.0, 32);
+    let two = super::effects::smooth_head_look_yaw(
+        super::effects::smooth_head_look_yaw(0.0, 90.0, 16), 90.0, 16,
+    );
+    assert!((one - two).abs() < 0.0001, "step independent: {one} {two}");
+    assert_eq!(super::effects::smooth_head_look_yaw(25.0, 80.0, 0), 25.0);
+}

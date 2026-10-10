@@ -688,6 +688,8 @@ pub struct App {
     jump_height_shade: bool,
     /// cg_screenShake.
     screen_shake: u8,
+    /// cg_headLook: head target visuals only; authoritative targets unchanged.
+    head_look: u8,
     /// DinurdoJK compact player-model visibility override. `0` disables; one
     /// model applies to all other players; `ally,enemy` splits team relations.
     force_model: String,
@@ -759,6 +761,9 @@ pub struct App {
     /// Session-only Phase 2.5 overlay: 0 off, 1 treatment, 2 boundaries,
     /// 3 bathymetry cells.
     coastal_debug_mode: u8,
+    coastal_enabled: bool,
+    coastal_pool: u8,
+    coastal_live_sent: Option<(usize, u8, bool, u8)>,
     coastal_debug_sent: Option<(usize, u8, u8)>,
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,

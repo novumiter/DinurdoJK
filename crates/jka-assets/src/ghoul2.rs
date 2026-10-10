@@ -1088,21 +1088,48 @@ impl Ghoul2Animator {
         if !anim_speed.is_finite() {
             return Err("Ghoul2 bone animation speed is non-finite".into());
         }
-        if let Some(set_frame) = set_frame {
-            if !set_frame.is_finite() {
+        // TaystJK G2_Set_Bone_Anim_Index asserts setFrame <= endFrame, inclusive.
+        // In particular, 0..0 with setFrame=0 is valid (although it has no
+        // frames to advance). Do not turn the stock debug assertion into an
+        // unconditional live-session disconnect.
+        let set_frame = if let Some(frame) = set_frame {
+            if !frame.is_finite() {
                 return Err("Ghoul2 setFrame is non-finite".into());
-            }
-            let valid = (set_frame >= start_frame as f32 && set_frame < end_frame as f32)
-                || (set_frame > end_frame as f32 && set_frame <= (start_frame + 1) as f32);
-            if !valid {
-                return Err(format!(
-                    "Ghoul2 setFrame {set_frame} outside animation range {start_frame}..{end_frame}"
-                ));
             }
             if anim_speed == 0.0 {
                 return Err("Ghoul2 setFrame cannot be used with zero animation speed".into());
             }
-        }
+            let valid = (frame >= start_frame as f32 && frame <= end_frame as f32)
+                || (frame > end_frame as f32 && frame <= (start_frame + 1) as f32);
+            if !valid {
+                // A bad resume frame must not feed the start-time calculation.
+                // Log it to the game console/latest.log and start the animation
+                // normally instead of disconnecting or sampling invalid GLA data.
+                log::warn!(
+                    "Ghoul2 setFrame {frame} outside animation range {start_frame}..{end_frame} \
+                     (GLA {:?}, bone {} {:?}); restarting animation at its start",
+                    gla.name,
+                    bone_index,
+                    gla.skeleton[bone_index].name,
+                );
+                None
+            } else {
+                if start_frame == end_frame {
+                    // This is permitted by TaystJK; retain a diagnostic so
+                    // malformed animation sets can be investigated separately.
+                    log::warn!(
+                        "Ghoul2 zero-length animation range {start_frame}..{end_frame} \
+                         (GLA {:?}, bone {} {:?}); continuing without disconnect",
+                        gla.name,
+                        bone_index,
+                        gla.skeleton[bone_index].name,
+                    );
+                }
+                Some(frame)
+            }
+        } else {
+            None
+        };
 
         let mut mod_flags = flags;
         if mod_flags & BONE_ANIM_BLEND != 0 {
@@ -1874,6 +1901,59 @@ mod tests {
         ];
         let out = multiply_3x4(&parent, &child);
         assert_eq!(transform_point(&out, [0.0, 0.0, 0.0]), [11.0, 22.0, 33.0]);
+    }
+
+    // Regression: TaystJK treats endFrame as inclusive when validating
+    // setFrame. The previous strict `< endFrame` check caused a disconnect on
+    // converted humanoid models with a 0..0 animation entry.
+    #[test]
+    fn g2_set_frame_inclusive_end_and_zero_length_range() {
+        let gla = test_gla_for_animation_range();
+        let mut animator = Ghoul2Animator::new(&gla);
+        animator
+            .set_bone_anim_index(&gla, 0, 0, 0, BONE_ANIM_OVERRIDE_FREEZE, 1.0, 1000, Some(0.0), 0)
+            .unwrap();
+        assert_eq!(animator.bone_frame(&gla, 0, 1000).unwrap(), Some(0.0));
+
+        animator
+            .set_bone_anim_index(&gla, 0, 2, 5, BONE_ANIM_OVERRIDE_FREEZE, 1.0, 1000, Some(5.0), 0)
+            .unwrap();
+        assert_eq!(animator.bone_anim(0).unwrap().start_time, 850);
+    }
+
+    #[test]
+    fn g2_out_of_range_resume_frame_is_warning_and_safe_restart() {
+        let gla = test_gla_for_animation_range();
+        let mut animator = Ghoul2Animator::new(&gla);
+        animator
+            .set_bone_anim_index(&gla, 0, 2, 5, BONE_ANIM_OVERRIDE_FREEZE, 1.0, 1000, Some(9.0), 0)
+            .unwrap();
+        assert_eq!(animator.bone_anim(0).unwrap().start_time, 1000);
+        assert_eq!(animator.bone_anim(0).unwrap().start_frame, 2);
+        assert_eq!(animator.bone_anim(0).unwrap().end_frame, 5);
+    }
+
+    fn test_gla_for_animation_range() -> GlaAnimation {
+        let identity: Matrix3x4 = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        GlaAnimation {
+            name: "test.gla".to_owned(),
+            scale: 1.0,
+            num_frames: 10,
+            skeleton: vec![GlaBone {
+                name: "model_root".to_owned(),
+                flags: 0,
+                parent: -1,
+                base_pose: identity,
+                base_pose_inv: identity,
+                children: vec![],
+            }],
+            frame_indices: vec![],
+            compressed_bones: vec![],
+        }
     }
 
     #[test]

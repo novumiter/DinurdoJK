@@ -66,6 +66,15 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
 }
 
 impl WorldShaderVariantKey {
+    /// The authored Legacy dlight contribution is a separate depth-equal pass.
+    /// The base material BSP pass has ENABLE_LEGACY_DLIGHTS=0 even while the
+    /// selected dynamic-light mode is Legacy. Treat its compiled PSOs as the
+    /// *same program* across otherwise-identical variants (no runtime flags).
+    pub(in crate::renderer) fn base_pass_key(mut self) -> Self {
+        self.legacy_dlights = false;
+        self
+    }
+
     pub(in crate::renderer) fn family(self) -> WorldShaderFamily {
         if self.point_lights
             || self.area_lights

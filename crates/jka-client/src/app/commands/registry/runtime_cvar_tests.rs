@@ -20,6 +20,7 @@ fn cvar_runtime_setters_and_latches_match_baseline() {
         event_loop.create_proxy(),
     )
     .unwrap();
+    assert_command_encoding_ab_controls(&mut app);
     let names: Vec<_> = include_str!("../../../testdata/cvars/runtime-matrix.txt")
         .lines()
         .map(|row| row.split_whitespace().next().unwrap())
@@ -109,4 +110,36 @@ fn stage_collapse_extra_is_live_and_archived() {
         .expect("renderer stage-collapse cvar registered");
     assert_eq!(definition.entry.latch, LatchScope::None);
     assert!(!crate::ui::VideoSettings::default().stage_collapse_extra);
+}
+
+fn assert_command_encoding_ab_controls(app: &mut App) {
+    use crate::console::{cvars::CvarFlags, LatchScope};
+    app.config_dirty = false;
+    for (name, baseline, experimental) in [
+        ("r_modelStateCache", "0", "1"),
+        ("r_dynamicBatchDraws", "0", "1"),
+        ("r_worldCompactMinDraws", "1", "2"),
+        ("r_modelPrepareThreads", "0", "2"),
+        ("r_modelIndexUploadCache", "0", "1"),
+        ("r_ghoul2BatchKeyCache", "0", "1"),
+    ] {
+        let definition = crate::app::cvar_registry().find(name).unwrap();
+        assert_eq!(definition.entry.latch, LatchScope::None);
+        assert!(!definition.flags.contains(CvarFlags::ARCHIVE));
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some(baseline));
+        app.set_console_cvar(name, experimental).unwrap();
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some(experimental));
+        assert!(!app.config_dirty);
+        assert!(app.set_console_cvar(name, "invalid").is_err());
+        assert_eq!(app.console_cvar_value(name).as_deref(), Some(experimental));
+        app.set_console_cvar(name, baseline).unwrap();
+    }
+    for value in ["0", "3", "-1", "1.5"] {
+        assert!(app.set_console_cvar("r_worldCompactMinDraws", value).is_err());
+        assert_eq!(app.video.world_compact_min_draws, 1);
+    }
+    for value in ["3", "8", "-1", "1.5"] {
+        assert!(app.set_console_cvar("r_modelPrepareThreads", value).is_err());
+        assert_eq!(app.video.model_prepare_threads, 0);
+    }
 }
