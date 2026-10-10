@@ -1,6 +1,6 @@
 //! Compose.
 use crate::ui::{
-    build_background_progress, build_center_print, build_chat_history, build_chat_input,
+    build_background_progress, build_shader_compile_progress, build_center_print, build_chat_history, build_chat_input,
     build_console, build_console_notify, build_crosshair_name, build_crosshair_vertices,
     build_demo_timeline,
     build_follow_indicator, build_force_select, build_fps_simple, build_game_timer, build_hud,
@@ -28,6 +28,9 @@ pub fn build_vertices(
     }
     if let Some(loading) = &ui.loading {
         build_loading_screen(&mut out, loading, width, height, splash_size);
+        if let Some(progress) = &ui.shader_compile_progress {
+            build_shader_compile_progress(&mut out, progress, width, height);
+        }
         // Keep the console usable during background map preparation/upload.
         // It is intentionally layered over the loading screen rather than
         // replacing it, so load progress remains visible behind the console.
@@ -62,6 +65,7 @@ pub fn build_vertices(
         | OverlayMode::MapEdit
         | OverlayMode::EntityGraph
         | OverlayMode::Trace
+        | OverlayMode::DevRadial
         | OverlayMode::StrafeTrails
         | OverlayMode::RaceGhosts => {}
     }
@@ -72,6 +76,9 @@ pub fn build_vertices(
     // nothing draws it on the HUD any more.
     if let Some(progress) = &ui.static_ao_progress {
         build_background_progress(&mut out, progress, width, height);
+    }
+    if let Some(progress) = &ui.shader_compile_progress {
+        build_shader_compile_progress(&mut out, progress, width, height);
     }
     out
 }

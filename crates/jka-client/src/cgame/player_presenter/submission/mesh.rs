@@ -454,7 +454,7 @@ fn promote_glute_mesh(
             round,
             tuning.glute_bottom_z,
             tuning.glute_top_z,
-        )
+        ) * profile.size_skin_gate(true, &vertex.bone_indices, &vertex.weights, vertex.weight_count)
     };
     let h_weight = |vertex: &Ghoul2GpuVertex| weight(vertex, false);
     let i_weight = |vertex: &Ghoul2GpuVertex| weight(vertex, true);
@@ -534,7 +534,7 @@ pub(in crate::cgame::player_presenter) fn inflate_jiggle_mass(
             .any(|vertex| vertex.jiggle_weight > 0.0 && profile.is_breast_region(vertex.jiggle_region));
     // Candidate I is prepared once and evaluated for every vertex of a hips
     // surface, including its cloth/skin openings and original clothing pieces.
-    let glute_shape = if !egg_wrap
+    let glute_shape = if (!egg_wrap || profile.uses_source_anatomy())
         && tuning.glute_size > 0.0
         && vertices.iter().any(|vertex| {
             vertex.jiggle_weight > 0.0 && profile.is_glute_region(vertex.jiggle_region)
@@ -547,8 +547,33 @@ pub(in crate::cgame::player_presenter) fn inflate_jiggle_mass(
 
     let mut displacement = vec![Vec3::ZERO; group_count];
     let mut members = vec![0u32; group_count];
+    // The nipple pass runs after smoothing: also track which welded vertices
+    // are genuinely breast-skinned so adjacent hands cannot get a nipple bump.
+    let mut breast_skin_gates = vec![0.0f32; group_count];
     for (vertex, &group) in vertices.iter().zip(&group_of) {
-        let offset = if egg_wrap {
+        let offset = if profile.uses_source_anatomy() && (egg_wrap || glute_shape.is_some()) {
+            let breast_gate = profile.size_skin_gate(
+                false, &vertex.bone_indices, &vertex.weights, vertex.weight_count,
+            );
+            let glute_gate = profile.size_skin_gate(
+                true, &vertex.bone_indices, &vertex.weights, vertex.weight_count,
+            );
+            breast_skin_gates[group as usize] =
+                breast_skin_gates[group as usize].max(breast_gate);
+            // Source bodies often share one mesh for both regions; blend their
+            // *independent* size fields, rather than letting a breast wrap
+            // suppress the glute slider for the whole combined surface.
+            let mut delta = Vec3::ZERO;
+            if egg_wrap {
+                delta += Vec3::from_array(profile.breast_egg_displacement(
+                    vertex.position, vertex.normal, tuning.breast_size,
+                )) * breast_gate;
+            }
+            if let Some(shape) = &glute_shape {
+                delta += Vec3::from_array(shape.displacement(vertex.position)) * glute_gate;
+            }
+            delta.to_array()
+        } else if egg_wrap {
             profile.breast_egg_displacement(vertex.position, vertex.normal, tuning.breast_size)
         } else if let Some(shape) = &glute_shape {
             shape.displacement(vertex.position)
@@ -669,9 +694,16 @@ pub(in crate::cgame::player_presenter) fn inflate_jiggle_mass(
                 continue;
             }
             let wrapped = bind[group] + displacement[group];
-            displacement[group] += Vec3::from_array(
-                profile.breast_nipple_displacement(wrapped.to_array(), tuning.breast_size),
-            );
+            let breast_gate = if profile.uses_source_anatomy() {
+                breast_skin_gates[group]
+            } else {
+                1.0
+            };
+            if breast_gate > 0.0 {
+                displacement[group] += Vec3::from_array(
+                    profile.breast_nipple_displacement(wrapped.to_array(), tuning.breast_size),
+                ) * breast_gate;
+            }
         }
     }
     let mut before = vec![Vec3::ZERO; group_count];
@@ -1043,7 +1075,7 @@ pub(in crate::cgame::player_presenter) fn build_gpu_mesh_source(
     ));
     let key = if promote {
         Arc::<str>::from(format!(
-            "{base_key}#jiggle_local_guard_v3{}#rb{:08x}#rt{:08x}#gb{:08x}#gt{:08x}#bs{:08x}#gs{:08x}",
+            "{base_key}#jiggle_source_skin_guard_v1{}#rb{:08x}#rt{:08x}#gb{:08x}#gt{:08x}#bs{:08x}#gs{:08x}",
             if joined_breast_bake.is_some() { "#breast_joined_v1" } else { "" },
             jiggle_remesh.breast_bottom_z.to_bits(),
             jiggle_remesh.breast_top_z.to_bits(),
@@ -1159,4 +1191,47 @@ pub(in crate::cgame::player_presenter) fn static_model_key(
         u8::from(preview_fallback),
     )
     .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod source_morph_tests {
+    use super::*;
+
+    fn point(position: [f32; 3], bone: u32, glute: bool) -> Ghoul2GpuVertex {
+        Ghoul2GpuVertex {
+            position,
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+            bone_indices: [bone, 0, 0, 0],
+            weights: [1.0, 0.0, 0.0, 0.0],
+            weight_count: 1,
+            jiggle_region: if glute { 0 } else { u32::MAX },
+            jiggle_weight: if glute { 1.0 } else { 0.0 },
+            jiggle_coord: 0.0,
+        }
+    }
+
+    #[test]
+    fn positive_glute_size_does_not_move_nearby_hand_on_a_shared_source_surface() {
+        let profile = JiggleProfile::source_size_test_profile();
+        // Different triangles on one mesh. The hand occupies the same volume
+        // as the glute at bind pose, but has unrelated GLA skin weights.
+        let mut vertices = vec![
+            point([2.98403537, 3.70633138, 40.7899405], 0, true),
+            point([3.4, 3.6, 40.5], 0, true),
+            point([2.7, 3.9, 40.0], 0, true),
+            point([3.02, 3.76, 40.73], 1, false),
+            point([3.45, 3.65, 40.45], 1, false),
+            point([2.75, 3.95, 39.95], 1, false),
+        ];
+        let original = vertices.iter().map(|v| v.position).collect::<Vec<_>>();
+        let indices = [0, 1, 2, 3, 4, 5];
+        let tuning = JiggleRemeshTuning { glute_size: 4.0, ..Default::default() };
+        inflate_jiggle_mass(&mut vertices, &indices, &profile, tuning);
+        assert!(vertices[..3].iter().zip(&original[..3]).any(|(v, p)| v.position != *p),
+            "hip-skinned points should still respond to the size slider");
+        for i in 3..6 {
+            assert_eq!(vertices[i].position, original[i], "hand vertex {i} must remain fixed");
+        }
+    }
 }

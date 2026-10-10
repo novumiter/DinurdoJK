@@ -675,8 +675,8 @@ mod tests {
             vibrance: 0.35,
             temperature: 7200.0,
             tint: -0.2,
-            shadows: 0.4,
-            highlights: -0.3,
+            shadows: 45.0,
+            highlights: -35.0,
         };
         save_video_settings(
             &path,

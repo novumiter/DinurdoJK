@@ -208,35 +208,81 @@ pub(super) fn scan_profile_catalog(
     Ok((models, sabers))
 }
 
+/// TaystJK `UI_SelectedTeamHead` RGB model category:
+/// `model_rgb*.skin`, plus the vanilla `model_sp.skin` for Trandoshan/Weequay.
+/// These are *skin names*, not a shader-stage introspection heuristic.
+/// Keep this shared by the catalog and Studio filter so that RGB skins
+/// without a matching icon (which TaystJK lists with a fallback icon) remain
+/// discoverable in Studio as well.
+pub(super) fn profile_is_rgb_skin(model: &str, skin: &str) -> bool {
+    skin.get(..3).is_some_and(|prefix| prefix.eq_ignore_ascii_case("rgb"))
+        || (skin.eq_ignore_ascii_case("sp")
+            && (model.eq_ignore_ascii_case("trandoshan")
+                || model.eq_ignore_ascii_case("weequay")))
+}
+
+/// The Studio's four independent checkbox categories are a direct adaptation
+/// of TaystJK `UI_SelectedTeamHead`: only /red and /blue exactly match the
+/// team categories, /rgb* and the two stock /sp exceptions count as RGB, and
+/// every remaining supported skin belongs to Original.
+/// Calculated from the scan result; there is no per-toggle disk or PK3 work.
+pub(super) fn profile_skin_category(model: &str, skin: &str) -> usize {
+    if profile_is_rgb_skin(model, skin) {
+        3
+    } else if skin.eq_ignore_ascii_case("red") {
+        1
+    } else if skin.eq_ignore_ascii_case("blue") {
+        2
+    } else {
+        0
+    }
+}
+
 /// Image extensions accepted for `icon_<skin>.*`, in OpenJK's `bIsImageFile`
 /// probe order (jpg, png, tga) plus jpeg.
 const PROFILE_ICON_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "tga"];
 
-/// Profile entries promoted the way OpenJK's `UI_BuildQ3Model_List` does: for
-/// every `models/players/<model>/*_<skin>.skin` file, the skin is listed only
-/// when a matching `icon_<skin>.{jpg,png,tga}` exists. No model.glm or GLA
-/// check is made; a missing icon hides the skin from the browser but leaves it
-/// valid for `/model model/skin`. Names are VFS-normalized qpaths, so each
-/// logical skin/icon appears once however many providers or image formats
-/// carry it. Storage is unbounded (OpenJK caps at MAX_Q3PLAYERMODELS).
+/// Port of TaystJK `UI_BuildQ3Model_List` / `bIsSkinFile` discovery.
+///
+/// Image-backed skins are always listed. Without a matching icon, TaystJK's
+/// `ui_showAllSkins` path accepts an actual `model_<skin>.skin`, but excludes
+/// non-player/model-menu folders, first-person-only skins, and folders that
+/// carry `animation.cfg`. Studio intentionally displays all eligible installed
+/// skins; its checkboxes filter the already-built catalog rather than touching
+/// the VFS. Jaden multipart icons retain their existing special handling.
+///
+/// All names come from the cached VFS index, so there are no per-frame reads.
 fn profile_model_entries<'a>(names: impl Iterator<Item = &'a str>) -> Vec<ProfileModelEntry> {
     let mut skins = BTreeMap::<&str, BTreeSet<&str>>::new();
     let mut icons = BTreeMap::<&str, BTreeSet<&str>>::new();
     let mut source_models = BTreeSet::<&str>::new();
+    let mut model_skin_names = BTreeMap::<&str, BTreeSet<&str>>::new();
+    let mut animated_directories = BTreeSet::<&str>::new();
     for name in names {
         let Some(rest) = name.strip_prefix("models/players/") else { continue };
         let Some((folder, leaf)) = rest.split_once('/') else { continue };
-        // Only direct children of models/players/<model>/, like FS_GetFileList.
+        // FS_GetFileList only examines direct children of model directories.
         if folder.is_empty() || leaf.contains('/') {
             continue;
         }
         if leaf == "source_model.json" {
             source_models.insert(folder);
         }
+        if leaf == "animation.cfg" {
+            animated_directories.insert(folder);
+        }
         if let Some(stem) = leaf.strip_suffix(".skin") {
-            // Everything after the first underscore: model_/head_/torso_/lower_<skin>.
-            if let Some((_, skin)) = stem.split_once('_').filter(|(_, skin)| !skin.is_empty()) {
+            // Jaden modular skins are `head_a1.skin` etc.; ordinary player
+            // variants are `model_red.skin`, `model_rgb.skin`, and so on.
+            let modular = ["head_", "torso_", "lower_"]
+                .iter().any(|prefix| stem.starts_with(prefix));
+            let skin = if modular { Some(stem) }
+                else { stem.split_once('_').map(|(_, suffix)| suffix) };
+            if let Some(skin) = skin.filter(|skin| !skin.is_empty()) {
                 skins.entry(folder).or_default().insert(skin);
+                if stem.starts_with("model_") {
+                    model_skin_names.entry(folder).or_default().insert(skin);
+                }
             }
         } else if let Some((stem, extension)) = leaf.rsplit_once('.') {
             if PROFILE_ICON_EXTENSIONS.contains(&extension) {
@@ -249,8 +295,23 @@ fn profile_model_entries<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Profil
 
     let mut models = Vec::new();
     for (model, model_skins) in skins {
-        let Some(model_icons) = icons.get(model) else { continue };
-        for skin in model_skins.intersection(model_icons) {
+        let model_icons = icons.get(model);
+        for skin in model_skins {
+            let has_icon = model_icons.is_some_and(|icons| icons.contains(skin));
+            // TaystJK's bIsSkinFile is a *fallback* when the icon is absent.
+            // Do not apply these exclusions to a legitimate icon-backed skin.
+            // Modular skins require icons to preserve the original Jaden UI
+            // representation (their file names are not model_<skin>.skin).
+            let excluded_model = ["default", "mutant_rancor", "r5d2"].iter()
+                .any(|prefix| model.starts_with(prefix));
+            let excluded_skin = skin.starts_with("menu") || skin.starts_with("fpls");
+            let multipart = ["head_", "torso_", "lower_"]
+                .iter().any(|prefix| skin.starts_with(prefix));
+            if !has_icon && (excluded_model || excluded_skin
+                || animated_directories.contains(model) || multipart
+                || !model_skin_names.get(model).is_some_and(|names| names.contains(skin))) {
+                continue;
+            }
             let value = if skin.eq_ignore_ascii_case("default") {
                 model.to_owned()
             } else {
@@ -264,8 +325,7 @@ fn profile_model_entries<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Profil
             });
         }
     }
-    // Source 1 characters have no .skin/.glm pair, so they are listed from
-    // their descriptor instead of from the skin/icon intersection above.
+    // Source 1 characters are indexed from their descriptor, not a .skin/icon.
     for model in source_models {
         if !models.iter().any(|entry| entry.model_name == model) {
             models.push(ProfileModelEntry {
@@ -280,26 +340,38 @@ fn profile_model_entries<'a>(names: impl Iterator<Item = &'a str>) -> Vec<Profil
     models
 }
 
-/// JKA profile portrait for models/players/<model>/icon_<skin>.*. Read on
-/// demand for visible tiles instead of during the catalog scan. There is no
-/// fallback to the default icon: catalog entries exist only because this icon
-/// does.
+/// JKA portrait lookup with TaystJK's `UI_BuildQ3Model_List` fallback
+/// icons. The worker tries the selected skin icon before the relevant stock
+/// category placeholder (`icons/icon_*_unknown`). If the installation does
+/// not contain those TaystJK asset images, the egui stage draws a colored
+/// stand-in instead; an absent icon never prevents skin selection.
 pub(super) fn read_profile_icon(
     assets: &mut AssetSearchPath,
     model: &str,
     skin: &str,
 ) -> Option<LevelshotAsset> {
-    for extension in PROFILE_ICON_EXTENSIONS {
-        let format = match extension {
-            "jpg" | "jpeg" => image::ImageFormat::Jpeg,
-            "png" => image::ImageFormat::Png,
-            _ => image::ImageFormat::Tga,
-        };
-        let candidate = format!("models/players/{model}/icon_{skin}.{extension}");
-        match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
-            Ok(Some(asset)) => return Some(LevelshotAsset { bytes: asset.bytes, format }),
-            Ok(None) => {}
-            Err(error) => eprintln!("Profile icon {candidate}: {error}"),
+    let fallback = if profile_is_rgb_skin(model, skin) || skin.eq_ignore_ascii_case("sp") {
+        "icons/icon_rgb_unknown"
+    } else if skin.eq_ignore_ascii_case("red") {
+        "icons/icon_red_unknown"
+    } else if skin.eq_ignore_ascii_case("blue") {
+        "icons/icon_blue_unknown"
+    } else {
+        "icons/icon_default_unknown"
+    };
+    for base in [format!("models/players/{model}/icon_{skin}"), fallback.to_owned()] {
+        for extension in PROFILE_ICON_EXTENSIONS {
+            let format = match extension {
+                "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+                "png" => image::ImageFormat::Png,
+                _ => image::ImageFormat::Tga,
+            };
+            let candidate = format!("{base}.{extension}");
+            match assets.read(&candidate, LEVELSHOT_LIMIT_BYTES) {
+                Ok(Some(asset)) => return Some(LevelshotAsset { bytes: asset.bytes, format }),
+                Ok(None) => {}
+                Err(error) => eprintln!("Profile icon {candidate}: {error}"),
+            }
         }
     }
     None
@@ -1813,6 +1885,16 @@ mod profile_catalog_tests {
     }
 
     #[test]
+    fn modular_jka_skins_preserve_part_names() {
+        let skins = values(&[
+            "models/players/jedi_hm/head_a1.skin", "models/players/jedi_hm/icon_head_a1.jpg",
+            "models/players/jedi_hm/torso_d1.skin", "models/players/jedi_hm/icon_torso_d1.jpg",
+            "models/players/jedi_hm/lower_a1.skin", "models/players/jedi_hm/icon_lower_a1.jpg",
+        ]);
+        assert_eq!(skins, ["jedi_hm/head_a1", "jedi_hm/lower_a1", "jedi_hm/torso_d1"]);
+    }
+
+    #[test]
     fn source_descriptor_shows_unavailable_entry() {
         let entries = profile_model_entries(["models/players/hev_mk2/source_model.json"].into_iter());
         assert_eq!(entries.len(), 1);
@@ -1829,14 +1911,15 @@ mod profile_catalog_tests {
     }
 
     #[test]
-    fn skin_without_icon_is_hidden() {
-        assert!(values(&["models/players/foo/model.glm", "models/players/foo/model_secret.skin"]).is_empty());
-        // The default icon does not stand in for a missing skin icon.
-        assert!(values(&[
-            "models/players/foo/model_secret.skin",
-            "models/players/foo/icon_default.jpg",
-        ])
-        .is_empty());
+    fn skin_without_icon_uses_taystjk_fallback() {
+        // UI_BuildQ3Model_List permits true model_*.skin files when the
+        // optional portrait is absent and bIsSkinFile accepts the directory.
+        assert_eq!(values(&[
+            "models/players/foo/model.glm", "models/players/foo/model_secret.skin",
+        ]), ["foo/secret"]);
+        assert_eq!(values(&[
+            "models/players/foo/model_secret.skin", "models/players/foo/icon_default.jpg",
+        ]), ["foo/secret"]);
     }
 
     #[test]
@@ -1876,20 +1959,39 @@ mod profile_catalog_tests {
     #[test]
     fn skin_name_is_everything_after_first_underscore() {
         assert_eq!(
-            values(&["models/players/foo/torso_dark_hood.skin", "models/players/foo/icon_dark_hood.jpg"]),
+            values(&["models/players/foo/npc_dark_hood.skin", "models/players/foo/icon_dark_hood.jpg"]),
             ["foo/dark_hood"]
         );
     }
 
     #[test]
     fn ignores_nested_folders_and_unsupported_icon_formats() {
-        assert!(values(&[
+        // Unsupported icon types do not block a valid skin fallback.
+        assert_eq!(values(&[
             "models/players/custom/foo/model_default.skin",
             "models/players/custom/foo/icon_default.jpg",
             "models/players/bar/model_default.skin",
             "models/players/bar/icon_default.bmp",
-        ])
-        .is_empty());
+        ]), ["bar"]);
+    }
+
+    #[test]
+    fn taystjk_skin_fallback_guard_matches_b_is_skin_file() {
+        assert_eq!(values(&[
+            "models/players/foo/model_default.skin",
+            "models/players/foo/model_rgb2.skin",
+            "models/players/foo/model_red.skin",
+            "models/players/foo/model_blue.skin",
+            "models/players/foo/model_menu_test.skin",
+            "models/players/foo/model_fpls_gloves.skin",
+            "models/players/mutant_rancor/model_rgb.skin",
+            "models/players/default_test/model_rgb.skin",
+            "models/players/r5d2_pro/model_default.skin",
+            "models/players/animated/animation.cfg",
+            "models/players/animated/model_rgb.skin",
+            "models/players/animated/icon_rgb.jpg",
+            "models/players/other/npc_red.skin",
+        ]), ["animated/rgb", "foo/blue", "foo", "foo/red", "foo/rgb2"]);
     }
 
     #[test]
@@ -1903,5 +2005,57 @@ mod profile_catalog_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(profile_model_entries(names.iter().map(String::as_str)).len(), 3000);
+    }
+}
+
+#[cfg(test)]
+mod profile_rgb_catalog_tests {
+    use super::{profile_is_rgb_skin, profile_model_entries, profile_skin_category};
+
+    #[test]
+    fn taystjk_rgb_model_category() {
+        assert!(profile_is_rgb_skin("any", "rgb"));
+        assert!(profile_is_rgb_skin("any", "rgb2"));
+        assert!(profile_is_rgb_skin("any", "RGB_green"));
+        assert!(profile_is_rgb_skin("trandoshan", "sp"));
+        assert!(profile_is_rgb_skin("Weequay", "SP"));
+        for (model, skin) in [
+            ("any", "sp"), ("luke", "default"), ("any", "red"),
+            ("any", "blue"), ("any", "head_a1"),
+        ] {
+            assert!(!profile_is_rgb_skin(model, skin), "{model}/{skin}");
+        }
+    }
+
+    #[test]
+    fn studio_skin_categories_match_taystjk_selected_team_head() {
+        for (model, skin, expected) in [
+            ("luke", "default", 0), ("luke", "custom", 0),
+            ("luke", "sp", 0), ("luke", "red_alt", 0),
+            ("luke", "red", 1), ("luke", "BLUE", 2),
+            ("luke", "rgb", 3), ("luke", "RGB_green", 3),
+            ("trandoshan", "sp", 3), ("weequay", "sp", 3),
+        ] {
+            assert_eq!(profile_skin_category(model, skin), expected, "{model}/{skin}");
+        }
+    }
+
+    #[test]
+    fn rgb_skins_without_portraits_follow_taystjk_all_skins_fallback() {
+        let names = [
+            "models/players/test/model_default.skin",
+            "models/players/test/icon_default.png",
+            "models/players/test/model_rgb.skin",
+            "models/players/test/model_rgbalt.skin",
+            "models/players/test/model_hidden.skin",
+            "models/players/weequay/model_sp.skin",
+        ];
+        let catalog = profile_model_entries(names.into_iter());
+        let skins: Vec<&str> = catalog.iter().map(|entry| entry.value.as_str()).collect();
+        assert!(skins.contains(&"test"));
+        assert!(skins.contains(&"test/rgb"));
+        assert!(skins.contains(&"test/rgbalt"));
+        assert!(skins.contains(&"weequay/sp"));
+        assert!(skins.contains(&"test/hidden"));
     }
 }

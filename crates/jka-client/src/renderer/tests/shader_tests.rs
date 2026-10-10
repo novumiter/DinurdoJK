@@ -4,9 +4,8 @@ use super::*;
 fn rt_isolation_variants_validate_and_match_receiver_layouts() {
     use crate::renderer::lighting::{ray_tracing::{ray_traced_world_shader_source_with_features,
         rt_receiver_layout_entries}, rt_diagnostics::ReceiverFeatures};
-    for denoiser in [false, true] {
         for glass in [false, true] {
-            let features = ReceiverFeatures { denoiser, glass };
+            let features = ReceiverFeatures { glass };
             for base in [include_str!("../../bsp.wgsl"), include_str!("../../bsp_lean.wgsl")] {
                 let source = compose_world_shader(&ray_traced_world_shader_source_with_features(base, features).unwrap());
                 let module = wgpu::naga::front::wgsl::parse_str(&source)
@@ -20,13 +19,13 @@ fn rt_isolation_variants_validate_and_match_receiver_layouts() {
                 let expected: std::collections::BTreeSet<_> = rt_receiver_layout_entries(features)
                     .iter().map(|entry| entry.binding).collect();
                 assert_eq!(actual, expected, "{features:?}: WGSL/layout drift");
-                assert_eq!(source.contains("fn rt_denoised_local_visibility("), denoiser);
-                assert_eq!(source.contains("fn rt_denoiser_debug("), denoiser);
+                assert!(!source.contains("fn rt_denoised_local_visibility("));
+                assert!(!source.contains("fn rt_denoiser_debug("));
                 assert_eq!(source.contains("fn rt_trace_shadow_throughput("), glass);
                 assert_eq!(source.contains("var<storage, read> raster_glass_slots:"), glass);
             }
         }
-    }
+
 }
 
 #[test]
@@ -925,6 +924,9 @@ fn dynamic_model_depth_phase_places_saber_fx_after_gpu_skinned_opaque_geometry()
     // the blade is occluded only where it is actually behind the body.
     assert!(dynamic_model_writes_depth(DynamicModelAlphaMode::Opaque));
     assert!(dynamic_model_writes_depth(DynamicModelAlphaMode::Mask));
+    assert!(dynamic_model_writes_depth(DynamicModelAlphaMode::BlendDepthWrite));
+    assert!(dynamic_model_writes_depth(DynamicModelAlphaMode::BlendUnlitDepthWrite));
+    assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::Blend));
     assert!(!dynamic_model_writes_depth(
         DynamicModelAlphaMode::AdditiveOne
     ));
@@ -949,11 +951,15 @@ fn dynamic_model_depth_phase_places_saber_fx_after_gpu_skinned_opaque_geometry()
         .iter()
         .position(|mode| *mode == DynamicModelAlphaMode::Opaque)
         .unwrap();
+    let ghost = phases
+        .iter()
+        .position(|mode| *mode == DynamicModelAlphaMode::BlendDepthWrite)
+        .unwrap();
     let saber = phases
         .iter()
         .position(|mode| *mode == DynamicModelAlphaMode::AdditiveOne)
         .unwrap();
-    assert!(opaque < saber);
+    assert!(opaque < ghost && ghost < saber);
 }
 
 /// The occlusion-culling shaders validate on their own, so a failure in an
@@ -1499,6 +1505,8 @@ fn ocean_render_uniform_matches_water_and_spray_layouts() {
             ("swell",offset_of!(OceanRenderUniform,swell)),
             ("authored_plane",offset_of!(OceanRenderUniform,authored_plane)),
             ("mask_ranges",offset_of!(OceanRenderUniform,mask_ranges)),
+            ("mask_bounds",offset_of!(OceanRenderUniform,mask_bounds)),
+            ("mask_tiles",offset_of!(OceanRenderUniform,mask_tiles)),
             ("mask_triangles",offset_of!(OceanRenderUniform,mask_triangles))] {
             assert_eq!(offset_of_member(&members,name) as usize,offset,"{name}");
         }

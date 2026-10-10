@@ -41,7 +41,6 @@ fn acceptance_shader() -> String {
     let donor = ray_traced_world_shader_source_with_features(
         include_str!("../../bsp.wgsl"),
         ReceiverFeatures {
-            denoiser: false,
             glass: true,
         },
     )

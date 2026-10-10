@@ -266,7 +266,9 @@ pub(in crate::ui) fn build_scoreboard(
         TEXT_BRIGHT,
     );
 
-    let meta = if board.team_game {
+    let meta = if board.entries.is_empty() {
+        "AWAITING SCORES".to_owned()
+    } else if board.team_game {
         format!(
             "^1RED  {}    ^7|    ^4BLUE  {}",
             board.team_scores[0], board.team_scores[1]

@@ -32,13 +32,11 @@ impl Renderer {
             self.dynamic_model_renderer.legacy_fog_compiled,
             self.map_light_simulation_active(),
         );
-        if self
-            .ray_traced_shadows
-            .as_ref()
-            .and_then(|rt| rt.model_receivers.as_ref())
-            .is_some_and(|models| models.key == key)
-        {
-            return;
+        if let Some(rt) = self.ray_traced_shadows.as_mut() {
+            discard_incompatible_receivers(&mut rt.model_receivers, key);
+            if rt.model_receivers.is_some() {
+                return;
+            }
         }
         let Some(rt) = self.ray_traced_shadows.as_ref() else {
             return;
@@ -126,6 +124,17 @@ impl Renderer {
                     mask_blend: pipeline(DynamicModelAlphaMode::MaskBlend),
                 }
             });
+    }
+}
+
+fn discard_incompatible_receivers(
+    receivers: &mut Option<RtModelReceivers>,
+    key: (wgpu::TextureFormat, u32, bool, bool),
+) {
+    // A worker may take several frames. Old pipelines cannot bridge a change
+    // in attachment format/MSAA; normal model lighting is the safe fallback.
+    if receivers.as_ref().is_some_and(|models| models.key != key) {
+        *receivers = None;
     }
 }
 
@@ -299,6 +308,95 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn rt_model_cache_drops_old_msaa_before_replacement_is_ready() {
+        block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                ..Default::default()
+            }).await.unwrap();
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Wgsl(r#"
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[i], 0.0, 1.0);
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(0.25, 0.5, 0.75, 1.0); }
+"#.into()),
+            });
+            let make = |key: (wgpu::TextureFormat, u32, bool, bool)| {
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("JKA dynamic model opaque pipeline"), layout: None,
+                    vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"), compilation_options: Default::default(), buffers: &[] },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState { format: key.0, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    }),
+                    primitive: Default::default(), depth_stencil: None,
+                    multisample: wgpu::MultisampleState { count: key.1, ..Default::default() },
+                    multiview_mask: None, cache: None,
+                });
+                let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
+                let lights = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[] });
+                RtModelReceivers { key, lights, opaque: pipeline.clone(), mask: pipeline.clone(), blend: pipeline.clone(), mask_blend: pipeline }
+            };
+            let encode = |pipeline: &wgpu::RenderPipeline, key: (wgpu::TextureFormat, u32, bool, bool)| {
+                let target = device.create_texture(&wgpu::TextureDescriptor {
+                    label: None, size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: key.1, dimension: wgpu::TextureDimension::D2,
+                    format: key.0, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+                });
+                let view = target.create_view(&Default::default());
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("JKA frame encoder") });
+                {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: None,
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, depth_slice: None, resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                        depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.draw(0..3, 0..1);
+                }
+                encoder.finish()
+            };
+            let key2 = (wgpu::TextureFormat::Bgra8UnormSrgb, 2, false, false);
+            let key1 = (key2.0, 1, false, false);
+            let mut cached = Some(make(key2));
+            // Reproduce the reported validation failure before applying the
+            // cache fix. This requires no world assets or RT driver compiler.
+            let guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let _invalid = encode(&cached.as_ref().unwrap().opaque, key1);
+            let error = guard.pop().await.expect("old 2x pipeline unexpectedly accepted in a 1x pass");
+            assert!(error.to_string().contains("sample count"), "{error}");
+            discard_incompatible_receivers(&mut cached, key1);
+            assert!(cached.is_none(), "a pending async replacement must leave no incompatible receiver");
+            // While the RT worker is pending, the ordinary 1x model pipeline
+            // can render. Repeated MSAA/format/fog/source transitions invalidate
+            // the same cache contract and cannot reintroduce the stale pipeline.
+            for key in [key1, key2, key1, (wgpu::TextureFormat::Rgba16Float, 1, false, false),
+                (wgpu::TextureFormat::Rgba16Float, 1, true, false), (wgpu::TextureFormat::Rgba16Float, 1, true, true)] {
+                discard_incompatible_receivers(&mut cached, key);
+                assert!(cached.is_none());
+                let replacement = make(key);
+                let guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                queue.submit([encode(&replacement.opaque, key)]);
+                assert!(guard.pop().await.is_none());
+                cached = Some(replacement);
+                discard_incompatible_receivers(&mut cached, key);
+                assert!(cached.is_some(), "matching receiver must remain installed");
+            }
+            println!("reproduced 2x-to-1x validation error; six replacement/fallback transitions passed");
+        });
+    }
+
     #[test]
     #[ignore = "requires a Vulkan GPU with hardware ray queries"]
     fn model_receiver_gpu_pipelines() {

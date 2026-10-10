@@ -1,4 +1,5 @@
 use super::*;
+use super::submission::mesh::append_surface_indices;
 
 fn wait_for_player_model(
     presenter: &mut PlayerPresenter,
@@ -272,6 +273,48 @@ fn opaque_base_player_shaders_keep_the_single_stage_path() {
     let layers = material_layers(&shaders, "models/players/TinkerBell/newer");
     assert!(layers.stages.is_empty());
     assert_eq!(layers.base.alpha_mode, DynamicModelAlphaMode::Mask);
+    assert!(layers.two_sided, "alphaFunc GE128 does not override cull disable");
+}
+
+#[test]
+fn jawa_cape_ge128_keeps_authored_two_sided_culling() {
+    let shaders = jka_assets::shader::parse(
+        "models/players/JAWA_SephFF/cloth
+{
+    q3map_material Flesh
+    cull twosided
+    {
+        map models/players/JAWA_SephFF/cloth
+        alphaFunc GE128
+    }
+}
+",
+    )
+    .expect("Jawa cape shader parses");
+    let layers = material_layers(&shaders, "models/players/JAWA_SephFF/cloth");
+    assert_eq!(layers.base.alpha_mode, DynamicModelAlphaMode::Mask);
+    assert!(layers.two_sided, "cull twosided must be independent of alphaFunc");
+}
+
+#[test]
+fn ghoul2_two_sided_mesh_appends_reverse_winding() {
+    let surface = jka_assets::ghoul2::GlmSurface {
+        surface_index: 0,
+        vertices: (0..3)
+            .map(|_| jka_assets::ghoul2::GlmVertex {
+                normal: [0.0, 0.0, 1.0],
+                position: [0.0; 3],
+                weights: vec![],
+            })
+            .collect(),
+        texcoords: vec![[0.0, 0.0]; 3],
+        triangles: vec![[0, 1, 2]],
+        bone_references: vec![],
+    };
+    // JKA GLM winding is flipped when imported to WGPU. An authored
+    // two-sided shader then adds the opposite winding, so both sides draw.
+    assert_eq!(append_surface_indices(&surface, false).unwrap(), vec![0, 2, 1]);
+    assert_eq!(append_surface_indices(&surface, true).unwrap(), vec![0, 2, 1, 0, 1, 2]);
 }
 
 #[test]
@@ -331,7 +374,7 @@ fn jedi_zf_torso_registers_with_entity_tint_and_overlay() {
 
 /// ShadowTink (TinkerBell 1.0): an opaque `rgbGen const` base under scrolling
 /// marble/smoke layers, a lit opaque eye under a `glow` map, and twosided
-/// additive wings. Each was drawn as its primary stage only.
+/// additive wings. Two-sided culling must apply even to an opaque first stage.
 #[test]
 fn opaque_base_shaders_with_overlay_stages_draw_the_whole_stack() {
     let shaders = jka_assets::shader::parse(
@@ -401,7 +444,7 @@ models/players/test/plain_opaque
     let base = resolved_stage(legs.stages[0].0, legs.stages[0].1, None);
     assert_eq!(base.rgb, [0.2, 0.0, 0.4]);
     assert!(base.unlit, "rgbGen const is not lit by the light grid");
-    assert!(!legs.two_sided, "an opaque body hides its own back faces");
+    assert!(legs.two_sided, "authored cull twosided applies to opaque surfaces too");
 
     let eyes = material_layers(&shaders, "models/players/ShadowTink/ShadowEyes");
     let modes = eyes
@@ -1616,4 +1659,79 @@ fn player_angle_reset_preserves_openjk_clientinfo_state() {
     assert_eq!(state.corr_time, 41);
     assert_eq!(state.look_time, 42);
     assert_eq!(state.last_head_angles, [4.0, 5.0, 6.0]);
+}
+
+/// Regression for a common two-pass Ghoul2 ghost material. The renderer must
+/// preserve the authored alpha/depth state independently of the additive glow
+/// that follows it, rather than turning the base into ordinary transparent FX.
+#[test]
+fn ghoul2_alpha_blended_depthwrite_and_waves_follow_taystjk() {
+    let shaders = jka_assets::shader::parse(
+        r"models/players/test/forceghost
+{
+    q3map_nolightmap
+    surfaceparm trans
+    cull twosided
+    {
+        map models/players/test/forceghost
+        blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+        depthWrite
+        rgbGen lightingDiffuse
+        alphaGen wave sin 0.8 0.2 0.1 0.1
+    }
+    {
+        map models/players/test/white_glow
+        blendFunc GL_ONE GL_ONE
+        rgbGen wave sin 3.0 0.5 0.1 0.1
+        alphaGen wave sin 2.0 0.4 0.1 0.1
+    }
+}
+models/players/test/unlit_depthwrite
+{
+    {
+        map models/players/test/unlit_depthwrite
+        blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+        depthWrite
+        rgbGen wave sin 0.6 0.2 0 1
+    }
+}
+models/players/test/ordinary_blend
+{
+    {
+        map models/players/test/ordinary_blend
+        blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+        rgbGen lightingDiffuse
+        alphaGen wave sin 0.6 0.2 0 1
+    }
+}
+",
+    ).unwrap();
+    let ghost = material_layers(&shaders, "models/players/test/forceghost");
+    assert!(ghost.two_sided);
+    assert_eq!(ghost.base.alpha_mode, DynamicModelAlphaMode::BlendDepthWrite);
+    assert_eq!(ghost.stages.len(), 2);
+    assert_eq!(ghost.stages[0].1, DynamicModelAlphaMode::BlendDepthWrite);
+    assert_eq!(ghost.stages[1].1, DynamicModelAlphaMode::AdditiveOne);
+    let base = resolved_stage(ghost.stages[0].0, ghost.stages[0].1, None);
+    assert!(!base.unlit, "rgbGen lightingDiffuse needs entity lighting");
+    let alpha_wave = base.alpha_wave.expect("authored alphaGen wave preserved");
+    assert!((wave_value(alpha_wave, 0.0).clamp(0.0, 1.0) - 0.917557).abs() < 0.0001);
+    assert!(base.rgb_wave.is_none());
+    let glow = resolved_stage(ghost.stages[1].0, ghost.stages[1].1, None);
+    assert!(glow.unlit);
+    assert_eq!(wave_value(glow.rgb_wave.unwrap(), 0.0).clamp(0.0, 1.0), 1.0);
+    assert_eq!(wave_value(glow.alpha_wave.unwrap(), 0.0).clamp(0.0, 1.0), 1.0);
+
+    // A single stage with procedural alpha still runs its generator each
+    // frame, but never starts writing depth without an explicit depthWrite.
+    let unlit = material_layers(&shaders, "models/players/test/unlit_depthwrite");
+    assert_eq!(unlit.base.alpha_mode, DynamicModelAlphaMode::BlendUnlitDepthWrite);
+    assert_eq!(unlit.stages.len(), 1);
+    assert!(resolved_stage(unlit.stages[0].0, unlit.stages[0].1, None).unlit);
+
+    let ordinary = material_layers(&shaders, "models/players/test/ordinary_blend");
+    assert_eq!(ordinary.base.alpha_mode, DynamicModelAlphaMode::Blend);
+    assert_eq!(ordinary.stages.len(), 1);
+    assert_eq!(ordinary.stages[0].1, DynamicModelAlphaMode::Blend);
+    assert!(resolved_stage(ordinary.stages[0].0, ordinary.stages[0].1, None).alpha_wave.is_some());
 }

@@ -1,7 +1,7 @@
 //! Lighting ray tracing.
 use crate::renderer::{
     comparison_sampler_entry, depth_array_texture_entry, material_uniform,
-    nonfiltering_sampler_entry, rt_local_radiance, rt_models, rt_radiance, rt_resolution, unfilterable_texture_entry_stages,
+    nonfiltering_sampler_entry, rt_models, rt_resolution, unfilterable_texture_entry_stages,
     uniform_entry, weather, Arc, DrawBatch, DynamicModelAlphaMode, DynamicModelSurface,
     DynamicModelVertex, DynamicShadowsMode, Ghoul2GpuVertex, GpuVertex, Hash, HashMap, HashSet,
     Hasher, InlineModelGpu, InlineModelInstance, MaterialUniform, Pod, RayTracedRigidInstance,
@@ -326,8 +326,6 @@ pub(in crate::renderer) struct RayTracedShadowResources {
     pub(in crate::renderer) world_pipeline_layout_lean: wgpu::PipelineLayout,
     pub(in crate::renderer) world_shader: wgpu::ShaderModule,
     pub(in crate::renderer) world_shader_lean: wgpu::ShaderModule,
-    world_shader_raw: wgpu::ShaderModule,
-    world_shader_lean_raw: wgpu::ShaderModule,
     pub(in crate::renderer) receiver_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) _blas: wgpu::Blas,
     pub(in crate::renderer) static_mask_blas: Option<RayTracedMaskBlas>,
@@ -1144,18 +1142,6 @@ impl Renderer {
                     world_shader_lean_source.into(),
                 ),
             });
-        let raw_shader = |family: &str, base: &str, filtered: &wgpu::ShaderModule| {
-            if !rt_diagnostics::config().receiver.denoiser { return filtered.clone(); }
-            let features = ReceiverFeatures { denoiser: false, glass: rt_diagnostics::config().receiver.glass };
-            let source = compose_world_shader(&ray_traced_world_shader_source_with_features(base, features)
-                .expect("RT raw receiver shader anchors"));
-            rt_diagnostics::dump_shader(family, &source);
-            self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(family), source: wgpu::ShaderSource::Wgsl(source.into()),
-            })
-        };
-        let world_shader_raw = raw_shader("bsp-rt-enhanced-raw", include_str!("../../bsp.wgsl"), &world_shader);
-        let world_shader_lean_raw = raw_shader("bsp-rt-lean-raw", include_str!("../../bsp_lean.wgsl"), &world_shader_lean);
         let sun_shadow_history = rt_resolution::RtSunShadowHistory::new(&self.device);
         let receiver_bind_group = create_rt_receiver_bind_group(
             &self.device,
@@ -1191,8 +1177,6 @@ impl Renderer {
             world_pipeline_layout_lean,
             world_shader,
             world_shader_lean,
-            world_shader_raw,
-            world_shader_lean_raw,
             receiver_bind_group,
             _blas: blas,
             static_mask_blas,
@@ -2055,50 +2039,14 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
         return Err("clustered emitter sampling anchors not found".to_string());
     }
     source = rt_sampled_light_loops(&source)?;
-    // The newer RT radiance denoiser provides scalar visibility, which is
-    // correct only for neutral/opaque shadows. When RGB glass is enabled,
-    // preserve actual per-channel throughput through every pane instead of
-    // collapsing tinted light to a scalar filtered value. Keep the denoised
-    // scalar path intact when glass is disabled.
-    if features.denoiser {
+    source.push_str(include_str!("../../rt_resolution_read.wgsl"));
+    if features.glass {
         for n in ["normal", "n"] {
             source = source.replace(
                 &format!("local_light_shadow_rgb(light, input.world_position, {n})"),
-                &format!("rt_local_shadow_receiver_rgb(light, input, {n}, cluster.indices[i])"),
+                &format!("rt_local_shadow_rgb(light, input.world_position, {n})"),
             );
         }
-        // Append only after call-site rewrites: helper fallback calls should not
-        // acquire out-of-scope cluster indices from a recursive replacement.
-        source.push_str(include_str!("../../rt_resolution_read.wgsl"));
-        source.push_str(r#"
-fn rt_local_shadow_receiver_rgb(
-    light: PointLight, input: VertexOut, normal: vec3<f32>, light_index: u32
-) -> vec3<f32> {
-    if ((lighting_settings.feature_flags.z & 0x200u) != 0u) {
-        return rt_denoised_local_throughput(light, input, normal, light_index);
-    }
-    return vec3<f32>(rt_denoised_local_visibility(light, input, normal, light_index));
-}
-"#);
-    } else {
-        // The pre-denoiser receiver source and group-3 interface (bindings 0..16).
-        source.push_str(include_str!("../../rt_resolution_read_legacy.wgsl"));
-        if features.glass {
-            for n in ["normal", "n"] {
-                source = source.replace(
-                    &format!("local_light_shadow_rgb(light, input.world_position, {n})"),
-                    &format!("rt_local_shadow_rgb(light, input.world_position, {n})"),
-                );
-            }
-        }
-    }
-
-
-    if features.denoiser {
-        source = source.replace(
-            "    let shaded = shade_surface(input, front);",
-            "    let rt_debug = rt_denoiser_debug(input);\n    if (rt_debug.a >= 0.0) { return rt_debug; }\n    let shaded = shade_surface(input, front);"
-        );
     }
 
     // The enhanced ocean path has one outer guard that bypasses the common
@@ -2154,11 +2102,9 @@ pub(in crate::renderer) fn create_ray_traced_shadow_receiver_layout(
     })
 }
 
-pub(in crate::renderer) fn rt_receiver_layout_entries(features: ReceiverFeatures) -> Vec<wgpu::BindGroupLayoutEntry> {
+pub(in crate::renderer) fn rt_receiver_layout_entries(_features: ReceiverFeatures) -> Vec<wgpu::BindGroupLayoutEntry> {
     let alpha_entries = rt_alpha_storage_entries();
     let cache_entries = rt_resolution::receiver_entries();
-    let radiance_entries = rt_radiance::receiver_entries();
-    let local_entries = rt_local_radiance::receiver_entries();
     let entries = [
             depth_array_texture_entry(0),
             comparison_sampler_entry(1),
@@ -2175,27 +2121,15 @@ pub(in crate::renderer) fn rt_receiver_layout_entries(features: ReceiverFeatures
             alpha_entries[0], alpha_entries[1], alpha_entries[2],
             alpha_entries[3], alpha_entries[4], alpha_entries[5],
             cache_entries[0], cache_entries[1],
-            radiance_entries[0], radiance_entries[1], radiance_entries[2], radiance_entries[3],
-            local_entries[0], local_entries[1], local_entries[2],
     ];
-    entries[..rt_receiver_binding_count(features)].to_vec()
+    entries.to_vec()
 }
 
-fn rt_receiver_binding_count(features: ReceiverFeatures) -> usize {
-    if features.denoiser { 24 } else { 17 }
-}
+
 
 impl RayTracedShadowResources {
-    pub(in crate::renderer) fn world_shader_for_variant(
-        &self, key: crate::renderer::WorldShaderVariantKey,
-    ) -> &wgpu::ShaderModule {
-        let enhanced = key.family() == crate::renderer::WorldShaderFamily::Enhanced;
-        match (enhanced, key.rt_receiver_denoiser) {
-            (true, true) => &self.world_shader,
-            (false, true) => &self.world_shader_lean,
-            (true, false) => &self.world_shader_raw,
-            (false, false) => &self.world_shader_lean_raw,
-        }
+    pub(in crate::renderer) fn world_shader_for_variant(&self, key: crate::renderer::WorldShaderVariantKey) -> &wgpu::ShaderModule {
+        if key.family() == crate::renderer::WorldShaderFamily::Enhanced { &self.world_shader } else { &self.world_shader_lean }
     }
 
     pub(in crate::renderer) fn scene(&self) -> RtReceiverScene<'_> {
@@ -2324,40 +2258,11 @@ pub(in crate::renderer) fn create_rt_receiver_bind_group(
                 binding: 16,
                 resource: wgpu::BindingResource::TextureView(&sun_shadow_history.published),
             },
-            wgpu::BindGroupEntry {
-                binding: 17,
-                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.radiance.published),
-            },
-            wgpu::BindGroupEntry {
-                binding: 18,
-                resource: sun_shadow_history.radiance.sun_uniform.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 19,
-                resource: wgpu::BindingResource::TextureView(sun_shadow_history.radiance.raw_view()),
-            },
-            wgpu::BindGroupEntry {
-                binding: 20,
-                resource: wgpu::BindingResource::TextureView(sun_shadow_history.radiance.temporal_view()),
-            },
-            wgpu::BindGroupEntry {
-                binding: 21,
-                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local_radiance.filter.published),
-            },
-            wgpu::BindGroupEntry {
-                binding: 22,
-                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local_radiance.raw),
-            },
-            wgpu::BindGroupEntry {
-                binding: 23,
-                resource: wgpu::BindingResource::TextureView(&sun_shadow_history.local_radiance.reference),
-            },
     ];
-    let count = rt_receiver_binding_count(rt_diagnostics::config().receiver);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA hardware ray-traced sun/weather receiver bind group"),
         layout,
-        entries: &entries[..count],
+        entries: &entries,
     })
 }
 

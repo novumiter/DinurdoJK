@@ -45,7 +45,6 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     pub(in crate::renderer) ray_traced_shadows: bool,
     pub(in crate::renderer) ray_traced_sun: bool,
     /// Shader source/interface identity, frozen for the lifetime of the process.
-    pub(in crate::renderer) rt_receiver_denoiser: bool,
     pub(in crate::renderer) rt_receiver_glass: bool,
     pub(in crate::renderer) planar_reflections: bool,
     pub(in crate::renderer) legacy_fog: bool,
@@ -63,7 +62,7 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     pub(in crate::renderer) deluxe: bool,
     /// Deluxe GGX specular lobe; implies `deluxe` and a non-zero r_deluxeSpecular.
     pub(in crate::renderer) deluxe_specular: bool,
-    pub(in crate::renderer) detail_texture_mode: u32,
+    pub(in crate::renderer) detail_textures_enabled: bool,
 }
 
 impl WorldShaderVariantKey {
@@ -148,7 +147,7 @@ impl WorldShaderVariantKey {
                 f64::from(u8::from(self.planar_reflections)),
             ),
             ("ENABLE_OCEAN", f64::from(u8::from(self.ocean))),
-            ("DETAIL_TEXTURE_MODE", f64::from(self.detail_texture_mode)),
+            ("ENABLE_DETAIL_TEXTURES", f64::from(u8::from(self.detail_textures_enabled))),
             ("ENABLE_LEGACY_FOG", f64::from(u8::from(self.legacy_fog))),
             ("ENABLE_JUMP_SHADE", f64::from(u8::from(self.jump_shade))),
             (
@@ -281,7 +280,7 @@ impl WorldShaderVariantKey {
                 "deluxe"
             });
         }
-        if self.detail_texture_mode != 0 {
+        if self.detail_textures_enabled {
             enabled.push("detail");
         }
         if enabled.is_empty() {

@@ -28,6 +28,8 @@ struct RainSimUniform {
 // slot + 1, 0 meaning "the whole box is water".
 struct WaterMasks {
     ranges: array<vec4<f32>, 8>,       // first triangle, triangle count
+    bounds: array<vec4<f32>, 8>,       // min xz, max xz for tile lookup
+    tiles: array<vec4<u32>, 8>,        // 2-bit 8x8 exact accelerator
     triangles: array<vec4<f32>, 512>,  // per triangle: a.xy b.xy / c.xy
 };
 @group(0) @binding(5) var<uniform> water_masks: WaterMasks;
@@ -245,6 +247,17 @@ fn water_mask_contains(slot: i32, p: vec2<f32>) -> bool {
     if (triangle_count == 0u) {
         return true;
     }
+    let bounds = water_masks.bounds[slot];
+    if (any(p < bounds.xy) || any(p > bounds.zw)) {
+        return false;
+    }
+    let tile_xy = vec2<u32>(clamp(
+        floor((p - bounds.xy) / max(bounds.zw - bounds.xy, vec2<f32>(1.0e-4)) * 8.0),
+        vec2<f32>(0.0), vec2<f32>(7.0)));
+    let tile = tile_xy.y * 8u + tile_xy.x;
+    let code = (water_masks.tiles[slot][tile >> 4u] >> ((tile & 15u) * 2u)) & 3u;
+    if (code == 1u) { return false; }
+    if (code == 2u) { return true; }
     let first = u32(range.x);
     let tolerance = 0.75;
     for (var i = 0u; i < triangle_count; i = i + 1u) {

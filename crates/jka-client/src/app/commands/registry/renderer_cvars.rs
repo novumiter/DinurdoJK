@@ -3348,6 +3348,28 @@ app_cvars! {
         ]
     }
 
+    APP_R_PIPELINE_TRACE {
+        runtime: CvarDef::new("r_pipelineTrace", "0", "0|1", "Log native BSP/RT pipeline BEGIN/END and background shader job progress. Session-only; enable before the slow settings change.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.pipeline_trace)),
+            |app, value| App::cvar_set_r_pipeline_trace(app, APP_R_PIPELINE_TRACE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_pipeline_trace, None),
+        config: CvarBinding {
+            default: Some(|state| bool_value(state.video.pipeline_trace)),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_pipeline_trace(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    self.video.pipeline_trace = enabled;
+                    crate::pipeline_jobs::set_pipeline_trace(enabled);
+                    self.console_status = format!("SHADER COMPILE TRACE: {}", if enabled { "ON" } else { "OFF" });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_VERBOSE {
         runtime: CvarDef::new("r_verbose", "", "0..3", "Renderer-only diagnostic level: 0 quiet, 1 basic renderer lifecycle, 2 verbose renderer internals, 3 trace. A matching developer level also enables renderer output.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_verbose(app)), |app, value| App::cvar_set_r_verbose(app, APP_R_VERBOSE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_verbose, None),
         config: CvarBinding {

@@ -21,8 +21,11 @@ pub(in crate::renderer) struct ScreenFxTexture {
 }
 
 impl Renderer {
-    pub(in crate::renderer) fn set_ui(&mut self, ui_state: UiSnapshot) {
+    pub(in crate::renderer) fn set_ui(&mut self, mut ui_state: UiSnapshot) {
         let needs_key_atlas = !self.ui_keys_loaded && ui_state.movement_keys.mode != 0;
+        // The app is not the owner of pipeline jobs; preserve the render-thread
+        // status when a gameplay/menu UI snapshot arrives between samples.
+        ui_state.shader_compile_progress = self.ui_state.shader_compile_progress;
         self.ui_state = ui_state;
         if needs_key_atlas {
             self.load_ui_key_atlas_now();
@@ -31,6 +34,24 @@ impl Renderer {
         self.sync_ui_team_icons();
         self.sync_ui_loading_background();
         self.rebuild_ui();
+    }
+
+    /// Poll background shader jobs at UI cadence, not at render frame rate.
+    /// Upload only the small retained HUD batch when the integer count changes.
+    pub(in crate::renderer) fn refresh_shader_compile_progress(&mut self) {
+        let status = self.pipeline_jobs.progress().map(|progress| ui::MapLoadingBar {
+            label: "COMPILING SHADERS",
+            completed: progress.finished,
+            total: progress.total,
+            skipped: false,
+        });
+        let signature = |bar: &Option<ui::MapLoadingBar>| {
+            bar.as_ref().map(|bar| (bar.completed, bar.total))
+        };
+        if signature(&self.ui_state.shader_compile_progress) != signature(&status) {
+            self.ui_state.shader_compile_progress = status;
+            self.rebuild_retained_ui();
+        }
     }
 
     pub(in crate::renderer) fn set_player_names(

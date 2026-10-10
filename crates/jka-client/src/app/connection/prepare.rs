@@ -285,12 +285,7 @@ impl App {
                 devprintln!(1, "[JOIN] map preflight blocked: {error}");
                 self.console_status = format!("MAP NOT FOUND: {map_name}");
                 self.push_console_line(format!("^3[JOIN]^7 map not found locally: {map_name}"));
-                self.missing_map_prompt = Some(MissingMapPrompt {
-                    map_name,
-                    reason: error,
-                });
-                self.egui_repaint_requested = true;
-                self.publish_ui();
+                self.show_missing_map_prompt(&map_name, error);
                 // Intentionally leave ClientSession's preflight pause engaged.
                 // The dialog explicitly chooses abort, connect-anyway, or
                 // autodownload before the gameplay connect packet is sent.
@@ -368,6 +363,15 @@ impl App {
             map_name: map_name.to_owned(),
             reason: reason.into(),
         });
+        // Map changes keep OverlayMode::None from the previous gameplay map.
+        // Explicitly return raw-input ownership to the OS before presenting
+        // the egui dialog, and clear held gameplay binds like set_overlay does.
+        self.release_all_pressed_bindings();
+        self.keys.clear();
+        self.movement_keys.clear();
+        self.mouse_buttons_down.clear();
+        self.last_mouse_motion_at = None;
+        self.set_capture(false);
         self.console_status = format!("MAP NOT FOUND: {map_name}");
         self.egui_repaint_requested = true;
         self.publish_ui();

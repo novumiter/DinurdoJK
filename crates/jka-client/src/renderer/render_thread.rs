@@ -379,6 +379,11 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.set_pvs_mode(initial_ui.video.pvs_mode);
     let mut fps_cap = initial_ui.video.fps_cap;
     let mut input_latelatch = initial_ui.video.input_latelatch;
+    // `inputdiag` force-enables GPU timestamps for the capture, because the CPU
+    // side of this loop never waits on the GPU and therefore cannot show a GPU
+    // that is missing the cap. These two track what to put back afterwards.
+    let mut user_gpu_timings = initial_ui.video.gpu_timings;
+    let mut diag_forced_gpu_timings = false;
     renderer.set_gamma_method(
         if initial_ui.video.gamma_method == crate::gamma::GammaMethod::Hardware {
             crate::gamma::GammaMethod::Shader
@@ -507,7 +512,6 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
     renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
     renderer.set_rt_samples(initial_ui.video.rt_samples);
-    renderer.set_rt_denoiser_mode(initial_ui.video.rt_denoiser_mode);
     renderer.set_dynamic_light_falloff(initial_ui.video.dynamic_light_falloff);
     renderer.set_rt_half_resolution(initial_ui.video.rt_half_resolution);
     renderer.set_map_light_simulation(initial_ui.video.map_light_simulation);
@@ -635,6 +639,7 @@ pub(in crate::renderer) fn render_thread_main(
         println!("JKA perf trace enabled (enable GPU TIMESTAMPS too for per-pass GPU timings)");
     }
 
+    let mut shader_progress_polled_at = Instant::now() - Duration::from_millis(100);
     let mut gamma_preparation = None;
     let mut first_frame_notified = false;
     let mut batch_timing: Option<RenderBatchTiming> = None;
@@ -642,6 +647,12 @@ pub(in crate::renderer) fn render_thread_main(
     let mut deferred_load_map = None;
 
     loop {
+        // Before any encoding, so the capture's first frames carry timestamps.
+        let diag_recording = input_diagnostic.is_recording();
+        if diag_recording != diag_forced_gpu_timings {
+            diag_forced_gpu_timings = diag_recording;
+            renderer.set_gpu_timings(diag_recording || user_gpu_timings);
+        }
         let mut diag_command_drain_count = 0_u32;
         let diag_command_drain_ms: f64;
         // Checked before the command batch as well as before the frame: map and
@@ -740,6 +751,9 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetEntityMarkers(mesh)) => {
                         renderer.set_entity_markers(mesh);
+                    }
+                    Ok(RenderCommand::SetCoastalDebugMesh(mesh)) => {
+                        renderer.set_coastal_debug_mesh(mesh);
                     }
                     Ok(RenderCommand::SetSunRayPreview(enabled)) => {
                         renderer.debug_volumes.sun_ray_enabled = enabled;
@@ -849,7 +863,14 @@ pub(in crate::renderer) fn render_thread_main(
                             if enabled { "enabled" } else { "disabled" }
                         );
                     }
-                    Ok(RenderCommand::SetGpuTimings(enabled)) => renderer.set_gpu_timings(enabled),
+                    Ok(RenderCommand::SetGpuTimings(enabled)) => {
+                        user_gpu_timings = enabled;
+                        // A capture owns the profiler until it finishes; the new
+                        // preference is applied when it restores.
+                        if !diag_forced_gpu_timings {
+                            renderer.set_gpu_timings(enabled);
+                        }
+                    }
                     Ok(RenderCommand::SetFxZeroAlphaDiscard(enabled)) => {
                         renderer
                             .dynamic_model_renderer
@@ -871,7 +892,6 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.set_dynamic_light_debug(enabled);
                     }
                     Ok(RenderCommand::SetRtSamples(samples)) => renderer.set_rt_samples(samples),
-                    Ok(RenderCommand::SetRtDenoiserMode(mode)) => renderer.set_rt_denoiser_mode(mode),
                     Ok(RenderCommand::SetDynamicLightFalloff(mode)) => {
                         renderer.set_dynamic_light_falloff(mode)
                     }
@@ -1317,6 +1337,10 @@ pub(in crate::renderer) fn render_thread_main(
             // process through __fastfail - no minidump, no log tail, and the
             // original message buried under the fallout.
             let frame_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if shader_progress_polled_at.elapsed() >= Duration::from_millis(90) {
+                    shader_progress_polled_at = Instant::now();
+                    renderer.refresh_shader_compile_progress();
+                }
                 renderer.render(
                     &frame_camera,
                     snapshot.player_position,
@@ -1793,7 +1817,7 @@ pub(in crate::renderer) fn render_thread_main(
                 );
             }
             println!(
-                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_sim={}ms ocean_surface={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms rain_sim={}ms rain_draw={}ms rain_haze={}ms rain_froxel={}ms rain_lens={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms",
+                "[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_sim={}ms ocean_surface={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms rain_sim={}ms rain_draw={}ms rain_haze={}ms rain_froxel={}ms rain_lens={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms ssr_visibility={}ms ssr_trace={}ms",
                 gpu_ms(GpuPass::Frame),
                 gpu_ms(GpuPass::RtBuild),
                 gpu_ms(GpuPass::World),
@@ -1818,6 +1842,8 @@ pub(in crate::renderer) fn render_thread_main(
                 gpu_ms(GpuPass::Cluster),
                 gpu_ms(GpuPass::Ui),
                 gpu_ms(GpuPass::Clouds),
+                gpu_ms(GpuPass::SsrVisibility),
+                gpu_ms(GpuPass::SsrTrace),
             );
             println!(
                 "[JKA WEATHER PERF] ab[fast_post={} water_field={} fast_vertex={} lean_depth={} static_depth={} opaque_depth={} lean_models={} lean_post={} haze_2d={}] rain_only_depth={} rain_only_post={} rain[sim={}ms draw={}ms haze={}ms froxel={}ms lens={}ms] frame={}ms depth={}ms post={}ms",
@@ -1844,14 +1870,12 @@ pub(in crate::renderer) fn render_thread_main(
             if renderer.hardware_rt_active() {
                 if let Some(rt) = renderer.ray_traced_shadows.as_ref() {
                     println!(
-                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms sun_radiance={}ms local_radiance={}ms rt_denoiser={} sun_shadow_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
+                        "[JKA RT PERF] build={}ms skin={}ms accel={}ms visibility={}ms rt_taa={} sun_shadow_rate={} static_opaque[geoms={} tris={}] masked[geoms={} tris={}] dynamic[instances={} rigid_tris={} skinned_tris={} masked_rigid={} masked_skinned={}] caches[rigid={} skinned={}] alpha[textures={} packed_words={} generation={}] sun_rays={} local_rays={} (budget_per_light_evaluation; not_measured)",
                     gpu_ms(GpuPass::RtBuild),
                     gpu_ms(GpuPass::RtSkin),
                     gpu_ms(GpuPass::RtAcceleration),
                     gpu_ms(GpuPass::RtVisibility),
-                    gpu_ms(GpuPass::RtRadiance),
-                    gpu_ms(GpuPass::RtLocalRadiance),
-                    renderer.rt_denoiser_mode,
+                    renderer.rt_taa_mode,
                     if renderer.rt_reduced_shadows { "quarter" } else { "full" },
                     rt.geometry_count,
                     rt.triangle_count,
@@ -2175,6 +2199,9 @@ pub(in crate::renderer) fn render_thread_main(
                     pace_wake_error_ms: diag_pace_wake_error_ms,
                     pace_late_before_wait_ms: diag_pace_late_before_wait_ms,
                     pace_anchor_reset: diag_pace_anchor_reset,
+                    gpu_frame_ms: renderer.gpu_profiler.latest_frame_ms(),
+                    gpu_sample_generation: renderer.gpu_profiler.latest_generation(),
+                    gpu_timing: renderer.gpu_profiler.latest_timing(),
                     client_perf: snapshot.client_perf,
                 });
             }

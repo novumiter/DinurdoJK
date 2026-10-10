@@ -200,22 +200,22 @@ impl App {
         );
         self.egui_color_grade_slider(
             ui,
-            "Shadow brightness",
-            "Brightness of darker tonal ranges, in stops, with a smooth falloff into the midtones.",
+            "Shadows",
+            "Lift or deepen dark tones on a monotonic tone curve. -100 to +100 is adjustment strength, not EV or literal percent brightness; 0 is neutral. Middle grey and the black/white endpoints stay fixed.",
             "r_colorShadows",
             grade.shadows,
-            -2.0..=2.0,
-            |v| format!("{v:+.2} EV"),
+            -100.0..=100.0,
+            |v| format!("{v:+.0}"),
             true,
         );
         self.egui_color_grade_slider(
             ui,
-            "Highlight brightness",
-            "Brightness of brighter tonal ranges, in stops, with a smooth falloff into the midtones.",
+            "Highlights",
+            "Recover or boost bright tones on a monotonic tone curve. -100 to +100 is adjustment strength, not EV or literal percent brightness; 0 is neutral. Shadows cannot overtake highlights on a grey ramp.",
             "r_colorHighlights",
             grade.highlights,
-            -2.0..=2.0,
-            |v| format!("{v:+.2} EV"),
+            -100.0..=100.0,
+            |v| format!("{v:+.0}"),
             true,
         );
 

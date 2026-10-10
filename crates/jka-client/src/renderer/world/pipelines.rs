@@ -56,20 +56,18 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_world_pipelines(&mut self) {
-        // Render-target compatibility changes (MSAA / scene format) invalidate
-        // every cached render pipeline. Rebuild only the active specialized
-        // variant plus the known-fast baseline; future settings combinations
-        // are created lazily again on demand.
-        //
-        // Keep this selection identical to activate_world_pipeline_variant():
-        // an RT key must always be paired with the lazily-created RT WGSL and
-        // RT group-3 layout. Passing the RT specialization constant to the stock
-        // BSP shader is invalid because that shader intentionally does not
-        // declare ENABLE_RAY_TRACED_SHADOWS.
+        // A genuine format/MSAA transition needs compatible PSOs immediately.
+        // Compile the raster fallback synchronously (normally a few ms), NEVER
+        // the multi-second RT specialization on the render thread. The desired
+        // RT variant is queued with activate_world_pipeline_variant() below, and
+        // becomes active only after its background job has completed.
+        let started = Instant::now();
         let mut key = self.world_shader_variant_key();
-        if key.ray_traced_shadows && !self.ensure_ray_traced_shadow_resources() {
+        let rt_requested = key.ray_traced_shadows;
+        if rt_requested {
             key.ray_traced_shadows = false;
             key.ray_traced_sun = false;
+            key.rt_receiver_glass = false;
         }
         let scene_format = self.scene_format();
         let samples = self.msaa_samples;
@@ -191,6 +189,11 @@ impl Renderer {
             // demand the next time the frame plan selects FastBaseline.
             world.fast_pipelines.clear();
         }
+        rverbose!(1, "Synchronous world format/MSAA fallback compiled in {:.1} ms (RT requested: {rt_requested})",
+            started.elapsed().as_secs_f64() * 1000.0);
+        if rt_requested {
+            self.activate_world_pipeline_variant();
+        }
     }
 
     /// The known-fast baseline pipelines only serve `WorldRenderPath::FastBaseline`.
@@ -246,12 +249,10 @@ impl Renderer {
 
     /// Queue the scene rebuild instead of running it inline.
     ///
-    /// Recreating the targets also recompiles the whole world pipeline set, which
-    /// costs hundreds of milliseconds. Several independent settings request it —
-    /// HDR, bloom, SSAO, SSR, depth of field, cloud resolution, MSAA — so a burst
-    /// of changes arriving together (a quality preset sends about forty cvars at
-    /// once) would otherwise pay that cost once per setting. Collapsing them to a
-    /// single rebuild before the next frame turns a multi-second stall into one.
+    /// Several independent settings request target-resource rebuilds — bloom,
+    /// SSAO, SSR, depth of field, cloud resolution and MSAA. Collapse bursts of
+    /// changes into one target refresh. World PSOs are invalidated only for
+    /// actual format/MSAA changes; slow RT variants remain asynchronous.
     pub(in crate::renderer) fn request_scene_rebuild(&mut self) {
         self.scene_rebuild_pending = true;
     }
@@ -263,13 +264,21 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_scene_targets_and_pipelines(&mut self) {
+        let scene_format = self.scene_format();
+        let samples = self.msaa_samples;
+        // Post-resource changes (bloom, SSAO, SSR, DOF, cloud resolution) do NOT
+        // invalidate render pipelines that still target the same format/MSAA.
+        // In particular, avoid recompiling expensive RT BSP variants here.
+        let pipeline_compat_changed = self.targets._scene_texture.format() != scene_format
+            || self.targets._msaa_texture.as_ref().map_or(1, |texture| texture.sample_count()) != samples;
+        if crate::pipeline_jobs::pipeline_trace_enabled() {
+            println!("[scene rebuild] format={scene_format:?} samples={samples} pipeline_compat_changed={pipeline_compat_changed}");
+        }
         self.invalidate_rt_sun_shadow_depth();
         // Companion scene textures/pipelines share the gameplay scene format and
         // MSAA count. Recreate them lazily after this rebuild; the presentation
         // worker keeps showing its last safe texture until the new ring arrives.
         self.companion_scene_targets.clear();
-        let scene_format = self.scene_format();
-        let samples = self.msaa_samples;
         self.targets = create_targets(
             &self.device,
             self.config.width,
@@ -295,26 +304,28 @@ impl Renderer {
         self._ssr_visibility_layout = ssr_visibility_layout;
         self.ssr_visibility_pipeline = ssr_visibility_pipeline;
         self.ssr_visibility_bind_group = ssr_visibility_bind_group;
-        self.weather
-            .rain
-            .rebuild_render_pipelines(&self.device, scene_format, samples);
-        self.weather
-            .snow
-            .rebuild_render_pipeline(scene_format, samples);
-        self.weather
-            .atmosphere
-            .rebuild_render_pipeline(scene_format, samples);
-        self.weather
-            .wind_visuals
-            .rebuild_render_pipelines(scene_format, samples);
-        self.grass_renderer
-            .rebuild_pipeline(&self.device, scene_format, samples);
-        self.surface_sprite_effect_renderer
-            .rebuild_pipelines(&self.device, scene_format, samples);
-        self.dynamic_model_renderer
-            .rebuild_pipelines(&self.device, scene_format, samples);
-        self.dynamic_model_renderer
-            .prewarm_core_model_pipelines(&mut self.pipeline_jobs, &self.device);
+        if pipeline_compat_changed {
+            self.weather
+                .rain
+                .rebuild_render_pipelines(&self.device, scene_format, samples);
+            self.weather
+                .snow
+                .rebuild_render_pipeline(scene_format, samples);
+            self.weather
+                .atmosphere
+                .rebuild_render_pipeline(scene_format, samples);
+            self.weather
+                .wind_visuals
+                .rebuild_render_pipelines(scene_format, samples);
+            self.grass_renderer
+                .rebuild_pipeline(&self.device, scene_format, samples);
+            self.surface_sprite_effect_renderer
+                .rebuild_pipelines(&self.device, scene_format, samples);
+            self.dynamic_model_renderer
+                .rebuild_pipelines(&self.device, scene_format, samples);
+            self.dynamic_model_renderer
+                .prewarm_core_model_pipelines(&mut self.pipeline_jobs, &self.device);
+        }
         // One shared spray pipeline serves every ocean; recompiled on demand by
         // ensure_lazy_scene_pipelines only while some ocean has sea spray on.
         self.ocean_spray_pipeline = None;
@@ -339,15 +350,22 @@ impl Renderer {
         self.ssr_frame_index = 0;
         self.update_post_uniform();
         self.update_lighting_settings();
-        self.rebuild_world_pipelines();
-        self.cull_debug_pipeline = None;
-        // All wireframe pipelines are diagnostic-only and are rebuilt lazily on
-        // demand after a scene-format/MSAA change.
-        self.wireframe_pipeline = None;
-        self.world_wireframe_pipelines.clear();
-        self.fast_world_wireframe_pipeline = None;
-        self.debug_volumes.clear_pipelines();
-        self.surface_inspector_pipeline = None;
+        if pipeline_compat_changed {
+            // True format/MSAA changes still need compatible PSOs. These are
+            // relatively rare; a transactional async format switch is separate
+            // work because old targets must remain valid until all PSOs are ready.
+            self.rebuild_world_pipelines();
+            self.cull_debug_pipeline = None;
+            self.wireframe_pipeline = None;
+            self.world_wireframe_pipelines.clear();
+            self.fast_world_wireframe_pipeline = None;
+            self.debug_volumes.clear_pipelines();
+            self.surface_inspector_pipeline = None;
+        } else {
+            // In a resource-only rebuild, keep the old GPU pipelines cached,
+            // but pick up any shader-key change (e.g. legacy fog) asynchronously.
+            self.activate_world_pipeline_variant();
+        }
     }
 
     /// Compiles the pipelines that are only needed while TAA, the surface

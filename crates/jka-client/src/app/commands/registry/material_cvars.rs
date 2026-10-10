@@ -160,33 +160,34 @@ app_cvars! {
     }
 
     APP_R_DETAILTEXTURES {
-        runtime: CvarDef::new("r_detailTextures", "", "off|neutral2x|linear2x|dstcolor_one|multiply", "Fallback detail-texture blend mode for eligible opaque BSP materials that do not author a classic detail stage.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_detailtextures(app)), |app, value| App::cvar_set_r_detailtextures(app, APP_R_DETAILTEXTURES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_detailtextures, None),
+        runtime: CvarDef::new("r_detailTextures", "0", "0|1", "Enable neutral 2x detail textures on eligible opaque BSP materials without authored detail stages.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_detailtextures(app)), |app, value| App::cvar_set_r_detailtextures(app, APP_R_DETAILTEXTURES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_detailtextures, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
-                    settings.detail_textures =
-                        DetailTextureMode::from_config(value).unwrap_or(settings.detail_textures);
+                    // Older configs stored the selected blend mode. All modes
+                    // now map to the one remaining neutral 2x implementation.
+                    settings.detail_textures = parse_bool(value).or_else(|| match value.trim().to_ascii_lowercase().as_str() {
+                        "neutral2x" | "enhanced" | "softlight" | "linear2x" | "modulate2x"
+                        | "dstcolor_one" | "dstcolorone" | "multiply" | "modulate" | "2" | "3" | "4" => Some(true),
+                        _ => None,
+                    }).unwrap_or(settings.detail_textures);
                 }),
                 archive: Some((14, |state| {
                     let settings = state.video;
-                    format!("{}", settings.detail_textures.config_value())
+                    format!("{}", u8::from(settings.detail_textures))
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_detailtextures(&self) -> String {
-                    self.video.detail_textures.config_value().into()
+                    bool_value(self.video.detail_textures)
                 }
                 fn cvar_set_r_detailtextures(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        self.video.detail_textures =
-                            DetailTextureMode::from_config(value).ok_or_else(|| {
-                                format!("{name}: expected off|neutral2x|linear2x|dstcolor_one|multiply")
-                            })?;
-                        self.render_command(RenderCommand::SetDetailTextures(self.video.detail_textures));
-                        self.mark_config_dirty();
-                        self.publish_ui();
-                    }
+                    self.video.detail_textures = parse_bool(value)
+                        .ok_or_else(|| format!("{name}: expected 0 or 1"))?;
+                    self.render_command(RenderCommand::SetDetailTextures(self.video.detail_textures));
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

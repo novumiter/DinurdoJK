@@ -3,7 +3,7 @@ use std::{fmt::Write as _, path::Path};
 
 impl Atlas {
     pub fn summary(&self) -> String {
-        let mut s=format!("BSP coastal geometry checkpoint 1\nBake: {:.3} ms; retained grid memory: {} bytes\nCoordinates: JKA XY, Z up; units: JKA world units (40 units/metre in the ocean).\n",self.bake_ms,self.memory_bytes());
+        let mut s=format!("BSP coastal geometry\nBake: {:.3} ms; retained grid memory: {} bytes\nCoordinates: JKA XY, Z up; units: JKA world units (40 units/metre in the ocean).\n",self.bake_ms,self.memory_bytes());
         for g in &self.grids {
             let _ = write!(
                 s,
@@ -29,6 +29,7 @@ impl Atlas {
             }
             for boundary in [
                 Boundary::Open,
+                Boundary::Bank,
                 Boundary::Wall,
                 Boundary::Outline,
                 Boundary::Unsupported,

@@ -290,6 +290,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.is_some(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.is_some(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.is_some(),
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => false,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.is_some(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.is_some(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.is_some(),
@@ -309,6 +310,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.as_ref(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.as_ref(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.as_ref(),
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => None,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.as_ref(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.as_ref(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.as_ref(),
@@ -329,6 +331,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => {},
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline = Some(pipeline),
             DynamicModelAlphaMode::AdditiveOne => {
                 self.fx_sprite_additive_one_pipeline = Some(pipeline)
@@ -754,6 +757,8 @@ pub(in crate::renderer) fn fx_sprite_blend(
             },
         }),
         DynamicModelAlphaMode::Blend
+        | DynamicModelAlphaMode::BlendDepthWrite
+        | DynamicModelAlphaMode::BlendUnlitDepthWrite
         | DynamicModelAlphaMode::MaskBlend
         | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
         DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
@@ -898,6 +903,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
             DynamicModelAlphaMode::Opaque => "JKA GPU FX sprite opaque pipeline",
             DynamicModelAlphaMode::Mask => "JKA GPU FX sprite alpha-test pipeline",
             DynamicModelAlphaMode::Blend => "JKA GPU FX sprite blend pipeline",
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => "JKA GPU FX sprite blended depth-writing pipeline",
             DynamicModelAlphaMode::MaskBlend => {
                 "JKA GPU FX sprite alpha-test forced-alpha pipeline"
             }
@@ -956,6 +962,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
                 }
                 DynamicModelAlphaMode::Additive
                 | DynamicModelAlphaMode::BlendUnlit
+                | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
                 | DynamicModelAlphaMode::Modulate2x
                 | DynamicModelAlphaMode::Darken => "fs_unlit",
@@ -1127,6 +1134,8 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
             },
         }),
         DynamicModelAlphaMode::Blend
+        | DynamicModelAlphaMode::BlendDepthWrite
+        | DynamicModelAlphaMode::BlendUnlitDepthWrite
         | DynamicModelAlphaMode::MaskBlend
         | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
         DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
@@ -1180,6 +1189,8 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
             DynamicModelAlphaMode::Opaque => "JKA dynamic model opaque pipeline",
             DynamicModelAlphaMode::Mask => "JKA dynamic model alpha-test pipeline",
             DynamicModelAlphaMode::Blend => "JKA dynamic model blend pipeline",
+            DynamicModelAlphaMode::BlendDepthWrite => "JKA dynamic model blended depth-writing pipeline",
+            DynamicModelAlphaMode::BlendUnlitDepthWrite => "JKA dynamic model unlit blended depth-writing pipeline",
             DynamicModelAlphaMode::MaskBlend => {
                 "JKA dynamic model alpha-test forced-alpha pipeline"
             }
@@ -1235,6 +1246,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
                 }
                 DynamicModelAlphaMode::Additive
                 | DynamicModelAlphaMode::BlendUnlit
+                | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
                 | DynamicModelAlphaMode::Modulate2x
                 | DynamicModelAlphaMode::Darken => "fs_unlit",
@@ -1295,6 +1307,8 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
             },
         }),
         DynamicModelAlphaMode::Blend
+        | DynamicModelAlphaMode::BlendDepthWrite
+        | DynamicModelAlphaMode::BlendUnlitDepthWrite
         | DynamicModelAlphaMode::MaskBlend
         | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
         DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
@@ -1348,6 +1362,8 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
             DynamicModelAlphaMode::Opaque => "JKA Ghoul2 GPU skin opaque pipeline",
             DynamicModelAlphaMode::Mask => "JKA Ghoul2 GPU skin alpha-test pipeline",
             DynamicModelAlphaMode::Blend => "JKA Ghoul2 GPU skin blend pipeline",
+            DynamicModelAlphaMode::BlendDepthWrite => "JKA Ghoul2 GPU skin blended depth-writing pipeline",
+            DynamicModelAlphaMode::BlendUnlitDepthWrite => "JKA Ghoul2 GPU skin unlit blended depth-writing pipeline",
             DynamicModelAlphaMode::MaskBlend => {
                 "JKA Ghoul2 GPU skin alpha-test forced-alpha pipeline"
             }
@@ -1418,6 +1434,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
                 }
                 DynamicModelAlphaMode::Additive
                 | DynamicModelAlphaMode::BlendUnlit
+                | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
                 | DynamicModelAlphaMode::Modulate2x
                 | DynamicModelAlphaMode::Darken => "fs_unlit",
@@ -1671,7 +1688,8 @@ pub(in crate::renderer) fn create_world_pipeline(
     };
     let is_rt = shader_variant.is_some_and(|variant| variant.ray_traced_shadows);
     let _compile_guard = rt_diagnostics::compile_guard(is_rt);
-    let traced = is_rt && rt_diagnostics::config().trace;
+    let traced = crate::pipeline_jobs::pipeline_trace_enabled()
+        || (is_rt && rt_diagnostics::config().trace);
     let fingerprint = pipeline_hash(&(key, shader_variant, surface_format, msaa_samples,
         legacy_fog, fog_pass, legacy_dlight_pass, vertex_entry_point, fragment_entry_point));
     // This line is flushed by the logger BEFORE entering the native compiler.
@@ -1680,9 +1698,11 @@ pub(in crate::renderer) fn create_world_pipeline(
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let current_thread = std::thread::current();
-        let family = shader_variant.expect("RT variant").family();
-        let source_hash = rt_diagnostics::world_shader_hash(family == crate::renderer::WorldShaderFamily::Enhanced, shader_variant.expect("RT variant").rt_receiver_denoiser);
-        println!("[RT pipeline BEGIN] id={id} hash={fingerprint:016x} source_hash={source_hash:016x} family={family:?} thread={:?} key={key:?} variant={shader_variant:?} vs={vertex_entry_point} fs={fragment_entry_point} format={surface_format:?} msaa={msaa_samples} legacy_fog={legacy_fog} fog_pass={fog_pass} legacy_dlight_pass={legacy_dlight_pass}", current_thread.name());
+        let source_hash = shader_variant.filter(|variant| variant.ray_traced_shadows)
+            .map(|variant| rt_diagnostics::world_shader_hash(
+                variant.family() == crate::renderer::WorldShaderFamily::Enhanced));
+        let kind = if is_rt { "RT" } else { "BSP" };
+        println!("[{kind} pipeline BEGIN] id={id} hash={fingerprint:016x} source_hash={source_hash:?} thread={:?} key={key:?} variant={shader_variant:?} vs={vertex_entry_point} fs={fragment_entry_point} format={surface_format:?} msaa={msaa_samples} legacy_fog={legacy_fog} fog_pass={fog_pass} legacy_dlight_pass={legacy_dlight_pass}", current_thread.name());
         Some(id)
     } else { None };
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1750,7 +1770,8 @@ pub(in crate::renderer) fn create_world_pipeline(
         cache: None,
     });
     if let Some(id) = compile_id {
-        println!("[RT pipeline END] id={id} hash={fingerprint:016x}");
+        let kind = if is_rt { "RT" } else { "BSP" };
+        println!("[{kind} pipeline END] id={id} hash={fingerprint:016x}");
     }
     pipeline
 }

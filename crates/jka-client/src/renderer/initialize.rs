@@ -8,7 +8,7 @@ use crate::renderer::{
     create_dof_pipeline, create_fast_post_bind_group, create_gamma_post_bind_group,
     create_gamma_post_pipeline, create_hiz_build_bind_group, create_hiz_prepass_pipeline,
     create_hiz_reduce_bind_groups, create_planar_debug_pipeline,
-    create_planar_reflection_resources, create_post_bind_group, create_post_pipeline,
+    create_planar_reflection_resources, create_post_bind_group,
     create_shader_module_timed, create_shadow_mask_pipeline, create_shadow_pipeline,
     create_shadow_resources, create_shadow_translucent_pipeline, create_sky_admission_pipeline,
     create_ssao_temporal_bind_groups, create_ssao_temporal_pipeline,
@@ -17,19 +17,19 @@ use crate::renderer::{
     depth_array_texture_entry, depth_cube_array_texture_entry, depth_texture_entry,
     empty_ui_font_texture, encode_screenshot_job, env_flag, load_texture_asset_or_missing,
     load_ui_font_texture, load_ui_loading_texture, load_ui_proportional_font,
-    load_ui_unknown_map_texture, mpsc, no_vsync_mode, nonfiltering_sampler_entry, pipeline_hash,
+    load_ui_unknown_map_texture, mpsc, no_vsync_mode, nonfiltering_sampler_entry,
     sampler_entry, sampler_entry_stages, storage_buffer_entry, supported_msaa,
     texture_2d_array_entry, texture_3d_entry, texture_3d_entry_stages, texture_entry,
     texture_entry_stages, thread, timed_init_step, unfilterable_texture_entry,
     unfilterable_texture_entry_stages, uniform_entry, upload_texture, weather, ui, Arc,
     AutoExposureState, AutoExposureUniform, BTreeMap, CameraUniform, CloudLayerSettings,
     CloudRenderResolution, CloudRenderSettings, CloudSunSettings, CloudType, ColorLutPreset,
-    CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DetailTextureMode, DofQuality,
+    CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DofQuality,
     OceanVisibility,
     DofUniform, DynamicLightsMode, DynamicModelRenderer, DynamicShadowsMode, EntityShadowLight,
     EntityShadowState, FramePlan, GammaPostUniform, GpuCullSettings, GpuProfiler, GrassRenderer,
     HashMap, InlineDrawScratch, Instant, JumpShadeState, LightingSettings, Mat4, Path, PbrSettings,
-    PipelineJobKey, PipelineJobManager, PlanarReflectionDebugMode, PlanarReflectionMode,
+    PipelineJobManager, PlanarReflectionDebugMode, PlanarReflectionMode,
     PostAaSettings, PostCameraFxSettings, PostCloudShadowSettings, PostCloudShapingSettings,
     PostCloudSkyAmbientSettings, PostCloudTemporalSettings, PostCloudTemporalTuningSettings,
     PostCloudVariationSettings, PostCloudWindSettings, PostColorSettings, PostFilmSettings,
@@ -367,24 +367,9 @@ impl Renderer {
             immediate_size: 0,
         });
         let mut pipeline_jobs = PipelineJobManager::new();
-        // The full post pipeline is the slowest optional startup compile. Queue it
-        // through the shared non-blocking pipeline worker system immediately; a
-        // frame that needs it before completion uses the cheap gamma path rather
-        // than ever waiting on the render thread.
-        {
-            let key = PipelineJobKey::new("post", 0, pipeline_hash(&(config.format,)));
-            let (device, layout, shader, format) = (
-                device.clone(),
-                post_pipeline_layout.clone(),
-                post_shader.clone(),
-                config.format,
-            );
-            pipeline_jobs.request(key, "full post", move || {
-                timed_init_step("post pipeline (background)", || {
-                    create_post_pipeline(&device, &layout, &shader, format)
-                })
-            });
-        }
+        // Full post is requested on demand by FramePlan, not during startup.
+        // No heavyweight post compilation for Minimal (Unified) + compact
+        // grading, even when those paths render for the entire session.
         let msaa_samples = 1;
         let targets = create_targets(
             &device,
@@ -2401,7 +2386,7 @@ impl Renderer {
             sky_sampler,
             texture_filter,
             picmip: 0,
-            detail_textures_mode: DetailTextureMode::Off,
+            detail_textures_enabled: false,
             jump_shade: JumpShadeState::Off,
             detail_texture_fade: false,
             detail_texture_fade_distance: 512.0,
@@ -2529,7 +2514,6 @@ impl Renderer {
             tinted_glass_enabled: false,
             tinted_glass_debug: 0,
             rt_samples: 1,
-            rt_denoiser_mode: 0,
             dynamic_light_falloff: 0,
             rt_reduced_shadows: false,
             clustered_lighting_enabled: false,

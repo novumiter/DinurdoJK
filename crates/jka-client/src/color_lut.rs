@@ -449,6 +449,37 @@ mod grading_tests {
     }
 
     #[test]
+    fn baked_tonal_adjustments_preserve_greyscale_order() {
+        // Verify the actual RGBA8 33^3 LUT path, not just the CPU curve.
+        // Opposite extremes were the old EV-mask implementation's worst case.
+        let grade = crate::color_grading::ColorGradeSettings {
+            shadows: 100.0,
+            highlights: -100.0,
+            ..Default::default()
+        };
+        for gamma in [0.75, 1.0, 2.2] {
+            let (_, data) = build_graded_rgba8(
+                ColorLutPreset::Off,
+                1.0,
+                grade,
+                SplitToningSettings::default(),
+                gamma,
+                Path::new("."),
+                None,
+            );
+            let mut previous = -1.0;
+            for step in 0..=1024 {
+                let x = step as f64 / 1024.0;
+                let result = sample_lut(&data, [x; 3]);
+                let y = result[0] * 0.2126 + result[1] * 0.7152 + result[2] * 0.0722;
+                assert!(y >= previous - 1e-9,
+                    "baked tonal inversion with gamma {gamma} at {x}: {previous} -> {y}");
+                previous = y;
+            }
+        }
+    }
+
+    #[test]
     fn split_toning_works_without_a_film_lut() {
         let (size, data) = build_graded_rgba8(
             ColorLutPreset::Off,

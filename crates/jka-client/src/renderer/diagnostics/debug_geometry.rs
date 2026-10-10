@@ -43,6 +43,10 @@ pub(in crate::renderer) struct DebugVolumeRenderer {
     /// app thread each tick) rather than uploaded once and left alone.
     pub(in crate::renderer) entities_enabled: bool,
     pub(in crate::renderer) entities: Option<DebugVolumeMeshGpu>,
+    /// Phase 2.5 coastal classification. Replaced only when its background
+    /// bathymetry job completes or `r_coastalDebug` changes.
+    pub(in crate::renderer) coastal_enabled: bool,
+    pub(in crate::renderer) coastal: Option<DebugVolumeMeshGpu>,
     pub(in crate::renderer) fill_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) line_pipeline: Option<wgpu::RenderPipeline>,
     /// Sun-to-head beam shown while the sun angles are being edited. Unlike the
@@ -124,7 +128,11 @@ pub(in crate::renderer) fn sun_ray_vertices(
 
 impl DebugVolumeRenderer {
     pub(in crate::renderer) fn any_enabled(&self) -> bool {
-        self.triggers_enabled || self.clips_enabled || self.entities_enabled || self.sun_ray_enabled
+        self.triggers_enabled
+            || self.clips_enabled
+            || self.entities_enabled
+            || self.coastal_enabled
+            || self.sun_ray_enabled
     }
 
     pub(in crate::renderer) fn update_sun_ray(
@@ -154,6 +162,8 @@ impl DebugVolumeRenderer {
         self.cpu = volumes;
         self.triggers = None;
         self.clips = None;
+        self.coastal = None;
+        self.coastal_enabled = false;
     }
 
     /// Replaces the entity-marker mesh immediately (not lazily like
@@ -165,6 +175,15 @@ impl DebugVolumeRenderer {
     ) {
         self.entities_enabled = mesh.is_some();
         self.entities = mesh.and_then(|mesh| Self::upload(device, mesh, "entities"));
+    }
+
+    pub(in crate::renderer) fn set_coastal_debug_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        mesh: Option<&jka_assets::bsp::DebugVolumeMesh>,
+    ) {
+        self.coastal_enabled = mesh.is_some();
+        self.coastal = mesh.and_then(|mesh| Self::upload(device, mesh, "coastal"));
     }
 
     pub(in crate::renderer) fn clear_pipelines(&mut self) {
@@ -265,7 +284,11 @@ impl DebugVolumeRenderer {
                 }
             }
         }
-        if !(self.triggers_enabled || self.clips_enabled || self.entities_enabled) {
+        if !(self.triggers_enabled
+            || self.clips_enabled
+            || self.entities_enabled
+            || self.coastal_enabled)
+        {
             return;
         }
         if self.triggers_enabled && self.triggers.is_none() {
@@ -324,18 +347,26 @@ impl DebugVolumeRenderer {
                 self.triggers.as_ref().filter(|_| self.triggers_enabled),
                 self.clips.as_ref().filter(|_| self.clips_enabled),
                 self.entities.as_ref().filter(|_| self.entities_enabled),
+                self.coastal.as_ref().filter(|_| self.coastal_enabled),
             ];
-            for mesh in meshes.into_iter().flatten() {
-                pass.set_bind_group(0, camera_bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        for mesh in meshes.into_iter().flatten() {
+            pass.set_bind_group(0, camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+
+            if mesh.triangle_count != 0 {
                 pass.set_pipeline(fill);
                 pass.set_index_buffer(mesh.triangles.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.triangle_count, 0, 0..1);
+                drew = true;
+            }
+
+            if mesh.line_count != 0 {
                 pass.set_pipeline(line);
                 pass.set_index_buffer(mesh.lines.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.line_count, 0, 0..1);
                 drew = true;
             }
+        }
         }
         if let (true, Some(buffer), Some(solid), Some(ghost)) = (
             self.sun_ray_enabled,

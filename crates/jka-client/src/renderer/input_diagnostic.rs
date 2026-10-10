@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::diagnostics::profiling::{GpuPass, GpuTiming};
 use super::{ClientFramePerf, ViewSampleMeasurement};
 
 const STATE_IDLE: u8 = 0;
@@ -327,6 +328,12 @@ pub(in crate::renderer) struct InputDiagFrameSample {
     pub pace_late_before_wait_ms: f64,
     pub pace_anchor_reset: bool,
     pub client_perf: ClientFramePerf,
+    /// GPU execution time of the most recently *resolved* profiler frame, not of
+    /// this frame: timestamp readback lands a few frames later. Pair it with
+    /// `gpu_sample_generation` to separate fresh measurements from repeats.
+    pub gpu_frame_ms: Option<f64>,
+    pub gpu_sample_generation: u64,
+    pub gpu_timing: Option<GpuTiming>,
 }
 
 #[derive(Clone, Debug)]
@@ -416,6 +423,13 @@ struct FrameSample {
     client_events_ms: f64,
     client_entity_present_ms: f64,
     client_fx_ms: f64,
+    gpu_frame_ms: Option<f64>,
+    gpu_sample_generation: u64,
+    /// Whether this row carries a GPU measurement no earlier row reported.
+    gpu_sample_fresh: bool,
+    /// Per-pass breakdown, kept only on the frame that first reported this
+    /// measurement so the summary can aggregate without counting repeats.
+    gpu_timing: Option<GpuTiming>,
 }
 
 #[derive(Debug)]
@@ -433,6 +447,7 @@ pub(in crate::renderer) struct InputDiagnostic {
     last_mouse_win32_sequence: AtomicU64,
     last_frame_start_ns: AtomicU64,
     last_event_loop_ns: AtomicU64,
+    last_gpu_generation: AtomicU64,
     mouse: Mutex<Vec<MouseSample>>,
     event_loop: Mutex<Vec<EventLoopSample>>,
     frames: Mutex<Vec<FrameSample>>,
@@ -452,6 +467,7 @@ impl InputDiagnostic {
             last_mouse_win32_sequence: AtomicU64::new(0),
             last_frame_start_ns: AtomicU64::new(0),
             last_event_loop_ns: AtomicU64::new(0),
+            last_gpu_generation: AtomicU64::new(0),
             mouse: Mutex::new(Vec::new()),
             event_loop: Mutex::new(Vec::new()),
             frames: Mutex::new(Vec::new()),
@@ -499,6 +515,7 @@ impl InputDiagnostic {
         self.last_mouse_win32_sequence.store(0, Ordering::Release);
         self.last_frame_start_ns.store(0, Ordering::Release);
         self.last_event_loop_ns.store(0, Ordering::Release);
+        self.last_gpu_generation.store(0, Ordering::Release);
         {
             let mut mouse = self.mouse.lock().unwrap_or_else(|p| p.into_inner());
             mouse.clear();
@@ -718,6 +735,14 @@ impl InputDiagnostic {
             })
         });
 
+        // Generation 0 means the profiler has not resolved anything yet (off,
+        // unsupported, or still filling its slots), so it is never fresh.
+        let gpu_sample_fresh = sample.gpu_sample_generation != 0
+            && self
+                .last_gpu_generation
+                .swap(sample.gpu_sample_generation, Ordering::AcqRel)
+                != sample.gpu_sample_generation;
+
         let mut frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
         if frames.len() < MAX_FRAME_SAMPLES {
             frames.push(FrameSample {
@@ -765,6 +790,10 @@ impl InputDiagnostic {
                 client_events_ms: sample.client_perf.events_ms,
                 client_entity_present_ms: sample.client_perf.entity_present_ms,
                 client_fx_ms: sample.client_perf.fx_ms,
+                gpu_frame_ms: sample.gpu_frame_ms,
+                gpu_sample_generation: sample.gpu_sample_generation,
+                gpu_sample_fresh,
+                gpu_timing: gpu_sample_fresh.then_some(sample.gpu_timing).flatten(),
             });
         }
     }
@@ -843,8 +872,26 @@ impl InputDiagnostic {
                         } else {
                             ""
                         };
+                        // The CPU never waits on the GPU here, so a GPU that
+                        // cannot hold the cap shows up in no other number.
+                        let gpu_text = if summary.gpu_measurements == 0 {
+                            " GPU FRAME: no timestamp data.".to_owned()
+                        } else {
+                            format!(
+                                " GPU FRAME: median {:.3} ms max {:.3} ms over {} measurement(s), {} over budget{}.",
+                                summary.gpu_frame_ms_p50,
+                                summary.gpu_frame_ms_max,
+                                summary.gpu_measurements,
+                                summary.gpu_frames_over_budget,
+                                if summary.gpu_frames_over_budget > 0 {
+                                    " ^1<- GPU-BOUND^7"
+                                } else {
+                                    ""
+                                },
+                            )
+                        };
                         format!(
-                            "^2inputdiag:^7 captured {} mouse event(s), {} WM_INPUT message(s), {} frame(s); max mouse gap {:.3} ms, max frame interval {:.3} ms, max latch age {:.3} ms. SURFACE ACQUIRE: median {:.3} ms p95 {:.3} ms max {:.3} ms{}; surface gen {} -> {} ({} change(s)). Wrote {}",
+                            "^2inputdiag:^7 captured {} mouse event(s), {} WM_INPUT message(s), {} frame(s); max mouse gap {:.3} ms, max frame interval {:.3} ms, max latch age {:.3} ms. SURFACE ACQUIRE: median {:.3} ms p95 {:.3} ms max {:.3} ms{}; surface gen {} -> {} ({} change(s)).{} Wrote {}",
                             mouse.len(),
                             win32.len(),
                             frames.len(),
@@ -858,6 +905,7 @@ impl InputDiagnostic {
                             summary.surface_generation_first,
                             summary.surface_generation_last,
                             summary.surface_generation_changes,
+                            gpu_text,
                             summary.summary_path.display(),
                         )
                     }
@@ -901,6 +949,10 @@ struct CaptureSummary {
     acquire_p50_ms: f64,
     acquire_p95_ms: f64,
     max_latch_age_ms: f64,
+    gpu_frame_ms_p50: f64,
+    gpu_frame_ms_max: f64,
+    gpu_measurements: usize,
+    gpu_frames_over_budget: usize,
     surface_generation_first: u64,
     surface_generation_last: u64,
     surface_generation_changes: usize,
@@ -988,13 +1040,13 @@ fn write_capture(
 
     let mut frame_csv = String::with_capacity(frames.len().saturating_mul(300));
     frame_csv.push_str(
-        "t_ms,frame_interval_ms,loop_elapsed_ms,frame_ms,prepare_ms,acquire_ms,encode_ms,submit_ms,present_call_ms,command_drain_count,command_drain_ms,frame_start_seq,latch_seq,present_latest_seq,event_to_latch_ms,latch_to_submit_ms,latch_to_present_call_ms,event_to_present_call_ms,latch_phase,world_path,fps_cap,vsync,present_mode,max_frame_latency,surface_width,surface_height,surface_config_generation,surface_config_reason,surface_config_age_ms,input_latelatch,pace_target_ms,pace_wait_ms,pace_wake_error_ms,pace_late_before_wait_ms,pace_anchor_reset,client_total_ms,client_snapshot_ms,client_events_ms,client_entity_present_ms,client_fx_ms\n",
+        "t_ms,frame_interval_ms,loop_elapsed_ms,frame_ms,prepare_ms,acquire_ms,encode_ms,submit_ms,present_call_ms,command_drain_count,command_drain_ms,frame_start_seq,latch_seq,present_latest_seq,event_to_latch_ms,latch_to_submit_ms,latch_to_present_call_ms,event_to_present_call_ms,latch_phase,world_path,fps_cap,vsync,present_mode,max_frame_latency,surface_width,surface_height,surface_config_generation,surface_config_reason,surface_config_age_ms,input_latelatch,pace_target_ms,pace_wait_ms,pace_wake_error_ms,pace_late_before_wait_ms,pace_anchor_reset,client_total_ms,client_snapshot_ms,client_events_ms,client_entity_present_ms,client_fx_ms,gpu_frame_ms,gpu_sample_generation,gpu_sample_fresh,gpu_budget_ratio\n",
     );
     for row in frames {
         let t_ms = row.frame_start_ns.saturating_sub(start_ns) as f64 / 1_000_000.0;
         let _ = writeln!(
             frame_csv,
-            "{t_ms:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            "{t_ms:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{:.6},{:.6},{:.6},{:.6},{},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{}",
             row.frame_interval_ms,
             row.loop_elapsed_ms,
             row.frame_ms,
@@ -1034,6 +1086,15 @@ fn write_capture(
             row.client_events_ms,
             row.client_entity_present_ms,
             row.client_fx_ms,
+            opt_f64(row.gpu_frame_ms),
+            row.gpu_sample_generation,
+            u8::from(row.gpu_sample_fresh),
+            // >1 means the GPU could not finish inside the pacer's own budget,
+            // i.e. the configured cap is not actually achievable.
+            opt_f64(match (row.gpu_frame_ms, row.pace_target_ms) {
+                (Some(gpu), target) if target > 0.0 => Some(gpu / target),
+                _ => None,
+            }),
         );
     }
     std::fs::write(&frame_path, frame_csv)?;
@@ -1080,6 +1141,36 @@ fn write_capture(
         .skip(1)
         .filter(|row| row.hook_gap_ms > 5.0 && row.message_time_gap_ms < 3)
         .count();
+
+    // Count every GPU measurement once. Timestamp readback is slower than the
+    // render loop, so consecutive rows repeat the same resolved frame.
+    let gpu_frame: Vec<f64> = frames
+        .iter()
+        .filter(|row| row.gpu_sample_fresh)
+        .filter_map(|row| row.gpu_frame_ms)
+        .collect();
+    let gpu_budget_ratio: Vec<f64> = frames
+        .iter()
+        .filter(|row| row.gpu_sample_fresh && row.pace_target_ms > 0.0)
+        .filter_map(|row| row.gpu_frame_ms.map(|gpu| gpu / row.pace_target_ms))
+        .collect();
+    let gpu_frames_over_budget = gpu_budget_ratio.iter().filter(|ratio| **ratio > 1.0).count();
+    let gpu_timings: Vec<GpuTiming> = frames.iter().filter_map(|row| row.gpu_timing).collect();
+    let mut gpu_pass_ms = serde_json::Map::new();
+    for pass in GpuPass::ALL {
+        let values: Vec<f64> = gpu_timings
+            .iter()
+            .filter_map(|timing| timing.milliseconds[pass.index()])
+            .collect();
+        if !values.is_empty() {
+            gpu_pass_ms.insert(pass.label().to_owned(), stats_json(&values));
+        }
+    }
+    let mut gpu_frame_sorted = gpu_frame.clone();
+    gpu_frame_sorted.sort_by(f64::total_cmp);
+    let gpu_frame_ms_p50 = percentile(&gpu_frame_sorted, 0.50);
+    let gpu_frame_ms_max = max_or_zero(&gpu_frame);
+    let gpu_measurements = gpu_frame.len();
 
     let max_mouse_gap_ms = max_or_zero(&mouse_gaps);
     let max_frame_interval_ms = max_or_zero(&frame_intervals);
@@ -1133,8 +1224,66 @@ fn write_capture(
             "supported_present_modes": metadata.supported_present_modes.as_str(),
         })
     });
+    // Split out of the summary literal: serde_json's json! recurses once
+    // per entry, and one object with every key hit the recursion limit.
+    let counts_json = serde_json::json!({
+        "mouse_events": mouse.len(),
+        "event_loop_turns": event_loop.len(),
+        "win32_input_messages": win32.len(),
+        "mouse_events_with_correlated_win32_input": mouse.iter().filter(|row| row.win32_input_sequence.is_some()).count(),
+        "mouse_device_ids": device_ids.len(),
+        "device_event_gap_gt_5ms": device_gap_gt_5ms,
+        "device_event_gap_gt_5ms_with_win32_hook_gap_gt_5ms": device_gap_gt_5ms_with_win32_gap_gt_5ms,
+        "device_event_gap_gt_5ms_with_win32_hook_gap_lt_3ms": device_gap_gt_5ms_with_win32_gap_lt_3ms,
+        "win32_hook_gap_gt_5ms_with_msg_time_gap_lt_3ms": win32_hook_gap_gt_5ms_with_msg_gap_lt_3ms,
+        "frames": frames.len(),
+        "gpu_measurements": gpu_measurements,
+        "gpu_frames_over_budget": gpu_frames_over_budget,
+        "frames_with_gpu_sample": frames.iter().filter(|row| row.gpu_frame_ms.is_some()).count(),
+        "pace_anchor_resets": frames.iter().filter(|row| row.pace_anchor_reset).count(),
+        "pace_late_without_reset_frames": frames
+            .iter()
+            .filter(|row| row.pace_late_before_wait_ms > 0.0 && !row.pace_anchor_reset)
+            .count(),
+        "pre_acquire_latches": frames.iter().filter(|row| matches!(row.latch_phase, InputDiagLatchPhase::PreAcquire)).count(),
+        "post_acquire_latches": frames.iter().filter(|row| matches!(row.latch_phase, InputDiagLatchPhase::PostAcquire)).count(),
+        "newer_input_visible_after_latch": frames
+            .iter()
+            .filter(|row| matches!((row.latch_sequence, row.present_latest_input_sequence), (Some(latch), Some(latest)) if latest > latch))
+            .count(),
+        "pre_acquire_latch_with_newer_input": frames
+            .iter()
+            .filter(|row| matches!(row.latch_phase, InputDiagLatchPhase::PreAcquire)
+                && matches!((row.latch_sequence, row.present_latest_input_sequence), (Some(latch), Some(latest)) if latest > latch))
+            .count(),
+    });
+    // Split out of the summary literal: serde_json's json! recurses once
+    // per entry, and one object with every key hit the recursion limit.
+    let notes_json = serde_json::json!({
+        "event_to_latch_ms": "Age of the exact mouse input sample when the renderer sampled it.",
+        "gpu_frame_ms": "GPU execution time of one resolved profiler frame: the Frame timestamp interval, or the sum of the independent passes when Frame is absent. Readback lands a few render frames after the frame it measured, so only rows with gpu_sample_fresh=1 are distinct measurements and this block counts each one once.",
+        "gpu_frame_budget_ratio": "gpu_frame_ms / pace_target_ms. Above 1.0 means the GPU cannot finish a frame inside the pacer's budget, so the configured FPS cap is not actually achievable and presents queue behind the GPU while every CPU-side timing still looks idle.",
+        "gpu_pass_ms": "Per-pass GPU breakdown over the same distinct measurements. Several passes are sub-intervals of World/Post and overlap each other, so they do not sum to gpu_frame_ms.",
+        "gpu_sample_fresh": "1 when this row is the first to report its GPU measurement; later rows repeat the previous value because timestamp readback is slower than the render loop.",
+        "gpu_timestamps": "The capture force-enables GPU timestamps for its duration and restores the previous r_gpuTimings state afterwards. The timestamp writes themselves add a small amount of GPU work.",
+        "present_latest_seq": "Newest input sequence visible immediately after the frame's render/present call completed.",
+        "pace_late_before_wait_ms": "Positive means the render loop reached its software-cap deadline late before calling the wait routine.",
+        "pace_wake_error_ms": "Signed actual wake time minus the software-cap deadline; positive is late.",
+        "pace_anchor_reset": "Whether the pacer rebased because the render loop had already missed this frame's software-cap deadline before waiting.",
+        "surface_config_generation": "Monotonic primary-surface configure generation. A change means Surface::configure ran between captured frames.",
+        "surface_config_reason": "Reason recorded by the renderer for the most recent primary-surface configure.",
+        "surface_config_age_ms": "Age of the current primary-surface configuration when this frame completed.",
+        "present_call_ms": "CPU time spent in SurfaceTexture::present; this is not scanout latency.",
+        "mouse_event_gap_ms": "Gap between raw DeviceEvent::MouseMotion callbacks delivered to the app; this is not a direct hardware polling-rate measurement.",
+        "win32_hook_gap_ms": "Gap between WM_INPUT messages as observed by Winit's pre-dispatch Win32 message hook. This is before Winit converts the message to DeviceEvent, but after the Windows message pump receives it.",
+        "win32_message_time_gap_ms": "Gap between successive MSG.time values carried by WM_INPUT. A large hook gap with a small MSG.time gap suggests queued messages were dispatched late; both gaps large suggests starvation before message dispatch.",
+        "win32_to_device_event_ms": "Time from the correlated WM_INPUT pre-dispatch hook timestamp to the beginning of DeviceEvent::MouseMotion.",
+        "event_loop_gap_ms": "Gap between ApplicationHandler::new_events callbacks while the capture is running.",
+        "grab_mode": "Cursor grab mode last successfully applied by the app: locked, confined, or none.",
+        "newer_input_visible_after_latch": "Frames where the input mailbox had a newer mouse sequence after render/present returned than the sequence actually latched for that frame.",
+    });
     let summary = serde_json::json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "capture_seconds": CAPTURE_DURATION.as_secs_f64(),
         "client_version": env!("CARGO_PKG_VERSION"),
         "renderer": renderer_json,
@@ -1150,34 +1299,7 @@ fn write_capture(
             "win32": win32_path.file_name().map(|name| name.to_string_lossy().into_owned()),
             "frames": frame_path.file_name().map(|name| name.to_string_lossy().into_owned()),
         },
-        "counts": {
-            "mouse_events": mouse.len(),
-            "event_loop_turns": event_loop.len(),
-            "win32_input_messages": win32.len(),
-            "mouse_events_with_correlated_win32_input": mouse.iter().filter(|row| row.win32_input_sequence.is_some()).count(),
-            "mouse_device_ids": device_ids.len(),
-            "device_event_gap_gt_5ms": device_gap_gt_5ms,
-            "device_event_gap_gt_5ms_with_win32_hook_gap_gt_5ms": device_gap_gt_5ms_with_win32_gap_gt_5ms,
-            "device_event_gap_gt_5ms_with_win32_hook_gap_lt_3ms": device_gap_gt_5ms_with_win32_gap_lt_3ms,
-            "win32_hook_gap_gt_5ms_with_msg_time_gap_lt_3ms": win32_hook_gap_gt_5ms_with_msg_gap_lt_3ms,
-            "frames": frames.len(),
-            "pace_anchor_resets": frames.iter().filter(|row| row.pace_anchor_reset).count(),
-            "pace_late_without_reset_frames": frames
-                .iter()
-                .filter(|row| row.pace_late_before_wait_ms > 0.0 && !row.pace_anchor_reset)
-                .count(),
-            "pre_acquire_latches": frames.iter().filter(|row| matches!(row.latch_phase, InputDiagLatchPhase::PreAcquire)).count(),
-            "post_acquire_latches": frames.iter().filter(|row| matches!(row.latch_phase, InputDiagLatchPhase::PostAcquire)).count(),
-            "newer_input_visible_after_latch": frames
-                .iter()
-                .filter(|row| matches!((row.latch_sequence, row.present_latest_input_sequence), (Some(latch), Some(latest)) if latest > latch))
-                .count(),
-            "pre_acquire_latch_with_newer_input": frames
-                .iter()
-                .filter(|row| matches!(row.latch_phase, InputDiagLatchPhase::PreAcquire)
-                    && matches!((row.latch_sequence, row.present_latest_input_sequence), (Some(latch), Some(latest)) if latest > latch))
-                .count(),
-        },
+        "counts": counts_json,
         "mouse_event_gap_ms": stats_json(&mouse_gaps),
         "mouse_callback_ms": stats_json(&callback),
         "event_loop_gap_ms": stats_json(&event_loop_gaps),
@@ -1185,6 +1307,9 @@ fn write_capture(
         "win32_message_time_gap_ms": stats_json(&win32_message_time_gaps),
         "win32_to_device_event_ms": stats_json(&win32_to_device),
         "frame_interval_ms": stats_json(&frame_intervals),
+        "gpu_frame_ms": stats_json(&gpu_frame),
+        "gpu_frame_budget_ratio": stats_json(&gpu_budget_ratio),
+        "gpu_pass_ms": serde_json::Value::Object(gpu_pass_ms),
         "surface_acquire_ms": stats_json(&acquire),
         "input_event_to_latch_ms": stats_json(&latch_age),
         "render_command_drain_ms": stats_json(&command_drain),
@@ -1196,24 +1321,7 @@ fn write_capture(
                 .map(|row| row.pace_late_before_wait_ms)
                 .collect::<Vec<_>>()
         ),
-        "notes": {
-            "event_to_latch_ms": "Age of the exact mouse input sample when the renderer sampled it.",
-            "present_latest_seq": "Newest input sequence visible immediately after the frame's render/present call completed.",
-            "pace_late_before_wait_ms": "Positive means the render loop reached its software-cap deadline late before calling the wait routine.",
-            "pace_wake_error_ms": "Signed actual wake time minus the software-cap deadline; positive is late.",
-            "pace_anchor_reset": "Whether the pacer rebased because the render loop had already missed this frame's software-cap deadline before waiting.",
-            "surface_config_generation": "Monotonic primary-surface configure generation. A change means Surface::configure ran between captured frames.",
-            "surface_config_reason": "Reason recorded by the renderer for the most recent primary-surface configure.",
-            "surface_config_age_ms": "Age of the current primary-surface configuration when this frame completed.",
-            "present_call_ms": "CPU time spent in SurfaceTexture::present; this is not scanout latency.",
-            "mouse_event_gap_ms": "Gap between raw DeviceEvent::MouseMotion callbacks delivered to the app; this is not a direct hardware polling-rate measurement.",
-            "win32_hook_gap_ms": "Gap between WM_INPUT messages as observed by Winit's pre-dispatch Win32 message hook. This is before Winit converts the message to DeviceEvent, but after the Windows message pump receives it.",
-            "win32_message_time_gap_ms": "Gap between successive MSG.time values carried by WM_INPUT. A large hook gap with a small MSG.time gap suggests queued messages were dispatched late; both gaps large suggests starvation before message dispatch.",
-            "win32_to_device_event_ms": "Time from the correlated WM_INPUT pre-dispatch hook timestamp to the beginning of DeviceEvent::MouseMotion.",
-            "event_loop_gap_ms": "Gap between ApplicationHandler::new_events callbacks while the capture is running.",
-            "grab_mode": "Cursor grab mode last successfully applied by the app: locked, confined, or none.",
-            "newer_input_visible_after_latch": "Frames where the input mailbox had a newer mouse sequence after render/present returned than the sequence actually latched for that frame.",
-        }
+        "notes": notes_json,
     });
     let json = serde_json::to_vec_pretty(&summary).map_err(std::io::Error::other)?;
     std::fs::write(&summary_path, json)?;
@@ -1226,6 +1334,10 @@ fn write_capture(
         acquire_p50_ms,
         acquire_p95_ms,
         max_latch_age_ms,
+        gpu_frame_ms_p50,
+        gpu_frame_ms_max,
+        gpu_measurements,
+        gpu_frames_over_budget,
         surface_generation_first,
         surface_generation_last,
         surface_generation_changes,

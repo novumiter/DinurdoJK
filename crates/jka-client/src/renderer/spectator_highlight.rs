@@ -13,6 +13,8 @@ use crate::renderer::{
 };
 
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+// Allow shallow player/floor overlap to count as visible in world units.
+const VISIBLE_ERASE_TOLERANCE_UNITS: f64 = 2.0;
 
 pub(in crate::renderer) struct SpectatorHighlightResources {
     width: u32,
@@ -381,10 +383,9 @@ impl SpectatorHighlightResources {
             }
         }
 
-        // Erase candidate pixels that are actually visible in the final scene.
-        // The camera is reverse-Z, so GreaterEqual keeps the player's nearest
-        // surface when it matches/overrides scene depth. Fully visible players
-        // disappear from the mask; wall-hidden pixels remain untouched.
+        // Erase candidate pixels that are visible, or lie within 2 world units
+        // behind scene depth. The vertex shader biases only the depth used by
+        // this reverse-Z GreaterEqual test; the silhouette is unchanged.
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA spectator outline visible-player erase"),
@@ -546,7 +547,17 @@ fn create_mask_pipeline(
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[(
+                    "SPEC_ERASE_DEPTH_TOLERANCE",
+                    if depth_compare.is_some() {
+                        VISIBLE_ERASE_TOLERANCE_UNITS
+                    } else {
+                        0.0
+                    },
+                )],
+                ..Default::default()
+            },
             buffers: std::slice::from_ref(&vertex_layout),
         },
         primitive: wgpu::PrimitiveState {

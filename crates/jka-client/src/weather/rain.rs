@@ -162,6 +162,8 @@ struct RainSimUniform {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct RainWaterMasks {
     ranges: [[f32; 4]; crate::ocean::OCEAN_MAX_SURFACES],
+    bounds: [[f32; 4]; crate::ocean::OCEAN_MAX_SURFACES],
+    tiles: [[u32; 4]; crate::ocean::OCEAN_MAX_SURFACES],
     triangles: [[f32; 4]; crate::ocean::OCEAN_MASK_VEC4S],
 }
 #[repr(C)]
@@ -939,6 +941,8 @@ impl RainSystem {
         if masks_changed {
             let mut uploaded = RainWaterMasks::zeroed();
             uploaded.ranges = water_masks.ranges;
+            uploaded.bounds = water_masks.bounds;
+            uploaded.tiles = water_masks.tiles;
             uploaded.triangles[..water_masks.triangles.len()].copy_from_slice(&water_masks.triangles);
             queue.write_buffer(&self.gpu.water_mask_buffer, 0, bytemuck::bytes_of(&uploaded));
             self.water_masks = Arc::clone(water_masks);
@@ -1738,12 +1742,21 @@ pub(crate) mod layout_tests {
 
     #[test]
     fn rain_sim_uniform_matches_its_wgsl_struct() {
-        let (size, _) =
-            wgsl_struct_layout(include_str!("../rain_sim.wgsl"), "RainSimUniform");
+        let source = include_str!("../rain_sim.wgsl");
+        let (size, _) = wgsl_struct_layout(source, "RainSimUniform");
         assert_eq!(size as usize, size_of::<RainSimUniform>());
-        let (particle, _) =
-            wgsl_struct_layout(include_str!("../rain_sim.wgsl"), "RainParticle");
+        let (particle, _) = wgsl_struct_layout(source, "RainParticle");
         assert_eq!(particle as usize, size_of::<RainParticle>());
+        let (masks, members) = wgsl_struct_layout(source, "WaterMasks");
+        assert_eq!(masks as usize, size_of::<RainWaterMasks>());
+        for (name, rust_offset) in [
+            ("ranges", offset_of!(RainWaterMasks, ranges)),
+            ("bounds", offset_of!(RainWaterMasks, bounds)),
+            ("tiles", offset_of!(RainWaterMasks, tiles)),
+            ("triangles", offset_of!(RainWaterMasks, triangles)),
+        ] {
+            assert_eq!(offset_of_member(&members, name) as usize, rust_offset, "{name}");
+        }
     }
 
     #[test]

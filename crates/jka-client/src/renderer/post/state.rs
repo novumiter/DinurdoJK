@@ -71,8 +71,10 @@ impl Renderer {
     /// Polls/queues the full post pipeline without ever waiting for compilation.
     /// Until it is ready, the frame recorder falls back to the already-hot gamma
     /// copy so a first-use shader compile cannot hitch gameplay.
-    pub(in crate::renderer) fn ensure_post_pipeline(&mut self, _needed_now: bool) {
-        if self.post_pipeline.is_some() {
+    pub(in crate::renderer) fn ensure_post_pipeline(&mut self, needed_now: bool) {
+        // Full post is genuinely lazy: compact gamma/LUT/HDR frames must not
+        // request or poll this heavyweight pipeline until an effect needs it.
+        if !needed_now || self.post_pipeline.is_some() {
             return;
         }
         let key = PipelineJobKey::new("post", 0, pipeline_hash(&(self.config.format,)));

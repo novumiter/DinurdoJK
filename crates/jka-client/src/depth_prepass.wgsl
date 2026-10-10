@@ -225,7 +225,14 @@ fn radial_depth(world_position: vec3<f32>) -> f32 {
 fn fs_main(input: VertexOut) -> FragmentOut {
     var out: FragmentOut;
     out.linear_depth = radial_depth(input.world_position);
-    out.motion_vector = bevy_motion_vector(input.world_position);
+    // SSR, fog, AO and depth consumers do not need Bevy motion vectors.
+    // Only TAA samples this attachment. Avoid two extra 4x4 matrix transforms
+    // per BSP pixel when TAA is off (the attachment remains bound for the
+    // other prepass consumers; full MRT specialization can follow separately).
+    out.motion_vector = vec2<f32>(0.0);
+    if ((camera.render_flags.y & 4u) != 0u) {
+        out.motion_vector = bevy_motion_vector(input.world_position);
+    }
     out.reflection_policy = reflection_policy(input.world_position);
     return out;
 }
@@ -238,7 +245,14 @@ fn fs_mask(input: MaskVertexOut) -> FragmentOut {
     }
     var out: FragmentOut;
     out.linear_depth = radial_depth(input.world_position);
-    out.motion_vector = bevy_motion_vector(input.world_position);
+    // SSR, fog, AO and depth consumers do not need Bevy motion vectors.
+    // Only TAA samples this attachment. Avoid two extra 4x4 matrix transforms
+    // per BSP pixel when TAA is off (the attachment remains bound for the
+    // other prepass consumers; full MRT specialization can follow separately).
+    out.motion_vector = vec2<f32>(0.0);
+    if ((camera.render_flags.y & 4u) != 0u) {
+        out.motion_vector = bevy_motion_vector(input.world_position);
+    }
     out.reflection_policy = reflection_policy(input.world_position);
     return out;
 }

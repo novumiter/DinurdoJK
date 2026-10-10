@@ -111,6 +111,9 @@ impl App {
             self.japro_cg,
             self.network.plugin_disable,
         );
+        session
+            .client_game
+            .set_predicted_event_correction(self.network.correct_predicted_events);
         match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
             Ok(assets) => {
                 let mut sound = crate::cgame::sound_presenter::SoundPresenter::new(

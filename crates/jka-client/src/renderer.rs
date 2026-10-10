@@ -277,10 +277,6 @@ use world::variants::{WorldRenderPath, WorldShaderFamily, WorldShaderVariantKey}
 mod rt_models;
 #[path = "renderer/lighting/rt_resolution.rs"]
 mod rt_resolution;
-#[path = "renderer/lighting/rt_radiance.rs"]
-mod rt_radiance;
-#[path = "renderer/lighting/rt_local_radiance.rs"]
-mod rt_local_radiance;
 #[cfg(test)]
 #[path = "renderer/tests/shader_audit.rs"]
 mod shader_audit;
@@ -306,7 +302,7 @@ use crate::{
         SNOW_SHELL_DRAW_RADIUS, SNOW_SHELL_TESSELLATION,
     },
     ui::{
-        self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DetailTextureMode,
+        self, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode,
         DofQuality, DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode,
         EntityShadowLight, FogMode, FootprintMode, Ghoul2BatchMode, Ghoul2SkinningMode,
         PlanarReflectionDebugMode, PlanarReflectionMode, PuddleQuality, PvsMode, RainIntensity,
@@ -740,7 +736,7 @@ struct Renderer {
     /// Latched `r_picmip`. Existing worlds retain their uploaded textures;
     /// the value is consumed the next time `load_map` builds a WorldGpu.
     picmip: u32,
-    detail_textures_mode: DetailTextureMode,
+    detail_textures_enabled: bool,
     jump_shade: JumpShadeState,
     detail_texture_fade: bool,
     detail_texture_fade_distance: f32,
@@ -875,7 +871,6 @@ struct Renderer {
     tinted_glass_enabled: bool,
     tinted_glass_debug: u32,
     rt_samples: u32,
-    rt_denoiser_mode: u32,
     dynamic_light_falloff: u32,
     rt_reduced_shadows: bool,
     clustered_lighting_enabled: bool,

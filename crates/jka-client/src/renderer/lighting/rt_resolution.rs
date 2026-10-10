@@ -33,8 +33,6 @@ pub(super) struct RtSunShadowHistory {
     uniform: wgpu::Buffer,
     pub flags_uniform: wgpu::Buffer,
     pub published: wgpu::TextureView,
-    pub radiance: rt_radiance::RtSunRadiance,
-    pub local_radiance: rt_local_radiance::RtLocalRadiance,
     _published_texture: wgpu::Texture,
     _ping_textures: [wgpu::Texture; 2],
     ping_views: [wgpu::TextureView; 2],
@@ -85,7 +83,6 @@ fn target(
 }
 
 impl RtSunShadowHistory {
-    pub(super) fn sampling_frame(&self) -> u32 { self.frame_index }
 
     pub fn new(device: &wgpu::Device) -> Self {
         let (t0, v0) = target(device, [1, 1], "RT sun shadow ping 0");
@@ -103,8 +100,6 @@ impl RtSunShadowHistory {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             }),
             published,
-            radiance: rt_radiance::RtSunRadiance::new(device),
-            local_radiance: rt_local_radiance::RtLocalRadiance::new(device),
             _published_texture: published_texture,
             _ping_textures: [t0, t1],
             ping_views: [v0, v1],
@@ -132,9 +127,6 @@ impl RtSunShadowHistory {
         self.read_index = 0;
         self.history_valid = false;
         self.frame_index = 0;
-        self.radiance.invalidate();
-        self.local_radiance.filter.invalidate();
-        self.radiance.dims = [1, 1]; // Force bind groups to rebind resized visibility cache.
         if let Some(compute) = self.compute.as_mut() {
             compute.inputs = [None, None];
         }
@@ -162,98 +154,39 @@ impl Renderer {
     /// never read it (their `ENABLE_RAY_TRACED_SUN` override is off), so tracing
     /// it, and forcing the depth prepass for it, would be pure waste.
     pub(super) fn rt_sun_cache_wanted(&self) -> bool {
-        (self.rt_reduced_shadows || (self.rt_denoiser_mode != 0
-            && crate::renderer::lighting::rt_diagnostics::config().receiver.denoiser))
-            && !self.tinted_glass_enabled
-            && self
-                .world
-                .as_ref()
-                .is_some_and(|world| world.active_pipeline_variant.ray_traced_sun)
+        self.rt_reduced_shadows && !self.tinted_glass_enabled
+            && self.world.as_ref().is_some_and(|world| world.active_pipeline_variant.ray_traced_sun)
     }
 
-    pub(super) fn rt_local_radiance_wanted(&self) -> bool {
-        self.rt_denoiser_mode != 0
-            && crate::renderer::lighting::rt_diagnostics::config().receiver.denoiser
-            && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
-            && self.ray_traced_local_shadows_active()
-    }
+
 
     pub(super) fn prepare_rt_sun_shadow(&mut self, view_proj: Mat4, eye: Vec3) {
-        let sun_enabled = self.rt_sun_cache_wanted();
-        let local_enabled = self.rt_local_radiance_wanted();
-        let enabled = sun_enabled || local_enabled;
+        let enabled = self.rt_sun_cache_wanted();
         let previous_eye = self.previous_camera_position;
-        let sun = self.active_sun();
-        // RGB is incident radiance, not scene color/albedo.  Keep color bounded
-        // so the inverse visibility mapping in receivers remains well conditioned.
-        let sun_color = [sun.color[0].clamp(0.001, 16.0), sun.color[1].clamp(0.001, 16.0), sun.color[2].clamp(0.001, 16.0), 0.0];
-        let mode = if (sun_enabled || local_enabled) && crate::renderer::lighting::rt_diagnostics::config().receiver.denoiser {
-            self.rt_denoiser_mode
-        } else { 0 };
-        let cut = eye.distance(previous_eye) > 96.0; // Independent of scene TAA history
-        let width = self.config.width.max(1);
-        let height = self.config.height.max(1);
-        let Some(rt) = self.ray_traced_shadows.as_mut() else {
-            return;
-        };
+        let size = [self.config.width.max(1), self.config.height.max(1)];
+        let Some(rt) = self.ray_traced_shadows.as_mut() else { return; };
         let history = &mut rt.sun_shadow_history;
-        if !enabled && !history.enabled {
-            history.radiance.disable();
-            history.local_radiance.disable();
-            return;
-        }
+        if !enabled && !history.enabled { return; }
         let just_enabled = enabled && !history.enabled;
-        let resized = enabled && history.resize(&self.device, [width, height]);
-        if just_enabled {
-            history.history_valid = false;
-            history.frame_index = 0;
-        }
-        let settings = RtSunShadowSettings {
+        let resized = enabled && history.resize(&self.device, size);
+        if just_enabled { history.history_valid = false; history.frame_index = 0; }
+        if eye.distance(previous_eye) > 96.0 { history.history_valid = false; }
+        self.queue.write_buffer(&history.uniform, 0, bytemuck::bytes_of(&RtSunShadowSettings {
             inverse_view_proj: view_proj.inverse().to_cols_array_2d(),
-            dimensions: [width, height, history.frame_index, 0],
-            flags: [u32::from(sun_enabled), u32::from(history.history_valid), 0, 0],
+            dimensions: [size[0], size[1], history.frame_index, 0],
+            flags: [u32::from(enabled), u32::from(history.history_valid), 0, 0],
             prev_camera_pos: previous_eye.extend(0.0).to_array(),
-        };
-        self.queue
-            .write_buffer(&history.uniform, 0, bytemuck::bytes_of(&settings));
-        let radiance_resized = if sun_enabled {
-            history.radiance.prepare(
-                &self.device, &self.queue, [width, height], view_proj, eye, previous_eye,
-                sun_color, mode, history.frame_index, cut,
-                &history.published, &self.targets.linear_depth_render_view,
-                &self.targets.motion_vector_view, false,
-            )
-        } else {
-            history.radiance.disable();
-            false
-        };
-        let local_resized = if local_enabled {
-            history.local_radiance.prepare(
-                &self.device, &self.queue, [width, height], view_proj, eye, previous_eye,
-                self.rt_denoiser_mode, history.frame_index, cut,
-                &self.targets.linear_depth_render_view, &self.targets.motion_vector_view,
-            )
-        } else {
-            history.local_radiance.disable();
-            false
-        };
-        self.queue.write_buffer(
-            &history.flags_uniform,
-            0,
-            bytemuck::bytes_of(&RtShadowReceiverFlags {
-                flags: [u32::from(sun_enabled), mode, u32::from(local_enabled), 0],
-            }),
-        );
+        }));
+        self.queue.write_buffer(&history.flags_uniform, 0, bytemuck::bytes_of(&RtShadowReceiverFlags {
+            flags: [u32::from(enabled), 0, 0, 0],
+        }));
         history.enabled = enabled;
-        if resized || radiance_resized || local_resized {
-            self.rebuild_weather_surface_receiver_bind_group();
-        }
+        if resized { self.rebuild_weather_surface_receiver_bind_group(); }
     }
 
     pub(super) fn encode_rt_sun_shadow(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let sun_enabled = self.rt_sun_cache_wanted();
-        let local_enabled = self.rt_local_radiance_wanted();
-        if !sun_enabled && !local_enabled { return; }
+        if !sun_enabled { return; }
         let Some(rt) = self.ray_traced_shadows.as_mut() else {
             return;
         };
@@ -410,26 +343,6 @@ impl Renderer {
         self.gpu_profiler
             .write_encoder_timestamp(encoder, GpuPass::RtVisibility, true);
         history.read_index = write_index;
-        }
-        // The separate direct-sun HDR signal consumes this frame's published
-        // scalar RT visibility.  Both stages precede the world/material pass.
-        if history.radiance.enabled {
-            self.gpu_profiler.write_encoder_timestamp(encoder, GpuPass::RtRadiance, false);
-            history.radiance.encode(encoder, self.rt_denoiser_mode);
-            self.gpu_profiler.write_encoder_timestamp(encoder, GpuPass::RtRadiance, true);
-        }
-        if local_enabled {
-            if let Some(world) = self.world.as_ref() {
-                self.gpu_profiler.write_encoder_timestamp(encoder, GpuPass::RtLocalRadiance, false);
-                history.local_radiance.encode(
-                    &self.device, encoder, &self.camera_layout, &self.camera_bind_group,
-                    &compute.scene_layout, compute.scene.as_ref().unwrap(),
-                    &world.light_buffer, &world._cluster_buffer,
-                    &self.lighting_settings_buffer, &self.targets.linear_depth_render_view,
-                    self.rt_denoiser_mode,
-                );
-                self.gpu_profiler.write_encoder_timestamp(encoder, GpuPass::RtLocalRadiance, true);
-            }
         }
         history.history_valid = true;
         history.frame_index = history.frame_index.wrapping_add(1);
@@ -795,10 +708,7 @@ pub(super) fn validate_gpu(device: &wgpu::Device, queue: &wgpu::Queue) {
     probe.push_str(rt_models::declaration(&donor, "struct Camera ").unwrap());
     probe.push_str(";\n");
     probe.push_str("\n@group(0) @binding(0) var<uniform> camera: Camera;\n@group(1) @binding(0) var<storage, read_write> output: array<vec4<f32>>;\n@group(1) @binding(1) var<storage, read> positions: array<vec4<f32>>;\n");
-    let reader = include_str!("../../rt_resolution_read.wgsl");
-    probe.push_str(&reader[..reader.find("// HDR incident direct-sun radiance").unwrap()]);
-    probe.push_str("fn rt_filtered_sun_visibility(_input: VertexOut) -> f32 { return -1.0; }\n");
-    probe.push_str(rt_models::declaration(reader, "fn rt_cached_sun_visibility(").unwrap());
+    probe.push_str(include_str!("../../rt_resolution_read.wgsl"));
     probe.push_str(r#"
 @compute @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {

@@ -31,6 +31,18 @@ impl App {
             let _ = self.set_console_cvar("r_verbose", &level.to_string());
         }
 
+        theme::row(
+            ui,
+            "Shader compile trace",
+            "r_pipelineTrace. Print each queued/started/finished background job and each native BSP/RT pipeline BEGIN/END, including the pipeline key. A BEGIN without END identifies a compiler stall. Runtime-only, with negligible overhead while off. Enable before changing a setting.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.pipeline_trace) {
+                    let _ = self.set_console_cvar("r_pipelineTrace", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+
         self.egui_toggle_row(
             ui,
             "Lightmap-only debug view",
@@ -168,7 +180,19 @@ impl App {
         theme::section(
             ui,
             "PREDICTION",
-            "Client-prediction diagnostics. These switches do not change Pmove results.",
+            "Client-prediction diagnostics, plus the one switch below that changes which predicted events play. None of them change Pmove results.",
+        );
+        theme::row(
+            ui,
+            "Correct mispredicted events",
+            "cg_correctPredictedEvents. When a replay or a server snapshot puts a different event where this client already played one, re-fire the corrected event (OpenJK CG_CheckChangedPredictableEvents). Raven shipped that call commented out and every JKA fork inherited it, so off matches them and the first guess keeps playing; Quake 3 ran it. Unlike the switches below, this one changes what you see and hear: a corrected event plays a sound or effect those builds never played. It never affects Pmove or the command sent to the server.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, self.network.correct_predicted_events) {
+                    let _ = self
+                        .set_console_cvar("cg_correctPredictedEvents", if value { "1" } else { "0" });
+                }
+            },
         );
         theme::row(
             ui,

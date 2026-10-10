@@ -86,6 +86,13 @@ pub struct NetworkSettings {
     /// Session-only prediction instrumentation. This intentionally does not
     /// affect Pmove or the state sent to the server.
     pub prediction_debug: bool,
+    /// Re-fire a predicted one-shot event when a replay or snapshot puts a
+    /// different event at an absolute eventSequence index that was already
+    /// played (OpenJK `CG_CheckChangedPredictableEvents`). Raven shipped that
+    /// call commented out and every JKA fork inherited it, so this defaults
+    /// off and matches them; Quake 3 ran it. Off, a mispredicted event keeps
+    /// whatever was played first. Never affects Pmove or the sent command.
+    pub correct_predicted_events: bool,
     /// Flash a HUD warning when a prediction correction exceeds the threshold.
     pub prediction_miss_highlight: bool,
     /// Keep the rolling per-frame history that `hitchmark` writes out. Session-only.
@@ -156,6 +163,7 @@ impl Default for NetworkSettings {
             no_predict: false,
             show_miss: false,
             prediction_debug: false,
+            correct_predicted_events: false,
             prediction_miss_highlight: false,
             hitch_record: false,
             model_frame_debug: false,
@@ -1246,29 +1254,21 @@ pub fn adjust_position_for_mover(
     std::array::from_fn(|axis| position[axis] + (new[axis] - old[axis]))
 }
 
-/// The provisional step repeats held inputs a few ms past a command that has
-/// already run them. Its discrete results (a jump or flip animation started by
-/// a held or tapped jump key) are taken back by the next real command, which
-/// shows up as a one-frame pose flash on the model. Movement stays predicted;
-/// the model's animation follows the committed state.
-fn keep_committed_animation(display: &mut PlayerState, committed: &PlayerState) {
-    let get = |ps: &PlayerState, name: &str| ps.field_i32(name).unwrap_or(0);
-    let (display_legs, display_torso) = (get(display, "legsAnim"), get(display, "torsoAnim"));
-    if display_legs == get(committed, "legsAnim") {
-        return;
+/// Preserve committed discrete state, including events, while
+/// extracting only continuous render information from the speculative step.
+fn provisional_presentation_state(tentative: &PlayerState, committed: &PlayerState) -> PlayerState {
+    let mut display = committed.clone();
+    for field in [
+        "commandTime", "viewheight", "bobCycle",
+        "origin[0]", "origin[1]", "origin[2]",
+        "velocity[0]", "velocity[1]", "velocity[2]",
+        "viewangles[0]", "viewangles[1]", "viewangles[2]",
+    ] {
+        if let Some(bits) = tentative.field_bits(field) {
+            display.set_field_bits(field, bits);
+        }
     }
-    // BOTH_ animations drive legs and torso together; leave an independent
-    // torso (saber attacks, weapon fire) alone.
-    let both = display_legs == display_torso;
-    let copied: &[&str] = if both {
-        &["legsAnim", "legsTimer", "torsoAnim", "torsoTimer"]
-    } else {
-        &["legsAnim", "legsTimer"]
-    };
-    for name in copied {
-        let value = get(committed, name);
-        display.set_field_bits(name, value as u32);
-    }
+    display
 }
 
 fn set_origin(ps: &mut PlayerState, origin: [f32; 3]) {
@@ -1395,6 +1395,10 @@ pub struct Predictor {
     saber_movement: Option<[SaberMovementInfo; 2]>,
     /// The loadout the native player currently carries.
     saber_installed: Option<[SaberMovementInfo; 2]>,
+    /// Rate limit diagnostics for discarded provisional discrete transitions.
+    last_provisional_discrete_log_time: Option<i32>,
+    /// Avoid reporting the same replay correction on every render frame.
+    last_saber_replay_log_time: Option<i32>,
     /// Foot bolts of the predicted client's rendered Ghoul2 pose (`pmove_t::ghoul2`).
     foot_bolts: Option<[[f32; 3]; 2]>,
     pub misses: Vec<String>,
@@ -1568,6 +1572,12 @@ impl Predictor {
     /// The playerstate to present this frame (see `display`).
     pub fn predicted(&self) -> Option<&PlayerState> {
         self.display.as_ref().or(self.predicted.as_ref())
+    }
+
+    /// Prediction advanced only by recorded usercmds, never the unsent render
+    /// preview. This state alone owns predictable events and one-shot effects.
+    pub fn committed(&self) -> Option<&PlayerState> {
+        self.predicted.as_ref()
     }
 
     /// usercmd angles behind [`Self::predicted`].
@@ -1851,6 +1861,36 @@ impl Predictor {
         }
         if let Some(replayed) = replayed_at_old.take() {
             let command_time = old_command_time;
+            // The existing correction check below only compares origins. A
+            // saber chain can diverge without moving the player one unit.
+            // Compare the same commandTime before a fresh authoritative base
+            // has replayed it. This distinguishes real replay corrections
+            // from the presentation-only provisional branch below.
+            if settings.prediction_debug
+                && self.last_saber_replay_log_time != Some(command_time)
+                && old.field_i32("weapon") == Some(i32::from(jka_movement::WP_SABER))
+                && ["saberMove", "saberAttackChainCount"]
+                    .iter()
+                    .any(|&field| old.field_bits(field) != replayed.field_bits(field))
+            {
+                self.last_saber_replay_log_time = Some(command_time);
+                let describe = |ps: &PlayerState| {
+                    format!(
+                        "move={} chain={} torso={} flip={} torsoTimer={} weaponTime={} style={}",
+                        ps.field_i32("saberMove").unwrap_or(-1),
+                        ps.field_i32("saberAttackChainCount").unwrap_or(-1),
+                        ps.field_i32("torsoAnim").unwrap_or(-1),
+                        ps.field_i32("torsoFlip").unwrap_or(-1),
+                        ps.field_i32("torsoTimer").unwrap_or(-1),
+                        ps.field_i32("weaponTime").unwrap_or(-1),
+                        ps.field_i32("fd.saberAnimLevel").unwrap_or(-1),
+                    )
+                };
+                self.misses.push(format!(
+                    "^1SABER-REPLAY-DIFF^7 cmdtime={command_time} | previous {} | replayed {}",
+                    describe(&old), describe(&replayed),
+                ));
+            }
             if self.this_frame_teleport {
                 self.predicted_error = [0.0; 3];
                 self.this_frame_teleport = false;
@@ -2120,14 +2160,36 @@ impl Predictor {
         if let Some(cmd) = provisional {
             let reached = native.view().command_time;
             if prediction_settings.pmove_fixed == 0 && cmd.server_time > reached && cmd.server_time > latest.server_time {
+                // Native Pmove still advances the hypothetical presentation command,
+                // but only its continuous movement/camera state may be displayed.
                 movement.predict(native, movement_cmd(&cmd), &prediction_settings, &mut world)?;
                 let native_view = native.view();
-                let mut display = from_native(native.network());
-                let carried = adjust_position_for_mover(entities, &display, origin(&display), physics_time, time);
-                set_origin(&mut display, carried);
-                if let Some(committed) = self.predicted.as_ref() {
-                    keep_committed_animation(&mut display, committed);
-                }
+                let mut tentative = from_native(native.network());
+                let carried = adjust_position_for_mover(entities, &tentative, origin(&tentative), physics_time, time);
+                set_origin(&mut tentative, carried);
+                let display = if let Some(committed) = self.predicted.as_ref() {
+                    let discrete_changed = [
+                        "saberMove", "saberAttackChainCount", "torsoAnim", "legsAnim", "eventSequence",
+                    ].iter().any(|field| tentative.field_bits(field) != committed.field_bits(field));
+                    if settings.prediction_debug && discrete_changed
+                        && self.last_provisional_discrete_log_time.is_none_or(|last| cmd.server_time.saturating_sub(last) >= 100)
+                    {
+                        self.last_provisional_discrete_log_time = Some(cmd.server_time);
+                        self.misses.push(format!(
+                            "^3PRED-PROVISIONAL^7 t={} committed_t={} | tentative move={} chain={} events={} | committed move={} chain={} events={} (discrete state discarded; continuous motion displayed)",
+                            cmd.server_time, reached,
+                            tentative.field_i32("saberMove").unwrap_or(-1),
+                            tentative.field_i32("saberAttackChainCount").unwrap_or(-1),
+                            tentative.field_i32("eventSequence").unwrap_or(-1),
+                            committed.field_i32("saberMove").unwrap_or(-1),
+                            committed.field_i32("saberAttackChainCount").unwrap_or(-1),
+                            committed.field_i32("eventSequence").unwrap_or(-1),
+                        ));
+                    }
+                    provisional_presentation_state(&tentative, committed)
+                } else {
+                    tentative
+                };
                 self.display = Some(display);
                 self.display_view_forced = native_view.view_forced != 0;
                 self.display_angles = Some(cmd.angles);
@@ -2647,6 +2709,81 @@ mod tests {
         let mut cfg = String::new();
         settings.write_cfg(&mut cfg);
         assert!(cfg.contains("seta cp_pluginDisable \"1048576\""));
+    }
+
+    #[test]
+    fn provisional_pmove_mode_cvar_is_removed() {
+        let mut settings = NetworkSettings::default();
+        assert!(settings.cvar_value("cg_provisionalPmoveMode").is_none());
+        assert!(settings.set_cvar("cg_provisionalPmoveMode", "2").is_none());
+    }
+
+    #[test]
+    fn provisional_pmove_renders_continuous_state_without_committing_discrete_state() {
+        use jka_protocol::entity_event::EntityEvent;
+        for style in [1, 2, 3, 4, 5] {
+            let mut committed = PlayerState::default();
+            for (field, value) in [
+                ("weapon", 3), ("fd.saberAnimLevel", style),
+                ("saberAttackChainCount", 4), ("saberMove", 5),
+                ("torsoAnim", 204), ("torsoTimer", 50),
+                ("legsAnim", 190), ("eventSequence", 12),
+            ] {
+                assert!(committed.set_field_bits(field, value));
+            }
+            let mut tentative = committed.clone();
+            for (field, value) in [
+                ("saberAttackChainCount", 5), ("saberMove", 8),
+                ("torsoAnim", 205), ("torsoTimer", 100),
+                ("legsAnim", 197), ("eventSequence", 13),
+                ("events[0]", EntityEvent::EV_SABER_ATTACK.as_i32() as u32),
+                ("commandTime", 1007), ("bobCycle", 17),
+            ] {
+                assert!(tentative.set_field_bits(field, value));
+            }
+            tentative.set_field_bits("origin[0]", 120.5_f32.to_bits());
+            tentative.set_field_bits("velocity[1]", 300.25_f32.to_bits());
+            tentative.set_field_bits("viewangles[1]", 72.0_f32.to_bits());
+            let display = provisional_presentation_state(&tentative, &committed);
+            for field in [
+                "saberAttackChainCount", "saberMove", "torsoAnim", "torsoTimer",
+                "legsAnim", "eventSequence", "events[0]", "weapon",
+            ] {
+                assert_eq!(display.field_bits(field), committed.field_bits(field), "{field}, style={style}");
+            }
+            assert_eq!(display.field_i32("commandTime"), Some(1007));
+            assert_eq!(display.field_i32("bobCycle"), Some(17));
+            assert_eq!(display.field_f32("origin[0]"), Some(120.5));
+            assert_eq!(display.field_f32("velocity[1]"), Some(300.25));
+            assert_eq!(display.field_f32("viewangles[1]"), Some(72.0));
+        }
+    }
+
+    #[test]
+    fn provisional_events_never_play_but_recorded_events_do_once() {
+        use jka_protocol::entity_event::EntityEvent;
+        for event in [EntityEvent::EV_SABER_ATTACK, EntityEvent::EV_JUMP, EntityEvent::EV_FOOTSTEP] {
+            let mut committed = PlayerState::default();
+            committed.set_field_bits("eventSequence", 12);
+            let mut tentative = committed.clone();
+            tentative.set_field_bits("eventSequence", 13);
+            tentative.set_field_bits("events[0]", event.as_i32() as u32);
+            let display = provisional_presentation_state(&tentative, &committed);
+            let mut game = crate::cgame::ClientGameState::new();
+            // Event transitions use the recorded-command states only.
+            game.transition_predicted_player_state(&committed, &committed, 1000).unwrap();
+            assert!(game.drain_presentation_events().is_empty());
+            assert_eq!(display.field_i32("eventSequence"), Some(12));
+            let mut accepted = committed.clone();
+            accepted.set_field_bits("eventSequence", 13);
+            accepted.set_field_bits("events[0]", event.as_i32() as u32);
+            game.transition_predicted_player_state(&accepted, &committed, 1008).unwrap();
+            let events = game.drain_presentation_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, event);
+            game.transition_predicted_player_state(&accepted, &accepted, 1016).unwrap();
+            assert!(game.drain_presentation_events().is_empty());
+        }
     }
 
     #[test]

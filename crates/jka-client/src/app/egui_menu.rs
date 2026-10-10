@@ -11,6 +11,7 @@ mod frontend_pages;
 mod maps;
 mod movement;
 mod profile;
+mod profile_studio;
 mod resume;
 mod screenshots;
 mod servers;
@@ -67,11 +68,9 @@ const GUTTER: f32 = 24.0;
 /// world/fog clear color with intentional black during startup.
 const FRONTEND_SCENE_FADE_IN_SECS: f32 = 4.0;
 
-const PROFILE_SECTIONS: [&str; 5] = ["IDENTITY", "MODEL", "FORCE", "SABER", "COSMETICS"];
-const PROFILE_IDENTITY: usize = 0;
+// The Studio nav retains these indices for Force-preview behavior.
 const PROFILE_MODEL: usize = 1;
 const PROFILE_FORCE: usize = 2;
-const PROFILE_SABER: usize = 3;
 const PROFILE_COSMETICS: usize = 4;
 
 // OpenJK bg_misc.c / TaystJK ui_force.c. Keep Profile force editing on the

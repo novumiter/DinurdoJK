@@ -31,6 +31,7 @@ pub(crate) fn digest(text: &str) -> String {
     // compatibility digest focused on pre-existing behavior; each addition has
     // a dedicated load/archive test below.
     let projected = text
+        .replace(", dynamic_light_falloff: ", ", rt_denoiser_mode: 0, dynamic_light_falloff: ")
         .replace("OceanSettings { interaction: false, interaction_strength: 1.0, interaction_splash_mode: 3, interaction_debug: false, ", "OceanSettings { ")
         .replace("interaction_splash_mode: 3, ", "")
         .replace("interaction_lifetime: 2.5, interaction_fade: 1.0, interaction_damping: 2.0, interaction_edge_fade: 81.92, ", "")
@@ -145,6 +146,9 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
             })
             .map(|line| format!("{line}\n"))
             .collect();
+    }
+    if name.ends_with(".cfg") {
+        expected = expected.lines().filter(|line| !line.starts_with("seta r_rtDenoiser ")).map(|line| format!("{line}\n")).collect();
     }
     if name == "changed.cfg" {
         // The removed r_volumetricFog import used to override current r_drawfog.
@@ -452,15 +456,27 @@ fn jiggle_impulse_cap_loads_and_archives() {
 }
 
 #[test]
+fn removed_rt_denoiser_is_not_registered_or_archived() {
+    assert!(crate::app::cvar_registry().find("r_rtDenoiser").is_none());
+    let fixture = Fixture::new();
+    let path = fixture.0.join("removed-rt-denoiser.cfg");
+    fs::write(&path, "seta r_rtDenoiser 2\nseta r_rtTaa 1\n").unwrap();
+    let settings = config::load_video_settings(&path);
+    assert_eq!(settings.rt_taa, 1);
+    config::save_video_settings(&path, settings, &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(), &config::AudioSettings::default()).unwrap();
+    assert!(!fs::read_to_string(&path).unwrap().contains("r_rtDenoiser"));
+}
+
+#[test]
 fn rt_regional_taa_loads_and_archives_without_changing_msaa() {
     let fixture = Fixture::new();
     let path = fixture.0.join("rt-taa.cfg");
-    fs::write(&path, "seta r_ext_multisample 2\nseta r_taa 0\nseta r_rtTaa 1\nseta r_rtDenoiser 0\n").unwrap();
+    fs::write(&path, "seta r_ext_multisample 2\nseta r_taa 0\nseta r_rtTaa 1\n").unwrap();
     let settings = config::load_video_settings(&path);
     assert_eq!(settings.rt_taa, 1);
     assert_eq!(settings.msaa_samples, 2);
     assert!(!settings.taa);
-    assert_eq!(settings.rt_denoiser_mode, 0);
     config::save_video_settings(&path, settings, &crate::keybinds::Bindings::default(),
         &config::ClientPresentationSettings::default(), &config::AudioSettings::default()).unwrap();
     let saved = fs::read_to_string(&path).unwrap();

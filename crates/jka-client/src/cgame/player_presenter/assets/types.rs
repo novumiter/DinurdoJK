@@ -1,7 +1,7 @@
 //! Assets types.
 use crate::cgame::player_presenter::{
     Arc, DynamicModelAlphaMode, Ghoul2GpuVertex, GlaAnimation, GlmModel, JiggleProfile,
-    SourceMaterialParams, TcMod, TextureData,
+    SourceMaterialParams, TcMod, TextureData, Wave,
 };
 
 #[derive(Debug)]
@@ -35,6 +35,9 @@ pub(in crate::cgame::player_presenter) struct ResolvedStage {
     pub(in crate::cgame::player_presenter) alpha: f32,
     /// `rgbGen const` stages are not lit by the light grid.
     pub(in crate::cgame::player_presenter) unlit: bool,
+    /// Stage generators run at shader time, not model-load time.
+    pub(in crate::cgame::player_presenter) rgb_wave: Option<Wave>,
+    pub(in crate::cgame::player_presenter) alpha_wave: Option<Wave>,
     /// `alphaGen lightingSpecular`: alpha is q3's specular term per vertex.
     pub(in crate::cgame::player_presenter) specular_alpha: bool,
     /// Only `tcMod scale` / `tcMod scroll` are applied.
@@ -51,8 +54,9 @@ pub(in crate::cgame::player_presenter) struct ResolvedMaterial {
     /// Non-empty for a blended multi-stage shader; then `texture`/`alpha_mode`
     /// are the first entry's and the surface is drawn once per stage.
     pub(in crate::cgame::player_presenter) stages: Vec<ResolvedStage>,
-    /// `cull twosided` on a translucent surface (wings): the mesh also needs its
-    /// reversed-winding triangles because the pipelines always cull back faces.
+    /// Authored `cull twosided` / `cull none` / `cull disable`, independent
+    /// of alpha test and blend mode. Ghoul2 pipelines cull back faces, so
+    /// two-sided meshes receive reversed-winding triangles at load time.
     pub(in crate::cgame::player_presenter) two_sided: bool,
     /// Exact `glow` marker for the single-stage/base path.
     pub(in crate::cgame::player_presenter) authored_glow: bool,
@@ -149,6 +153,8 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     pub(in crate::cgame::player_presenter) key: String,
     pub(in crate::cgame::player_presenter) glm: Arc<GlmModel>,
     pub(in crate::cgame::player_presenter) gla: Arc<GlaAnimation>,
+    /// Per-Source-model anatomical Ghoul2 pivots. None for stock GLM players.
+    pub(in crate::cgame::player_presenter) source_native_pivots: Option<Arc<Vec<[f32; 3]>>>,
     /// `players/_humanoid/` skeletons use the normal multiplayer animation/angle
     /// path.  Creature skeletons use the model-local tables cached below.
     pub(in crate::cgame::player_presenter) humanoid: bool,

@@ -77,6 +77,7 @@ use session::types::{
 };
 
 mod companion;
+mod egui_dev_radial;
 mod egui_entity_graph;
 mod egui_menu;
 mod egui_pages;
@@ -142,7 +143,7 @@ use crate::{
     ui::{
         self, ChatMode, CloudRenderResolution, CloudType, ColorLutPreset, ConsolePathLinkUi,
         ConsoleSearchMatch, ConsoleSelection, ConsoleSize, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode, DemoKillMarkerUi,
-        DemoTimelineUi, DetailTextureMode, DofQuality, DynamicLightsMode, DynamicShadowsMode,
+        DemoTimelineUi, DofQuality, DynamicLightsMode, DynamicShadowsMode,
         EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FullscreenMode,
         FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, GlowMode, HudElementId, HudElementLayout,
         HudLayout, HudState,
@@ -295,9 +296,21 @@ pub struct App {
     profile_catalog_loaded: bool,
     profile_catalog_error: Option<String>,
     profile_selected_section: usize,
+    profile_studio_started: Instant,
+    profile_studio_last_frame: Instant,
+    /// Angular velocity (degrees/second). Decays naturally when drag releases.
+    profile_studio_spin_velocity: f32,
+    /// Head-look control from cursor position on the Studio stage (-1..1).
+    profile_studio_head_look: [f32; 2],
+    /// Animated JKA-space bolt anchors: head, face, back, right hand, left hand.
+    profile_studio_world_anchors: [Option<[f32; 3]>; 5],
+    /// Stage-anchored cosmetic chooser (0 closed, jaPRO groups 1..=3).
+    profile_studio_cosmetic_group: u8,
+    profile_studio_show_saber: bool,
+    /// Independent Studio model-library filters: Original, Red, Blue, RGB.
+    /// Every category is visible by default.
+    profile_studio_skin_visible: [bool; 4],
     profile_model_search: String,
-    /// 0=all, 1=red variants, 2=blue variants.
-    profile_model_team_filter: u8,
     /// Selected model/skin shown in Profile until exit commits the model cvar once.
     profile_model_staged: Option<String>,
     profile_model_icon_textures: HashMap<String, egui::TextureHandle>,
@@ -623,6 +636,8 @@ pub struct App {
     previous_tick: Instant,
     overlay: OverlayMode,
     overlay_before_console: OverlayMode,
+    /// UI to restore when `/dev` is canceled (including when invoked from console).
+    dev_radial_return_overlay: OverlayMode,
     console_input: String,
     /// UTF-8 byte offset of the editable console caret inside `console_input`.
     console_cursor: usize,
@@ -741,6 +756,10 @@ pub struct App {
     ocean_settings_target: i32, // -1 shared, >=0 promoted slot, <=-2 authored index
     promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     promoted_ocean_overrides: Vec<(usize, crate::ocean::OceanSettings)>,
+    /// Session-only Phase 2.5 overlay: 0 off, 1 treatment, 2 boundaries,
+    /// 3 bathymetry cells.
+    coastal_debug_mode: u8,
+    coastal_debug_sent: Option<(usize, u8, u8)>,
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,
     video: VideoSettings,

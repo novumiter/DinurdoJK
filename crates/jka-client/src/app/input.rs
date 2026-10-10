@@ -5,7 +5,23 @@ use crate::app::{
 };
 
 impl App {
+    /// Connection/download dialogs are drawn even when the normal gameplay
+    /// overlay is None (for example, after a server map change). They must own
+    /// the OS pointer just like an ordinary egui menu does.
+    pub(in crate::app) fn connection_modal_active(&self) -> bool {
+        self.server_password_prompt.is_some()
+            || self.missing_map_prompt.is_some()
+            || self.demo_missing_map_prompt.is_some()
+            || self.live_download.is_some()
+            || self.live_join_ui.is_some()
+    }
+
     pub(in crate::app) fn set_capture(&mut self, captured: bool) {
+        // A focus regain, left click, or set_overlay(None) must not re-lock the
+        // cursor while a map/download modal is open over live gameplay.
+        let captured = captured
+            && self.overlay == OverlayMode::None
+            && !self.connection_modal_active();
         if !captured {
             self.noclip_primary_down = false;
             self.noclip_alt_down = false;
@@ -16,7 +32,7 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
-        if captured && self.overlay == OverlayMode::None {
+        if captured {
             let grab_mode = if window.set_cursor_grab(CursorGrabMode::Locked).is_ok() {
                 Some("locked")
             } else if window.set_cursor_grab(CursorGrabMode::Confined).is_ok() {
@@ -38,6 +54,23 @@ impl App {
             self.captured = false;
             self.mouse_grab_mode = "none";
         }
+    }
+
+    /// Enter the single Profile experience. Both front-end and in-game routes
+    /// use this same initialization; studio/old tab names are command aliases.
+    pub(in crate::app) fn open_profile_studio(&mut self, tab: Option<&str>) {
+        self.profile_selected_section = match tab {
+            Some("force") => 2,
+            Some("visibility") | Some("cosmetics") => 4,
+            _ => 1, // Look includes sabers and the player name.
+        };
+        self.profile_studio_started = Instant::now();
+        self.profile_studio_last_frame = Instant::now();
+        self.profile_studio_spin_velocity = 0.0;
+        self.profile_studio_head_look = [0.0; 2];
+        self.profile_studio_world_anchors = [None; 5];
+        self.profile_studio_cosmetic_group = 0;
+        self.profile_preview_key = None;
     }
 
     pub(in crate::app) fn sync_profile_preview_mode(&mut self, active: bool) {
@@ -124,6 +157,26 @@ impl App {
             self.set_capture(true);
         }
         self.publish_ui();
+    }
+
+    /// Open or close the `/dev` wheel without losing the overlay that owned
+    /// input before it. When invoked in the console, return to what was under
+    /// the console, not the console itself.
+    pub(in crate::app) fn toggle_dev_radial(&mut self) {
+        if self.overlay == OverlayMode::DevRadial {
+            self.close_dev_radial();
+            return;
+        }
+        self.dev_radial_return_overlay = if self.overlay == OverlayMode::Console {
+            self.overlay_after_console()
+        } else {
+            self.overlay
+        };
+        self.set_overlay(OverlayMode::DevRadial);
+    }
+
+    pub(in crate::app) fn close_dev_radial(&mut self) {
+        self.set_overlay(self.dev_radial_return_overlay);
     }
 
     pub(in crate::app) fn controls_page_active(&self) -> bool {
@@ -349,6 +402,17 @@ impl App {
                 self.spectator_binding_context(),
             )
             .is_some_and(|binding| keybinds::binding_contains_command(binding, "trace"))
+    }
+
+    /// The same key used to open `/dev` must be able to close it while egui
+    /// owns the cursor; see `route_egui_window_event` and raw key dispatch.
+    pub(in crate::app) fn key_bound_to_dev(&self, code: KeyCode) -> bool {
+        self.bindings
+            .get_resolved(
+                keybinds::bind_key_for_code(code),
+                self.spectator_binding_context(),
+            )
+            .is_some_and(|binding| keybinds::binding_contains_command(binding, "dev"))
     }
 
     pub(in crate::app) fn execute_binding_press(&mut self, key: BindKey) {

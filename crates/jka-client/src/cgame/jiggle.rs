@@ -2,8 +2,9 @@
 //!
 //! Stock JKA's 53-bone humanoid has no dedicated breast/soft-tissue bones, so this
 //! intentionally works after Ghoul2 skinning. `_humanoid` models are classified
-//! automatically from Raven's helper surfaces plus the mesh normals and real GLM skin
-//! weights (per-model `.jiggle` files are no longer supported). Masks and spring
+//! automatically from Raven helper surfaces or Source-converted joint pivots,
+//! plus mesh normals and real GLM skin weights (per-model `.jiggle` files are no
+//! longer supported). Masks and spring
 //! anchors are compiled once at model registration; runtime
 //! work is then only a handful of damped points plus masked offsets.
 
@@ -366,6 +367,14 @@ fn surface_boundary_vertices(surface: &GlmSurface) -> Vec<bool> {
     boundary
 }
 
+/// Where a `_humanoid` model gets its anatomical search landmarks.
+/// The soft-tissue fit and its physics are identical for both variants.
+#[derive(Clone, Copy)]
+enum AnatomyReference<'a> {
+    Raven,
+    Source { native_pivots: Option<&'a [[f32; 3]]> },
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct JiggleProfile {
     regions: Vec<RegionSpec>,
@@ -374,9 +383,24 @@ pub(crate) struct JiggleProfile {
     /// The compact GPU vertex payload stores one region per vertex. Profiles
     /// with overlapping regions retain exact behavior through the CPU fallback.
     gpu_compatible: bool,
+    /// Source rebinding can merge arms, hands, and hips into one GLM surface.
+    /// Keep stock JKA's authored surface-specific size shaping unchanged.
+    source_anatomy: bool,
 }
 
 impl JiggleProfile {
+    #[cfg(test)]
+    pub(crate) fn source_size_test_profile() -> Self {
+        let mut profile = Self::worker_test_profile();
+        profile.source_anatomy = true;
+        let region = &mut profile.regions[0];
+        region.name = "glute_left".into();
+        region.semantic.allowed_bones = vec![0]; // synthetic pelvis
+        region.center = [0.0, 3.22789141, 37.4822428 + GLUTE_APEX_CENTER_OFFSET];
+        region.radius = [4.74686644, 1.0, 6.4];
+        profile
+    }
+
     #[cfg(test)]
     pub(crate) fn worker_test_profile() -> Self {
         Self {
@@ -388,23 +412,58 @@ impl JiggleProfile {
                 strength: 1.0, side: RegionSide::PositiveX,
                 semantic: SemanticMask { allowed_bones: vec![0], facing_y: -1.0 },
             }],
-            lod_masks: vec![], gpu_compatible: true,
+            lod_masks: vec![], gpu_compatible: true, source_anatomy: false,
         }
     }
 
-    /// Build the `_humanoid` profile directly from Raven's semantic helper
-    /// surfaces; zero authoring for ordinary player GLMs.
+    /// Build the stock `_humanoid` profile from Raven's chest/hip helpers.
     pub(crate) fn auto_humanoid(
         glm: &GlmModel,
         gla: &GlaAnimation,
     ) -> Result<Option<Self>, String> {
+        Self::auto_anatomical(glm, gla, AnatomyReference::Raven)
+    }
+
+    /// Source meshes have the same rebound `_humanoid` skin weights but no
+    /// Raven anatomical helper surfaces. Use their converted joint pivots and
+    /// all non-bolt meshes for *the same* fitting and mask compilation path.
+    /// No Source jiggle bones are required or synthesized.
+    pub(crate) fn auto_source_humanoid(
+        glm: &GlmModel,
+        gla: &GlaAnimation,
+        native_pivots: Option<&[[f32; 3]]>,
+    ) -> Result<Option<Self>, String> {
+        Self::auto_anatomical(glm, gla, AnatomyReference::Source { native_pivots })
+    }
+
+    /// Common anatomical fitting for stock JKA and Source-rebound GLMs.
+    /// Only mesh selection and search landmarks differ; semantic weights,
+    /// region physics, symmetry, masks and spring anchors stay shared.
+    fn auto_anatomical(
+        glm: &GlmModel,
+        gla: &GlaAnimation,
+        reference: AnatomyReference<'_>,
+    ) -> Result<Option<Self>, String> {
         if !glm.anim_name.to_ascii_lowercase().contains("_humanoid") {
             return Ok(None);
         }
-
-        let torso_surfaces = surface_family(glm, "torso");
-        let hips_surfaces = surface_family(glm, "hips");
-        if torso_surfaces.is_empty() && hips_surfaces.is_empty() {
+        let (chest_surfaces, hip_surfaces) = match reference {
+            AnatomyReference::Raven => (surface_family(glm, "torso"), surface_family(glm, "hips")),
+            AnatomyReference::Source { .. } => {
+                // Generated Source bodypart names are arbitrary. Skin weights,
+                // facing normals and search height reject other anatomy.
+                // Never deform borrowed JKA attachment/bolt surfaces.
+                let surfaces = glm.hierarchy.iter()
+                    .filter(|surface| !surface.name.starts_with('*'))
+                    .map(|surface| surface.name.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                (surfaces.clone(), surfaces)
+            }
+        };
+        if chest_surfaces.is_empty() && hip_surfaces.is_empty() {
+            return Ok(None);
+        }
+        if matches!(reference, AnatomyReference::Source { .. }) && glm.lods.is_empty() {
             return Ok(None);
         }
 
@@ -419,62 +478,82 @@ impl JiggleProfile {
         let rfemur_yz = find_bone(gla, "rfemurYZ");
         let rfemur_x = find_bone(gla, "rfemurX");
 
-        let mut regions = Vec::with_capacity(MAX_GPU_JIGGLE_REGIONS);
+        // Source detection needs a complete central spine to place search
+        // windows. Raven profiles retain partial-region fallback semantics.
+        let source_heights = match reference {
+            AnatomyReference::Raven => None,
+            AnatomyReference::Source { native_pivots } => {
+                let (Some(_), Some(upper), Some(chest), Some(hips)) =
+                    (lower_lumbar, upper_lumbar, thoracic, pelvis) else {
+                        return Ok(None);
+                    };
+                let heights = (
+                    source_joint_z(gla, native_pivots, upper),
+                    source_joint_z(gla, native_pivots, chest),
+                    source_joint_z(gla, native_pivots, hips),
+                );
+                if !heights.0.is_finite() || !heights.1.is_finite() || !heights.2.is_finite() {
+                    return Ok(None);
+                }
+                Some(heights)
+            }
+        };
 
-        let chest_common = [lower_lumbar, upper_lumbar, thoracic];
+        let mut regions = Vec::with_capacity(MAX_GPU_JIGGLE_REGIONS);
         if let (Some(lower_lumbar), Some(upper_lumbar), Some(thoracic)) =
-            (chest_common[0], chest_common[1], chest_common[2])
+            (lower_lumbar, upper_lumbar, thoracic)
         {
             for (name, side, lower_marker, upper_marker, clavicle) in [
                 ("breast_left", RegionSide::PositiveX, "*lchest_l", "*uchest_l", lclavical),
                 ("breast_right", RegionSide::NegativeX, "*lchest_r", "*uchest_r", rclavical),
             ] {
-                let (Some(lower), Some(upper), Some(clavicle)) = (
-                    marker_centroid(glm, lower_marker),
-                    marker_centroid(glm, upper_marker),
-                    clavicle,
-                ) else {
-                    continue;
+                let Some(clavicle) = clavicle else { continue };
+                // Only the reference points and (stock-tuned) footprint caps
+                // differ. The actual flesh fitting is exactly the same.
+                let (z_min, z_max, lateral, max_radius) = match reference {
+                    AnatomyReference::Raven => {
+                        let (Some(lower), Some(upper)) =
+                            (marker_centroid(glm, lower_marker), marker_centroid(glm, upper_marker))
+                        else { continue };
+                        let x = (lower[0] + upper[0]) * 0.5;
+                        (lower[2].min(upper[2]) - 1.5,
+                         lower[2].max(upper[2]) + 2.5,
+                         Some((x, (x.abs() * 1.18).clamp(3.2, 4.0))),
+                         [4.8, 5.5])
+                    }
+                    AnatomyReference::Source { native_pivots } => {
+                        let Some((lumbar_z, chest_z, pelvis_z)) = source_heights else {
+                            continue;
+                        };
+                        let collar_z = source_joint_z(gla, native_pivots, clavicle);
+                        let waist_z = (lumbar_z + pelvis_z) * 0.5;
+                        let z_min = (lumbar_z.min(chest_z) - 2.0).max(waist_z + 0.5);
+                        let z_max = collar_z.max(chest_z) + 2.0;
+                        if z_max <= z_min + 1.0 { continue }
+                        (z_min, z_max, None, [5.0, 6.5])
+                    }
                 };
-                let z_min = lower[2].min(upper[2]) - 1.5;
-                let z_max = lower[2].max(upper[2]) + 2.5;
                 let semantic = SemanticMask {
                     allowed_bones: vec![lower_lumbar, upper_lumbar, thoracic, clavicle],
                     facing_y: -1.0,
                 };
                 if let Some((mut center, mut radius, _)) = fit_semantic_region(
-                    glm,
-                    &torso_surfaces,
-                    side,
-                    &semantic,
-                    z_min,
-                    z_max,
-                    [2.8, 3.8],
-                    [4.8, 5.5],
+                    glm, &chest_surfaces, side, &semantic, z_min, z_max,
+                    [2.8, 3.8], max_radius,
                 ) {
-                    // The chest helper triangles are exceptionally stable across
-                    // Raven/community `_humanoid` GLMs; use them for lateral
-                    // placement while the rendered vertices determine height.
-                    center[0] = (lower[0] + upper[0]) * 0.5;
-                    radius[0] = (center[0].abs() * 1.18).clamp(3.2, 4.0);
+                    if let Some((x, rx)) = lateral {
+                        center[0] = x;
+                        radius[0] = rx;
+                    }
                     regions.push(RegionSpec {
                         name: name.into(),
-                        surfaces: torso_surfaces.clone(),
+                        surfaces: chest_surfaces.clone(),
                         anchor_terms: Vec::new(),
                         solver_root_bone: Some(thoracic),
-                        center,
-                        radius,
-                        // Model X lateral, Y depth, Z vertical. Gait bounce is
-                        // mostly vertical with a lateral component; depth-led
-                        // response mostly flattened/pushed the chest.
+                        center, radius,
                         response: [0.45, 0.80, 1.00],
-                        // KawaiiPhysics-style normalized settings.
-                        stiffness: 0.10,
-                        damping: 0.18,
-                        max_offset: 1.15,
-                        strength: 1.0,
-                        side,
-                        semantic,
+                        stiffness: 0.10, damping: 0.18, max_offset: 1.15,
+                        strength: 1.0, side, semantic,
                     });
                 }
             }
@@ -485,10 +564,24 @@ impl JiggleProfile {
                 ("glute_left", RegionSide::PositiveX, "*hip_bl", lfemur_yz, lfemur_x),
                 ("glute_right", RegionSide::NegativeX, "*hip_br", rfemur_yz, rfemur_x),
             ] {
-                let (Some(back), Some(femur_yz), Some(femur_x)) =
-                    (marker_centroid(glm, back_marker), femur_yz, femur_x)
-                else {
-                    continue;
+                let (Some(femur_yz), Some(femur_x)) = (femur_yz, femur_x) else { continue };
+                let (z_min, z_max, lateral) = match reference {
+                    AnatomyReference::Raven => {
+                        let Some(back) = marker_centroid(glm, back_marker) else { continue };
+                        (back[2] - 11.5, back[2] + 1.2,
+                         Some((back[0] * 0.85, (back[0].abs() * 1.35).clamp(4.0, 5.5))))
+                    }
+                    AnatomyReference::Source { native_pivots } => {
+                        let Some((lumbar_z, _, pelvis_z)) = source_heights else {
+                            continue;
+                        };
+                        let waist_z = (lumbar_z + pelvis_z) * 0.5;
+                        let z_min = (pelvis_z - 11.5)
+                            .min(source_joint_z(gla, native_pivots, femur_yz) - 2.0);
+                        let z_max = (pelvis_z + 2.5).min(waist_z - 0.5);
+                        if z_max <= z_min + 1.0 { continue }
+                        (z_min, z_max, None)
+                    }
                 };
                 let mut allowed_bones = vec![pelvis, femur_yz, femur_x];
                 if let Some(lower_lumbar) = lower_lumbar {
@@ -496,64 +589,64 @@ impl JiggleProfile {
                 }
                 let semantic = SemanticMask { allowed_bones, facing_y: 1.0 };
                 if let Some((mut center, mut radius, apex_z)) = fit_semantic_region(
-                    glm,
-                    &hips_surfaces,
-                    side,
-                    &semantic,
-                    // Keep most of the automatic footprint on the glute, but let
-                    // the lower falloff reach into the upper thigh. The helper
-                    // marker is a better anatomical reference than a fixed JKA Z.
-                    back[2] - 11.5,
-                    back[2] + 1.2,
-                    [3.4, 5.0],
-                    [6.0, 7.5],
+                    glm, &hip_surfaces, side, &semantic, z_min, z_max,
+                    [3.4, 5.0], [6.0, 7.5],
                 ) {
-                    center[0] = back[0] * 0.85;
-                    // Height follows the rear-protrusion apex, not the sample
-                    // mean: belt/chaps/vest overlays are rear-facing hips*
-                    // surfaces weighted to the pelvis and dragged the mean up
-                    // (jan: 39.8 vs apex 37.4). Stock jedi_tf/zf/hf sit ~0.8
-                    // above their apex, which this offset preserves within 0.2.
-                    center[2] = match apex_z {
-                        Some(apex_z) => apex_z + GLUTE_APEX_CENTER_OFFSET,
-                        None => center[2] + 0.35,
-                    };
-                    radius[0] = (back[0].abs() * 1.35).clamp(4.0, 5.5);
+                    if let Some((x, rx)) = lateral {
+                        center[0] = x;
+                        radius[0] = rx;
+                    }
+                    // Use the rear-protrusion apex, not the mean of belt or
+                    // garment vertices. Both model formats share this rule.
+                    center[2] = apex_z.map_or(center[2] + 0.35,
+                        |z| z + GLUTE_APEX_CENTER_OFFSET);
                     radius[2] = (radius[2] * 0.88).clamp(4.6, 6.4);
                     regions.push(RegionSpec {
                         name: name.into(),
-                        surfaces: hips_surfaces.clone(),
+                        surfaces: hip_surfaces.clone(),
                         anchor_terms: Vec::new(),
                         solver_root_bone: Some(pelvis),
-                        center,
-                        radius,
+                        center, radius,
                         response: [0.30, 0.80, 1.00],
-                        stiffness: 0.12,
-                        damping: 0.20,
-                        max_offset: 0.95,
-                        strength: 1.0,
-                        side,
-                        semantic,
+                        stiffness: 0.12, damping: 0.20, max_offset: 0.95,
+                        strength: 1.0, side, semantic,
                     });
                 }
             }
         }
 
-        if regions.is_empty() {
-            return Ok(None);
-        }
-        // Raven's helper markers are not mirror images (stock *lchest_l x 2.67
-        // vs *lchest_r -2.21; *hip_bl 3.38 vs *hip_br -3.65), which left the
-        // fitted pairs visibly lopsided. Average each pair and mirror it.
+        if regions.is_empty() { return Ok(None) }
+        // Raven helpers can be asymmetrical; both formats use one correction.
         symmetrize_pair(&mut regions, "breast_left", "breast_right");
         symmetrize_pair(&mut regions, "glute_left", "glute_right");
-        Self::compile(regions, glm, gla).map(Some)
+
+        if matches!(reference, AnatomyReference::Source { .. }) {
+            // A Source bodypart may be extremely low-poly: discard regions
+            // without movable interior vertices before compiling the profile.
+            regions.retain(|region| {
+                glm.lods.first().is_some_and(|lod| lod.surfaces.iter().any(|surface| {
+                    glm.hierarchy.get(surface.surface_index).is_some_and(|entry| {
+                        region.surfaces.iter().any(|name| entry.name.eq_ignore_ascii_case(name))
+                    }) && {
+                        let boundary = region.name.contains("glute")
+                            .then(|| surface_boundary_vertices(surface));
+                        surface.vertices.iter().enumerate().any(|(index, vertex)| {
+                            !boundary.as_ref().is_some_and(|boundary| boundary[index])
+                                && region_vertex_weight(region, surface, vertex) > 0.0001
+                        })
+                    }
+                }))
+            });
+            if regions.is_empty() { return Ok(None) }
+        }
+        Self::compile(regions, glm, gla, matches!(reference, AnatomyReference::Source { .. })).map(Some)
     }
 
     fn compile(
         mut regions: Vec<RegionSpec>,
         glm: &GlmModel,
         gla: &GlaAnimation,
+        source_anatomy: bool,
     ) -> Result<Self, String> {
         let mut lod_masks = Vec::with_capacity(glm.lods.len());
         let mut gpu_compatible = regions.len() <= MAX_GPU_JIGGLE_REGIONS;
@@ -663,7 +756,41 @@ impl JiggleProfile {
             }
         }
 
-        Ok(Self { regions, lod_masks, gpu_compatible })
+        Ok(Self { regions, lod_masks, gpu_compatible, source_anatomy })
+    }
+
+    pub(crate) fn uses_source_anatomy(&self) -> bool {
+        self.source_anatomy
+    }
+
+    /// Source conversion may combine the entire body in one mesh. Positive size
+    /// shaping is intentionally broader than the motion mask (to include thigh
+    /// and cloth fades), but must NEVER reshape a nearby hand/arm just because
+    /// it happens to overlap the butt/chest in bind-pose coordinates.
+    ///
+    /// Use the *same semantic bone sets* as the existing detector, applied to
+    /// the model's global GLA skin indices. Weight-based fade avoids seams
+    /// across hips/thighs while rejecting unrelated appendages entirely.
+    pub(crate) fn size_skin_gate(
+        &self,
+        glute: bool,
+        indices: &[u32; 4],
+        weights: &[f32; 4],
+        count: u32,
+    ) -> f32 {
+        if !self.source_anatomy {
+            return 1.0;
+        }
+        let category = if glute { "glute" } else { "breast" };
+        let weight = (0..count.min(4) as usize)
+            .filter(|&i| self.regions.iter().any(|region| {
+                region.name.contains(category)
+                    && region.semantic.allowed_bones.contains(&(indices[i] as usize))
+            }))
+            .map(|i| weights[i].max(0.0))
+            .sum::<f32>()
+            .clamp(0.0, 1.0);
+        smoothstep(0.08, 0.40, weight)
     }
 
     pub(crate) fn affects_surface(&self, lod_index: usize, surface_index: usize) -> bool {
@@ -1808,6 +1935,17 @@ fn compile_region_anchor(
     Ok(terms)
 }
 
+/// Height of a converted Source joint in the bind-pose coordinate system of
+/// the generated GLM. The normal Source FK path has model-specific pivots;
+/// legacy rebind modes use the generic humanoid GLA rest joints instead.
+fn source_joint_z(gla: &GlaAnimation, native_pivots: Option<&[[f32; 3]]>, index: usize) -> f32 {
+    native_pivots
+        .and_then(|pivots| pivots.get(index))
+        .map(|pivot| pivot[2])
+        .filter(|height| height.is_finite())
+        .unwrap_or(gla.skeleton[index].base_pose[2][3])
+}
+
 fn find_bone(gla: &GlaAnimation, name: &str) -> Option<usize> {
     gla.skeleton
         .iter()
@@ -2015,6 +2153,276 @@ fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Build a minimal GLA with anatomical bones. This uses the real parser so
+    // Source jiggle tests need no external PK3s, models or assets.
+    fn synthetic_source_gla() -> GlaAnimation {
+        let names_and_z: [(&str, f32); 11] = [
+            ("pelvis", 39.0), ("lower_lumbar", 43.0),
+            ("upper_lumbar", 49.0), ("thoracic", 53.0),
+            ("lclavical", 57.0), ("rclavical", 57.0),
+            ("lfemurYZ", 35.0), ("lfemurX", 35.0),
+            ("rfemurYZ", 35.0), ("rfemurX", 35.0),
+            ("head", 67.0),
+        ];
+        let count = names_and_z.len();
+        let skeleton_start = 100 + count * 4;
+        let frame_start = skeleton_start + count * 172;
+        let pool_start = frame_start + count * 3;
+        let total = pool_start + 14;
+        let mut bytes = vec![0u8; total];
+        // Fill the MDXA header, then the independent skeleton records.
+        bytes[..4].copy_from_slice(b"2LGA");
+        let mut put_i32 = |offset: usize, value: i32| {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        put_i32(4, 6);
+        put_i32(76, 1);
+        put_i32(80, frame_start as i32);
+        put_i32(84, count as i32);
+        put_i32(88, pool_start as i32);
+        put_i32(92, skeleton_start as i32);
+        put_i32(96, total as i32);
+        drop(put_i32);
+        bytes[8..18].copy_from_slice(b"testsource");
+        bytes[72..76].copy_from_slice(&1.0f32.to_le_bytes());
+        for (index, (name, z)) in names_and_z.iter().enumerate() {
+            let record = skeleton_start + index * 172;
+            let relative = (record - 100) as i32;
+            bytes[100 + index * 4..104 + index * 4]
+                .copy_from_slice(&relative.to_le_bytes());
+            bytes[record..record + name.len()].copy_from_slice(name.as_bytes());
+            bytes[record + 68..record + 72].copy_from_slice(&(-1i32).to_le_bytes());
+            for offset in [72, 120] {
+                for row in 0..3 {
+                    let start = record + offset + row * 16;
+                    bytes[start + row * 4..start + row * 4 + 4]
+                        .copy_from_slice(&1.0f32.to_le_bytes());
+                    let translation = if row == 2 {
+                        if offset == 72 { *z } else { -*z }
+                    } else { 0.0 };
+                    bytes[start + 12..start + 16]
+                        .copy_from_slice(&translation.to_le_bytes());
+                }
+            }
+        }
+        jka_assets::ghoul2::parse_gla(&bytes).expect("synthetic test GLA parses")
+    }
+
+    // One arbitrary Source bodypart, containing disconnected anatomically
+    // weighted pieces. No Raven torso/hips surface names or helper markers.
+    fn synthetic_source_glm() -> GlmModel {
+        use jka_assets::ghoul2::{GlmLod, GlmSurfaceHierarchy, GlmWeight};
+        let mut body = GlmSurface {
+            surface_index: 0,
+            vertices: Vec::new(),
+            texcoords: Vec::new(),
+            triangles: Vec::new(),
+            bone_references: vec![3, 0], // thoracic and pelvis
+        };
+        for (x_center, z_center, y, bone, facing) in [
+            (3.0, 53.0, -4.0, 0, -1.0),
+            (-3.0, 53.0, -4.0, 0, -1.0),
+            (3.0, 37.5, 4.0, 1, 1.0),
+            (-3.0, 37.5, 4.0, 1, 1.0),
+        ] {
+            let base = body.vertices.len() as u32;
+            for row in 0..4 {
+                for col in 0..4 {
+                    body.vertices.push(GlmVertex {
+                        position: [x_center + (col as f32 - 1.5) * 0.65,
+                                   y, z_center + (row as f32 - 1.5) * 0.75],
+                        normal: [0.0, facing, 0.0],
+                        weights: vec![GlmWeight { local_bone_index: bone, weight: 1.0 }],
+                    });
+                    body.texcoords.push([col as f32 / 3.0, row as f32 / 3.0]);
+                }
+            }
+            for row in 0..3 {
+                for col in 0..3 {
+                    let i = base + row * 4 + col;
+                    body.triangles.push([i, i + 1, i + 4]);
+                    body.triangles.push([i + 1, i + 5, i + 4]);
+                }
+            }
+        }
+        let head = GlmSurface {
+            surface_index: 1,
+            vertices: vec![GlmVertex {
+                position: [2.5, -2.0, 67.0], normal: [0.0, -1.0, 0.0],
+                // Intentionally torso-weighted: height must reject this vertex.
+                weights: vec![GlmWeight { local_bone_index: 0, weight: 1.0 }],
+            }],
+            texcoords: vec![[0.0, 0.0]],
+            triangles: Vec::new(), bone_references: vec![3],
+        };
+        GlmModel {
+            name: "models/players/source/test.mdl".into(),
+            anim_name: "models/players/_humanoid/_humanoid".into(),
+            num_bones: 11,
+            hierarchy: ["body_citizen_mesh_0", "face_head_mesh_1"]
+                .into_iter()
+                .map(|name| GlmSurfaceHierarchy {
+                    name: name.into(), flags: 0, shader: String::new(),
+                    parent_index: -1, children: Vec::new(),
+                })
+                .collect(),
+            lods: vec![GlmLod { surfaces: vec![body, head] }],
+        }
+    }
+
+    // Raven-style fixture with named torso/hips and four anatomical marker
+    // surfaces. The common fitter must preserve the original stock marker
+    // offsets/caps rather than adopting Source's joint-only placement.
+    fn synthetic_raven_glm() -> GlmModel {
+        use jka_assets::ghoul2::{GlmLod, GlmSurfaceHierarchy, GlmWeight};
+        let source = synthetic_source_glm();
+        let mut torso = source.lods[0].surfaces[0].clone();
+        torso.surface_index = 0;
+        let mut hips = torso.clone();
+        hips.surface_index = 1;
+        let marker_names_and_centers = [
+            ("*lchest_l", [3.0, -2.0, 51.0]),
+            ("*uchest_l", [3.0, -2.0, 55.0]),
+            ("*lchest_r", [-3.0, -2.0, 51.0]),
+            ("*uchest_r", [-3.0, -2.0, 55.0]),
+            ("*hip_bl", [3.5, 3.0, 40.0]),
+            ("*hip_br", [-3.5, 3.0, 40.0]),
+        ];
+        let mut hierarchy = ["torso_test", "hips_test"].into_iter()
+            .map(|name| GlmSurfaceHierarchy {
+                name: name.into(), flags: 0, shader: String::new(),
+                parent_index: -1, children: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut surfaces = vec![torso, hips];
+        for (name, center) in marker_names_and_centers {
+            let surface_index = hierarchy.len();
+            hierarchy.push(GlmSurfaceHierarchy {
+                name: name.into(), flags: 0, shader: String::new(),
+                parent_index: -1, children: Vec::new(),
+            });
+            surfaces.push(GlmSurface {
+                surface_index,
+                vertices: vec![GlmVertex {
+                    position: center, normal: [0.0, 1.0, 0.0],
+                    weights: vec![GlmWeight { local_bone_index: 0, weight: 1.0 }],
+                }],
+                texcoords: vec![[0.0, 0.0]],
+                triangles: Vec::new(),
+                bone_references: vec![0],
+            });
+        }
+        GlmModel {
+            name: "models/players/raven/test.glm".into(),
+            anim_name: source.anim_name,
+            num_bones: source.num_bones,
+            hierarchy,
+            lods: vec![GlmLod { surfaces }],
+        }
+    }
+
+    #[test]
+    fn stock_jka_still_fits_from_raven_markers() {
+        let gla = synthetic_source_gla();
+        let glm = synthetic_raven_glm();
+        let profile = JiggleProfile::auto_humanoid(&glm, &gla)
+            .unwrap().expect("Raven fixture should have four regions");
+        assert_eq!(profile.region_count(), 4);
+        assert!(profile.affects_surface(0, 0));
+        assert!(profile.affects_surface(0, 1));
+        assert!(!profile.affects_surface(0, 2)); // attachment marker
+        let breast = profile.regions.iter().find(|r| r.name == "breast_left").unwrap();
+        let glute = profile.regions.iter().find(|r| r.name == "glute_left").unwrap();
+        assert!((breast.center[0] - 3.0).abs() < 0.001);
+        assert!((breast.radius[0] - 3.54).abs() < 0.001);
+        assert!((glute.center[0] - 2.975).abs() < 0.001);
+        assert!((glute.radius[0] - 4.725).abs() < 0.001);
+    }
+
+    #[test]
+    fn source_and_raven_share_anatomical_motion_parameters() {
+        let gla = synthetic_source_gla();
+        let raven = JiggleProfile::auto_humanoid(&synthetic_raven_glm(), &gla)
+            .unwrap().unwrap();
+        let source = JiggleProfile::auto_source_humanoid(&synthetic_source_glm(), &gla, None)
+            .unwrap().unwrap();
+        for source_region in &source.regions {
+            let stock = raven.regions.iter()
+                .find(|r| r.name == source_region.name).unwrap();
+            assert_eq!(source_region.response, stock.response);
+            assert_eq!(source_region.stiffness, stock.stiffness);
+            assert_eq!(source_region.damping, stock.damping);
+            assert_eq!(source_region.max_offset, stock.max_offset);
+            assert_eq!(source_region.strength, stock.strength);
+            assert_eq!(source_region.solver_root_bone, stock.solver_root_bone);
+        }
+    }
+
+    #[test]
+    fn source_jiggle_uses_geometry_not_raven_surface_names() {
+        let gla = synthetic_source_gla();
+        let glm = synthetic_source_glm();
+        assert!(JiggleProfile::auto_humanoid(&glm, &gla).unwrap().is_none());
+        let profile = JiggleProfile::auto_source_humanoid(&glm, &gla, None)
+            .expect("Source profile compilation")
+            .expect("Source profile should detect weighted torso and hips");
+        assert_eq!(profile.region_count(), 4);
+        assert!(profile.gpu_supported());
+        assert!(profile.affects_surface(0, 0));
+        assert!(!profile.affects_surface(0, 1));
+        for start in [0, 16, 32, 48] {
+            let (region, weight, _) = profile.gpu_vertex_binding(0, 0, start + 5);
+            assert!(region < 4 && weight > 0.01,
+                "Source body quadrant {start} should receive jiggle, got {region} {weight}");
+        }
+        assert_eq!(profile.gpu_vertex_binding(0, 1, 0).1, 0.0);
+    }
+
+    #[test]
+    fn source_size_morph_rejects_unrelated_bones_in_a_shared_body_mesh() {
+        let gla = synthetic_source_gla();
+        let source = JiggleProfile::auto_source_humanoid(&synthetic_source_glm(), &gla, None)
+            .unwrap().unwrap();
+        let stock = JiggleProfile::auto_humanoid(&synthetic_raven_glm(), &gla)
+            .unwrap().unwrap();
+        // Synthetic model's pelvis (0) and thoracic (3) share one Source
+        // body mesh with unrelated vertices (10 stands in for a hand bone).
+        let bones = |bone| [bone, 0, 0, 0];
+        let weights = [1.0, 0.0, 0.0, 0.0];
+        assert_eq!(source.size_skin_gate(true, &bones(0), &weights, 1), 1.0);
+        assert_eq!(source.size_skin_gate(true, &bones(3), &weights, 1), 0.0);
+        assert_eq!(source.size_skin_gate(true, &bones(10), &weights, 1), 0.0);
+        assert_eq!(source.size_skin_gate(false, &bones(3), &weights, 1), 1.0);
+        assert_eq!(source.size_skin_gate(false, &bones(10), &weights, 1), 0.0);
+        // A partial hip influence gets a smooth fade rather than creating a
+        // hard split where neighboring vertices have mixed skin weights.
+        let midway = source.size_skin_gate(true, &[0, 10, 0, 0], &[0.24, 0.76, 0.0, 0.0], 2);
+        assert!(midway > 0.0 && midway < 1.0);
+        // JKA retains its old surface-local shape semantics unchanged.
+        assert_eq!(stock.size_skin_gate(true, &bones(10), &weights, 1), 1.0);
+    }
+
+    #[test]
+    fn source_jiggle_rebased_pivots_are_used_for_anatomical_search() {
+        let gla = synthetic_source_gla();
+        let mut glm = synthetic_source_glm();
+        // A taller Source rest skeleton, expressed in its own converted GLM
+        // coordinates. Without pivots the model's tissue is outside the GLA
+        // chest/hip windows; with pivots it has valid search windows.
+        for surface in &mut glm.lods[0].surfaces {
+            for vertex in &mut surface.vertices {
+                vertex.position[2] += 20.0;
+            }
+        }
+        assert!(JiggleProfile::auto_source_humanoid(&glm, &gla, None).unwrap().is_none());
+        let pivots = gla.skeleton.iter().map(|bone| {
+            [bone.base_pose[0][3], bone.base_pose[1][3], bone.base_pose[2][3] + 20.0]
+        }).collect::<Vec<_>>();
+        let profile = JiggleProfile::auto_source_humanoid(&glm, &gla, Some(&pivots))
+            .unwrap().expect("native pivots must track shifted anatomy");
+        assert_eq!(profile.region_count(), 4);
+    }
 
     #[test]
     fn worker_snapshot_contains_raw_offset_at_actual_solve_time() {

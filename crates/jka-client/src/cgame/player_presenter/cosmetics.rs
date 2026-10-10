@@ -33,7 +33,7 @@ pub(in crate::cgame::player_presenter) fn model_bolt_matrix_timed(
 /// Profile is intentionally studio-lit rather than map-lightgrid-lit. This bakes
 /// a key + soft fill from vertex normals into preview-only shaderRGBA. Gameplay
 /// models continue through the configured lighting.
-pub fn apply_profile_studio_light(draws: &mut [DynamicModelSurface]) {
+pub fn apply_profile_studio_light(draws: &mut [DynamicModelSurface], cinematic: bool) {
     for surface in draws {
         let vertices = Arc::make_mut(&mut surface.vertices);
         for vertex in vertices.iter_mut() {
@@ -44,7 +44,11 @@ pub fn apply_profile_studio_light(draws: &mut [DynamicModelSurface]) {
             let fill = normal
                 .dot(Vec3::new(0.55, 0.20, -0.35).normalize())
                 .max(0.0);
-            let light = (0.38 + 0.72 * key + 0.20 * fill).min(1.18);
+            let light = if cinematic {
+                (0.18 + 0.53 * key + 0.12 * fill).min(0.83)
+            } else {
+                (0.38 + 0.72 * key + 0.20 * fill).min(1.18)
+            };
             for channel in 0..3 {
                 vertex.color[channel] *= light;
             }

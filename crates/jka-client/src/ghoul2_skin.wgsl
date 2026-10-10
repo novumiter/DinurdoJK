@@ -13,6 +13,10 @@ override ENABLE_LEGACY_FOG: bool = false;
 // replaying explicitly-authored `glow` stages. Pipeline-specialize that replay
 // rather than changing material classification or blend behavior.
 override FORCE_FOG_BLACK: bool = false;
+// Only the spectator visible-player erase pipeline uses this. Move the depth
+// test toward the eye by this many JKA world units without changing the
+// rasterized silhouette (screen XY/W remain exactly as before).
+override SPEC_ERASE_DEPTH_TOLERANCE: f32 = 0.0;
 // A Source 1 ($bumpmap / $phong) material. False compiles the normal-map
 // sample, the per-pixel tangent frame and all of Valve's phong out of the
 // module, so every JKA model keeps exactly the cost it had. It must be false
@@ -245,6 +249,15 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
 
     var output: VertexOut;
     output.clip_position = camera.view_proj * vec4<f32>(render_position, 1.0);
+    if (SPEC_ERASE_DEPTH_TOLERANCE > 0.0) {
+        let toward_eye = camera.camera_pos_time.xyz - render_position;
+        let eye_distance = length(toward_eye);
+        let shift = min(SPEC_ERASE_DEPTH_TOLERANCE, eye_distance * 0.5);
+        let nearer_position = render_position + toward_eye * (shift / max(eye_distance, 0.0001));
+        let nearer_clip = camera.view_proj * vec4<f32>(nearer_position, 1.0);
+        // Keep the original pixel footprint; only bias the depth test.
+        output.clip_position.z = nearer_clip.z * (output.clip_position.w / nearer_clip.w);
+    }
     // `tcGen environment` (packed into params.w; see ghoul2_specular_viewer /
     // Ghoul2GpuSkinning::env_map): q3's RB_CalcEnvironmentTexCoords, done
     // directly in render space (an orthogonal axis relabeling of JKA space,

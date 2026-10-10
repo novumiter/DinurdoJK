@@ -40,6 +40,7 @@ fn region() -> Region {
         slot: 2,
         level: 0.0,
         triangles: rectangle([0., 0.], [64., 64.]),
+        bounds: None,
     }
 }
 fn basin() -> Geometry {
@@ -151,6 +152,24 @@ fn subcell_wall_splits_wet_connectivity_in_deep_water() {
     assert_eq!(
         grid.faces_x[y * (grid.size[0] as usize + 1) + x].boundary,
         Boundary::Wall
+    );
+}
+
+#[test]
+fn sloped_waterline_is_an_overtoppable_bank_not_a_wall() {
+    let mut g = basin();
+    g.solids[0].planes[4] = Plane {
+        normal: [-1.0, 0.0, 1.0],
+        distance: -16.0,
+    };
+    let grid = bake(g, region());
+    assert_eq!(cell(&grid, [8.0, 24.0]).class, Class::Wet);
+    assert_eq!(cell(&grid, [24.0, 24.0]).class, Class::Dry);
+    let x = ((16.0 - grid.origin[0]) / grid.cell_size) as usize;
+    let y = ((24.0 - grid.origin[1]) / grid.cell_size) as usize;
+    assert_eq!(
+        grid.faces_x[y * (grid.size[0] as usize + 1) + x].boundary,
+        Boundary::Bank
     );
 }
 
@@ -336,4 +355,38 @@ fn oversized_grid_is_rejected_without_coarsening_or_guessing_depth() {
     assert!(atlas.grids.is_empty());
     assert_eq!(atlas.warnings.len(), 1);
     assert!(atlas.warnings[0].contains("retain legacy water"));
+}
+
+#[test]
+fn sparse_l_tiles_skip_the_empty_envelope_corner_and_stitch_open_faces() {
+    let mut exact = rectangle([0.0, 0.0], [512.0, 256.0]);
+    exact.extend(rectangle([0.0, 256.0], [256.0, 512.0]));
+    let tile = |bounds: [[f32; 2]; 2]| Region {
+        slot: 4,
+        level: 0.0,
+        triangles: exact.clone(),
+        bounds: Some(bounds),
+    };
+    let geometry = Geometry {
+        solids: vec![box_solid([-64.0, -64.0, -128.0], [576.0, 576.0, -16.0])],
+        triangles: vec![],
+        liquids: vec![],
+    };
+    let atlas = geometry
+        .bake(
+            &[
+                tile([[0.0, 0.0], [256.0, 256.0]]),
+                tile([[0.0, 256.0], [256.0, 512.0]]),
+                tile([[256.0, 0.0], [512.0, 256.0]]),
+            ],
+            Options::default(),
+        )
+        .unwrap();
+    assert_eq!(atlas.grids.len(), 3);
+    assert_eq!(atlas.grids.iter().map(|g| g.cells.len()).sum::<usize>(), 768);
+    let lower_left = atlas.grids.iter().find(|g| g.origin == [0.0, 0.0]).unwrap();
+    let nx = lower_left.size[0] as usize;
+    let ny = lower_left.size[1] as usize;
+    assert_eq!(lower_left.faces_x[8 * (nx + 1) + nx].boundary, Boundary::Open);
+    assert_eq!(lower_left.faces_y[ny * nx + 8].boundary, Boundary::Open);
 }

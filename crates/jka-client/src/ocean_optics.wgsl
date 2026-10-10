@@ -49,6 +49,17 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
     if (count == 0u) {
         return true;
     }
+    let bounds = ocean.mask_bounds[slot];
+    if (any(p < bounds.xy) || any(p > bounds.zw)) {
+        return false;
+    }
+    let tile_xy = vec2<u32>(clamp(
+        floor((p - bounds.xy) / max(bounds.zw - bounds.xy, vec2<f32>(1.0e-4)) * 8.0),
+        vec2<f32>(0.0), vec2<f32>(7.0)));
+    let tile = tile_xy.y * 8u + tile_xy.x;
+    let code = (ocean.mask_tiles[slot][tile >> 4u] >> ((tile & 15u) * 2u)) & 3u;
+    if (code == 1u) { return false; }
+    if (code == 2u) { return true; }
     let first = u32(range.x);
     let tolerance = 0.75;
     for (var i = 0u; i < count; i = i + 1u) {

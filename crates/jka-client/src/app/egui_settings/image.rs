@@ -1,7 +1,7 @@
 //! Image.
 use crate::app::egui_settings::{
-    index_of, quality_row, quality_table_row, segmented_row, theme, ui, App, DetailTextureMode,
-    PvsMode, RenderCommand, TextureFilter,
+    index_of, quality_row, quality_table_row, segmented_row, theme, ui, App, PvsMode,
+    RenderCommand, TextureFilter,
 };
 
 impl App {
@@ -74,70 +74,21 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
-        const DETAIL_TEXTURES: [(DetailTextureMode, &str); 5] = [
-            (DetailTextureMode::Off, "Off"),
-            (DetailTextureMode::Neutral2x, "Neutral 2×"),
-            (DetailTextureMode::Linear2x, "Linear 2×"),
-            (DetailTextureMode::DstColorOne, "DstColor + One"),
-            (DetailTextureMode::Multiply, "Multiply"),
-        ];
-        if let Some(target) = quality_table_row(
-            ui,
-            "Detail textures",
-            "Adds the selected textures/japro/detail/* image as a synthetic high-frequency layer on \
-             eligible opaque BSP materials. Modes expose several blend equations for A/B testing; \
-             authored detail stages are left untouched. Off keeps the stripped fast BSP path.",
-            theme::Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
-            self.video.detail_textures,
-            &DETAIL_TEXTURES,
-            0,
-        ) {
-            let current = index_of(&DETAIL_TEXTURES, self.video.detail_textures, 0);
-            self.video_selected = ui::VIDEO_ROW_DETAIL_TEXTURES;
-            self.change_video_setting(target as i32 - current as i32);
-        }
-
-        ui.add_enabled_ui(self.video.detail_textures != DetailTextureMode::Off, |ui| {
         theme::row(
             ui,
-            "Detail distance fade",
-            "Ports the standard distance-based detail blend: camera/world distance is divided by the fade distance, raised to the fourth power and clamped, then the detail contribution is lerped back to its neutral identity. This avoids alpha/transparency rendering and keeps the normal opaque BSP path.",
-            theme::Reset::None,
+            "Detail textures",
+            "Adds textures/japro/detail/* to eligible opaque BSP materials using neutral 2× modulation. Authored detail stages are unchanged.",
+            theme::Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
             |ui| {
-                let mut enabled = self.video.detail_texture_fade;
+                let mut enabled = self.video.detail_textures;
                 if ui.checkbox(&mut enabled, "Enabled").changed() {
-                    self.video.detail_texture_fade = enabled;
-                    self.render_command(RenderCommand::SetDetailTextureFade {
-                        enabled,
-                        distance: self.video.detail_texture_fade_distance,
-                    });
+                    self.video_selected = ui::VIDEO_ROW_DETAIL_TEXTURES;
+                    self.video.detail_textures = enabled;
+                    self.render_command(RenderCommand::SetDetailTextures(enabled));
                     self.mark_config_dirty();
                 }
             },
         );
-        });
-
-        if self.video.detail_texture_fade && self.video.detail_textures != DetailTextureMode::Off {
-            theme::row(
-                ui,
-                "Detail fade distance",
-                "Distance in JKA map units where the ported distance fade reaches the neutral/no-detail result. The reference technique uses 512 units.",
-                theme::Reset::None,
-                |ui| {
-                    let mut value = self.video.detail_texture_fade_distance;
-                    let readout = format!("{value:.0}");
-                    if theme::slider(ui, &mut value, 64.0..=8192.0, &readout) {
-                        self.video.detail_texture_fade_distance = value;
-                        self.render_command(RenderCommand::SetDetailTextureFade {
-                            enabled: self.video.detail_texture_fade,
-                            distance: value,
-                        });
-                        self.mark_config_dirty();
-                    }
-                },
-            );
-        }
-
     }
 
     pub(in crate::app::egui_settings) fn egui_visibility(&mut self, ui: &mut egui::Ui) {

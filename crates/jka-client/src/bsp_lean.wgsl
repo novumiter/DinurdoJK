@@ -138,7 +138,7 @@ override ENABLE_STATIC_BSP_AO: bool = true; // cached BSP ambient occlusion
 override ENABLE_DELUXE: bool = true; // directional baked lighting (deluxemap / lightgrid) on PBR surfaces
 override ENABLE_DELUXE_SPECULAR: bool = true; // GGX lobe from the baked light direction
 override ENABLE_PLANAR_DEBUG: bool = true; // r_planarDebug views
-override DETAIL_TEXTURE_MODE: u32 = 0u;
+override ENABLE_DETAIL_TEXTURES: bool = false;
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
@@ -2276,9 +2276,8 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         surface_uv = parallax_uv(input, shared_frame);
     }
     var source_sample = textureSample(base_texture, base_sampler, surface_uv);
-    if (DETAIL_TEXTURE_MODE != 0u && (material.header.w & 2u) != 0u) {
-        // Synthetic fallback only. Keep scale fixed at the authored-style
-        // tcMod scale 8 8 while exposing several blend equations for live A/B.
+    if (ENABLE_DETAIL_TEXTURES && (material.header.w & 2u) != 0u) {
+        // Synthetic neutral 2x fallback only, at authored-style tcMod scale 8 8.
         // Authored stages are never routed through this block.
         //
         // When distance fade is enabled, resolve its weight *before* sampling
@@ -2301,26 +2300,12 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
                 detail_sampler,
                 surface_uv * 8.0
             ).rgb;
-            var detail_factor = vec3<f32>(1.0);
-            if (DETAIL_TEXTURE_MODE == 1u) {
-                // Mid-grey-neutral doubled modulation. Color textures are sampled
-                // through an sRGB view in this renderer, so recover the encoded
-                // detail value before applying the fixed-function-style factor.
-                let lo = detail_linear * 12.92;
-                let hi = 1.055 * pow(max(detail_linear, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
-                let detail_encoded = select(lo, hi, detail_linear > vec3<f32>(0.0031308));
-                detail_factor = detail_encoded * 2.0;
-            } else if (DETAIL_TEXTURE_MODE == 2u) {
-                // blendFunc GL_DST_COLOR GL_SRC_COLOR in the renderer's linear space:
-                // src*dst + dst*src == 2*src*dst.
-                detail_factor = detail_linear * 2.0;
-            } else if (DETAIL_TEXTURE_MODE == 3u) {
-                // Previous test: blendFunc GL_DST_COLOR GL_ONE.
-                detail_factor = vec3<f32>(1.0) + detail_linear;
-            } else {
-                // Plain modulation: blendFunc GL_DST_COLOR GL_ZERO.
-                detail_factor = detail_linear;
-            }
+            // Neutral 2x: recover the encoded sRGB detail before modulation.
+            // 128 grey stays approximately neutral instead of darkening the base.
+            let lo = detail_linear * 12.92;
+            let hi = 1.055 * pow(max(detail_linear, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
+            let detail_encoded = select(lo, hi, detail_linear > vec3<f32>(0.0031308));
+            let detail_factor = detail_encoded * 2.0;
 
             let faded_detail_factor = mix(vec3<f32>(1.0), detail_factor, detail_weight);
             source_sample = vec4<f32>(source_sample.rgb * faded_detail_factor, source_sample.a);

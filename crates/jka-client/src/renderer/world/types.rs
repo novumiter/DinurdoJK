@@ -100,6 +100,12 @@ pub(in crate::renderer) struct RuntimeOceanClipmap {
     pub(in crate::renderer) active_range: std::ops::Range<u32>,
     pub(in crate::renderer) current_half_cells: i32,
     pub(in crate::renderer) current_minimum_level: u32,
+    /// Final per-surface centre after global and outer-ring snapping. NaN
+    /// forces the first rendered frame to install footprint-pruned indices.
+    pub(in crate::renderer) current_centre: [f32; 2],
+    /// Exact BSP cluster whose visible water pieces shaped `active_range`.
+    /// `None` is the conservative PVS-off/outside-the-tree footprint.
+    pub(in crate::renderer) current_pvs_cluster: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -332,9 +338,12 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     /// Real outlines of `ocean_surfaces`, by the slot baked into each clipmap.
     pub(in crate::renderer) ocean_masks: Arc<crate::ocean::OceanMasks>,
+    /// Fine footprints for exact FULL water pieces, indexed in parallel with
+    /// `full_batches`; unioned only when the camera changes BSP cluster.
+    pub(in crate::renderer) ocean_pvs_footprints: crate::ocean::OceanPvsFootprints,
     /// Runtime-rebuildable promoted-water index ranges, one per surface and
-    /// mesh quality. These are rewritten only when amplitude or 3D-distance
-    /// crosses an LOD threshold.
+    /// mesh quality. These are rewritten only when amplitude, 3D-distance,
+    /// snapped centre or the camera's BSP cluster changes.
     pub(in crate::renderer) runtime_ocean_clipmaps: Vec<RuntimeOceanClipmap>,
     pub(in crate::renderer) inline_models: Vec<InlineModelGpu>,
     pub(in crate::renderer) vertex_buffer: wgpu::Buffer,

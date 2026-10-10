@@ -804,13 +804,18 @@ pub struct ClientGameState {
     /// OpenJK cg.eventSequence / cg.predictableEvents. These track events
     /// already played from committed local prediction so later predicted
     /// corrections can be recognized without replaying every render frame.
+    /// Unlike OpenJK's dispatch counter this holds one past the highest
+    /// absolute playerState.eventSequence index stored in `predictable_events`,
+    /// because `check_changed_predictable_events` compares it against absolute
+    /// indices. See the note at its increment site.
     predicted_event_sequence: i32,
     predictable_events: [i32; MAX_PREDICTED_EVENTS],
-    /// Highest playerState eventSequence already played. Predicted events come
-    /// from the displayed state, which is re-predicted every frame with a
-    /// provisional command, so the previous frame's state alone is not a
-    /// reliable "already played" marker.
+    /// Highest committed-prediction eventSequence already played. This guards
+    /// against duplicates across successive replays and snapshot corrections.
+    /// See the predictable-event parity audit before changing this gate.
     predicted_event_high: Option<i32>,
+    /// `cg_correctPredictedEvents`. Off by default, matching every JKA fork.
+    correct_predicted_events: bool,
     /// Last authoritative/predicted playerState reward counters seen. This
     /// de-duplicates the same transition when both snapshot and prediction
     /// paths observe it while still making demos/follow views work.
@@ -848,6 +853,7 @@ impl Default for ClientGameState {
             predicted_event_sequence: 0,
             predictable_events: [0; MAX_PREDICTED_EVENTS],
             predicted_event_high: None,
+            correct_predicted_events: false,
             reward_baseline: None,
             presentation_events: PresentationEventQueue::default(),
             pending_event_traces: VecDeque::new(),
@@ -870,6 +876,12 @@ impl ClientGameState {
 
     pub fn set_plugin_disable(&mut self, bits: i32) {
         self.plugin_disable = bits;
+    }
+
+    /// `cg_correctPredictedEvents`: run the OpenJK correction gate that Raven
+    /// left commented out. See `transition_predicted_player_state`.
+    pub fn set_predicted_event_correction(&mut self, enabled: bool) {
+        self.correct_predicted_events = enabled;
     }
 
     pub fn set_presentation_viewer(&mut self, viewer: PresentationViewer) {
@@ -1185,13 +1197,10 @@ impl ClientGameState {
     }
 
     /// OpenJK `CG_TransitionPlayerState` event portion for the local predicted
-    /// player. `ps` and `ops` are the presented state and the previous frame's
-    /// presented state (stock cgame runs a real usercmd every frame, so its
-    /// predicted state is the presented one). Events must fire with the state
-    /// the eye and model are drawn from; firing them from the trailing
-    /// committed state delayed every predicted effect, and made step smoothing
-    /// cancel a rise that had already been shown. `predicted_event_high` stops
-    /// the per-frame re-prediction from replaying an event.
+    /// player. Live callers supply the current and previous recorded-command
+    /// predicted states; unsent render-frame Pmove is presentation-only and
+    /// must not commit one-shot events. `predicted_event_high` guards against
+    /// duplicate events across replay and presentation frames.
     pub fn transition_predicted_player_state(
         &mut self,
         ps: &PlayerState,
@@ -1206,10 +1215,21 @@ impl ClientGameState {
 
         self.check_reward_notices(ps);
         self.check_playerstate_events(ps, ops, server_time)?;
-        // Port the correction gate as requested by the live handoff. Current
-        // OpenJK keeps this routine available even where a callsite may be
-        // disabled; running it after the ordinary transition cannot duplicate
-        // events just stored above, but can replace a recently mispredicted one.
+        // Correction gate, `cg_correctPredictedEvents`. Every JKA lineage
+        // (Raven/OpenJK, EternalJK, jaMME, jaPRO, TaystJK, and JKA single
+        // player) ships the equivalent call commented out in
+        // CG_PredictPlayerState; Quake 3 ran it. Off is therefore the
+        // fork-parity default. On, it catches the one case the sequence
+        // arithmetic above cannot see: committed prediction is re-derived from
+        // the latest snapshot every frame, so a replay can change which event
+        // occupies an absolute sequence index without moving the sequence
+        // number. Comparing against `predictable_events` can only replace a
+        // stored event, never duplicate one just dispatched, but it does mean
+        // a corrected event plays a sound or effect that Raven's build never
+        // played.
+        if !self.correct_predicted_events {
+            return Ok(());
+        }
         self.check_changed_predictable_events(ps, server_time)
     }
 
@@ -1297,7 +1317,15 @@ impl ClientGameState {
                 let parm = ps.field_i32(&format!("eventParms[{slot}]")).unwrap_or(0);
                 self.push_predicted_player_event(ps, event, parm, server_time)?;
                 self.predictable_events[index as usize & (MAX_PREDICTED_EVENTS - 1)] = event;
-                self.predicted_event_sequence = self.predicted_event_sequence.saturating_add(1);
+                // OpenJK does `cg.eventSequence++` here, which only counts
+                // dispatches. Its sole consumer is
+                // CG_CheckChangedPredictableEvents, which compares the count
+                // against an absolute playerState.eventSequence index -- and
+                // JKA gets away with the mismatch only because Raven commented
+                // that call out. This port keeps the call live, so the marker
+                // has to live in the same (absolute) domain as the ring index.
+                self.predicted_event_sequence =
+                    self.predicted_event_sequence.max(index.saturating_add(1));
             }
         }
         Ok(())
@@ -3882,6 +3910,121 @@ mod tests {
 
         game.transition_predicted_player_state(&corrected, &corrected, 1_016).unwrap();
         assert!(game.drain_presentation_events().is_empty());
+    }
+
+    #[test]
+    fn corrected_event_is_recognized_when_joining_at_a_nonzero_event_sequence() {
+        // Connecting mid-session starts the playerState well past zero. The
+        // ring is written at the absolute index, so the marker that guards
+        // `check_changed_predictable_events` has to be absolute too, or every
+        // correction in the session is skipped.
+        let mut game = ClientGameState::new();
+        game.set_predicted_event_correction(true);
+        let old = predicted_ps(3, 300, 0, 0, 0, 0);
+        let played = predicted_ps(
+            3,
+            302,
+            EntityEvent::EV_JUMP.as_i32(),
+            1,
+            EntityEvent::EV_ROLL.as_i32(),
+            2,
+        );
+        game.transition_predicted_player_state(&played, &old, 1_000).unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 2);
+
+        // A replay swapped the event at absolute index 300. The sequence number
+        // did not move and `ops` already carries the correction, so only the
+        // stored ring can still see it.
+        let corrected = predicted_ps(
+            3,
+            302,
+            EntityEvent::EV_STEP_8.as_i32(),
+            5,
+            EntityEvent::EV_ROLL.as_i32(),
+            2,
+        );
+        game
+            .transition_predicted_player_state(&corrected, &corrected, 1_008)
+            .unwrap();
+        let events = game.drain_presentation_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].event, events[0].parm), (EntityEvent::EV_STEP_8, 5));
+
+        game
+            .transition_predicted_player_state(&corrected, &corrected, 1_016)
+            .unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+    }
+
+    #[test]
+    fn event_sequence_regression_then_recovery_keeps_the_corrected_event() {
+        // A prediction miss can replay fewer events, dropping eventSequence,
+        // and the next replay can put a different event back at the same
+        // absolute index. `predicted_event_high` suppresses the identical
+        // replay; only the ring comparison can tell the changed one apart.
+        let mut game = ClientGameState::new();
+        game.set_predicted_event_correction(true);
+        let old = predicted_ps(3, 10, 0, 0, 0, 0);
+        let played = predicted_ps(
+            3,
+            12,
+            EntityEvent::EV_JUMP.as_i32(),
+            1,
+            EntityEvent::EV_ROLL.as_i32(),
+            2,
+        );
+        game.transition_predicted_player_state(&played, &old, 1_000).unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 2);
+
+        // Regression: the replay no longer produces those events.
+        let regressed = predicted_ps(3, 10, 0, 0, 0, 0);
+        game
+            .transition_predicted_player_state(&regressed, &played, 1_008)
+            .unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+
+        // Recovery with a different event at index 10 and the same event at
+        // index 11: exactly one dispatch, and no replay of the unchanged one.
+        let recovered = predicted_ps(
+            3,
+            12,
+            EntityEvent::EV_STEP_8.as_i32(),
+            7,
+            EntityEvent::EV_ROLL.as_i32(),
+            2,
+        );
+        game
+            .transition_predicted_player_state(&recovered, &regressed, 1_016)
+            .unwrap();
+        let events = game.drain_presentation_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].event, events[0].parm), (EntityEvent::EV_STEP_8, 7));
+    }
+
+    #[test]
+    fn correction_gate_is_off_until_cg_correctpredictedevents_is_set() {
+        // Raven/OpenJK parity: a changed event at an already played absolute
+        // index is left alone unless the gate is explicitly enabled.
+        let mut game = ClientGameState::new();
+        let old = predicted_ps(3, 300, 0, 0, 0, 0);
+        let played = predicted_ps(3, 302, EntityEvent::EV_JUMP.as_i32(), 1, 0, 0);
+        game.transition_predicted_player_state(&played, &old, 1_000).unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 1);
+
+        let corrected = predicted_ps(3, 302, EntityEvent::EV_STEP_8.as_i32(), 5, 0, 0);
+        game
+            .transition_predicted_player_state(&corrected, &corrected, 1_008)
+            .unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+
+        // Same state, gate on: the stored ring entry is now corrected once.
+        game.set_predicted_event_correction(true);
+        game
+            .transition_predicted_player_state(&corrected, &corrected, 1_016)
+            .unwrap();
+        let events = game.drain_presentation_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].event, events[0].parm), (EntityEvent::EV_STEP_8, 5));
     }
 
     #[test]

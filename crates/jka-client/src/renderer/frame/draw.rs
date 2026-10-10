@@ -205,6 +205,16 @@ impl Renderer {
             self.ocean_visibility.begin_frame(&self.device);
         }
         let mut plan = self.frame_plan;
+        // The full post PSO compiles only for a consuming effect. The request is
+        // queued by rebuild_frame_plan, but its worker result must also be
+        // polled while the settings stay unchanged; otherwise the gamma-copy
+        // fallback could remain permanently active after a cold switch to SSR.
+        // Once installed (or in compact mode) this adds no pipeline-manager work.
+        if plan.use_post && !plan.gamma_only_post && !plan.rain_only_post
+            && self.post_pipeline.is_none()
+        {
+            self.ensure_post_pipeline(true);
+        }
         let rt_taa_active = self.rt_taa_active();
         if self.video_depth_capture_requested() {
             // Export the exact linear depth texture used by the compositor/DOF
@@ -340,12 +350,12 @@ impl Renderer {
             clip_plane: [0.0; 4],
             render_flags: [
                 0,
-                (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)),
+                (u32::from(self.static_bsp_ao_enabled)
+                    | (u32::from(self.sky_fractal_override) << 1)
+                    | (u32::from(self.temporal_resolve_active()) << 2)),
                 self.classic_world_render_flags(),
                 if self.temporal_resolve_active() {
                     self.taa_frame_index
-                } else if self.rt_local_radiance_wanted() {
-                    self.ray_traced_shadows.as_ref().map_or(0, |rt| rt.sun_shadow_history.sampling_frame())
                 } else {
                     0
                 },
@@ -4550,6 +4560,8 @@ impl Renderer {
                 self.ssr_visibility_pipeline.as_ref(),
                 self.ssr_visibility_bind_group.as_ref(),
             ) {
+                self.gpu_profiler
+                    .write_encoder_timestamp(&mut encoder, GpuPass::SsrVisibility, false);
                 if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("JKA resolved final scene depth"),
@@ -4575,6 +4587,9 @@ impl Renderer {
                     if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
                     pass.draw(0..3, 0..1);
                 }
+                drop(pass);
+                self.gpu_profiler
+                    .write_encoder_timestamp(&mut encoder, GpuPass::SsrVisibility, true);
             }
         }
 
@@ -4621,6 +4636,8 @@ impl Renderer {
                 (&self.targets.ssr_history, &self.ssr_temporal_bind_groups)
             {
                 let history_write_index = 1 - self.ssr_history_read_index;
+                self.gpu_profiler
+                    .write_encoder_timestamp(&mut encoder, GpuPass::SsrTrace, false);
                 let color_attachments = [
                     Some(wgpu::RenderPassColorAttachment {
                         view: &history.radiance_views[history_write_index],
@@ -4657,6 +4674,8 @@ impl Renderer {
                 if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
                 pass.draw(0..3, 0..1);
                 drop(pass);
+                self.gpu_profiler
+                    .write_encoder_timestamp(&mut encoder, GpuPass::SsrTrace, true);
                 self.ssr_history_read_index = history_write_index;
             }
         }

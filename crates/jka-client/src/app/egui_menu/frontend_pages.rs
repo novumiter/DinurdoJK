@@ -94,8 +94,10 @@ impl App {
             )
             .show_inside(root, |ui| {
                 ui.horizontal_centered(|ui| {
-                    theme::glow_label(ui, "DINURDOJK", 16.0, theme::TEXT);
-                    ui.add_space(14.0);
+                    if self.frontend_page != FrontendPage::Profile {
+                        theme::glow_label(ui, "DINURDOJK", 16.0, theme::TEXT);
+                        ui.add_space(14.0);
+                    }
                     let page = if self.overlay == OverlayMode::Video {
                         "SETTINGS"
                     } else {
@@ -244,7 +246,7 @@ impl App {
             FrontendPage::ServerBrowser => self.egui_server_browser_page(ui),
             FrontendPage::SoloGame => self.egui_solo_game_page(ui),
             FrontendPage::PlayDemo => self.egui_play_demo_page(ui),
-            FrontendPage::Profile => self.egui_profile_page(ui),
+            FrontendPage::Profile => self.egui_profile_studio(ui),
             FrontendPage::Controls => self.egui_controls_page(ui),
             FrontendPage::ChatLogs => self.egui_chat_log_browser_page(ui),
             FrontendPage::DeveloperTools => self.egui_developer_tools_page(ui),
@@ -270,11 +272,11 @@ impl App {
         if menu_action(
             ui,
             "Profile",
-            "Player identity, model, Force loadout, saber, and cosmetics.",
+            "Customize your character, Force, sabers, and appearance.",
             true,
         ) {
+            self.open_profile_studio(None);
             self.frontend_page = FrontendPage::Profile;
-            self.profile_preview_key = None;
             self.set_overlay(OverlayMode::Game);
             return;
         }

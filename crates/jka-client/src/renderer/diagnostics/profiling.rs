@@ -70,18 +70,88 @@ pub(in crate::renderer) enum GpuPass {
     // than it is: OceanSurface only covers the surface draw and OceanOptics
     // only the scene capture/composite.
     OceanSim = 27,
-    RtRadiance = 28,
-    // Independent finite-emitter HDR ray trace and denoise.
-    RtLocalRadiance = 29,
+    // Sub-timings inside Post: these never contribute again to frame_ms.
+    SsrVisibility = 28,
+    SsrTrace = 29,
 }
 
 impl GpuPass {
     pub(in crate::renderer) fn index(self) -> usize {
         self as usize
     }
+
+    /// Every pass, in query-index order. Used by reporters that walk a resolved
+    /// `GpuTiming` without knowing which passes the frame happened to run.
+    pub(in crate::renderer) const ALL: [Self; GPU_PASS_COUNT] = [
+        Self::Frame,
+        Self::Depth,
+        Self::HiZ,
+        Self::Cull,
+        Self::Cluster,
+        Self::World,
+        Self::Post,
+        Self::Ui,
+        Self::Grass,
+        Self::GrassPrepare,
+        Self::DynamicModels,
+        Self::OceanOptics,
+        Self::DynamicModelsTranslucent,
+        Self::RtBuild,
+        Self::RtSkin,
+        Self::RtAcceleration,
+        Self::RtVisibility,
+        Self::FxSpritesOpaque,
+        Self::FxSpritesTranslucent,
+        Self::LegacyDlights,
+        Self::Clouds,
+        Self::OceanSurface,
+        Self::RainSim,
+        Self::RainDraw,
+        Self::RainHaze,
+        Self::RainLens,
+        Self::WeatherFog,
+        Self::OceanSim,
+        Self::SsrVisibility,
+        Self::SsrTrace,
+    ];
+
+    pub(in crate::renderer) fn label(self) -> &'static str {
+        match self {
+            Self::Frame => "frame",
+            Self::Depth => "depth",
+            Self::HiZ => "hiz",
+            Self::Cull => "cull",
+            Self::Cluster => "cluster",
+            Self::World => "world",
+            Self::Post => "post",
+            Self::Ui => "ui",
+            Self::Grass => "grass",
+            Self::GrassPrepare => "grass_prepare",
+            Self::DynamicModels => "dynamic_models",
+            Self::OceanOptics => "ocean_optics",
+            Self::DynamicModelsTranslucent => "dynamic_models_translucent",
+            Self::RtBuild => "rt_build",
+            Self::RtSkin => "rt_skin",
+            Self::RtAcceleration => "rt_acceleration",
+            Self::RtVisibility => "rt_visibility",
+            Self::FxSpritesOpaque => "fx_sprites_opaque",
+            Self::FxSpritesTranslucent => "fx_sprites_translucent",
+            Self::LegacyDlights => "legacy_dlights",
+            Self::Clouds => "clouds",
+            Self::OceanSurface => "ocean_surface",
+            Self::RainSim => "rain_sim",
+            Self::RainDraw => "rain_draw",
+            Self::RainHaze => "rain_haze",
+            Self::RainLens => "rain_lens",
+            Self::WeatherFog => "weather_fog",
+            Self::OceanSim => "ocean_sim",
+            Self::SsrVisibility => "ssr_visibility",
+            Self::SsrTrace => "ssr_trace",
+        }
+    }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub(in crate::renderer) struct GpuTiming {
     pub(in crate::renderer) milliseconds: [Option<f64>; GPU_PASS_COUNT],
 }
@@ -124,8 +194,6 @@ impl GpuTiming {
             GpuPass::OceanSim,
             GpuPass::RtBuild,
             GpuPass::RtVisibility,
-            GpuPass::RtRadiance,
-            GpuPass::RtLocalRadiance,
             GpuPass::World,
             GpuPass::Clouds,
             GpuPass::Post,
@@ -161,6 +229,11 @@ pub(in crate::renderer) struct GpuProfiler {
     pub(in crate::renderer) timestamp_inside_encoders: bool,
     pub(in crate::renderer) timestamp_inside_passes: bool,
     pub(in crate::renderer) latest: Option<GpuTiming>,
+    /// Bumped every time `latest` is replaced by a freshly resolved readback.
+    /// Readback lands a few frames after the frame it measured, so consumers
+    /// that record per render frame need this to tell a new measurement from
+    /// the previous one repeated.
+    pub(in crate::renderer) latest_generation: u64,
 }
 
 impl GpuProfiler {
@@ -180,6 +253,7 @@ impl GpuProfiler {
                 timestamp_inside_encoders: false,
                 timestamp_inside_passes: false,
                 latest: None,
+                latest_generation: 0,
             };
         }
 
@@ -221,6 +295,7 @@ impl GpuProfiler {
             timestamp_inside_encoders,
             timestamp_inside_passes,
             latest: None,
+            latest_generation: 0,
         }
     }
 
@@ -268,6 +343,7 @@ impl GpuProfiler {
             slot.pending = None;
             if completed.is_some() {
                 self.latest = completed;
+                self.latest_generation = self.latest_generation.wrapping_add(1);
             }
         }
 
@@ -395,5 +471,15 @@ impl GpuProfiler {
 
     pub(in crate::renderer) fn latest_frame_ms(&self) -> Option<f64> {
         self.latest.and_then(GpuTiming::frame_ms)
+    }
+
+    pub(in crate::renderer) fn latest_timing(&self) -> Option<GpuTiming> {
+        self.latest
+    }
+
+    /// Identity of the current `latest` measurement. Equal values across two
+    /// render frames mean both reported the same resolved GPU frame.
+    pub(in crate::renderer) fn latest_generation(&self) -> u64 {
+        self.latest_generation
     }
 }

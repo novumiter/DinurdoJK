@@ -5,14 +5,17 @@ use super::{
     brush_side_polygon, patch_vertex, Bsp, Plane, SurfaceKind, CONTENTS_SOLID, CONTENTS_TERRAIN,
     SURF_SKY,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 mod cache;
 mod promotion;
 mod report;
 pub use cache::fingerprint;
-pub use promotion::{cluster_water_faces, WaterCluster, WaterFace};
+pub use promotion::{
+    build_water_footprints, cluster_water_faces, WaterCluster, WaterFace, WaterFootprint,
+    WaterFootprintTile, WaterTriangle,
+};
 
 #[cfg(test)]
 mod tests;
@@ -21,7 +24,7 @@ mod tests;
 pub const CONTENTS_WATER: u32 = 0x0000_0004;
 const LIQUIDS: u32 = CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
 const EPS: f64 = 0.001;
-pub const CACHE_VERSION: u32 = 1;
+pub const CACHE_VERSION: u32 = 3;
 
 pub type FootprintTriangle = [[f32; 2]; 3];
 
@@ -31,6 +34,9 @@ pub struct Region {
     pub slot: u32,
     pub level: f32,
     pub triangles: Vec<FootprintTriangle>,
+    /// Optional sparse allocation rectangle. The exact triangles remain the
+    /// authority; this merely selects one occupied footprint tile to bake.
+    pub bounds: Option<[[f32; 2]; 2]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +113,9 @@ pub enum Boundary {
     Wall = 1,
     Outline = 2,
     Unsupported = 3,
+    /// Overtoppable terrain at the still-water line. Unlike a wall, this face
+    /// may become wet or dry as the future coastal free surface moves.
+    Bank = 4,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -164,6 +173,46 @@ struct Triangle {
     points: [[f32; 3]; 3],
     normal: [f64; 3],
     bounds: [[f32; 2]; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Blocker {
+    Bank,
+    Wall,
+}
+
+/// Surfaces steeper than 75 degrees from horizontal are rigid walls. Shallower
+/// faces are terrain banks which a wet/dry solver may overtop.
+const WALL_NORMAL_Z_MAX: f64 = 0.258_819_045_1;
+
+fn blocker_from_normal(normal: [f32; 3]) -> Blocker {
+    let length = normal
+        .iter()
+        .map(|v| f64::from(*v).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if length > 1e-9 && f64::from(normal[2]).abs() / length <= WALL_NORMAL_Z_MAX {
+        Blocker::Wall
+    } else {
+        Blocker::Bank
+    }
+}
+
+fn blocker_from_f64_normal(normal: [f64; 3]) -> Blocker {
+    let length = normal.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if length > 1e-9 && normal[2].abs() / length <= WALL_NORMAL_Z_MAX {
+        Blocker::Wall
+    } else {
+        Blocker::Bank
+    }
+}
+
+fn strongest_blocker(a: Option<Blocker>, b: Blocker) -> Option<Blocker> {
+    Some(if a == Some(Blocker::Wall) || b == Blocker::Wall {
+        Blocker::Wall
+    } else {
+        Blocker::Bank
+    })
 }
 
 /// Bake-only acceleration source. Inline/moving models are deliberately excluded.
@@ -382,8 +431,188 @@ impl Geometry {
                     .push(format!("slot {}: {e}; retain legacy water", region.slot)),
             }
         }
+        self.stitch_tiles(&mut atlas.grids);
         atlas.bake_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(atlas)
+    }
+
+    fn seam_face(
+        &self,
+        p: [f32; 2],
+        q: [f32; 2],
+        level: f32,
+        a: Cell,
+        b: Cell,
+        footprint: impl Iterator<Item = FootprintTriangle>,
+        solids: &[usize],
+        triangles: &[usize],
+    ) -> Face {
+        let mut mid = [(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5];
+        // Keep the midpoint explicitly finite even for malformed input; the
+        // caller only supplies aligned neighboring tile cells.
+        if mid.iter().any(|v| !v.is_finite()) {
+            mid = p;
+        }
+        let middle = self.column(mid, level, solids, triangles);
+        let blocker = solids
+            .iter()
+            .filter_map(|&s| self.solids[s].blocks(p, q, level))
+            .chain(
+                triangles
+                    .iter()
+                    .filter_map(|&t| self.triangles[t].blocks(p, q, level)),
+            )
+            .fold(None, strongest_blocker);
+        let exact: Vec<_> = footprint.collect();
+        let boundary = if blocker == Some(Blocker::Wall) {
+            Boundary::Wall
+        } else if blocker == Some(Blocker::Bank) || a.class == Class::Dry || b.class == Class::Dry {
+            Boundary::Bank
+        } else if a.class == Class::Outside
+            || b.class == Class::Outside
+            || a.class == Class::Outline
+            || b.class == Class::Outline
+            || !segment_covered(p, q, exact.into_iter())
+        {
+            Boundary::Outline
+        } else if a.class != Class::Wet
+            || b.class != Class::Wet
+            || middle.bed.is_none()
+            || middle.overhang
+        {
+            Boundary::Unsupported
+        } else {
+            Boundary::Open
+        };
+        Face {
+            boundary,
+            crest: middle.bed.map_or(f32::NAN, |v| v.max(a.bed).max(b.bed)),
+        }
+    }
+
+    fn stitch_tiles(&self, grids: &mut [Grid]) {
+        let key = |grid: &Grid, origin: [f32; 2]| {
+            (
+                grid.slot,
+                grid.level.to_bits(),
+                grid.cell_size.to_bits(),
+                (origin[0] / grid.cell_size).round() as i64,
+                (origin[1] / grid.cell_size).round() as i64,
+            )
+        };
+        let lookup: HashMap<_, _> = grids
+            .iter()
+            .enumerate()
+            .map(|(index, grid)| (key(grid, grid.origin), index))
+            .collect();
+        let candidates: Vec<(Vec<usize>, Vec<usize>)> = grids
+            .iter()
+            .map(|grid| {
+                let a_max = [
+                    grid.origin[0] + grid.size[0] as f32 * grid.cell_size,
+                    grid.origin[1] + grid.size[1] as f32 * grid.cell_size,
+                ];
+                let overlaps = |bounds: [[f32; 2]; 2]| {
+                    (0..2).all(|axis| {
+                        bounds[1][axis] + EPS as f32 >= grid.origin[axis] - grid.cell_size
+                            && bounds[0][axis] - EPS as f32 <= a_max[axis] + grid.cell_size
+                    })
+                };
+                (
+                    self.solids
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, value)| overlaps(value.bounds).then_some(i))
+                        .collect(),
+                    self.triangles
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, value)| overlaps(value.bounds).then_some(i))
+                        .collect(),
+                )
+            })
+            .collect();
+
+        for i in 0..grids.len() {
+            let right_origin = [
+                grids[i].origin[0] + grids[i].size[0] as f32 * grids[i].cell_size,
+                grids[i].origin[1],
+            ];
+            let top_origin = [
+                grids[i].origin[0],
+                grids[i].origin[1] + grids[i].size[1] as f32 * grids[i].cell_size,
+            ];
+            for (axis, neighbour) in [
+                (0usize, lookup.get(&key(&grids[i], right_origin)).copied()),
+                (1usize, lookup.get(&key(&grids[i], top_origin)).copied()),
+            ] {
+                let Some(j) = neighbour.filter(|&j| j != i) else { continue };
+                let mut solid_candidates = candidates[i].0.clone();
+                solid_candidates.extend(candidates[j].0.iter().copied());
+                solid_candidates.sort_unstable();
+                solid_candidates.dedup();
+                let mut triangle_candidates = candidates[i].1.clone();
+                triangle_candidates.extend(candidates[j].1.iter().copied());
+                triangle_candidates.sort_unstable();
+                triangle_candidates.dedup();
+                let (a, b) = if i < j {
+                    let (left, right) = grids.split_at_mut(j);
+                    (&mut left[i], &mut right[0])
+                } else {
+                    let (left, right) = grids.split_at_mut(i);
+                    (&mut right[0], &mut left[j])
+                };
+                if a.slot != b.slot
+                    || (a.level - b.level).abs() > 0.01
+                    || (a.cell_size - b.cell_size).abs() > 0.001
+                {
+                    continue;
+                }
+                if axis == 0 && a.size[1] == b.size[1] {
+                    let a_max_x = a.origin[0] + a.size[0] as f32 * a.cell_size;
+                    let (anx, bnx) = (a.size[0] as usize, b.size[0] as usize);
+                    for y in 0..a.size[1] as usize {
+                        let ak = y * anx + anx - 1;
+                        let bk = y * bnx;
+                        let p = [a_max_x - a.cell_size * 0.5, a.origin[1] + (y as f32 + 0.5) * a.cell_size];
+                        let q = [b.origin[0] + b.cell_size * 0.5, p[1]];
+                        let face = self.seam_face(
+                            p,
+                            q,
+                            a.level,
+                            a.cells[ak],
+                            b.cells[bk],
+                            a.footprint.iter().chain(&b.footprint).copied(),
+                            &solid_candidates,
+                            &triangle_candidates,
+                        );
+                        a.faces_x[y * (anx + 1) + anx] = face;
+                        b.faces_x[y * (bnx + 1)] = face;
+                    }
+                } else if axis == 1 && a.size[0] == b.size[0] {
+                    let a_max_y = a.origin[1] + a.size[1] as f32 * a.cell_size;
+                    let (nx, any) = (a.size[0] as usize, a.size[1] as usize);
+                    for x in 0..nx {
+                        let ak = (any - 1) * nx + x;
+                        let bk = x;
+                        let p = [a.origin[0] + (x as f32 + 0.5) * a.cell_size, a_max_y - a.cell_size * 0.5];
+                        let q = [p[0], b.origin[1] + b.cell_size * 0.5];
+                        let face = self.seam_face(
+                            p,
+                            q,
+                            a.level,
+                            a.cells[ak],
+                            b.cells[bk],
+                            a.footprint.iter().chain(&b.footprint).copied(),
+                            &solid_candidates,
+                            &triangle_candidates,
+                        );
+                        a.faces_y[any * nx + x] = face;
+                        b.faces_y[x] = face;
+                    }
+                }
+            }
+        }
     }
 
     fn bake_region(&self, region: &Region, options: Options) -> Result<Grid, String> {
@@ -398,13 +627,16 @@ impl Geometry {
         {
             return Err("invalid water footprint".into());
         }
-        let b = bounds(region.triangles.iter().flatten().copied());
+        let b = region
+            .bounds
+            .unwrap_or_else(|| bounds(region.triangles.iter().flatten().copied()));
         let dx = options.cell_size;
+        let padding = if region.bounds.is_some() { 0 } else { options.padding_cells };
         let origin: [f32; 2] = std::array::from_fn(|a| {
-            (b[0][a] / dx).floor() * dx - options.padding_cells as f32 * dx
+            (b[0][a] / dx).floor() * dx - padding as f32 * dx
         });
         let dims: [f32; 2] = std::array::from_fn(|a| {
-            ((b[1][a] - origin[a]) / dx).ceil() + options.padding_cells as f32
+            ((b[1][a] - origin[a]) / dx).ceil() + padding as f32
         });
         if dims
             .iter()
@@ -547,16 +779,24 @@ impl Geometry {
                     let b = grid.cells[qk];
                     // Exact convex segment clipping catches walls thinner than a
                     // cell, even when every center/corner sample misses the wall.
-                    let wall = solid_bins[k]
+                    let blocker = solid_bins[k]
                         .iter()
                         .chain(&solid_bins[qk])
-                        .any(|&s| self.solids[s].blocks(p, q, region.level))
-                        || triangle_bins[k]
-                            .iter()
-                            .chain(&triangle_bins[qk])
-                            .any(|&t| self.triangles[t].blocks(p, q, region.level));
-                    let boundary = if wall || a.class == Class::Dry || b.class == Class::Dry {
+                        .filter_map(|&s| self.solids[s].blocks(p, q, region.level))
+                        .chain(
+                            triangle_bins[k]
+                                .iter()
+                                .chain(&triangle_bins[qk])
+                                .filter_map(|&t| self.triangles[t].blocks(p, q, region.level)),
+                        )
+                        .fold(None, strongest_blocker);
+                    let boundary = if blocker == Some(Blocker::Wall) {
                         Boundary::Wall
+                    } else if blocker == Some(Blocker::Bank)
+                        || a.class == Class::Dry
+                        || b.class == Class::Dry
+                    {
+                        Boundary::Bank
                     } else if a.class == Class::Outside
                         || b.class == Class::Outside
                         || a.class == Class::Outline
@@ -706,8 +946,9 @@ impl Solid {
         }
         (low.is_finite() && high.is_finite() && low <= high + EPS).then_some((low, high, sky))
     }
-    fn blocks(&self, a: [f32; 2], b: [f32; 2], z: f32) -> bool {
+    fn blocks(&self, a: [f32; 2], b: [f32; 2], z: f32) -> Option<Blocker> {
         let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+        let (mut lo_blocker, mut hi_blocker) = (None, None);
         for plane in &self.planes {
             let d = f64::from(plane.normal[0]) * f64::from(b[0] - a[0])
                 + f64::from(plane.normal[1]) * f64::from(b[1] - a[1]);
@@ -717,18 +958,42 @@ impl Solid {
                 - f64::from(plane.normal[2]) * f64::from(z - EPS as f32);
             if d.abs() < 1e-9 {
                 if rhs < -EPS {
-                    return false;
+                    return None;
                 }
             } else if d > 0.0 {
-                hi = hi.min(rhs / d);
+                let clipped = rhs / d;
+                if clipped < hi {
+                    hi = clipped;
+                    hi_blocker = Some(blocker_from_normal(plane.normal));
+                }
             } else {
-                lo = lo.max(rhs / d);
+                let clipped = rhs / d;
+                if clipped > lo {
+                    lo = clipped;
+                    lo_blocker = Some(blocker_from_normal(plane.normal));
+                }
             }
             if lo > hi + 1e-9 {
-                return false;
+                return None;
             }
         }
-        hi >= 0.0 && lo <= 1.0
+        if hi < 0.0 || lo > 1.0 {
+            return None;
+        }
+        let mut result = None;
+        if (-1e-7..=1.0000001).contains(&lo) {
+            if let Some(kind) = lo_blocker {
+                result = strongest_blocker(result, kind);
+            }
+        }
+        if (-1e-7..=1.0000001).contains(&hi) {
+            if let Some(kind) = hi_blocker {
+                result = strongest_blocker(result, kind);
+            }
+        }
+        // A whole segment embedded in solid is dry terrain unless an actual
+        // limiting side identifies a vertical obstruction.
+        Some(result.unwrap_or(Blocker::Bank))
     }
 }
 
@@ -745,7 +1010,7 @@ impl Triangle {
                     / self.normal[2],
         )
     }
-    fn blocks(&self, a: [f32; 2], b: [f32; 2], z: f32) -> bool {
+    fn blocks(&self, a: [f32; 2], b: [f32; 2], z: f32) -> Option<Blocker> {
         let origin = [a[0], a[1], z - EPS as f32];
         let end = [b[0], b[1], z - EPS as f32];
         let dir = sub(end, origin);
@@ -754,17 +1019,18 @@ impl Triangle {
         let h = cross(dir, e2);
         let det = dot(e1, h);
         if det.abs() < 1e-9 {
-            return false;
+            return None;
         }
         let s = sub(origin, self.points[0]);
         let u = dot(s, h) / det;
         if !(-1e-7..=1.0000001).contains(&u) {
-            return false;
+            return None;
         }
         let q = cross(s, e1);
         let v = dot(dir, q) / det;
         let t = dot(e2, q) / det;
-        v >= -1e-7 && u + v <= 1.0000001 && (-1e-7..=1.0000001).contains(&t)
+        (v >= -1e-7 && u + v <= 1.0000001 && (-1e-7..=1.0000001).contains(&t))
+            .then(|| blocker_from_f64_normal(self.normal))
     }
 }
 

@@ -3,7 +3,7 @@
 `r_rtTaa 1` enables a temporal resolve inside conservative runtime-light
 influence volumes. `r_rtTaa 0` disables it; `r_rtTaa 2` shows green coverage
 against black. It requires hardware RT dynamic lights. Enabling through the
-console/menu disables global TAA, FXAA, SMAA and the radiance denoiser, while
+console/menu disables global TAA, FXAA and SMAA, while
 retaining the current MSAA sample count. Global TAA takes precedence if both
 settings are subsequently enabled. The default is off.
 

@@ -98,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .flat_map(|&i| footprints[i].iter().copied())
                 .collect(),
+            bounds: None,
         })
         .collect();
     let started = Instant::now();

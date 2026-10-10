@@ -3,8 +3,7 @@ use crate::app::egui_menu::{
     confirmation_dialog, rail_group, rail_item, theme, App, ApplyVideoPath, Duration,
     EguiRenderData, ElementState, FrontendPage, Instant, KeyCode, KeyEvent, MapEditor, MouseButton,
     OverlayMode, PhysicalKey, RenderCommand, VideoSection, Window, WindowEvent, CONTENT_MAX_W,
-    GUTTER, PROFILE_COSMETICS, PROFILE_FORCE, PROFILE_IDENTITY, PROFILE_MODEL, PROFILE_SABER,
-    SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
+    GUTTER, SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
     SETUP_TAB_MOD, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
     TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
 };
@@ -32,11 +31,7 @@ impl App {
 
     /// egui owns every menu overlay, not just the Video page.
     pub(in crate::app) fn egui_menu_active(&self) -> bool {
-        let blocking_download_ui = self.server_password_prompt.is_some()
-            || self.missing_map_prompt.is_some()
-            || self.demo_missing_map_prompt.is_some()
-            || self.live_download.is_some()
-            || self.live_join_ui.is_some();
+        let blocking_download_ui = self.connection_modal_active();
         let asset_viewer_behind_console = self.front_end
             && self.frontend_page == FrontendPage::AssetViewer
             && self.overlay == OverlayMode::Console;
@@ -53,6 +48,7 @@ impl App {
                     | OverlayMode::MapEdit
                     | OverlayMode::EntityGraph
                     | OverlayMode::Trace
+                    | OverlayMode::DevRadial
                     | OverlayMode::StrafeTrails
                     | OverlayMode::RaceGhosts
             ))
@@ -161,6 +157,14 @@ impl App {
         let response = state.on_window_event(window, event);
         self.egui_repaint_requested |= response.repaint;
 
+        // The developer wheel is entirely pointer-driven. Never let a mouse
+        // press/release leak to an attack/bind when egui reports !consumed.
+        if self.overlay == OverlayMode::DevRadial
+            && matches!(event, WindowEvent::MouseInput { .. })
+        {
+            return true;
+        }
+
         // `egui_winit::Response::consumed` is not a reliable hit-test for every
         // pointer-button event. In Map Edit that used to let a toolbar press
         // fall through and start the 3D brush picker underneath (the giveaway
@@ -234,6 +238,13 @@ impl App {
                 && event.state == ElementState::Pressed
                 && !event.repeat
                 && self.key_bound_to_trace(code)
+            {
+                return false;
+            }
+            if self.overlay == OverlayMode::DevRadial
+                && event.state == ElementState::Pressed
+                && !event.repeat
+                && self.key_bound_to_dev(code)
             {
                 return false;
             }
@@ -396,6 +407,10 @@ impl App {
             self.egui_map_editor(ui);
             return;
         }
+        if self.overlay == OverlayMode::DevRadial {
+            self.egui_dev_radial(ui);
+            return;
+        }
         if self.overlay == OverlayMode::EntityGraph {
             self.egui_entity_graph(ui);
             return;
@@ -525,6 +540,9 @@ impl App {
 
     pub(in crate::app::egui_menu) fn select_top_menu(&mut self, index: usize) {
         self.controls_waiting_for_key = false;
+        if index == TOP_PROFILE && (self.menu_selected != TOP_PROFILE || self.overlay != OverlayMode::Game) {
+            self.open_profile_studio(None);
+        }
         if index == TOP_SETUP {
             self.menu_selected = TOP_SETUP;
             if self.overlay != OverlayMode::Video {
@@ -567,15 +585,8 @@ impl App {
                 Some("servers") => FrontendPage::ServerBrowser,
                 Some("solo") => FrontendPage::SoloGame,
                 Some("demo") => FrontendPage::PlayDemo,
-                Some("profile") => {
-                    self.profile_selected_section = match tab.as_deref() {
-                        Some("model") => PROFILE_MODEL,
-                        Some("force") => PROFILE_FORCE,
-                        Some("saber") => PROFILE_SABER,
-                        Some("cosmetics") => PROFILE_COSMETICS,
-                        _ => PROFILE_IDENTITY,
-                    };
-                    self.profile_preview_key = None;
+                Some("profile") | Some("profilestudio") | Some("studio") => {
+                    self.open_profile_studio(tab.as_deref());
                     FrontendPage::Profile
                 }
                 Some("controls") => FrontendPage::Controls,
@@ -619,16 +630,9 @@ impl App {
                 self.setup_selected = SETUP_TAB_MOVEMENT;
                 self.set_overlay(OverlayMode::Video);
             }
-            Some(page @ ("join" | "game" | "resume" | "servers" | "profile" | "controls" | "vote")) => {
-                if page == "profile" {
-                    self.profile_selected_section = match tab.as_deref() {
-                        Some("model") => PROFILE_MODEL,
-                        Some("force") => PROFILE_FORCE,
-                        Some("saber") => PROFILE_SABER,
-                        Some("cosmetics") => PROFILE_COSMETICS,
-                        _ => PROFILE_IDENTITY,
-                    };
-                    self.profile_preview_key = None;
+            Some(page @ ("join" | "game" | "resume" | "servers" | "profile" | "profilestudio" | "studio" | "controls" | "vote")) => {
+                if matches!(page, "profile" | "profilestudio" | "studio") {
+                    self.open_profile_studio(tab.as_deref());
                 }
                 if page == "servers" && !self.front_end {
                     self.server_browser.sort = crate::server_browser::BrowserSort::LastVisited;
@@ -637,7 +641,7 @@ impl App {
                 self.menu_selected = match page {
                     "join" | "game" | "resume" => TOP_RESUME,
                     "servers" => 1,
-                    "profile" => TOP_PROFILE,
+                    "profile" | "profilestudio" | "studio" => TOP_PROFILE,
                     "controls" => TOP_CONTROLS,
                     "vote" => TOP_VOTE,
                     _ => TOP_RESUME,
@@ -925,7 +929,7 @@ impl App {
                     .show(ui, |ui| self.egui_resume_page(ui));
             }
             1 => self.egui_server_browser_page(ui),
-            TOP_PROFILE => self.egui_profile_page(ui),
+            TOP_PROFILE => self.egui_profile_studio(ui),
             TOP_CONTROLS => self.egui_controls_page(ui),
             TOP_VOTE => self.egui_vote_page(ui),
             _ => {}

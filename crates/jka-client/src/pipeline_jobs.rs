@@ -41,6 +41,19 @@ pub(crate) fn hash_config<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
+/// Live diagnostic toggle; the fast path is one relaxed load per pipeline/job,
+/// not per rendered frame. Kept independent of `r_verbose` to avoid flooding.
+static PIPELINE_TRACE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn pipeline_trace_enabled() -> bool {
+    PIPELINE_TRACE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_pipeline_trace(enabled: bool) {
+    PIPELINE_TRACE.store(enabled, Ordering::Relaxed);
+    println!("Renderer pipeline trace: {} (new compilations only)", if enabled { "ON" } else { "OFF" });
+}
+
 type PipelineJobValue = Box<dyn std::any::Any + Send>;
 type BuildPipeline = Box<dyn FnOnce() -> PipelineJobValue + Send + 'static>;
 
@@ -66,6 +79,15 @@ enum JobState {
     Compiling { id: u64 },
     Ready(PipelineJobValue),
     Failed,
+}
+
+/// Progress for the current burst of actual worker-submitted shader/PSO jobs.
+/// `finished` counts successful, failed, and superseded completions so the bar
+/// cannot stall forever when the user changes settings during a compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PipelineCompileProgress {
+    pub finished: u32,
+    pub total: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -96,6 +118,10 @@ pub(crate) struct PipelineJobManager {
     stale: u64,
     failed: u64,
     slowest_ms: f64,
+    burst_total: u32,
+    burst_finished: u32,
+    burst_pending: u32,
+    burst_finished_at: Option<Instant>,
     stopping: Arc<AtomicBool>,
 }
 
@@ -149,9 +175,19 @@ impl PipelineJobManager {
                         if stopping_worker.load(Ordering::Acquire) {
                             continue;
                         }
+                        let traced = pipeline_trace_enabled();
+                        if traced {
+                            println!("[pipeline job BEGIN] id={id} family={} slot={} hash={:016x} label={label} thread={:?}",
+                                key.family, key.slot, key.config, thread::current().name());
+                        }
                         let started = Instant::now();
                         let result =
                             panic::catch_unwind(AssertUnwindSafe(build)).map_err(panic_message);
+                        if traced || pipeline_trace_enabled() {
+                            println!("[pipeline job END] id={id} family={} slot={} hash={:016x} label={label} elapsed={:.1}ms result={}",
+                                key.family, key.slot, key.config, started.elapsed().as_secs_f64() * 1000.0,
+                                if result.is_ok() { "ok" } else { "PANIC" });
+                        }
                         let _ = done_tx.send(CompletedJob {
                             id,
                             key,
@@ -177,6 +213,10 @@ impl PipelineJobManager {
             stale: 0,
             failed: 0,
             slowest_ms: 0.0,
+            burst_total: 0,
+            burst_finished: 0,
+            burst_pending: 0,
+            burst_finished_at: None,
             stopping,
         }
     }
@@ -205,6 +245,10 @@ impl PipelineJobManager {
         } else {
             &self.work_tx
         };
+        if pipeline_trace_enabled() {
+            println!("[pipeline job QUEUED] id={id} family={} slot={} hash={:016x} label={label}",
+                key.family, key.slot, key.config);
+        }
         if work_tx
             .send(WorkMessage::Compile {
                 id,
@@ -215,6 +259,13 @@ impl PipelineJobManager {
             .is_ok()
         {
             self.queued = self.queued.saturating_add(1);
+            if self.burst_pending == 0 {
+                self.burst_total = 0;
+                self.burst_finished = 0;
+                self.burst_finished_at = None;
+            }
+            self.burst_total = self.burst_total.saturating_add(1);
+            self.burst_pending = self.burst_pending.saturating_add(1);
             true
         } else {
             self.states.insert(key, JobState::Failed);
@@ -267,8 +318,32 @@ impl PipelineJobManager {
         }
     }
 
+    /// Non-blocking progress sample, intended for a throttled UI refresh.
+    /// A just-finished burst stays at 100% briefly before disappearing.
+    pub fn progress(&mut self) -> Option<PipelineCompileProgress> {
+        self.poll();
+        if self.burst_total == 0 {
+            return None;
+        }
+        if self.burst_pending == 0
+            && !self.burst_finished_at.is_some_and(|at| at.elapsed() < Duration::from_millis(450))
+        {
+            return None;
+        }
+        Some(PipelineCompileProgress {
+            finished: self.burst_finished,
+            total: self.burst_total,
+        })
+    }
+
     fn poll(&mut self) {
         while let Ok(done) = self.done_rx.try_recv() {
+            // Count even superseded jobs: they still consumed real compiler work.
+            self.burst_pending = self.burst_pending.saturating_sub(1);
+            self.burst_finished = self.burst_finished.saturating_add(1);
+            if self.burst_pending == 0 {
+                self.burst_finished_at = Some(Instant::now());
+            }
             let current = matches!(
                 self.states.get(&done.key),
                 Some(JobState::Compiling { id }) if *id == done.id
@@ -362,4 +437,29 @@ mod tests {
             "visible FX must compile while world variants are blocked"
         );
     }
+
+    #[test]
+    fn progress_counts_real_jobs_and_clears_after_completion() {
+        let mut jobs = PipelineJobManager::new();
+        assert_eq!(jobs.progress(), None);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let key = PipelineJobKey::new("progress-test", 1, 1);
+        assert!(jobs.request(key, "blocked test", move || {
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            7u32
+        }));
+        assert_eq!(jobs.progress(), Some(PipelineCompileProgress { finished: 0, total: 1 }));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while jobs.progress().is_some_and(|progress| progress.finished != 1)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(jobs.progress(), Some(PipelineCompileProgress { finished: 1, total: 1 }));
+        assert_eq!(jobs.take_ready::<u32>(key), Some(7));
+        thread::sleep(Duration::from_millis(475));
+        assert_eq!(jobs.progress(), None);
+    }
+
 }

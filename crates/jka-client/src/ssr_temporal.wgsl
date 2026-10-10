@@ -357,7 +357,28 @@ fn ssr_label(sample: SsrSample, use_label: bool, colour: vec3<f32>) -> SsrSample
     return labelled;
 }
 
-fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSample {
+// Shared with the preflight in fs_main. This is the exact same dry-material
+// quality admission as the full SSR path, before normal reconstruction.
+fn ssr_dry_gloss(roughness: f32) -> f32 {
+    return 1.0 - smoothstep(0.18, 0.95, roughness);
+}
+
+fn ssr_min_dry_gloss(quality: u32) -> f32 {
+    if (quality >= 4u) { return 0.30; }
+    if (quality >= 3u) { return 0.55; }
+    return 0.70;
+}
+
+// This is only a *conservative* preflight. Once rain or puddles can affect
+// the surface, the full per-pixel weather evaluation must remain authoritative.
+fn ssr_weather_possible() -> bool {
+    return (weather_surface.amount_distance.x > 0.001 || weather_surface.puddle.x > 0.001)
+        && weather_surface.occlusion_size.z != 0u
+        && weather_surface.occlusion_size.x != 0u
+        && weather_surface.occlusion_size.y != 0u;
+}
+
+fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>, reflection_policy: vec4<f32>) -> SsrSample {
     var result: SsrSample;
     result.radiance = vec3<f32>(0.0);
     result.weight = 0.0;
@@ -384,7 +405,6 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
 
     // Static material/geometry eligibility was cached at map load and rasterized
     // into the depth prepass. Reject before reconstructing normals or ray marching.
-    let reflection_policy = reflection_policy_at_uv(uv);
     if (reflection_policy.x < 0.5) {
         return ssr_label(result, label_march, vec3<f32>(0.15, 0.15, 0.15));
     }
@@ -426,16 +446,9 @@ fn current_ssr(uv: vec2<f32>, centre_depth: f32, frag_coord: vec2<f32>) -> SsrSa
     // Rain still overrides all of it: wetness is view- and time-dependent and
     // cannot be answered by a map-load cache, and water standing on rough ground
     // really is a mirror.
-    let dry_gloss = 1.0 - smoothstep(0.18, 0.95, reflection_policy.z);
-    var min_dry_gloss = 0.70;
-    if (quality >= 3u) {
-        min_dry_gloss = 0.55;
-    }
-    if (quality >= 4u) {
-        min_dry_gloss = 0.30;
-    }
+    let dry_gloss = ssr_dry_gloss(reflection_policy.z);
     let weather_reflective = wetness > 0.01 || puddle > 0.01;
-    if (!weather_reflective && dry_gloss < min_dry_gloss) {
+    if (!weather_reflective && dry_gloss < ssr_min_dry_gloss(quality)) {
         return ssr_label(result, label_march, vec3<f32>(0.25, 0.0, 0.0));
     }
 
@@ -768,6 +781,27 @@ fn temporal_ssr(uv: vec2<f32>, centre_depth: f32, current: SsrSample) -> SsrSamp
 @fragment
 fn fs_main(input: VertexOut) -> SsrFragmentOut {
     var out: SsrFragmentOut;
+    // Most dry JKA materials have no reflection response. Reject them *before*
+    // reconstructing a normal, sampling temporal history, ray marching, or
+    // even resolving frontmost depth. A rejected receiver also clears history,
+    // preventing a previous reflector from ghosting onto a dry surface.
+    // Preserve r_ssrDebug 7 (reason labels) and 9 (all geometric normals).
+    let packed_quality = u32(settings.previous_camera_pos.w + 0.5);
+    let quality = packed_quality & 7u;
+    let debug_reason = packed_quality >= 56u && packed_quality < 64u;
+    let debug_normal = packed_quality >= 72u && packed_quality < 80u;
+    let reflection_policy = reflection_policy_at_uv(input.uv);
+    if (!debug_reason && !debug_normal && quality >= 2u) {
+        if (reflection_policy.x < 0.5 ||
+            (quality >= 3u && reflection_policy.y >= 0.5) ||
+            (!ssr_weather_possible() &&
+             ssr_dry_gloss(reflection_policy.z) < ssr_min_dry_gloss(quality))) {
+            out.radiance = vec4<f32>(0.0);
+            out.depth = 0.0;
+            return out;
+        }
+    }
+
     // The policy/linear-depth buffers describe BSP geometry.  If the final
     // opaque scene has a closer depth owner at this pixel (player, vehicle,
     // ocean, grass/snow shell, etc.), erase SSR history here rather than merely
@@ -784,7 +818,7 @@ fn fs_main(input: VertexOut) -> SsrFragmentOut {
         return out;
     }
 
-    let current = current_ssr(input.uv, centre_depth, input.position.xy);
+    let current = current_ssr(input.uv, centre_depth, input.position.xy, reflection_policy);
     let resolved = temporal_ssr(input.uv, centre_depth, current);
     // Standing water may reflect almost fully; everything else is capped lower by
     // current_ssr itself.

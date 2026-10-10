@@ -1,8 +1,8 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><title>BSP coastal bathymetry — checkpoint 1</title>
+<!doctype html><html lang="en"><meta charset="utf-8"><title>BSP coastal bathymetry</title>
 <style>body{font:15px system-ui;background:#101923;color:#e0eaf4;margin:24px}select,label{margin-right:16px}canvas{display:block;margin-top:16px;max-width:100%;image-rendering:pixelated;border:1px solid #526778}pre{white-space:pre-wrap}button,select{padding:6px;background:#243746;color:inherit;border:1px solid #526778}.swatch{display:inline-block;width:12px;height:12px;margin-right:5px}#legend span{margin-right:16px}</style>
 <h1>BSP coastal geometry</h1><p>Static geometry checkpoint. Select a water slot and hover over a cell to inspect its depth and support. Coordinates use JKA XY with Z up; 40 units = 1 metre.</p>
 <select id="slot" aria-label="Water slot"></select><select id="mode" aria-label="Visualization"><option value="class">Classification</option><option value="depth">Water depth</option><option value="bed">Seabed elevation</option><option value="component">Wet connectivity</option></select>
-<label><input type="checkbox" id="walls" checked>Water wall faces</label><label><input type="checkbox" id="edges">Footprint and unsupported faces</label><label><input type="checkbox" id="source">Source footprint triangles</label>
+<label><input type="checkbox" id="walls" checked>Rigid wall faces</label><label><input type="checkbox" id="banks" checked>Wet/dry bank faces</label><label><input type="checkbox" id="edges">Footprint and unsupported faces</label><label><input type="checkbox" id="source">Source footprint triangles</label>
 <p id="meta"></p><p id="legend"></p><canvas id="map"></canvas><pre id="info">Hover over the map.</pre>
 <p>Unknown and unresolved cells retain a safe fallback. Coverage is five footprint probes, not an estimated water volume. Patches use eight samples per quadratic span. Thin solid walls are tested by segment clipping between centers.</p>
 <script>
@@ -24,14 +24,14 @@ function draw(){const g=atlas[+slot.value];if(!g){document.getElementById('meta'
   if(mode.value==='component'&&c[7]>0)color=`hsl(${c[7]*137.508%360} 65% 55%)`;
   ctx.fillStyle=color;ctx.fillRect(x*scale,(ny-1-y)*scale,scale,scale);
  }
- const line=(kind,x1,y1,x2,y2)=>{if(kind===0)return;if(kind===1&&!document.getElementById('walls').checked)return;if(kind!==1&&!document.getElementById('edges').checked)return;ctx.strokeStyle=kind===1?'#ff3333':kind===2?'#fcf5a0':'#f59bff';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x1*scale,(ny-y1)*scale);ctx.lineTo(x2*scale,(ny-y2)*scale);ctx.stroke();};
+ const line=(kind,x1,y1,x2,y2)=>{if(kind===0)return;if(kind===1&&!document.getElementById('walls').checked)return;if(kind===4&&!document.getElementById('banks').checked)return;if(kind!==1&&kind!==4&&!document.getElementById('edges').checked)return;ctx.strokeStyle=kind===1?'#ff3333':kind===4?'#48e56b':kind===2?'#fcf5a0':'#f59bff';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x1*scale,(ny-y1)*scale);ctx.lineTo(x2*scale,(ny-y2)*scale);ctx.stroke();};
  const fluid=k=>k>=0&&k<g.cells.length&&g.cells[k][0]!==2&&g.cells[k][6]>0;
- for(let y=0;y<ny;y++)for(let x=0;x<=nx;x++){const kind=g.fx[y*(nx+1)+x];if(kind===1&&!((x>0&&fluid(y*nx+x-1))||(x<nx&&fluid(y*nx+x))))continue;line(kind,x,y,x,y+1);}
- for(let y=0;y<=ny;y++)for(let x=0;x<nx;x++){const kind=g.fy[y*nx+x];if(kind===1&&!((y>0&&fluid((y-1)*nx+x))||(y<ny&&fluid(y*nx+x))))continue;line(kind,x,y,x+1,y);}
+ for(let y=0;y<ny;y++)for(let x=0;x<=nx;x++){const kind=g.fx[y*(nx+1)+x];if((kind===1||kind===4)&&!((x>0&&fluid(y*nx+x-1))||(x<nx&&fluid(y*nx+x))))continue;line(kind,x,y,x,y+1);}
+ for(let y=0;y<=ny;y++)for(let x=0;x<nx;x++){const kind=g.fy[y*nx+x];if((kind===1||kind===4)&&!((y>0&&fluid((y-1)*nx+x))||(y<ny&&fluid(y*nx+x))))continue;line(kind,x,y,x+1,y);}
  if(document.getElementById('source').checked){ctx.strokeStyle='#ffffff88';ctx.lineWidth=1;for(const t of g.footprint){ctx.beginPath();t.forEach((p,i)=>{const x=(p[0]-g.origin[0])/g.dx*scale,y=(ny-(p[1]-g.origin[1])/g.dx)*scale;i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.closePath();ctx.stroke();}}
 }
 canvas.onmousemove=e=>{const g=atlas[+slot.value];if(!g)return;const r=canvas.getBoundingClientRect(),x=Math.floor((e.clientX-r.left)/r.width*g.size[0]),y=g.size[1]-1-Math.floor((e.clientY-r.top)/r.height*g.size[1]);if(x<0||y<0||x>=g.size[0]||y>=g.size[1])return;
  const c=g.cells[y*g.size[0]+x],f=v=>v===null?'unknown':v.toFixed(3);
  document.getElementById('info').textContent=`Cell (${x}, ${y}) · ${names[c[0]]}\nJKA XY: ${(g.origin[0]+(x+.5)*g.dx).toFixed(3)}, ${(g.origin[1]+(y+.5)*g.dx).toFixed(3)}\nBed Z: ${f(c[1])} · depth: ${f(c[2])} units (${c[2]===null?'unknown':(c[2]/40).toFixed(3)} m)\nCeiling Z: ${f(c[3])} · bed probe range: ${f(c[4])}..${f(c[5])}\nFootprint coverage: ${c[6]}/5 probes · wet component: ${c[7]}`;
-};[slot,mode,document.getElementById('walls'),document.getElementById('edges'),document.getElementById('source')].forEach(e=>e.onchange=draw);draw();
+};[slot,mode,document.getElementById('walls'),document.getElementById('banks'),document.getElementById('edges'),document.getElementById('source')].forEach(e=>e.onchange=draw);draw();
 </script></html>

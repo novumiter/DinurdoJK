@@ -625,7 +625,6 @@ fn minimal_key() -> WorldShaderVariantKey {
         cascaded_shadows: false,
         ray_traced_shadows: false,
         ray_traced_sun: false,
-        rt_receiver_denoiser: false,
         rt_receiver_glass: false,
         planar_reflections: false,
         legacy_fog: false,
@@ -637,7 +636,7 @@ fn minimal_key() -> WorldShaderVariantKey {
         planar_debug: false,
         deluxe: false,
         deluxe_specular: false,
-        detail_texture_mode: 0,
+        detail_textures_enabled: false,
     }
 }
 

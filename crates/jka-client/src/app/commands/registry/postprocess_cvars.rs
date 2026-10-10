@@ -789,7 +789,7 @@ app_cvars! {
     }
 
     APP_R_RT_TAA {
-        runtime: CvarDef::new("r_rtTaa", "", "0..2", "Regional RT dynamic-light temporal resolve: 0 Off, 1 On, 2 influence mask. Keeps MSAA and an unjittered camera; reuses existing forward RT samples. Enabling disables global TAA and the radiance denoiser. The mask is a conservative light volume, including shadowed surfaces.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_rttaa(app)), |app, value| App::cvar_set_r_rttaa(app, APP_R_RT_TAA.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rttaa, None),
+        runtime: CvarDef::new("r_rtTaa", "", "0..2", "Regional RT dynamic-light temporal resolve: 0 Off, 1 On, 2 influence mask. Keeps MSAA and an unjittered camera; reuses existing forward RT samples. Enabling disables global TAA. The mask is a conservative light volume, including shadowed surfaces.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_rttaa(app)), |app, value| App::cvar_set_r_rttaa(app, APP_R_RT_TAA.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rttaa, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(mode @ (0..=2)) = value.parse::<u32>() { settings.rt_taa = mode; }
@@ -808,8 +808,6 @@ app_cvars! {
                         self.video.taa = false;
                         self.video.fxaa = false;
                         self.video.smaa = false;
-                        self.video.rt_denoiser_mode = 0;
-                        self.render_command(RenderCommand::SetRtDenoiserMode(0));
                     }
                     self.sync_post_effects();
                     self.mark_config_dirty();
@@ -820,30 +818,7 @@ app_cvars! {
         ]
     }
 
-    APP_R_RT_DENOISER {
-        runtime: CvarDef::new("r_rtDenoiser", "", "0..11", "HDR RT direct-light denoiser: 0 Off, 1 Temporal, 2 SVGF. 3 sun raw, 4 sun temporal, 5 sun SVGF, 6 sun temporal difference, 7 receiver normals, 8 local raw, 9 local filtered, 10 local difference, 11 selected local light ID. Works with RT sun and dominant finite transient local lights; unmatched lights use per-fragment RT.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_rtdenoiser(app)), |app, value| App::cvar_set_r_rtdenoiser(app, APP_R_RT_DENOISER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_rtdenoiser, None),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Ok(mode @ (0..=11)) = value.parse::<u32>() { settings.rt_denoiser_mode = mode; }
-            }),
-            archive: Some((420, |state| format!("{}", state.video.rt_denoiser_mode))),
-            ..CvarBinding::NONE
-        },
-        implementations: [
-            impl App {
-                fn cvar_get_r_rtdenoiser(&self) -> String { self.video.rt_denoiser_mode.to_string() }
-                fn cvar_set_r_rtdenoiser(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let mode = value.parse::<u32>().ok().filter(|m| *m <= 11)
-                        .ok_or_else(|| format!("{name}: expected 0..11"))?;
-                    self.video.rt_denoiser_mode = mode;
-                    self.render_command(RenderCommand::SetRtDenoiserMode(mode));
-                    self.mark_config_dirty();
-                    self.publish_ui();
-                    Ok(())
-                }
-            }
-        ]
-    }
+
 
     APP_R_SMAA {
         runtime: CvarDef::new(

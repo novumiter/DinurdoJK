@@ -1,8 +1,7 @@
 [CmdletBinding()]
 param(
-    [ValidateSet('baseline', 'denoiser', 'glass', 'full')][string]$Mode = 'baseline',
+    [ValidateSet('baseline', 'glass', 'full')][string]$Mode = 'baseline',
     [string]$Map = '',
-    [ValidateRange(0, 11)][int]$DenoiserMode = 0,
     [switch]$TintedGlass,
     [switch]$Serial,
     [string]$Executable = '',
@@ -30,10 +29,8 @@ foreach ($gameDirectory in @('base', 'japro')) {
         $settingsBackups[$settingsPath] = $null
     }
 }
-$denoiser = if ($Mode -in @('denoiser', 'full')) { '1' } else { '0' }
 $glass = if ($Mode -in @('glass', 'full')) { '1' } else { '0' }
 $values = @{
-    JKA_RT_RECEIVER_DENOISER = $denoiser
     JKA_RT_RECEIVER_GLASS = $glass
     JKA_RT_PIPELINE_TRACE = '1'
     JKA_RT_SERIALIZE_WORLD_PIPELINES = $(if ($Serial) { '1' } else { '0' })
@@ -45,7 +42,7 @@ foreach ($name in $values.Keys) {
     [Environment]::SetEnvironmentVariable($name, $values[$name], 'Process')
 }
 $launchArgs = @('--base', (Join-Path $repoRoot 'target\release\base'),
-    '+r_rtDenoiser', "$DenoiserMode", '+r_tintedGlass', $(if ($TintedGlass) { '1' } else { '0' }),
+    '+r_tintedGlass', $(if ($TintedGlass) { '1' } else { '0' }),
     '+r_dynamicLights', 'ray_traced')
 if ($Map) { $launchArgs += @('--map', $Map) }
 $started = Get-Date
@@ -85,8 +82,8 @@ try {
     foreach ($dump in Get-ChildItem -LiteralPath $exeDirectory -Filter 'crash-*.dmp' -File) {
         if ($dump.LastWriteTime -ge $started) { Copy-Item -LiteralPath $dump.FullName -Destination $runDirectory }
     }
-    [ordered]@{ mode = $Mode; receiver_denoiser = $denoiser; receiver_glass = $glass;
-        denoiser_mode = $DenoiserMode; tinted_glass = [bool]$TintedGlass; serial_world = [bool]$Serial;
+    [ordered]@{ mode = $Mode; receiver_glass = $glass;
+        tinted_glass = [bool]$TintedGlass; serial_world = [bool]$Serial;
         map = $Map; executable = $Executable; exit_code = $clientExit;
         started = $started.ToString('o'); ended = (Get-Date).ToString('o') } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $runDirectory 'run.json')

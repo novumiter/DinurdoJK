@@ -65,18 +65,7 @@ impl Renderer {
         }
     }
 
-    pub(in crate::renderer) fn set_rt_denoiser_mode(&mut self, mode: u32) {
-        let mode = if crate::renderer::lighting::rt_diagnostics::config().receiver.denoiser { mode } else { 0 };
-        let mode = mode.min(11);
-        if self.rt_denoiser_mode == mode { return; }
-        self.rt_denoiser_mode = mode;
-        if let Some(rt) = self.ray_traced_shadows.as_mut() {
-            rt.sun_shadow_history.radiance.invalidate();
-            rt.sun_shadow_history.local_radiance.filter.invalidate();
-        }
-        self.rebuild_frame_plan();
-        self.activate_world_pipeline_variant();
-    }
+
 
     pub(in crate::renderer) fn set_rt_half_resolution(&mut self, enabled: bool) {
         if self.rt_reduced_shadows == enabled {

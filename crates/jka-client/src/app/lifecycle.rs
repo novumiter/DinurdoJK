@@ -1204,6 +1204,9 @@ impl ApplicationHandler<UserEvent> for App {
                 if request_id != self.latest_request_id {
                     return;
                 }
+                // The renderer clears map-relative debug geometry on every
+                // upload, including reloads whose promoted descriptors match.
+                self.coastal_debug_sent = None;
                 if self.promoted_oceans != upload_timings.promoted_oceans {
                     self.promoted_oceans = upload_timings.promoted_oceans.clone();
                     self.promoted_ocean_overrides.clear();
@@ -2114,6 +2117,15 @@ impl ApplicationHandler<UserEvent> for App {
                             && code == KeyCode::Escape
                         {
                             self.set_overlay(OverlayMode::None);
+                        }
+                        return;
+                    }
+                    OverlayMode::DevRadial => {
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && self.key_bound_to_dev(code)
+                        {
+                            self.close_dev_radial();
                         }
                         return;
                     }

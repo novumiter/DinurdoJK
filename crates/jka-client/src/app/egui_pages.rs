@@ -1,6 +1,5 @@
 //! Menu pages added for the jaPRO cgame options: the Setup -> Camera page and
-//! its in-game editor, the editable Network page, the Vote page, the Profile
-//! -> Cosmetics tab and the player-visibility / race HUD / spectating rows.
+//! its in-game editor, Network and Vote pages, plus visibility and race HUD controls.
 
 use super::egui_menu::jka_colored_text;
 use super::egui_settings::segmented_row;
@@ -644,115 +643,6 @@ impl App {
     }
 
     // --------------------------------------------------------- cosmetics --
-
-    pub(super) fn egui_profile_cosmetics(&mut self, ui: &mut egui::Ui) {
-        theme::section(
-            ui,
-            "COSMETICS",
-            "Hats, masks and capes other players see on jaPRO servers. The preview shows your picks; APPLY sends them.",
-        );
-        if self.ui_mod() != Some(crate::net::mod_support::ServerMod::Japro) {
-            theme::banner(
-                ui,
-                "Cosmetics are drawn on jaPRO servers. Your choices are saved and sent when you join one.",
-                theme::TEXT_DIM,
-            );
-            ui.add_space(6.0);
-        }
-        let mask = self.network.cosmetics;
-        let mut new_mask = mask;
-
-        // What is worn right now, in menu order, with a one-click reset.
-        let worn: Vec<&str> = japro_cg::COSMETIC_GROUPS
-            .iter()
-            .flat_map(|&(group, _, _)| japro_cg::cosmetics_in_group(group))
-            .filter(|item| mask & item.bit != 0)
-            .map(|item| item.label)
-            .collect();
-        ui.add_space(4.0);
-        if worn.is_empty() {
-            theme::label(ui, theme::plain("Wearing nothing.", 12.0, theme::TEXT_FAINT));
-        } else {
-            // Wrapped: thirty-odd names on one line used to widen the whole panel.
-            ui.add(
-                egui::Label::new(theme::plain(&format!("Wearing: {}", worn.join(" · ")), 12.0, theme::TEXT))
-                    .wrap(),
-            );
-            ui.add_space(4.0);
-            if theme::ghost_button(ui, "REMOVE ALL").clicked() {
-                new_mask = 0;
-            }
-        }
-
-        // The three radio groups of jaPRO's own `cosmetics` command: picking an
-        // item drops the rest of its group, picking it again takes it off, and
-        // the groups combine with each other.
-        let saved_spacing = ui.spacing().item_spacing;
-        for (group, title, tip) in japro_cg::COSMETIC_GROUPS {
-            theme::section(ui, title, tip);
-            const GAP: f32 = 4.0;
-            const MIN_TILE: f32 = 112.0;
-            let width = ui.available_width();
-            let columns = (((width + GAP) / (MIN_TILE + GAP)).floor() as usize).max(1);
-            let tile = ((width - GAP * (columns - 1) as f32) / columns as f32).floor();
-            let items: Vec<Option<&japro_cg::Cosmetic>> =
-                std::iter::once(None).chain(japro_cg::cosmetics_in_group(group).map(Some)).collect();
-            ui.spacing_mut().item_spacing = egui::vec2(GAP, GAP);
-            for row in items.chunks(columns) {
-                ui.horizontal(|ui| {
-                    for item in row {
-                        let (label, bit) = match item {
-                            Some(item) => (item.label, Some(item.bit)),
-                            None => ("None", None),
-                        };
-                        let selected = match bit {
-                            Some(bit) => new_mask & bit != 0,
-                            None => !japro_cg::cosmetics_in_group(group).any(|other| new_mask & other.bit != 0),
-                        };
-                        if theme::chip_sized(ui, label, selected, Some(tile)).clicked() {
-                            new_mask = japro_cg::toggle_cosmetic(new_mask, group, bit);
-                        }
-                    }
-                });
-            }
-            ui.spacing_mut().item_spacing = saved_spacing;
-        }
-        if new_mask != mask {
-            let _ = self.profile_set_cvar("cp_cosmetics", &(new_mask as i32).to_string());
-        }
-
-        theme::section(ui, "DISPLAY", "How cosmetics look to you.");
-        theme::row(
-            ui,
-            "Hide everyone's cosmetics",
-            "cg_stylePlayer. Do not draw anybody's hats or capes.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(on) = theme::switch(ui, self.japro_cg.style_bit(japro_cg::style::HIDE_COSMETICS)) {
-                    self.set_style_bit(japro_cg::style::HIDE_COSMETICS, on);
-                }
-            },
-        );
-        theme::row(
-            ui,
-            "Seasonal cosmetics",
-            "cg_stylePlayer. Around Christmas and on Halloween, players wearing nothing get a santa hat or a pumpkin.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(on) = theme::switch(ui, self.japro_cg.style_bit(japro_cg::style::SEASONAL_COSMETICS)) {
-                    self.set_style_bit(japro_cg::style::SEASONAL_COSMETICS, on);
-                }
-            },
-        );
-        theme::label(
-            ui,
-            theme::plain(
-                "Some cosmetics are unlocked by server records; ones your account has not unlocked are removed by the server.",
-                10.5,
-                theme::TEXT_FAINT,
-            ),
-        );
-    }
 
     fn set_style_bit(&mut self, bit: u32, on: bool) {
         let mut style = self.japro_cg.style_player;

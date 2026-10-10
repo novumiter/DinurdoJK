@@ -227,15 +227,16 @@ impl GameSession {
             _ => None,
         };
         if let Some(prediction) = &predicted {
-            // Apply the same CG_DamageFeedback gate to predicted presentation.
-            if attacker_damage_transition(&prediction.previous_display, &prediction.display) {
+            // Only recorded commands commit predictable events or other discrete state.
+            // Unsent render Pmove can never dispatch one-shot audio/effects.
+            let now = &prediction.committed;
+            let before = &prediction.previous_committed;
+            if attacker_damage_transition(before, now) {
                 self.attacker_damage_seen = true;
             }
-            // CG_TransitionPlayerState / CG_CheckPlayerstateEvents on the state
-            // being presented, so events land on the frame they are drawn.
             self.client_game.transition_predicted_player_state(
-                &prediction.display,
-                &prediction.previous_display,
+                now,
+                before,
                 target_server_time,
             )?;
         }

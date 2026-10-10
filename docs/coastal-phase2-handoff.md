@@ -1,5 +1,9 @@
 # DinurdoJK coastal water — Phase 2 handoff
 
+> Historical handoff: Phase 2 is complete. Phase 2.5 subsequently split
+> overtoppable wet/dry banks from rigid walls and added the live
+> `r_coastalDebug` evaluation overlay; see `coastal-phase2.5.md`.
+
 ## Task to execute
 
 Implement **Checkpoint 2: independently validated coastal solver correctness**. Continue from the current working tree and the completed geometry checkpoint. Port the supplied Saltreach solver faithfully, validate it in synthetic domains, and save a reviewable on-disk checkpoint before starting live FFT coupling or shoreline rendering.
@@ -59,7 +63,10 @@ Important constraints for the next agent:
 - Five footprint probes are not exact area/volume fractions. Corner extrema are samples, not a proof that arbitrary subcell geometry is fully resolved.
 - Partial footprints, missing floors, mixed cells and ambiguous submerged layers are excluded from supported wet components. Never replace unknown depths with zero or a guessed deep-water value.
 - Face barriers preserve thin solid walls and narrow footprint gaps; exact source triangles remain available for later refinement/reconstruction.
-- **Current `Wall` diagnostics also include faces adjacent to dry solid cells and solid intersection at nominal water height. They are not yet a complete distinction between an impermeable vertical wall and an overtoppable bed step/sloping bank.** Before map run-up integration, refine that distinction using actual geometry. Do not seal every wet/dry terrain interface merely because it is labelled `Wall`, and do not open a true wall merely because the adjacent water is deep.
+- Phase 2.5 now distinguishes `Bank` (overtoppable wet/dry terrain) from
+  `Wall` (geometry at least 75 degrees from horizontal). This is a static
+  classification and must still be validated visually on real maps before a
+  live solver consumes it.
 - Separate draw clusters are not a complete physical-connectivity model across shader boundaries. Supported components are conservative grid connectivity, not a guarantee that every physical fluid connection has been resolved.
 - Ceilings are retained; this does not implement closed-roof fluid physics. Overhangs that cannot be represented safely need fallback.
 

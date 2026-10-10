@@ -50,6 +50,7 @@ impl App {
         }
         self.poll_race_ghost_loads();
         self.poll_race_ghost_web();
+        self.sync_coastal_debug();
         let trail_lines = self.strafe_trails.poll();
         let trail_changed = !trail_lines.is_empty();
         for line in trail_lines {
@@ -217,12 +218,11 @@ impl App {
                 || self.companion_scoreboard_visible()
                 || duel_mini_scores
             {
-                let demo_scores = self.refresh_demo_scoreboard(now);
-                if duel_mini_scores && !demo_scores {
-                    // Tayst's duel HUD reads clientInfo.score; keep our equivalent
-                    // score records fresh even when the full scoreboard is hidden.
-                    self.request_scores_if_due(false);
-                }
+                // Demo scores are indexed locally; the server's pushed duel
+                // and intermission score pushes update live boards. Do not
+                // issue background `score` requests, which can suppress chat
+                // through the server's shared flood-protection interval.
+                self.refresh_demo_scoreboard(now);
             }
         }
 
@@ -373,6 +373,38 @@ impl App {
 
         if self.config_dirty && self.last_config_write.elapsed() >= Duration::from_millis(250) {
             self.flush_config();
+        }
+    }
+
+    fn sync_coastal_debug(&mut self) {
+        let mode = self.coastal_debug_mode;
+        let job = self
+            .prepared_map_cache
+            .as_ref()
+            .and_then(|cache| cache.map.coastal_bathymetry.as_ref())
+            .cloned();
+        let pointer = job
+            .as_ref()
+            .map_or(0, |job| std::sync::Arc::as_ptr(job) as usize);
+        let status = job.as_ref().map_or(2, |job| job.debug_status_tag());
+        let key = (pointer, status, mode);
+        if self.coastal_debug_sent == Some(key) {
+            return;
+        }
+        let (mesh, lines) = if mode == 0 {
+            (None, Vec::new())
+        } else if let Some(job) = job {
+            job.debug_view(mode, &self.promoted_oceans)
+        } else {
+            (
+                None,
+                vec!["No coastal geometry job for this map (enable ocean and load a BSP with promoted water).".into()],
+            )
+        };
+        self.coastal_debug_sent = Some(key);
+        self.render_command(RenderCommand::SetCoastalDebugMesh(mesh));
+        for line in lines {
+            self.push_console_line(line);
         }
     }
 }

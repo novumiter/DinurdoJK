@@ -219,7 +219,8 @@ mod tests {
         display.set_field_bits("viewangles[1]", 15.0f32.to_bits());
         display.set_field_bits("commandTime", 108);
         LivePredictionFrame {
-            previous_display: PlayerState::default(),
+            committed: PlayerState::default(),
+            previous_committed: PlayerState::default(),
             display,
             error: [1.0, 2.0, 3.0],
             command_angles: Some([0, jka_movement::angle_to_short(15.0), 0]),

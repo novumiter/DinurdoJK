@@ -2,6 +2,26 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_COASTALDEBUG {
+        runtime: CvarDef::new(
+                "r_coastalDebug",
+                "0",
+                "0..3",
+                "Phase 2.5 promoted-water evaluation: 0 off, 1 treatment tint, 2 boundary faces, 3 bathymetry/depth cells.",
+                CvarType::Int { min: 0, max: 3 },
+                CvarFlags::NONE,
+                LatchScope::None,
+                |app: &App| CvarValue::Int(app.coastal_debug_mode.into()),
+                |app, value| {
+                    let CvarValue::Int(mode) = value else { unreachable!() };
+                    app.coastal_debug_mode = mode as u8;
+                    app.coastal_debug_sent = None;
+                    Ok(())
+                },
+            ),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_R_OCEANINTERACTION {
         runtime: CvarDef::new("r_oceanInteraction", "", "0|1",
             "Nearby player water deformation; inherits r_oceanUpdates.", CvarType::String,

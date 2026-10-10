@@ -1,6 +1,6 @@
 //! Settings video.
 use crate::ui::{
-    CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DetailTextureMode, DofQuality,
+    CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode, DofQuality,
     DynamicLightsMode, DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FogMode,
     FootprintMode, FullscreenMode, FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode,
     CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, PlanarReflectionDebugMode,
@@ -24,7 +24,7 @@ pub struct VideoSettings {
     /// Classic `r_picmip`: number of highest map-texture mip levels omitted
     /// when the texture is uploaded. TaystJK defaults to 0.
     pub picmip: u32,
-    pub detail_textures: DetailTextureMode,
+    pub detail_textures: bool,
     /// Port of the standard distance-based detail fade: blend the detail contribution
     /// back to its neutral identity as camera distance approaches the configured range.
     pub detail_texture_fade: bool,
@@ -77,6 +77,8 @@ pub struct VideoSettings {
     pub developer_tools: bool,
     /// Classic renderer-only verbose spew level (`r_verbose`).
     pub renderer_verbose: u8,
+    /// Session-only: log queued jobs and in-flight native BSP/RT PSOs.
+    pub pipeline_trace: bool,
     pub perf_trace: bool,
     /// World renderer choice (`r_worldPath unified`): keeps the world on
     /// the unified renderer even when the FastBaseline feature envelope matches,
@@ -348,8 +350,6 @@ pub struct VideoSettings {
     pub promote_shader_additive: bool,
     pub promote_shader_emissive: bool,
     pub rt_samples: u32,
-    /// 0 Off, 1 temporal, 2 SVGF; currently only direct RT sun radiance.
-    pub rt_denoiser_mode: u32,
     /// 0 = stock JKA 1 - d^2/r^2, 1 = windowed inverse-square.
     pub dynamic_light_falloff: u32,
     pub rt_half_resolution: bool,
@@ -503,7 +503,7 @@ impl Default for VideoSettings {
             window_maximized: false,
             texture_filter: TextureFilter::Trilinear,
             picmip: 0,
-            detail_textures: DetailTextureMode::Off,
+            detail_textures: false,
             detail_texture_fade: false,
             detail_texture_fade_distance: 512.0,
             wireframe_mask: 0,
@@ -528,6 +528,7 @@ impl Default for VideoSettings {
             developer_level: 0,
             developer_tools: false,
             renderer_verbose: 0,
+            pipeline_trace: false,
             perf_trace: false,
             force_unified_world: false,
             pom: true,
@@ -726,7 +727,6 @@ impl Default for VideoSettings {
             promote_shader_additive: true,
             promote_shader_emissive: true,
             rt_samples: 1,
-            rt_denoiser_mode: 0,
             dynamic_light_falloff: 0,
             rt_half_resolution: false,
             map_light_simulation: false,

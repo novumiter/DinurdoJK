@@ -8,6 +8,8 @@
 //! backend, vsync, frame queue, FPS cap, gamma, input timing and the debug/instrumentation
 //! toggles are left alone: those are machine and preference settings, not
 //! quality, and silently rewriting them would be hostile.
+//! GPU-driven drawing and Hi-Z occlusion are optimization A/B controls, not quality levers.
+//! Likewise, `cg_fxFPS` is a user preference and not part of quality presets.
 
 use super::*;
 
@@ -88,10 +90,7 @@ impl QualityPreset {
                 ("r_filmGrain", "0"),
                 ("r_motionBlur", "0"),
                 ("r_depthOfField", "0"),
-                ("cg_fxFPS", "30"),
                 ("r_colorLut", "off"),
-                ("r_gpuDriven", "0"),
-                ("r_hizOcclusion", "0"),
                 ("r_lodbias", "3"),
                 ("r_entityAmbientLighting", "bsp_lightgrid"),
                 ("r_dynamicLights", "off"),
@@ -141,12 +140,9 @@ impl QualityPreset {
                 ("r_motionBlur", "0"),
                 ("r_depthOfField", "0"),
                 ("r_dofQuality", "adaptive"),
-                ("cg_fxFPS", "60"),
                 ("r_colorLut", "fuji_velvia_50"),
                 ("r_colorLutStrength", "0.500"),
-                ("r_gpuDriven", "0"),
-                ("r_hizOcclusion", "0"),
-                ("r_lodbias", "2"),
+                ("r_lodbias", "0"),
                 ("r_entityAmbientLighting", "bsp_lightgrid"),
                 ("r_dynamicLights", "legacy"),
                 ("r_pbr", "0"),
@@ -164,7 +160,7 @@ impl QualityPreset {
                 // normalized single-sample state instead of asking for both.
                 ("r_ext_multisample", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
-                ("r_detailTextures", "enhanced"),
+                ("r_detailTextures", "1"),
                 ("r_hdr", "1"),
                 ("r_floatLightmap", "0"),
                 ("r_tonemap", "1"),
@@ -201,12 +197,9 @@ impl QualityPreset {
                 ("r_motionBlur", "0"),
                 ("r_depthOfField", "0"),
                 ("r_dofQuality", "adaptive"),
-                ("cg_fxFPS", "90"),
                 ("r_colorLut", "fuji_velvia_50"),
                 ("r_colorLutStrength", "0.500"),
-                ("r_gpuDriven", "1"),
-                ("r_hizOcclusion", "1"),
-                ("r_lodbias", "1"),
+                ("r_lodbias", "0"),
                 ("r_entityAmbientLighting", "bevy_irradiance_volume"),
                 ("r_dynamicLights", "forward_plus"),
                 ("r_pbr", "0"),
@@ -223,7 +216,7 @@ impl QualityPreset {
                 // MSAA, so the preset must match that final state.
                 ("r_ext_multisample", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
-                ("r_detailTextures", "enhanced"),
+                ("r_detailTextures", "1"),
                 ("r_hdr", "1"),
                 ("r_floatLightmap", "1"),
                 ("r_tonemap", "1"),
@@ -262,11 +255,8 @@ impl QualityPreset {
                 ("r_motionBlur", "0"),
                 ("r_depthOfField", "0"),
                 ("r_dofQuality", "high"),
-                ("cg_fxFPS", "120"),
                 ("r_colorLut", "fuji_velvia_50"),
                 ("r_colorLutStrength", "0.500"),
-                ("r_gpuDriven", "1"),
-                ("r_hizOcclusion", "1"),
                 ("r_lodbias", "0"),
                 ("r_entityAmbientLighting", "bevy_irradiance_volume"),
                 ("r_dynamicLights", "forward_plus"),
@@ -391,5 +381,40 @@ impl App {
                     .is_some_and(|current| cvar_values_match(&current, value))
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QualityPreset;
+
+    #[test]
+    fn quality_presets_do_not_touch_visibility_optimization_controls() {
+        for preset in QualityPreset::ALL {
+            let settings = preset.settings();
+            for cvar in ["r_gpuDriven", "r_hizOcclusion"] {
+                assert!(settings.iter().all(|(name, _)| !name.eq_ignore_ascii_case(cvar)),
+                    "{} preset must not change {cvar}", preset.label());
+            }
+        }
+    }
+
+    #[test]
+    fn quality_presets_leave_fx_fps_unchanged_and_use_expected_lod_bias() {
+        assert_eq!(crate::fx::FX_FPS_DEFAULT, 90);
+        for preset in QualityPreset::ALL {
+            let settings = preset.settings();
+            assert!(settings.iter().all(|(name, _)| !name.eq_ignore_ascii_case("cg_fxFPS")));
+            let expected_bias = match preset {
+                QualityPreset::Minimal | QualityPreset::MinimalUnified => "3",
+                QualityPreset::Low | QualityPreset::Medium | QualityPreset::High => "0",
+            };
+            assert_eq!(
+                settings.iter().find(|(name, _)| *name == "r_lodbias").map(|(_, value)| *value),
+                Some(expected_bias),
+                "{} preset",
+                preset.label(),
+            );
+        }
     }
 }

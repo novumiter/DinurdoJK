@@ -1115,6 +1115,15 @@ impl PlayerPresenter {
         let mut pose = runtime
             .animation
             .evaluate_pose_openjk_root(&model.gla, current_time)?;
+        // Source anatomy has custom joint lengths. Rebase this ONE model's
+        // Ghoul2 skin matrices to those pivots before ragdoll, bolt sampling,
+        // smoothing, GPU skinning or attachment effects inspect the pose.
+        // Stock GLM players bypass this path completely.
+        if let Some(ref pivots) = model.source_native_pivots {
+            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(
+                &model.gla, &pose, pivots.as_slice(),
+            )?;
+        }
         record_pose_eval(&mut self.perf, pose_started);
 
         let (render_axis, render_origin) = ghoul2_render_transform(entity, axis);

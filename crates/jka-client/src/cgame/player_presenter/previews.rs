@@ -76,8 +76,17 @@ impl PlayerPresenter {
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let model = self.load_model(info)?;
         let pose_started = Instant::now();
-        let pose =
+        let mut pose =
             Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
+        // Match the live player path: Source models animate around their
+        // native-FK joint pivots before geometry and attachment sampling.
+        if let Some(ref pivots) = model.source_native_pivots {
+            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(
+                &model.gla,
+                &pose,
+                pivots.as_slice(),
+            )?;
+        }
         record_pose_eval(&mut self.perf, pose_started);
         self.render_glm_surfaces(
             0,
@@ -110,7 +119,11 @@ impl PlayerPresenter {
         with_sabers: bool,
         skin_tint: [f32; 3],
         cosmetics: u32,
-    ) -> Result<Vec<DynamicModelSurface>, String> {
+        // Normalized cursor offset in the Studio stage, used for the player's
+        // authored cervical/cranium Ghoul2 look bones.
+        head_look: [f32; 2],
+        studio_cinematic: bool,
+    ) -> Result<(Vec<DynamicModelSurface>, [Option<[f32; 3]>; 5]), String> {
         let model = self.load_model(info)?;
         let animation_number = animation_index(animation_name)
             .ok_or_else(|| format!("missing animation table entry {animation_name}"))?
@@ -161,8 +174,51 @@ impl PlayerPresenter {
                 )?;
             }
         }
+        // The same cranium/cervical postmult conventions as OpenJK
+        // BG_G2PlayerAngles (POSITIVE_X, NEGATIVE_Y, NEGATIVE_Z). Apply before
+        // pose evaluation, so hats, sabers and the entire model stay coherent.
+        let pitch = (-head_look[1] * 15.0).clamp(-15.0, 15.0);
+        let yaw = (head_look[0] * 24.0).clamp(-24.0, 24.0);
+        for (bone, weight) in [("cervical", 0.34), ("cranium", 0.66)] {
+            if Ghoul2Animator::bone_index(&model.gla, bone).is_some() {
+                animator.set_bone_angles_postmult(
+                    &model.gla, bone, [pitch * weight, yaw * weight, 0.0],
+                    jka_movement::G2_POSITIVE_X,
+                    jka_movement::G2_NEGATIVE_Y,
+                    jka_movement::G2_NEGATIVE_Z,
+                )?;
+            }
+        }
         let pose_started = Instant::now();
-        let pose = animator.evaluate_pose_openjk_root(&model.gla, current_time.max(0))?;
+        let mut pose = animator.evaluate_pose_openjk_root(&model.gla, current_time.max(0))?;
+        // Match the live player path: Source models must animate around their
+        // native-FK joint pivots, not stock JKA rest-joint positions. Rebase
+        // before both geometry and saber/cosmetic bolt sampling below.
+        if let Some(ref pivots) = model.source_native_pivots {
+            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(
+                &model.gla, &pose, pivots.as_slice(),
+            )?;
+        }
+        // The UI anchors use the *same animated Ghoul2 pose* as skinning,
+        // including cursor-driven cranium/cervical edits and model yaw.
+        // No fixed screen percentages or arbitrary player-space guesses.
+        let mut anchors = [None; 5];
+        for (index, tag) in [(0, "*head_top"), (2, "*back"),
+            (3, "*r_hand"), (4, "*l_hand")] {
+            if let Some(matrix) = model_bolt_matrix_timed(
+                &mut self.perf, &model.glm, &model.gla, &pose, tag)? {
+                let point = [matrix[0][3], matrix[1][3], matrix[2][3]];
+                anchors[index] = Some(transform_jka_model_point(point, axis, origin));
+                if index == 0 {
+                    // Face follows the exact same head bolt matrix and its
+                    // local axes (rather than a fixed screen-space marker).
+                    let face = [point[0] - 5.0 * matrix[0][0] - 7.0 * matrix[0][2],
+                                point[1] - 5.0 * matrix[1][0] - 7.0 * matrix[1][2],
+                                point[2] - 5.0 * matrix[2][0] - 7.0 * matrix[2][2]];
+                    anchors[1] = Some(transform_jka_model_point(face, axis, origin));
+                }
+            }
+        }
         record_pose_eval(&mut self.perf, pose_started);
         let mut draws = self.render_glm_surfaces_tinted(
             0,
@@ -342,8 +398,8 @@ impl PlayerPresenter {
             self.cosmetic_draws.extend(worn);
         }
 
-        apply_profile_studio_light(&mut draws);
-        Ok(draws)
+        apply_profile_studio_light(&mut draws, studio_cinematic);
+        Ok((draws, anchors))
     }
 
     /// TaystJK's Profile saber preview resolves the selected saber block to its

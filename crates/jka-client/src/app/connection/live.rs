@@ -142,9 +142,11 @@ impl App {
         }) {
             self.begin_live_session();
         }
-        if self.scoreboard_should_show() || self.companion_scoreboard_visible() {
-            self.request_scores_if_due(false);
-        }
+        // Do not passively issue `score` while dead, at intermission, or with
+        // the companion open. The server shares reliable-command flood limits
+        // between `score` and `say` on many setups; TaystJK only requests
+        // scores on an explicit +scores press. The server also pushes scores
+        // for intermission, so no periodic poll is required here.
         let Some(net) = self.net.as_mut() else { return };
         let realtime = net.realtime();
         net.session_mut()
@@ -642,6 +644,9 @@ impl App {
                 self.japro_cg,
                 self.network.plugin_disable,
             );
+            session
+                .client_game
+                .set_predicted_event_correction(self.network.correct_predicted_events);
             self.attach_live_sound_presenter(&mut session);
             session
         } else {

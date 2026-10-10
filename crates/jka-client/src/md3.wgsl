@@ -13,6 +13,10 @@ override ENABLE_LEGACY_FOG: bool = false;
 // replaying explicitly-authored `glow` stages. Pipeline-specialize that replay
 // rather than changing material classification or blend behavior.
 override FORCE_FOG_BLACK: bool = false;
+// Only the spectator visible-player erase pipeline uses this. Move the depth
+// test toward the eye by this many JKA world units without changing the
+// rasterized silhouette (screen XY/W remain exactly as before).
+override SPEC_ERASE_DEPTH_TOLERANCE: f32 = 0.0;
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
@@ -57,6 +61,15 @@ struct VertexOut {
 fn vs_main(input: VertexIn) -> VertexOut {
     var output: VertexOut;
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
+    if (SPEC_ERASE_DEPTH_TOLERANCE > 0.0) {
+        let toward_eye = camera.camera_pos_time.xyz - input.position;
+        let eye_distance = length(toward_eye);
+        let shift = min(SPEC_ERASE_DEPTH_TOLERANCE, eye_distance * 0.5);
+        let nearer_position = input.position + toward_eye * (shift / max(eye_distance, 0.0001));
+        let nearer_clip = camera.view_proj * vec4<f32>(nearer_position, 1.0);
+        // Keep the original pixel footprint; only bias the depth test.
+        output.clip_position.z = nearer_clip.z * (output.clip_position.w / nearer_clip.w);
+    }
     // OpenJK RF_DEPTHHACK uses glDepthRange(0, 0.3) for view weapons.
     // The main camera is reverse-Z (near=1, far=0), so the equivalent range
     // is [0.7, 1.0]: d' = 0.7 + 0.3*d. Apply it in homogeneous clip space.

@@ -294,6 +294,21 @@ pub(in crate::cgame::player_presenter) struct MaterialLayers<'a> {
     pub(in crate::cgame::player_presenter) two_sided: bool,
 }
 
+/// Preserve an authored depth mask on alpha-blended Ghoul2 shader stages.
+/// TaystJK's `ParseStage` sets GLS_DEPTHMASK_TRUE independently of blendFunc;
+/// FinishShader then schedules a blended depth writer in SS_SEE_THROUGH.
+/// Stage lighting is independent of the blend equation: `lightingDiffuse`
+/// must use the light-grid path, not the unlit FX blend path.
+fn blended_alpha_mode(stage: &jka_assets::shader::Stage) -> DynamicModelAlphaMode {
+    let lit = matches!(stage.rgb_gen, RgbGen::LightingDiffuse | RgbGen::LightingDiffuseEntity);
+    match (stage.depth_write, lit) {
+        (true, true) => DynamicModelAlphaMode::BlendDepthWrite,
+        (true, false) => DynamicModelAlphaMode::BlendUnlitDepthWrite,
+        (false, true) => DynamicModelAlphaMode::Blend,
+        (false, false) => DynamicModelAlphaMode::BlendUnlit,
+    }
+}
+
 /// The pass mode of one stage of a blended player shader, or `None` when this
 /// path cannot draw it. Not drawn: environment/vector coordinates, alpha tests
 /// and `GL_DST_COLOR` filters.
@@ -322,7 +337,7 @@ pub(in crate::cgame::player_presenter) fn blended_stage_mode(
                 .join(" ")
                 .to_ascii_lowercase();
             (blend == "gl_src_alpha gl_one_minus_src_alpha" || blend == "blend")
-                .then_some(DynamicModelAlphaMode::BlendUnlit)
+                .then_some(blended_alpha_mode(stage))
         }
     }
 }
@@ -371,7 +386,14 @@ pub(in crate::cgame::player_presenter) fn blended_stages<'a>(
             DynamicModelAlphaMode::AdditiveOne | DynamicModelAlphaMode::Additive
         )
     });
-    if additive {
+    // Do not silently discard single-stage alpha/wave semantics just because
+    // there is no later additive pass. This is also how standalone
+    // depth-writing translucent materials retain their explicit first pass.
+    if additive
+        || primary.depth_write
+        || matches!(primary.rgb_gen, RgbGen::Wave(_))
+        || matches!(primary.alpha_gen, AlphaGen::Wave(_))
+    {
         stages
     } else {
         Vec::new()
@@ -397,7 +419,15 @@ pub(in crate::cgame::player_presenter) fn resolved_stage(
         } else {
             1.0
         },
-        unlit: const_rgb,
+        unlit: const_rgb || matches!(stage.rgb_gen, RgbGen::Wave(_)),
+        rgb_wave: match stage.rgb_gen {
+            RgbGen::Wave(wave) => Some(wave),
+            _ => None,
+        },
+        alpha_wave: match stage.alpha_gen {
+            AlphaGen::Wave(wave) => Some(wave),
+            _ => None,
+        },
         specular_alpha: stage.alpha_gen == AlphaGen::LightingSpecular,
         tc_mods: stage.tc_mods.clone(),
         authored_glow: stage.glow,
@@ -477,7 +507,13 @@ pub(in crate::cgame::player_presenter) fn stage_material(
     let alpha_mode = if !stage.alpha_test.trim().is_empty() {
         DynamicModelAlphaMode::Mask
     } else {
-        crate::fx::draw::FxBlend::from_blend_func(&stage.blend).custom_shader_alpha_mode()
+        let mode = crate::fx::draw::FxBlend::from_blend_func(&stage.blend)
+            .custom_shader_alpha_mode();
+        if matches!(mode, DynamicModelAlphaMode::Blend | DynamicModelAlphaMode::BlendUnlit) {
+            blended_alpha_mode(stage)
+        } else {
+            mode
+        }
     };
     StageMaterial {
         image: stage.image.as_str(),
@@ -540,16 +576,14 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
         .flatten();
     let stages = blended_stages(shader, primary);
     let base = stage_material(primary);
-    // Pipelines always cull back faces; only a translucent `cull twosided`
-    // surface (wings) shows its back side, so only it pays for the extra triangles.
+    // TaystJK's `cull twosided` (also `none` / `disable`) disables face
+    // culling regardless of stage alphaFunc or blend mode. The Ghoul2
+    // pipelines in DinurdoJK always cull back faces, so represent the same
+    // rendering semantics by appending reversed-winding triangles to *every*
+    // authored two-sided surface, including opaque and alpha-tested capes.
     let two_sided = matches!(
         shader.cull.to_ascii_lowercase().as_str(),
         "none" | "twosided" | "disable"
-    ) && !matches!(
-        stages.first().map_or(base.alpha_mode, |&(_, mode)| mode),
-        DynamicModelAlphaMode::Opaque
-            | DynamicModelAlphaMode::Mask
-            | DynamicModelAlphaMode::MaskBlend
     );
     MaterialLayers {
         base,
@@ -819,6 +853,7 @@ fn build_character_model(
         key,
         glm,
         gla,
+        source_native_pivots: None,
         humanoid,
         animations,
         anim_events,
@@ -849,6 +884,7 @@ pub(in crate::cgame::player_presenter) fn build_player_model(
             key,
             &descriptor_qpath,
             &descriptor,
+            jiggle_remesh,
         );
     }
     let female = authored_model_is_female(source, info);

@@ -108,8 +108,8 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_colorHighlights",
                 "",
-                "-2..2",
-                "Highlight-range brightness in EV; 0 is neutral.",
+                "-100..100",
+                "Highlight tone-curve strength (not EV); 0 is neutral. Preserves tonal ordering.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -130,7 +130,7 @@ app_cvars! {
                             .parse::<f32>()
                             .ok()
                             .filter(|v| v.is_finite())
-                            .map(|v| v.clamp(-2.0, 2.0))
+                            .map(|v| v.clamp(-100.0, 100.0))
                             .unwrap_or(settings.color_grade.highlights)
                     }
                 }),
@@ -148,7 +148,7 @@ app_cvars! {
                 fn cvar_set_r_colorhighlights(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.color_grade.highlights =
-                            Self::parse_cvar_finite(name, value)?.clamp(-2.0, 2.0);
+                            Self::parse_cvar_finite(name, value)?.clamp(-100.0, 100.0);
                         self.sync_post_effects();
                         self.mark_config_dirty();
                         self.publish_ui();
@@ -311,8 +311,8 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_colorShadows",
                 "",
-                "-2..2",
-                "Shadow-range brightness in EV; 0 is neutral.",
+                "-100..100",
+                "Shadow tone-curve strength (not EV); 0 is neutral. Preserves tonal ordering.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -329,7 +329,7 @@ app_cvars! {
                             .parse::<f32>()
                             .ok()
                             .filter(|v| v.is_finite())
-                            .map(|v| v.clamp(-2.0, 2.0))
+                            .map(|v| v.clamp(-100.0, 100.0))
                             .unwrap_or(settings.color_grade.shadows)
                     }
                 }),
@@ -347,7 +347,7 @@ app_cvars! {
                 fn cvar_set_r_colorshadows(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.color_grade.shadows =
-                            Self::parse_cvar_finite(name, value)?.clamp(-2.0, 2.0);
+                            Self::parse_cvar_finite(name, value)?.clamp(-100.0, 100.0);
                         self.sync_post_effects();
                         self.mark_config_dirty();
                         self.publish_ui();

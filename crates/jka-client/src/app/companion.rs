@@ -476,12 +476,21 @@ impl App {
                 .show(ui, |ui| self.draw_companion_server_info(ui));
 
             ui.separator();
-            ui.label(
-                egui::RichText::new("SCOREBOARD")
-                    .strong()
-                    .size(13.0)
-                    .color(theme::TEXT_DIM),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("SCOREBOARD")
+                        .strong()
+                        .size(13.0)
+                        .color(theme::TEXT_DIM),
+                );
+                // Optional explicit refresh, not an automatic background poll:
+                // shared server flood protection can otherwise drop chat.
+                if ui.small_button("Refresh").clicked()
+                    && !self.refresh_demo_scoreboard(Instant::now())
+                {
+                    self.request_scores_if_due(false);
+                }
+            });
             let scoreboard_height = (ui.available_height() * 0.36).clamp(150.0, 300.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), scoreboard_height),

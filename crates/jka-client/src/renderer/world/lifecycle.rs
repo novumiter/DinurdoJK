@@ -1,7 +1,7 @@
 //! World lifecycle.
 use crate::renderer::{
     build_auto_detail_by_base_texture, build_world, create_gpu_cull_bind_group,
-    create_world_froxel_bind_group, Arc, DetailTextureMode, EntityLegacyFog, GrassMapGpu, Instant,
+    create_world_froxel_bind_group, Arc, EntityLegacyFog, GrassMapGpu, Instant,
     Mat4, PreparedMap, Renderer, WorldShaderFamily, WorldUploadTimings, WorldVideoPlayer,
     PBR_PROFILE_COMPANION_COMPRESSION, WORLD_VIDEO_MAX_CATCH_UP,
 };
@@ -90,7 +90,7 @@ impl Renderer {
                 .chain(map.pvs_batches.iter())
                 .chain(map.inline_batches.iter()),
         );
-        if self.detail_textures_mode != DetailTextureMode::Off {
+        if self.detail_textures_enabled {
             self.ensure_auto_detail_textures_for_plan(&detail_texture_by_base);
         }
         let (world_pipeline_layout, world_shader) = match initial_shader_variant.family() {

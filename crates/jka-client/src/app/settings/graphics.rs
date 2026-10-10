@@ -1,7 +1,7 @@
 //! Settings graphics.
 use crate::app::{
     scene, ui, App, CloudRenderResolution, CloudType, ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
-    DetailTextureMode, DofQuality, DynamicLightsMode, DynamicShadowsMode,
+    DofQuality, DynamicLightsMode, DynamicShadowsMode,
     EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, FxGeometryMode,
     Ghoul2BatchMode, Ghoul2SkinningMode, GlowMode, Instant, PlanarReflectionDebugMode, PostEffects,
     PuddleQuality, PvsMode, RainIntensity, ReflectionQuality, RenderCommand, VsyncMode,
@@ -673,7 +673,6 @@ impl App {
             self.video.dynamic_light_debug,
         ));
         self.render_command(RenderCommand::SetRtSamples(self.video.rt_samples));
-        self.render_command(RenderCommand::SetRtDenoiserMode(self.video.rt_denoiser_mode));
         self.render_command(RenderCommand::SetDynamicLightFalloff(
             self.video.dynamic_light_falloff,
         ));
@@ -814,12 +813,7 @@ impl App {
                 self.mark_config_dirty();
             }
             ui::VIDEO_ROW_DETAIL_TEXTURES => {
-                let current = DetailTextureMode::ALL
-                    .iter()
-                    .position(|mode| *mode == self.video.detail_textures)
-                    .unwrap_or(0) as i32;
-                let next = (current + direction).rem_euclid(DetailTextureMode::ALL.len() as i32);
-                self.video.detail_textures = DetailTextureMode::ALL[next as usize];
+                self.video.detail_textures = !self.video.detail_textures;
                 self.render_command(RenderCommand::SetDetailTextures(self.video.detail_textures));
                 self.mark_config_dirty();
             }

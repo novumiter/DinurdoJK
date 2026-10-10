@@ -177,6 +177,7 @@ impl Atlas {
                         1 => Boundary::Wall,
                         2 => Boundary::Outline,
                         3 => Boundary::Unsupported,
+                        4 => Boundary::Bank,
                         _ => return Err(fail()),
                     };
                     let crest = reader.f32()?;

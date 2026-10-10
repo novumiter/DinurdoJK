@@ -40,12 +40,11 @@ impl App {
 
     pub(in crate::app) fn asset_preview_camera(&self) -> Camera {
         if self.profile_preview_active {
-            let saber = self.profile_selected_section == 3;
             // Lower the studio camera and give it a slight upward pitch. The
             // old origin-level camera made the portrait read as if it were
             // looking down from above the character's chest/head line.
             let mut camera =
-                Camera::new_with_fov([0.0, -11.0, 0.0], 0.0, if saber { 52.0 } else { 58.0 });
+                Camera::new_with_fov([0.0, -11.0, 0.0], 0.0, 58.0);
             camera.pitch = 5.0_f32.to_radians();
             camera
         } else {
@@ -119,7 +118,8 @@ impl App {
         }
 
         let force_page = self.profile_selected_section == 2;
-        let saber_page = self.profile_selected_section == 3;
+        // Show blades is presentation-only: no network or config changes.
+        let studio_saber = self.profile_studio_show_saber;
         if !force_page {
             self.profile_force_preview_pending = None;
             self.profile_force_preview_active = None;
@@ -183,12 +183,17 @@ impl App {
         } else {
             "BOTH_STAND2"
         };
-        let animation_name = force_animation.unwrap_or(if saber_page {
-            saber_stance
-        } else {
-            "BOTH_STAND1"
-        });
-        let with_sabers = saber_page || matches!(force_power, Some(15) | Some(16) | Some(17));
+        // Periodic stock Ghoul2 fidgets, not an invented procedural animation.
+        // Keep a stable stance whenever Force is performing its 1-shot action.
+        let idle_ms = self.profile_preview_started.elapsed().as_millis() as i32;
+        let idle_phase = idle_ms.rem_euclid(18000);
+        let in_idle = (13500..=16500).contains(&idle_phase);
+        let animation_name = force_animation.unwrap_or(if studio_saber {
+            if in_idle && !secondary_saber && !primary_staff { "BOTH_STAND2IDLE1" }
+            else { saber_stance }
+        } else if in_idle { "BOTH_STAND1IDLE1" }
+        else { "BOTH_STAND1" });
+        let with_sabers = studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17));
 
         // 30 Hz is ample for the isolated Profile character and keeps its CPU
         // skinning/studio-lighting work independent of an uncapped render loop.
@@ -203,10 +208,17 @@ impl App {
             .map(str::to_owned)
             .unwrap_or_else(|| self.solo_client_info.model_cvar());
         let animation_tick = (animation_elapsed.as_millis() / 33) as i32;
-        let current_time = animation_tick.saturating_mul(33);
+        // One-shot idle poses must start at frame zero when their 3-second
+        // window opens. Otherwise an animation installed with a start time
+        // of zero instantly freezes at its final frame after 13.5 seconds.
+        let current_time = if in_idle && force_animation.is_none() {
+            (idle_phase - 13500).max(0) / 33 * 33
+        } else {
+            animation_tick.saturating_mul(33)
+        };
         let key = (
             format!(
-                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}",
+                "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:.2}:{:.2}",
                 animation_name,
                 preview_model,
                 self.network.saber1,
@@ -218,6 +230,8 @@ impl App {
                 self.network.sb_rgb2,
                 self.network.char_color,
                 self.network.cosmetics,
+                self.profile_studio_head_look[0],
+                self.profile_studio_head_look[1],
             ),
             (self.profile_preview_yaw * 10.0).round() as i32,
             (self.profile_preview_zoom * 1000.0).round() as i32,
@@ -260,11 +274,7 @@ impl App {
             if with_sabers || cosmetics != 0 {
                 self.ensure_asset_preview_entity_presenter()?;
             }
-            let origin = if saber_page {
-                [72.0 * zoom, 0.0, -20.0]
-            } else {
-                [88.0 * zoom, 0.0, -22.0]
-            };
+            let origin = [88.0 * zoom, 0.0, -22.0];
             let (mut draws, fx_requests) = {
                 let presenter = self
                     .asset_preview_player_presenter
@@ -277,7 +287,7 @@ impl App {
                 // No stale requests from a prior Profile frame should leak into
                 // the current isolated saber preview.
                 let _ = presenter.drain_fx_requests();
-                let draws = presenter.present_profile_player_preview(
+                let (draws, anchors) = presenter.present_profile_player_preview(
                     &info,
                     origin,
                     axis,
@@ -288,8 +298,11 @@ impl App {
                         .char_color
                         .map(|channel| f32::from(channel) / 255.0),
                     cosmetics,
+                    self.profile_studio_head_look,
+                    true,
                 )?;
                 let requests = presenter.drain_fx_requests();
+                self.profile_studio_world_anchors = anchors;
                 (draws, requests)
             };
 
@@ -305,8 +318,54 @@ impl App {
                     .as_mut()
                     .expect("profile MD3 presenter initialized")
                     .present_cosmetics(worn);
-                crate::cgame::player_presenter::apply_profile_studio_light(&mut hats);
+                crate::cgame::player_presenter::apply_profile_studio_light(&mut hats, true);
                 draws.append(&mut hats);
+            }
+
+            if with_sabers {
+                // Actual saber FX bolt positions/colours, after animated
+                // skeleton evaluation. Only the preview's CPU vertices are
+                // affected. No world dlight pollution or map-lightgrid lookup.
+                for request in &fx_requests {
+                    if let PlayerFxRequest::SaberBlade {origin, direction, length, color, ..} = request {
+                        let rgb = crate::cgame::custom_saber_rgb(*color)
+                            .map(|rgb| rgb.map(|c| f32::from(c) / 255.0))
+                            .unwrap_or_else(|| match *color {
+                                0 => [1.0, 0.2, 0.2], 1 => [1.0, 0.5, 0.1],
+                                2 => [1.0, 1.0, 0.2], 3 => [0.2, 1.0, 0.2],
+                                4 => [0.2, 0.4, 1.0], 5 => [0.9, 0.2, 1.0],
+                                _ => [0.45, 0.55, 0.95],
+                            });
+                        for surface in &mut draws {
+                            let vertices = Arc::make_mut(&mut surface.vertices);
+                            for vertex in vertices {
+                                let dx = [vertex.position[0] - origin[0],
+                                    vertex.position[1] - origin[1],
+                                    vertex.position[2] - origin[2]];
+                                let projection = (dx[0]*direction[0]+dx[1]*direction[1]
+                                    +dx[2]*direction[2]).clamp(0.0,*length);
+                                let to_light = [
+                                    origin[0]+direction[0]*projection-vertex.position[0],
+                                    origin[1]+direction[1]*projection-vertex.position[1],
+                                    origin[2]+direction[2]*projection-vertex.position[2],
+                                ];
+                                let dist_sq = to_light.iter().map(|v|v*v).sum::<f32>();
+                                const RADIUS_SQ: f32 = 180.0*180.0;
+                                if dist_sq >= RADIUS_SQ { continue; }
+                                let distance = dist_sq.sqrt().max(0.5);
+                                let lambert = (vertex.normal[0]*to_light[0]
+                                    +vertex.normal[1]*to_light[1]
+                                    +vertex.normal[2]*to_light[2])/distance;
+                                let attenuation = (1.0-dist_sq/RADIUS_SQ).powi(2);
+                                let bounce = (0.30+0.70*lambert.max(0.0))*attenuation*1.65;
+                                for channel in 0..3 {
+                                    vertex.color[channel] = (vertex.color[channel]
+                                        +rgb[channel]*bounce).clamp(0.0,1.8);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             if with_sabers {

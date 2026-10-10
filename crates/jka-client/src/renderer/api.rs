@@ -1,7 +1,7 @@
 //! Api.
 use crate::renderer::{
     scene, ui, Arc, Camera, CloudRenderResolution, CloudType, ColorLutPreset, CullDebugMode,
-    DetailTextureMode, DofQuality, Duration, DynamicLightsMode, DynamicShadowsMode,
+    DofQuality, Duration, DynamicLightsMode, DynamicShadowsMode,
     EntityAmbientLightingMode, EntityShadowLight, FogMode, FootprintMode, Ghoul2BatchMode,
     Ghoul2SkinningMode, Hash, InputLatencySample, Instant, JumpShadeState, PathBuf, PhysicalSize,
     PlanarReflectionDebugMode, Pod, PreparedMap, PuddleQuality, PvsMode, RainIntensity,
@@ -16,6 +16,14 @@ pub enum DynamicModelAlphaMode {
     Opaque,
     Mask,
     Blend,
+    /// Authored blended stage with explicit `depthWrite` (TaystJK GLS_DEPTHMASK_TRUE).
+    /// Still uses SRC_ALPHA / ONE_MINUS_SRC_ALPHA, but seeds depth in the
+    /// see-through pass before ordinary additive overlays.
+    BlendDepthWrite,
+    /// Depth-writing SRC_ALPHA/ONE_MINUS_SRC_ALPHA stage with unlit rgbGen
+    /// (identity, wave, const). Same authored blend/depth as BlendDepthWrite,
+    /// but skip dynamic entity lighting.
+    BlendUnlitDepthWrite,
     /// Alpha-tested material plus OpenJK RF_FORCE_ENT_ALPHA semantics.
     MaskBlend,
     /// Unlit GL_ONE GL_ONE additive stage. Alpha does not scale source RGB.
@@ -35,7 +43,7 @@ pub enum DynamicModelAlphaMode {
 }
 
 impl DynamicModelAlphaMode {
-    pub(in crate::renderer) const COUNT: usize = 11;
+    pub(in crate::renderer) const COUNT: usize = 13;
 
     /// Dense index for per-alpha-mode pipeline tables and draw bitmasks.
     pub(in crate::renderer) const fn index(self) -> usize {
@@ -51,13 +59,17 @@ impl DynamicModelAlphaMode {
             Self::DstColorAdd => 8,
             Self::Modulate2x => 9,
             Self::Darken => 10,
+            Self::BlendDepthWrite => 11,
+            Self::BlendUnlitDepthWrite => 12,
         }
     }
 }
 
-pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 11] = [
+pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 13] = [
     DynamicModelAlphaMode::Opaque,
     DynamicModelAlphaMode::Mask,
+    DynamicModelAlphaMode::BlendDepthWrite,
+    DynamicModelAlphaMode::BlendUnlitDepthWrite,
     DynamicModelAlphaMode::MaskBlend,
     DynamicModelAlphaMode::Modulate,
     DynamicModelAlphaMode::DstColorAdd,
@@ -79,7 +91,10 @@ pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode;
 pub(in crate::renderer) fn dynamic_model_writes_depth(alpha_mode: DynamicModelAlphaMode) -> bool {
     matches!(
         alpha_mode,
-        DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
+        DynamicModelAlphaMode::Opaque
+            | DynamicModelAlphaMode::Mask
+            | DynamicModelAlphaMode::BlendDepthWrite
+            | DynamicModelAlphaMode::BlendUnlitDepthWrite
     )
 }
 
@@ -850,7 +865,7 @@ pub enum RenderCommand {
     SetMsaa(u32),
     SetTextureFilter(TextureFilter),
     SetPicmip(u32),
-    SetDetailTextures(DetailTextureMode),
+    SetDetailTextures(bool),
     SetDetailTexture {
         path: String,
         game: Option<PathBuf>,
@@ -869,6 +884,8 @@ pub enum RenderCommand {
     /// the app thread every tick (small vertex counts; see `DebugVolumeRenderer::entities`).
     /// `None` clears the overlay (cvar off or no map entity graph loaded).
     SetEntityMarkers(Option<jka_assets::bsp::DebugVolumeMesh>),
+    /// `r_coastalDebug`: static Phase 2.5 classification/boundary/cell overlay.
+    SetCoastalDebugMesh(Option<jka_assets::bsp::DebugVolumeMesh>),
     /// Draw a beam from the sun to the camera (player head) while sun angles are edited.
     SetSunRayPreview(bool),
     SetPvsMode(PvsMode),
@@ -918,7 +935,6 @@ pub enum RenderCommand {
     SetDynamicLighting(DynamicLightsMode),
     SetDynamicLightDebug(bool),
     SetRtSamples(u32),
-    SetRtDenoiserMode(u32),
     SetDynamicLightFalloff(u32),
     SetRtHalfResolution(bool),
     SetMapLightSimulation(bool),

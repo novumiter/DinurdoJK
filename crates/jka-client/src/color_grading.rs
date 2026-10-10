@@ -17,9 +17,9 @@ pub struct ColorGradeSettings {
     pub temperature: f32,
     /// Green/magenta tint. 0.0 is neutral; positive is magenta.
     pub tint: f32,
-    /// Shadow-only brightness in stops.
+    /// Shadow tone-curve adjustment strength (-100..100); 0 is neutral.
     pub shadows: f32,
-    /// Highlight-only brightness in stops.
+    /// Highlight tone-curve adjustment strength (-100..100); 0 is neutral.
     pub highlights: f32,
 }
 
@@ -51,8 +51,8 @@ impl ColorGradeSettings {
             vibrance: finite(self.vibrance, d.vibrance, -1.0, 1.0),
             temperature: finite(self.temperature, d.temperature, 2000.0, 11000.0),
             tint: finite(self.tint, d.tint, -1.0, 1.0),
-            shadows: finite(self.shadows, d.shadows, -2.0, 2.0),
-            highlights: finite(self.highlights, d.highlights, -2.0, 2.0),
+            shadows: finite(self.shadows, d.shadows, -100.0, 100.0),
+            highlights: finite(self.highlights, d.highlights, -100.0, 100.0),
         }
     }
 
@@ -96,11 +96,12 @@ impl ColorGradeSettings {
             rgb = add_chroma_gamut_safe(rgb, delta);
         }
 
-        let luma = luminance(rgb).clamp(0.0, 1.0);
-        let shadow_mask = 1.0 - smoothstep(0.08, 0.58, luma);
-        let highlight_mask = smoothstep(0.42, 0.92, luma);
-        let range_ev = s.shadows as f64 * shadow_mask + s.highlights as f64 * highlight_mask;
-        rgb = rgb.map(|v| v * 2.0f64.powf(range_ev));
+        // Lightroom-style tonal strengths, not extra EV multipliers. Map
+        // luminance through an order-preserving curve, then restore chroma
+        // around the adjusted luminance without per-channel clipping.
+        if s.shadows != 0.0 || s.highlights != 0.0 {
+            rgb = apply_tonal_curve(rgb, s.shadows, s.highlights);
+        }
 
         // Contrast about perceptual middle grey, then saturation around Rec.709 luma.
         rgb = rgb.map(|v| (v - 0.5) * s.contrast as f64 + 0.5);
@@ -127,9 +128,71 @@ impl ColorGradeSettings {
     }
 }
 
-fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+/// A five-knot monotone cubic curve for display-referred luminance.
+///
+/// The endpoints (black/white) and middle grey are fixed. Shadows adjust
+/// the quarter-tone and highlights adjust the three-quarter-tone by at most
+/// 0.20 each; adjacent knot values therefore never cross, even at opposite
+/// extremes. PCHIP/Fritsch-Carlson tangents avoid the overshoot and inversions
+/// of an unconstrained cubic spline, without flattening every knot's tangent.
+fn tonal_curve(luma: f64, shadows: f32, highlights: f32) -> f64 {
+    let x = luma.clamp(0.0, 1.0);
+    if shadows == 0.0 && highlights == 0.0 {
+        return x;
+    }
+    let knots = [
+        0.0,
+        0.25 + 0.20 * (shadows as f64 / 100.0),
+        0.5,
+        0.75 + 0.20 * (highlights as f64 / 100.0),
+        1.0,
+    ];
+    // Uniform quarter-width intervals: delta_i = dy/dx.
+    let slopes: [f64; 4] = std::array::from_fn(|i| 4.0 * (knots[i + 1] - knots[i]));
+    let mut tangents = [0.0; 5];
+    for i in 1..4 {
+        let left = slopes[i - 1];
+        let right = slopes[i];
+        tangents[i] = if left <= 0.0 || right <= 0.0 {
+            0.0
+        } else {
+            // PCHIP harmonic mean for equally spaced knots.
+            2.0 * left * right / (left + right)
+        };
+    }
+    tangents[0] = (0.5 * (3.0 * slopes[0] - slopes[1])).clamp(0.0, 3.0 * slopes[0]);
+    tangents[4] = (0.5 * (3.0 * slopes[3] - slopes[2])).clamp(0.0, 3.0 * slopes[3]);
+
+    let segment = ((x * 4.0) as usize).min(3);
+    let t = x * 4.0 - segment as f64;
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let y = (2.0 * t3 - 3.0 * t2 + 1.0) * knots[segment]
+        + (t3 - 2.0 * t2 + t) * 0.25 * tangents[segment]
+        + (-2.0 * t3 + 3.0 * t2) * knots[segment + 1]
+        + (t3 - t2) * 0.25 * tangents[segment + 1];
+    y.clamp(0.0, 1.0)
+}
+
+/// Adjust luminance exactly, retaining the input's chroma direction (hue).
+/// Compress chroma as a group where necessary so every channel stays in gamut.
+/// This avoids both RGB clipping and shifting individual channel ratios.
+fn apply_tonal_curve(rgb: [f64; 3], shadows: f32, highlights: f32) -> [f64; 3] {
+    let y = luminance(rgb).clamp(0.0, 1.0);
+    let adjusted = tonal_curve(y, shadows, highlights);
+    if (adjusted - y).abs() < 1e-12 {
+        return rgb;
+    }
+    let chroma = rgb.map(|v| v - y);
+    let mut scale: f64 = 1.0;
+    for component in chroma {
+        if component > 0.0 {
+            scale = scale.min((1.0 - adjusted) / component);
+        } else if component < 0.0 {
+            scale = scale.min(adjusted / -component);
+        }
+    }
+    std::array::from_fn(|i| (adjusted + chroma[i] * scale.clamp(0.0, 1.0)).clamp(0.0, 1.0))
 }
 
 fn add_chroma_gamut_safe(rgb: [f64; 3], delta: [f64; 3]) -> [f64; 3] {
@@ -320,11 +383,11 @@ mod tests {
     #[test]
     fn shadows_and_highlights_brightness_target_opposite_ends() {
         let shadows = ColorGradeSettings {
-            shadows: 1.0,
+            shadows: 50.0,
             ..Default::default()
         };
         let highlights = ColorGradeSettings {
-            highlights: 1.0,
+            highlights: 50.0,
             ..Default::default()
         };
         let dark = [0.15; 3];
@@ -336,6 +399,63 @@ mod tests {
     }
 
     #[test]
+    fn tonal_curve_is_monotonic_at_extreme_and_mixed_settings() {
+        for shadows in [-100.0, -50.0, 0.0, 50.0, 100.0] {
+            for highlights in [-100.0, -50.0, 0.0, 50.0, 100.0] {
+                let grade = ColorGradeSettings {
+                    shadows,
+                    highlights,
+                    ..Default::default()
+                };
+                let mut previous = -1.0;
+                for i in 0..=4096 {
+                    let x = i as f64 / 4096.0;
+                    let result = luminance(grade.apply_display([x; 3]));
+                    assert!(result >= previous - 1e-12,
+                        "inversion at {x} for shadows={shadows}, highlights={highlights}: {previous} -> {result}");
+                    assert!((0.0..=1.0).contains(&result));
+                    previous = result;
+                }
+                assert!((luminance(grade.apply_display([0.0; 3])) - 0.0).abs() < 1e-10);
+                assert!((luminance(grade.apply_display([0.5; 3])) - 0.5).abs() < 1e-10);
+                assert!((luminance(grade.apply_display([1.0; 3])) - 1.0).abs() < 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_opposing_controls_cannot_swap_shadows_and_highlights() {
+        let grade = ColorGradeSettings {
+            shadows: 100.0,
+            highlights: -100.0,
+            ..Default::default()
+        };
+        let dark = luminance(grade.apply_display([0.25; 3]));
+        let bright = luminance(grade.apply_display([0.75; 3]));
+        assert!((dark - 0.45).abs() < 1e-10);
+        assert!((bright - 0.55).abs() < 1e-10);
+        assert!(dark < bright);
+    }
+
+    #[test]
+    fn tonal_controls_preserve_luminance_and_chroma_direction_without_clipping() {
+        let rgb = [0.9, 0.12, 0.35];
+        let y = luminance(rgb);
+        for (shadows, highlights) in [(100.0, -100.0), (-100.0, 100.0), (60.0, -50.0)] {
+            let output = apply_tonal_curve(rgb, shadows, highlights);
+            let target = tonal_curve(y, shadows, highlights);
+            assert!((luminance(output) - target).abs() < 1e-10);
+            assert!(output.iter().all(|&v| (0.0..=1.0).contains(&v)));
+            // Differences between channels must keep their signs: no hue rotation.
+            for a in 0..3 {
+                for b in (a + 1)..3 {
+                    assert!((output[a] - output[b]) * (rgb[a] - rgb[b]) >= 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn primary_grade_sanitizes_invalid_values() {
         let settings = ColorGradeSettings {
             exposure_ev: f32::NAN,
@@ -344,8 +464,8 @@ mod tests {
             vibrance: 3.0,
             temperature: f32::NEG_INFINITY,
             tint: -3.0,
-            shadows: 9.0,
-            highlights: -9.0,
+            shadows: 900.0,
+            highlights: -900.0,
         }
         .sanitize();
         assert_eq!(settings.exposure_ev, 0.0);
@@ -354,8 +474,8 @@ mod tests {
         assert_eq!(settings.vibrance, 1.0);
         assert_eq!(settings.temperature, 6500.0);
         assert_eq!(settings.tint, -1.0);
-        assert_eq!(settings.shadows, 2.0);
-        assert_eq!(settings.highlights, -2.0);
+        assert_eq!(settings.shadows, 100.0);
+        assert_eq!(settings.highlights, -100.0);
         assert!(settings
             .apply_display([0.4; 3])
             .iter()

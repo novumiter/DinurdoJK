@@ -206,28 +206,32 @@ pub(in crate::renderer) fn build_world(
             } else { None });
             water_faces.push(entry.face);
         }
-        let clusters = crate::ocean::cluster_water_faces(&water_faces);
-        if clusters.len() > MAX_OCEAN_SURFACES {
+        let footprints = crate::ocean::build_water_footprints(
+            &water_faces,
+            &water_face_triangles,
+            crate::ocean::WATER_FOOTPRINT_TILE_SIZE,
+        );
+        if footprints.len() > MAX_OCEAN_SURFACES {
             rverbose!(
                 1,
                 "Ocean: {} promoted water surfaces from {} faces; the {} smallest stay on their authored faces",
-                clusters.len(),
+                footprints.len(),
                 water_faces.len(),
-                clusters.len() - MAX_OCEAN_SURFACES,
+                footprints.len() - MAX_OCEAN_SURFACES,
             );
         }
-        for (slot, cluster) in clusters.iter().take(MAX_OCEAN_SURFACES).enumerate() {
-            let authored = water_faces[cluster.members[0]].authored_ocean.is_some();
+        for (slot, footprint) in footprints.iter().take(MAX_OCEAN_SURFACES).enumerate() {
+            let authored = water_faces[footprint.members[0]].authored_ocean.is_some();
             // Use one stable representative for every face sharing this clipmap.
             // Choosing its largest member avoids PVS pieces changing tint,
             // tcMod-derived swell direction, or calm-water LOD by submission order.
-            let representative = cluster.members.iter().copied().max_by(|&a, &b| {
+            let representative = footprint.members.iter().copied().max_by(|&a, &b| {
                 let area = |i: usize| {
                     let f = water_faces[i];
                     (f.maximum[0]-f.minimum[0]) * (f.maximum[1]-f.minimum[1])
                 };
                 area(a).total_cmp(&area(b))
-            }).unwrap_or(cluster.members[0]);
+            }).unwrap_or(footprint.members[0]);
             let mut appearance = water_face_appearances[representative];
             let mut promoted_source = None;
             if !authored {
@@ -244,18 +248,16 @@ pub(in crate::renderer) fn build_world(
             let mask_slot = if authored {
                 None
             } else {
-                let triangles: Vec<crate::ocean::MaskTriangle> = cluster
-                    .members
-                    .iter()
-                    .flat_map(|&member| water_face_triangles[member].iter().copied())
-                    .collect();
                 if crate::ocean::promoted_outline_needs_mask(
-                    cluster.minimum,
-                    cluster.maximum,
-                    &triangles,
+                    footprint.minimum,
+                    footprint.maximum,
+                    &footprint.triangles,
                 ) {
-                    ocean_masks.push_surface(slot, &triangles).then_some(slot)
+                    ocean_masks.push_footprint(slot, footprint).then_some(slot)
                 } else {
+                    // Rectangles still retain their exact CPU footprint for
+                    // centering/distance even though fragment clipping is free.
+                    ocean_masks.footprints[slot] = Some(Arc::new(footprint.clone()));
                     None
                 }
             };
@@ -267,12 +269,12 @@ pub(in crate::renderer) fn build_world(
             let ranges = if let Some(appearance) = appearance {
                 let low = crate::ocean::build_runtime_promoted_clipmap(
                     crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
-                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                    footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
                     appearance.heuristic.amplitude,
                 );
                 let high = crate::ocean::build_runtime_promoted_clipmap(
                     crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
-                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                    footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
                     appearance.heuristic.amplitude,
                 );
                 ocean_coarsest_spacing = low.coarsest_spacing;
@@ -296,6 +298,8 @@ pub(in crate::renderer) fn build_world(
                         active_range: active_range.clone(),
                         current_half_cells: half_cells,
                         current_minimum_level: 0,
+                        current_centre: [f32::NAN; 2],
+                        current_pvs_cluster: None,
                     });
                     active_range
                 };
@@ -303,11 +307,11 @@ pub(in crate::renderer) fn build_world(
             } else {
                 let low = crate::ocean::build_clipmap(
                     crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
-                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                    footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
                 );
                 let high = crate::ocean::build_clipmap(
                     crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
-                    cluster.plane, cluster.minimum, cluster.maximum, mask_slot,
+                    footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
                 );
                 ocean_coarsest_spacing = low.coarsest_spacing;
                 upload_timings.ocean_clipmap_vertices +=
@@ -326,23 +330,23 @@ pub(in crate::renderer) fn build_world(
                     .map(|t| t.label.clone()).unwrap_or_else(|| format!("water shader {}", source.bsp_shader_index));
                 upload_timings.promoted_oceans.push(crate::ocean::appearance::PromotedOcean {
                     index: slot, name,
-                    surface: crate::ocean::OceanSurface { plane_height:cluster.plane, minimum:cluster.minimum, maximum:cluster.maximum },
+                    surface: crate::ocean::OceanSurface { plane_height:footprint.plane, minimum:footprint.minimum, maximum:footprint.maximum },
                     heuristic:appearance.heuristic,
                     roughness:(appearance.material[3] >= 0.0).then_some(appearance.material[3]),
                     color:crate::ocean::appearance::linear_to_srgb([appearance.color[0],appearance.color[1],appearance.color[2]]),
                     swell_direction:crate::ocean::appearance::swell_direction_from_stage(source, &vertices),
                 });
             }
-            for &member in &cluster.members {
+            for &member in &footprint.members {
                 if let Some(appearance) = appearance {
                     ocean_appearances.insert(water_face_keys[member], appearance);
                 }
                 ocean_clipmaps.insert(water_face_keys[member], (ranges.clone(), slot as u8));
             }
             ocean_surfaces.push(crate::ocean::OceanSurface {
-                plane_height: cluster.plane,
-                minimum: cluster.minimum,
-                maximum: cluster.maximum,
+                plane_height: footprint.plane,
+                minimum: footprint.minimum,
+                maximum: footprint.maximum,
             });
         }
     }
@@ -891,6 +895,30 @@ pub(in crate::renderer) fn build_world(
     } else {
         Vec::new()
     };
+    // Keep one compact footprint per exact FULL/PVS water piece. At runtime we
+    // union only the pieces already selected by the current cluster's PVS list;
+    // no second visibility system or per-cluster ocean allocation is needed.
+    let mut ocean_pvs_footprints =
+        crate::ocean::OceanPvsFootprints::with_batch_count(full_batches.len());
+    for (batch_index, batch) in full_batches.iter().enumerate() {
+        let slot = batch.ocean_clipmap_id as usize;
+        let Some(surface) = ocean_surfaces.get(slot).copied() else {
+            continue;
+        };
+        if batch.ocean_clipmap.is_none() || !batch.source.water_primary {
+            continue;
+        }
+        let source = batch.source.vertices.start as usize..batch.source.vertices.end as usize;
+        let triangles = vertices[source].chunks_exact(3).map(|triangle| {
+            [0, 1, 2].map(|vertex| {
+                [
+                    triangle[vertex].position[0],
+                    triangle[vertex].position[2],
+                ]
+            })
+        });
+        ocean_pvs_footprints.add_piece(batch_index, slot, surface, triangles);
+    }
     let planar_reflectors = collect_planar_reflectors(&coarse_batches, &vertices);
     // Inline models join both batch sets after the static world, so every
     // static batch index (reflectors, snow, AO) is unchanged. Their empty PVS
@@ -1782,6 +1810,7 @@ pub(in crate::renderer) fn build_world(
             ocean_surfaces,
             promoted_oceans: upload_timings.promoted_oceans.clone(),
             ocean_masks: Arc::new(ocean_masks),
+            ocean_pvs_footprints,
             runtime_ocean_clipmaps,
             inline_models,
             vertex_buffer,

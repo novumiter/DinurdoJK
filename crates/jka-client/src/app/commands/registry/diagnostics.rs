@@ -332,6 +332,16 @@ commands! {
         CommandResult::Status
     }
 
+    cmd_dev ["dev", ] ("dev", "Toggle the mouse-driven developer radial: Trace, 3D Entities, Entity Viewer, and Remap Shader (planned).", CommandScope::Always) |self, command| {
+        match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [_verb] => {
+                self.toggle_dev_radial();
+                CommandResult::Handled
+            }
+            _ => CommandResult::Unhandled,
+        }
+    }
+
     cmd_trace ["trace", ] ("trace", "jaPRO: Trace what you are looking at.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {

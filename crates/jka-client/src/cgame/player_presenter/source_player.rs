@@ -282,6 +282,7 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
     key: String,
     descriptor_qpath: &str,
     descriptor_bytes: &[u8],
+    jiggle_remesh: JiggleRemeshTuning,
 ) -> Result<PlayerModelAsset, String> {
     let descriptor = parse_descriptor(descriptor_qpath, descriptor_bytes)?;
     let base = descriptor
@@ -338,7 +339,31 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
             0
         }
     };
+    let source_native_pivots = rig.native_pivots.map(Arc::new);
     let glm = Arc::new(rig.glm);
+    // Source geometry is already rebound and weighted to _humanoid. The
+    // stock GLM auto detector requires Raven helper surfaces, which Source
+    // models don't have; use the anatomical Source detector instead.
+    let jiggle = match JiggleProfile::auto_source_humanoid(
+        &glm,
+        &gla,
+        source_native_pivots.as_deref().map(Vec::as_slice),
+    ) {
+        Ok(Some(profile)) => {
+            devprintln!(
+                2,
+                "SOURCE PLAYER JIGGLE: {model_name} auto regions={}",
+                profile.region_count(),
+            );
+            Some(Arc::new(profile))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            rverbose!(1, "SOURCE PLAYER JIGGLE AUTO WARNING: {model_name}: {error}");
+            None
+        }
+    };
+    let joined_breast_bakes = build_joined_breast_bakes(&glm, jiggle.as_deref(), jiggle_remesh)?;
 
     let mut surfaces = Vec::with_capacity(rig.surfaces.len());
     for (surface_index, surface) in rig.surfaces.iter().enumerate() {
@@ -361,9 +386,9 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
                 &glm,
                 surface_index,
                 false,
-                None,
-                JiggleRemeshTuning::default(),
-                &HashMap::new(),
+                jiggle.as_deref(),
+                jiggle_remesh,
+                &joined_breast_bakes,
             )?,
         });
     }
@@ -374,14 +399,14 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
         key,
         glm,
         gla,
+        source_native_pivots,
         // A Source player is driven by `players/_humanoid/`, so it takes the
         // ordinary multiplayer animation and BG_G2PlayerAngles path.
         humanoid: true,
         animations: None,
         anim_events: None,
         surfaces,
-        // Jiggle is authored beside a GLM and has no Source equivalent.
-        jiggle: None,
+        jiggle,
         female: descriptor.female,
     })
 }

@@ -14,8 +14,8 @@ use crate::app::{
 /// camera for sub-command-frame smoothness.
 pub(in crate::app) struct LivePredictionFrame {
     pub(in crate::app) display: jka_protocol::server::PlayerState,
-    /// The state presented on the previous frame (CG_TransitionPlayerState's ops).
-    pub(in crate::app) previous_display: jka_protocol::server::PlayerState,
+    pub(in crate::app) committed: jka_protocol::server::PlayerState,
+    pub(in crate::app) previous_committed: jka_protocol::server::PlayerState,
     pub(in crate::app) error: [f32; 3],
     pub(in crate::app) command_angles: Option<[i32; 3]>,
     pub(in crate::app) view_forced: bool,

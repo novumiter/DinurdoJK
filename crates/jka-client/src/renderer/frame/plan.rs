@@ -1,6 +1,6 @@
 //! Frame plan.
 use crate::renderer::{
-    weather, CullDebugMode, DetailTextureMode, DynamicLightsMode, DynamicShadowsMode,
+    weather, CullDebugMode, DynamicLightsMode, DynamicShadowsMode,
     PlanarReflectionDebugMode, Renderer, WorldRenderPath,
 };
 
@@ -101,7 +101,7 @@ impl Renderer {
             && self.depth_of_field_strength <= 0.001
             && !self.gpu_driven_enabled
             && !self.hiz_occlusion_enabled
-            && self.detail_textures_mode == DetailTextureMode::Off
+            && !self.detail_textures_enabled
             && !self.point_lighting_enabled()
             && !matches!(
                 self.dynamic_lights_mode,
@@ -124,11 +124,8 @@ impl Renderer {
         // linear-depth prepass: with no other consumer it runs a cheaper
         // depth-only early pass instead (see `FramePlan::hiz_early`).
         let other_linear_depth = self.ssao_enabled
-            || ((self.rt_reduced_shadows || self.rt_denoiser_mode != 0)
+            || (self.rt_reduced_shadows
                 && self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
-                && self.ray_tracing_supported)
-            || (self.rt_denoiser_mode != 0
-                && self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
                 && self.ray_tracing_supported)
             || self.temporal_resolve_active()
             || self.contact_shadows_enabled

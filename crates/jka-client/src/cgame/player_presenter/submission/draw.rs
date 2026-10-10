@@ -1,7 +1,7 @@
 //! Submission draw.
 use crate::cgame::player_presenter::{
     blend_for_alpha, gpu_bones_from_pose, skin_glm_surface, skin_surface_timed, specular_alpha,
-    stage_uv_xform, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode,
+    stage_uv_xform, wave_value, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuSkinning,
     Ghoul2SkinnedSurface, Ghoul2SkinningMode, GlaAnimation, GlmModel, HashMap, HashSet, Instant,
     JiggleProfile, Matrix3x4, PlayerPresenter, PlayerSurfaceAsset, ResolvedStage, StageFrame,
@@ -522,11 +522,21 @@ impl PlayerPresenter {
         seconds: f32,
         frame: &StageFrame,
     ) {
+        // TaystJK RB_CalcWaveColor/RB_CalcWaveAlpha clamp each waveform to
+        // [0,1] at shader time. In particular, alphaGen wave MUST NOT become
+        // identity on the first blended depth-writing pass.
+        let rgb = stage
+            .rgb_wave
+            .map(|wave| wave_value(wave, seconds).clamp(0.0, 1.0));
+        let generated_alpha = stage
+            .alpha_wave
+            .map(|wave| wave_value(wave, seconds).clamp(0.0, 1.0))
+            .unwrap_or(stage.alpha);
         let mut color = [
-            stage.rgb[0],
-            stage.rgb[1],
-            stage.rgb[2],
-            alpha * stage.alpha,
+            rgb.unwrap_or(stage.rgb[0]),
+            rgb.unwrap_or(stage.rgb[1]),
+            rgb.unwrap_or(stage.rgb[2]),
+            alpha * generated_alpha,
         ];
         let xform = stage_uv_xform(&stage.tc_mods, seconds);
         let specular = frame.specular_points().filter(|_| stage.specular_alpha);

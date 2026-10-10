@@ -3,7 +3,7 @@ use crate::renderer::{
     auto_detail_fallback_index, create_fast_world_wireframe_pipeline, create_wireframe_pipeline,
     create_world_pipeline_variant_from_plan, create_world_wireframe_pipeline, pipeline_hash,
     required_auto_detail_indices, try_load_texture_asset_from_search_path, ui, upload_texture,
-    AssetSearchPath, CullDebugMode, DetailTextureMode, DynamicLightsMode, DynamicShadowsMode,
+    AssetSearchPath, CullDebugMode, DynamicLightsMode, DynamicShadowsMode,
     GrassPreparedDraw, HashMap, Instant, JumpShadeState, Path, PipelineJobKey,
     PlanarReflectionDebugMode, PreparedSurfaceSpriteEffects, PvsMode, Renderer,
     WorldPipelineCompilePlan, WorldPipelineVariant, WorldRenderPath, WorldShaderFamily,
@@ -89,16 +89,16 @@ impl Renderer {
         );
     }
 
-    pub(in crate::renderer) fn set_detail_textures(&mut self, mode: DetailTextureMode) {
-        if self.detail_textures_mode == mode {
+    pub(in crate::renderer) fn set_detail_textures(&mut self, enabled: bool) {
+        if self.detail_textures_enabled == enabled {
             return;
         }
-        self.detail_textures_mode = mode;
+        self.detail_textures_enabled = enabled;
 
         // If a map was loaded while details were disabled, populate only the
         // textures selected by that world's MATERIAL_* plan when details are
         // enabled. The world keeps the plan specifically so this stays lazy.
-        if mode != DetailTextureMode::Off {
+        if enabled {
             let plan = self
                 .world
                 .as_ref()
@@ -118,7 +118,7 @@ impl Renderer {
         rverbose!(
             1,
             "Detail textures: {} (textures/japro/detail; eligible opaque BSP stages only)",
-            mode.label()
+            if enabled { "ON (NEUTRAL 2X)" } else { "OFF" }
         );
     }
 
@@ -149,7 +149,7 @@ impl Renderer {
             .world
             .as_ref()
             .map(|world| world.detail_texture_by_base.clone());
-        if self.detail_textures_mode != DetailTextureMode::Off {
+        if self.detail_textures_enabled {
             if let Some(plan) = plan {
                 self.ensure_auto_detail_textures_for_plan(&plan);
                 if let Some(mut world) = self.world.take() {
@@ -483,9 +483,6 @@ impl Renderer {
             ray_traced_shadows: self.hardware_rt_requested() && self.ray_tracing_supported,
             ray_traced_sun: self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
                 && self.ray_tracing_supported,
-            rt_receiver_denoiser: self.hardware_rt_requested() && self.ray_tracing_supported
-                && self.rt_denoiser_mode != 0
-                && crate::renderer::lighting::rt_diagnostics::config().receiver.denoiser,
             rt_receiver_glass: self.hardware_rt_requested() && self.ray_tracing_supported
                 && crate::renderer::lighting::rt_diagnostics::config().receiver.glass,
             planar_reflections: self.planar_reflection.active,
@@ -503,7 +500,7 @@ impl Renderer {
             planar_debug: self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off,
             deluxe: self.deluxe_shader_enabled(),
             deluxe_specular: self.deluxe_shader_enabled() && self.deluxe_specular > 0.0,
-            detail_texture_mode: self.detail_textures_mode.shader_mode(),
+            detail_textures_enabled: self.detail_textures_enabled,
         }
     }
 
@@ -572,7 +569,6 @@ impl Renderer {
             // but this particular map exceeds an acceleration-structure limit.
             key.ray_traced_shadows = false;
             key.ray_traced_sun = false;
-            key.rt_receiver_denoiser = false;
             key.rt_receiver_glass = false;
         }
         let Some(current_key) = self
@@ -766,6 +762,14 @@ impl Renderer {
     ) {
         self.debug_volumes
             .set_entity_markers(&self.device, mesh.as_ref());
+    }
+
+    pub(in crate::renderer) fn set_coastal_debug_mesh(
+        &mut self,
+        mesh: Option<jka_assets::bsp::DebugVolumeMesh>,
+    ) {
+        self.debug_volumes
+            .set_coastal_debug_mesh(&self.device, mesh.as_ref());
     }
 
     pub(in crate::renderer) fn set_force_unified_world(&mut self, force: bool) {

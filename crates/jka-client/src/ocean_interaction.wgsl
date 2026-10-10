@@ -4,6 +4,8 @@
 struct Input { position: vec4<f32>, motion: vec4<f32> };
 struct Params {
     region: vec4<f32>, source: vec4<f32>, bounds: vec4<f32>, indices: vec4<u32>,
+    mask_bounds: vec4<f32>,
+    mask_tiles: vec4<u32>,
     tuning: vec4<f32>,
     inputs: array<Input, 16>,
 };
@@ -23,6 +25,13 @@ fn is_wet(cell: vec2<i32>) -> bool {
 fn outline(world: vec2<f32>) -> bool {
     if (any(world < p.bounds.xy) || any(world > p.bounds.zw)) { return false; }
     if (p.indices.w == 0u) { return true; }
+    let tile_xy = vec2<u32>(clamp(
+        floor((world - p.mask_bounds.xy) / max(p.mask_bounds.zw - p.mask_bounds.xy, vec2<f32>(1.0e-4)) * 8.0),
+        vec2<f32>(0.0), vec2<f32>(7.0)));
+    let tile = tile_xy.y * 8u + tile_xy.x;
+    let code = (p.mask_tiles[tile >> 4u] >> ((tile & 15u) * 2u)) & 3u;
+    if (code == 1u) { return false; }
+    if (code == 2u) { return true; }
     for (var i = 0u; i < p.indices.w; i++) {
         let t = triangles[(p.indices.z + i) * 2u];
         let a = t.xy; let b = t.zw; let c = triangles[(p.indices.z + i) * 2u + 1u].xy;

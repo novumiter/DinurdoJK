@@ -1571,8 +1571,8 @@ impl App {
                         provisional,
                         entity_graph,
                     };
-                    let previous_display = predictor
-                        .predicted()
+                    let previous_committed = predictor
+                        .committed()
                         .cloned()
                         .unwrap_or_else(|| snap.player_state.clone());
                     if let Err(error) = predictor.predict(input) {
@@ -1586,9 +1586,11 @@ impl App {
                     let Some(display) = predictor.predicted().cloned() else {
                         return Ok(None);
                     };
+                    let committed = predictor.committed().cloned().unwrap_or_else(|| snap.player_state.clone());
                     Ok(Some(LivePredictionFrame {
                         display,
-                        previous_display,
+                        committed,
+                        previous_committed,
                         error,
                         command_angles: predictor.predicted_command_angles(),
                         view_forced: predictor.view_forced(),

@@ -210,6 +210,7 @@ impl App {
             surface_inspector,
             startup_splash: !self.startup_first_frame_seen,
             loading: self.loading.as_ref().map(MapLoadingState::ui),
+            shader_compile_progress: None, // Render thread owns worker progress.
             static_ao_progress: self
                 .static_ao_progress
                 .map(|(completed, total)| MapLoadingBar {
@@ -448,9 +449,11 @@ impl App {
         })
     }
 
-    /// OpenJK CG_ScoresDown_f request cadence. While held, refresh the reliable
-    /// `score` command every ~2 seconds; a newly requested stale board is cleared
-    /// so an old match/player list is not presented as current.
+    /// TaystJK CG_ScoresDown_f: request a `score` only on a fresh +scores press
+    /// when the cached request is at least two seconds old. Do NOT call this
+    /// periodically while the scoreboard is open or after death/intermission:
+    /// servers may share flood protection between `score` and `say`, causing
+    /// legitimate chat commands to be silently discarded.
     pub(in crate::app) fn request_scores_if_due(&mut self, clear_stale: bool) {
         let active = self
             .net
@@ -828,7 +831,27 @@ impl App {
         if !self.scoreboard_should_show() {
             return None;
         }
-        let mut board = self.scoreboard.clone()?;
+        // The scoreboard is a presentation surface, not a network response.
+        // TaystJK draws the header even when cg.numScores == 0 (including
+        // immediately after a new score request). A server rejecting/delaying
+        // `score` must never make the scoreboard itself disappear.
+        let session = self.game_session.as_ref()?;
+        let mut board = self.scoreboard.clone().unwrap_or_else(|| {
+            let gametype = session.client_game.gametype();
+            let limits = session.client_game.match_limits();
+            UiScoreboard {
+                team_scores: [limits.scores1.max(0), limits.scores2.max(0)],
+                ready_clients: 0,
+                team_game: gametype >= 6,
+                ctf: gametype == 8,
+                siege: gametype == 7,
+                siege_win_team: session.client_game.siege_win_team(),
+                spectator_scores: matches!(gametype, 3 | 4),
+                show_deaths: false,
+                icon_paths: Vec::new(),
+                entries: Vec::new(),
+            }
+        });
 
         // TaystJK CG_DrawClientScore does not cache readiness in the `scores`
         // command. It reads cg.snap->ps.stats[STAT_CLIENTS_READY] while drawing

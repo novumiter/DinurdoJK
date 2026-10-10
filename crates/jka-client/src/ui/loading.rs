@@ -363,3 +363,33 @@ pub(in crate::ui) const LOAD_DONE: [f32; 4] = [0.30, 0.85, 0.66, 1.0];
 pub(in crate::ui) const LOAD_LABEL: [f32; 4] = [0.62, 0.72, 0.84, 1.0];
 
 pub(in crate::ui) const LOAD_FAINT: [f32; 4] = [0.38, 0.46, 0.58, 1.0];
+
+/// Compact, noninteractive top-right indicator for live pipeline compilation.
+/// Uses the existing legacy UI draw list, so it works during gameplay even
+/// when the egui menu is closed and has no dependency on a freshly built PSO.
+pub(in crate::ui) fn build_shader_compile_progress(
+    out: &mut Vec<UiVertex>,
+    progress: &MapLoadingBar,
+    w: u32,
+    h: u32,
+) {
+    let panel_w = 300.0;
+    let panel_h = 43.0;
+    let x = (w as f32 - panel_w - 16.0).max(8.0);
+    // Below the top-right FPS/timer readouts rather than on top of them.
+    let y = 60.0;
+    rect(out, x, y, panel_w, panel_h, [0.025, 0.04, 0.07, 0.82], w, h);
+    rect_gradient(
+        out, x, y, panel_w, 1.5,
+        with_alpha(LOAD_CYAN, 0.9), with_alpha(LOAD_MAGENTA, 0.9),
+        with_alpha(LOAD_CYAN, 0.9), with_alpha(LOAD_MAGENTA, 0.9), w, h,
+    );
+    text(out, progress.label, x + 12.0, y + 9.0, 1.0, LOAD_LABEL, w, h);
+    let value = format!("{}/{}", progress.completed, progress.total);
+    let value_w = value.len() as f32 * 6.0 * 1.1;
+    text(out, &value, x + panel_w - 12.0 - value_w, y + 9.0, 1.1, HUD_VALUE, w, h);
+    progress_track(
+        out, x + 12.0, y + 28.0, panel_w - 24.0, 5.0,
+        loading_fraction(progress), with_alpha(LOAD_CYAN, 0.6), LOAD_CYAN, w, h,
+    );
+}

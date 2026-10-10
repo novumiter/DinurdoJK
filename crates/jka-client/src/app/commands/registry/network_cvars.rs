@@ -438,6 +438,78 @@ settings_cvars! { NetworkSettings;
         ]
     }
 
+    APP_CG_CORRECTPREDICTEDEVENTS {
+        runtime: CvarDef::new(
+                "cg_correctPredictedEvents",
+                "",
+                "0..1",
+                "Re-fire a predicted event when a replay or snapshot puts a different event at a sequence index this client already played (OpenJK CG_CheckChangedPredictableEvents). Raven shipped that call commented out and every JKA fork inherited it, so 0 matches them and a mispredicted one-shot keeps whatever played first; Quake 3 ran it. 1 corrects it, which can play a sound or effect those builds never played. Never affects Pmove or the sent command.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_cg_correctpredictedevents(app)),
+                |app, value| {
+                    App::cvar_set_cg_correctpredictedevents(
+                        app,
+                        APP_CG_CORRECTPREDICTEDEVENTS.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_cg_correctpredictedevents, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, name, value| {
+                    let _ = settings.network.set_cvar(name, value);
+                }),
+                archive: Some((424, |state| {
+                    let presentation = state.presentation;
+                    format!("{}", u8::from(presentation.network.correct_predicted_events))
+                })),
+                ..CvarBinding::NONE
+            },
+        settings: SETTINGS_CG_CORRECTPREDICTEDEVENTS = APP_CG_CORRECTPREDICTEDEVENTS
+                .bind(
+                    |state: &NetworkSettings| {
+                        CvarValue::String(u8::from(state.correct_predicted_events).to_string())
+                    },
+                    |state, value| {
+                        NetworkSettings::cvar_set_cg_correctpredictedevents(
+                            state,
+                            APP_CG_CORRECTPREDICTEDEVENTS.entry.name,
+                            &value.to_string(),
+                        )
+                    },
+                )
+                .with_text_setter(NetworkSettings::cvar_set_cg_correctpredictedevents, None),
+        implementations: [
+            impl NetworkSettings {
+                fn cvar_set_cg_correctpredictedevents(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    (Ok({
+                        self.correct_predicted_events = atoi(value.as_bytes()) != 0;
+                        false
+                    }))
+                    .map(|_: bool| ())
+                }
+            }
+            impl App {
+                fn cvar_get_cg_correctpredictedevents(&self) -> String {
+                    (SETTINGS_CG_CORRECTPREDICTEDEVENTS.get)(&self.network).to_string()
+                }
+                fn cvar_set_cg_correctpredictedevents(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_CORRECTPREDICTEDEVENTS.set_text.unwrap())(&mut self.network, name, value)?;
+                    self.mark_config_dirty();
+                    if let Some(session) = self.game_session.as_mut() {
+                        session
+                            .client_game
+                            .set_predicted_event_correction(self.network.correct_predicted_events);
+                    }
+
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_PREDICTIONDEBUG {
         runtime: CvarDef::new(
                 "cg_predictionDebug",

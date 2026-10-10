@@ -25,6 +25,9 @@ pub use authoring::{AtmosphericWind, OceanAuthoring, OceanWind};
 pub const OCEAN_CASCADES: usize = 3;
 pub const OCEAN_DEFAULT_MAP_SIZE: u32 = 1024;
 pub const OCEAN_MAX_SURFACES: usize = 8;
+/// Shared world-space sparse-footprint tile size. At the coastal bake's
+/// default 16-unit spacing this is a 16x16-cell allocation tile.
+pub const WATER_FOOTPRINT_TILE_SIZE: f32 = 256.0;
 // Five existing GPU passes per cascade.  No shader/FFT algorithm changes.
 const OCEAN_PASSES_PER_CASCADE: usize = 5;
 const OCEAN_FFT_PASSES: usize = OCEAN_CASCADES * OCEAN_PASSES_PER_CASCADE;
@@ -232,6 +235,11 @@ impl PromotedClipmapLayout {
         promoted_levels_for(self.base_spacing, self.extent, half_cells)
     }
 
+    pub fn outer_spacing_for_half_cells(&self, half_cells: i32) -> f32 {
+        let levels = self.levels_for_half_cells(half_cells);
+        self.base_spacing * (1u32 << levels.saturating_sub(1)) as f32
+    }
+
     /// Select the finest level worth drawing from the shortest 3D distance to
     /// the water footprint. This is the piece the old camera-centred clipmap
     /// missed: altitude (JKA Z / renderer Y) must count just like horizontal
@@ -314,6 +322,95 @@ impl PromotedClipmapLayout {
         indices
     }
 
+    /// Builds the same live LOD topology while omitting cells proven dry by
+    /// the promoted surface's exact footprint. This runs only when the snapped
+    /// clipmap centre or an existing LOD selector changes.
+    pub fn indices_for_footprint(
+        &self,
+        half_cells: i32,
+        minimum_level: u32,
+        centre: [f32; 2],
+        surface: OceanSurface,
+        masks: &OceanMasks,
+        mask_slot: Option<usize>,
+        pvs_tiles: Option<&OceanPvsTileMask>,
+    ) -> Vec<u32> {
+        let levels = self.levels_for_half_cells(half_cells);
+        let first = minimum_level.min(levels.saturating_sub(1));
+        let outer_spacing = self.base_spacing * (1u32 << (levels.saturating_sub(1))) as f32;
+        let mut indices = Vec::with_capacity(self.index_count_for(half_cells, minimum_level));
+        let mut previous_half = 0i32;
+        for level in first..levels {
+            let spacing_half = promoted_level_half_cells(level, half_cells);
+            let vertex_half = self.level_vertex_half_cells[level as usize];
+            debug_assert!(spacing_half <= vertex_half);
+            let spacing = self.base_spacing * (1u32 << level) as f32;
+            let hole = if level == first { 0 } else { previous_half / 2 };
+            let side = (vertex_half * 2 + 1) as u32;
+            let base = self.level_vertex_bases[level as usize];
+            let index = |c: i32, r: i32| {
+                base + (r + vertex_half) as u32 * side + (c + vertex_half) as u32
+            };
+            let position = |c: i32, r: i32| {
+                let mut offset = [c as f32 * spacing, r as f32 * spacing];
+                let on_outer = c.abs().max(r.abs()) >= spacing_half;
+                if on_outer && spacing < outer_spacing - 0.25 {
+                    let parent = spacing * 2.0;
+                    offset[0] = (offset[0] / parent).round() * parent;
+                    offset[1] = (offset[1] / parent).round() * parent;
+                }
+                [
+                    (centre[0] + offset[0]).clamp(surface.minimum[0], surface.maximum[0]),
+                    (centre[1] + offset[1]).clamp(surface.minimum[1], surface.maximum[1]),
+                ]
+            };
+            for row in -spacing_half..spacing_half {
+                for column in -spacing_half..spacing_half {
+                    if hole > 0
+                        && column >= -hole
+                        && column < hole
+                        && row >= -hole
+                        && row < hole
+                    {
+                        continue;
+                    }
+                    let corners = [
+                        position(column, row),
+                        position(column + 1, row),
+                        position(column, row + 1),
+                        position(column + 1, row + 1),
+                    ];
+                    let lo = [
+                        corners.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min),
+                        corners.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min),
+                    ];
+                    let hi = [
+                        corners.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max),
+                        corners.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max),
+                    ];
+                    if hi[0] - lo[0] <= 1.0e-4 || hi[1] - lo[1] <= 1.0e-4 {
+                        continue;
+                    }
+                    if mask_slot.is_some_and(|slot| !masks.rect_may_contain(slot, lo, hi)) {
+                        continue;
+                    }
+                    if pvs_tiles.is_some_and(|tiles| {
+                        !rect_intersects_pvs_tiles(surface, tiles, lo, hi)
+                    }) {
+                        continue;
+                    }
+                    let a = index(column, row);
+                    let b = index(column + 1, row);
+                    let c = index(column, row + 1);
+                    let d = index(column + 1, row + 1);
+                    indices.extend_from_slice(&[a, c, b, b, c, d]);
+                }
+            }
+            previous_half = spacing_half;
+        }
+        indices
+    }
+
     pub fn maximum_index_count(&self) -> usize {
         let mut maximum = 0usize;
         let mut half = PROMOTED_CLIPMAP_MIN_HALF_CELLS;
@@ -345,6 +442,23 @@ pub fn promoted_surface_distance(camera: [f32; 3], surface: OceanSurface) -> f32
     let dy = (camera[1] - surface.plane_height).abs();
     let dz = axis_distance(camera[2], surface.minimum[1], surface.maximum[1]);
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// True distance to the source water footprint when it is available. The
+/// AABB calculation remains the conservative fallback for authored/legacy data.
+pub fn promoted_footprint_distance(
+    camera: [f32; 3],
+    surface: OceanSurface,
+    masks: &OceanMasks,
+    slot: usize,
+) -> f32 {
+    let p = [camera[0], camera[2]];
+    let nearest = masks.closest_point(slot, p).unwrap_or([
+        p[0].clamp(surface.minimum[0], surface.maximum[0]),
+        p[1].clamp(surface.minimum[1], surface.maximum[1]),
+    ]);
+    let horizontal_sq = (p[0] - nearest[0]).powi(2) + (p[1] - nearest[1]).powi(2);
+    (horizontal_sq + (camera[1] - surface.plane_height).powi(2)).sqrt()
 }
 
 /// Builds the clipmap for one promoted water surface. Everything the vertex
@@ -557,6 +671,122 @@ fn build_clipmap_profile(
 
 /// Capacity of the shape-mask triangle store, in vec4s. A triangle takes two.
 pub const OCEAN_MASK_VEC4S: usize = 512;
+/// Coarse exact-acceleration grid for promoted-water outlines. Each tile uses
+/// two bits: 0 means test the source triangles, 1 is definitely outside and 2
+/// is definitely inside. Boundary tiles therefore retain the original answer.
+pub const OCEAN_MASK_TILE_AXIS: usize = 8;
+/// Finer CPU-only grid used when pruning dry cells from the moving clipmap.
+/// It never reaches a shader uniform, so improving topology precision costs
+/// only 256 bytes per masked surface.
+pub const OCEAN_PRUNE_TILE_AXIS: usize = 32;
+pub const OCEAN_PRUNE_TILE_WORDS: usize = OCEAN_PRUNE_TILE_AXIS * OCEAN_PRUNE_TILE_AXIS * 2 / 32;
+/// One bit per fine tile. PVS footprints need only visible/not-visible rather
+/// than the outline accelerator's three states, so one u32 represents a row.
+pub type OceanPvsTileMask = [u32; OCEAN_PRUNE_TILE_AXIS];
+
+#[derive(Clone, Debug)]
+struct OceanPvsPiece {
+    slot: usize,
+    tiles: OceanPvsTileMask,
+}
+
+/// Exact-PVS water-piece footprints, indexed in parallel with `full_batches`.
+/// The renderer unions only the entries in the current cluster's existing FULL
+/// visibility list, so memory scales with water pieces rather than with every
+/// ocean x every BSP cluster.
+#[derive(Clone, Debug, Default)]
+pub struct OceanPvsFootprints {
+    pieces: Vec<Option<OceanPvsPiece>>,
+    known: [bool; OCEAN_MAX_SURFACES],
+}
+
+impl OceanPvsFootprints {
+    pub fn with_batch_count(batch_count: usize) -> Self {
+        Self {
+            pieces: vec![None; batch_count],
+            known: [false; OCEAN_MAX_SURFACES],
+        }
+    }
+
+    /// Records the exact water geometry carried by one FULL/PVS batch.
+    pub fn add_piece(
+        &mut self,
+        batch: usize,
+        slot: usize,
+        surface: OceanSurface,
+        triangles: impl IntoIterator<Item = MaskTriangle>,
+    ) {
+        if batch >= self.pieces.len() || slot >= OCEAN_MAX_SURFACES {
+            return;
+        }
+        let size = [
+            surface.maximum[0] - surface.minimum[0],
+            surface.maximum[1] - surface.minimum[1],
+        ];
+        let mut tiles = [0u32; OCEAN_PRUNE_TILE_AXIS];
+        if size[0] <= 1.0e-4 || size[1] <= 1.0e-4 {
+            tiles.fill(u32::MAX);
+        } else {
+            let tile = |value: f32, axis: usize| {
+                (((value - surface.minimum[axis]) / size[axis]
+                    * OCEAN_PRUNE_TILE_AXIS as f32)
+                    .floor() as i32)
+                    .clamp(0, OCEAN_PRUNE_TILE_AXIS as i32 - 1) as usize
+            };
+            for triangle in triangles {
+                if triangle.iter().flatten().any(|value| !value.is_finite()) {
+                    tiles.fill(u32::MAX);
+                    break;
+                }
+                let lo = [0, 1].map(|axis| {
+                    triangle
+                        .iter()
+                        .map(|point| point[axis])
+                        .fold(f32::INFINITY, f32::min)
+                        - MASK_TOLERANCE
+                });
+                let hi = [0, 1].map(|axis| {
+                    triangle
+                        .iter()
+                        .map(|point| point[axis])
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        + MASK_TOLERANCE
+                });
+                let (x0, x1, y0, y1) =
+                    (tile(lo[0], 0), tile(hi[0], 0), tile(lo[1], 1), tile(hi[1], 1));
+                for row in &mut tiles[y0..=y1] {
+                    for x in x0..=x1 {
+                        *row |= 1u32 << x;
+                    }
+                }
+            }
+        }
+        self.known[slot] = true;
+        self.pieces[batch] = Some(OceanPvsPiece { slot, tiles });
+    }
+
+    /// Unions water tiles from the renderer's exact visible-batch list. `None`
+    /// means this surface lacked exact pieces and must remain conservative;
+    /// `Some(all-zero)` means the surface is completely outside this PVS.
+    pub fn visible_tiles(
+        &self,
+        visible_batches: &[usize],
+    ) -> [Option<OceanPvsTileMask>; OCEAN_MAX_SURFACES] {
+        let mut visible = std::array::from_fn(|slot| self.known[slot].then_some([0; OCEAN_PRUNE_TILE_AXIS]));
+        for &batch in visible_batches {
+            let Some(piece) = self.pieces.get(batch).and_then(Option::as_ref) else {
+                continue;
+            };
+            let Some(surface) = visible[piece.slot].as_mut() else {
+                continue;
+            };
+            for (destination, source) in surface.iter_mut().zip(piece.tiles) {
+                *destination |= source;
+            }
+        }
+        visible
+    }
+}
 
 /// One world-space xz triangle of a promoted water face.
 pub type MaskTriangle = [[f32; 2]; 3];
@@ -571,13 +801,197 @@ pub type MaskTriangle = [[f32; 2]; 3];
 #[derive(Clone, Debug, PartialEq)]
 pub struct OceanMasks {
     pub ranges: [[f32; 4]; OCEAN_MAX_SURFACES],
+    pub bounds: [[f32; 4]; OCEAN_MAX_SURFACES],
+    pub tiles: [[u32; 4]; OCEAN_MAX_SURFACES],
+    pub prune_tiles: [[u32; OCEAN_PRUNE_TILE_WORDS]; OCEAN_MAX_SURFACES],
     pub triangles: Vec<[f32; 4]>,
+    /// CPU-side exact sparse footprints. These do not enter the shader
+    /// uniform; they guide clipmap centering, LOD distance, and index pruning.
+    pub footprints: [Option<std::sync::Arc<WaterFootprint>>; OCEAN_MAX_SURFACES],
+}
+
+/// CPU twin of the promoted vertex shader's two-stage centre snapping. The
+/// global clipmap moves on the legacy coarse lattice; each promoted surface
+/// then clamps that point into its bounds and snaps it to its live outer ring.
+pub fn promoted_clipmap_centre(
+    camera: [f32; 3],
+    surface: OceanSurface,
+    global_spacing: f32,
+    outer_spacing: f32,
+) -> [f32; 2] {
+    let global = global_spacing.max(1.0);
+    let outer = outer_spacing.max(1.0);
+    let camera = [
+        (camera[0] / global).round() * global,
+        (camera[2] / global).round() * global,
+    ];
+    [
+        (camera[0].clamp(surface.minimum[0], surface.maximum[0]) / outer).round() * outer,
+        (camera[1].clamp(surface.minimum[1], surface.maximum[1]) / outer).round() * outer,
+    ]
+}
+
+/// Footprint-aware equivalent of [`promoted_clipmap_centre`]. An L-shaped
+/// ocean therefore keeps its finest rings on the nearest real water instead
+/// of centering them in the dry corner of its enclosing rectangle.
+pub fn promoted_footprint_clipmap_centre(
+    camera: [f32; 3],
+    surface: OceanSurface,
+    global_spacing: f32,
+    outer_spacing: f32,
+    masks: &OceanMasks,
+    slot: usize,
+) -> [f32; 2] {
+    let global = global_spacing.max(1.0);
+    let outer = outer_spacing.max(1.0);
+    let snapped = [
+        (camera[0] / global).round() * global,
+        (camera[2] / global).round() * global,
+    ];
+    let nearest = masks.closest_point(slot, snapped).unwrap_or([
+        snapped[0].clamp(surface.minimum[0], surface.maximum[0]),
+        snapped[1].clamp(surface.minimum[1], surface.maximum[1]),
+    ]);
+    [
+        (nearest[0] / outer).round() * outer,
+        (nearest[1] / outer).round() * outer,
+    ]
+}
+
+fn rect_intersects_pvs_tiles(
+    surface: OceanSurface,
+    tiles: &OceanPvsTileMask,
+    lo: [f32; 2],
+    hi: [f32; 2],
+) -> bool {
+    if hi[0] < surface.minimum[0]
+        || hi[1] < surface.minimum[1]
+        || lo[0] > surface.maximum[0]
+        || lo[1] > surface.maximum[1]
+    {
+        return false;
+    }
+    let size = [
+        (surface.maximum[0] - surface.minimum[0]).max(1.0e-4),
+        (surface.maximum[1] - surface.minimum[1]).max(1.0e-4),
+    ];
+    let tile = |value: f32, axis: usize| {
+        (((value - surface.minimum[axis]) / size[axis] * OCEAN_PRUNE_TILE_AXIS as f32).floor()
+            as i32)
+            .clamp(0, OCEAN_PRUNE_TILE_AXIS as i32 - 1) as usize
+    };
+    let (x0, x1, y0, y1) = (
+        tile(lo[0], 0),
+        tile(hi[0], 0),
+        tile(lo[1], 1),
+        tile(hi[1], 1),
+    );
+    (y0..=y1).any(|y| {
+        (x0..=x1).any(|x| tiles[y] & (1u32 << x) != 0)
+    })
 }
 
 impl Default for OceanMasks {
     fn default() -> Self {
-        Self { ranges: [[0.0; 4]; OCEAN_MAX_SURFACES], triangles: Vec::new() }
+        Self {
+            ranges: [[0.0; 4]; OCEAN_MAX_SURFACES],
+            bounds: [[0.0; 4]; OCEAN_MAX_SURFACES],
+            tiles: [[0; 4]; OCEAN_MAX_SURFACES],
+            prune_tiles: [[0; OCEAN_PRUNE_TILE_WORDS]; OCEAN_MAX_SURFACES],
+            triangles: Vec::new(),
+            footprints: std::array::from_fn(|_| None),
+        }
     }
+}
+
+const MASK_TILE_BOUNDARY: u32 = 0;
+const MASK_TILE_OUTSIDE: u32 = 1;
+const MASK_TILE_INSIDE: u32 = 2;
+const MASK_TOLERANCE: f32 = 0.75;
+
+fn mask_triangle_edges(t: MaskTriangle, p: [f32; 2]) -> [f32; 3] {
+    let edge = |from: [f32; 2], to: [f32; 2]| {
+        let d = [to[0] - from[0], to[1] - from[1]];
+        (d[0] * (p[1] - from[1]) - d[1] * (p[0] - from[0]))
+            / d[0].hypot(d[1]).max(1.0e-4)
+    };
+    [edge(t[0], t[1]), edge(t[1], t[2]), edge(t[2], t[0])]
+}
+
+fn mask_triangle_contains(t: MaskTriangle, p: [f32; 2]) -> bool {
+    let e = mask_triangle_edges(t, p);
+    e.iter().all(|&v| v >= -MASK_TOLERANCE)
+        || e.iter().all(|&v| v <= MASK_TOLERANCE)
+}
+
+fn tile_inside_triangle(t: MaskTriangle, lo: [f32; 2], hi: [f32; 2]) -> bool {
+    let corners = [lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]];
+    // Require one consistent winding branch for all four corners. Each branch
+    // is an intersection of half-planes, hence contains the complete tile.
+    let edges = corners.map(|p| mask_triangle_edges(t, p));
+    edges.iter().all(|e| e.iter().all(|&v| v >= -MASK_TOLERANCE))
+        || edges.iter().all(|e| e.iter().all(|&v| v <= MASK_TOLERANCE))
+}
+
+fn set_mask_tile(words: &mut [u32], tile: usize, code: u32) {
+    let bit = tile * 2;
+    words[bit / 32] |= code << (bit % 32);
+}
+
+fn build_mask_tiles<const AXIS: usize, const WORDS: usize>(
+    triangles: &[MaskTriangle],
+    minimum: [f32; 2],
+    maximum: [f32; 2],
+) -> [u32; WORDS] {
+    let size = [maximum[0] - minimum[0], maximum[1] - minimum[1]];
+    let mut tiles = [0u32; WORDS];
+    for y in 0..AXIS {
+        for x in 0..AXIS {
+            let lo = [
+                minimum[0] + size[0] * x as f32 / AXIS as f32,
+                minimum[1] + size[1] * y as f32 / AXIS as f32,
+            ];
+            let hi = [
+                minimum[0] + size[0] * (x + 1) as f32 / AXIS as f32,
+                minimum[1] + size[1] * (y + 1) as f32 / AXIS as f32,
+            ];
+            let overlaps = |t: &MaskTriangle| {
+                (0..2).all(|axis| {
+                    let tri_lo = t.iter().map(|p| p[axis]).fold(f32::INFINITY, f32::min);
+                    let tri_hi = t.iter().map(|p| p[axis]).fold(f32::NEG_INFINITY, f32::max);
+                    tri_hi + MASK_TOLERANCE >= lo[axis]
+                        && tri_lo - MASK_TOLERANCE <= hi[axis]
+                })
+            };
+            let code = if !triangles.iter().any(overlaps) {
+                MASK_TILE_OUTSIDE
+            } else if triangles.iter().any(|&t| tile_inside_triangle(t, lo, hi)) {
+                MASK_TILE_INSIDE
+            } else {
+                MASK_TILE_BOUNDARY
+            };
+            set_mask_tile(&mut tiles, y * AXIS + x, code);
+        }
+    }
+    tiles
+}
+
+fn mask_tile_code(bounds: [f32; 4], words: [u32; 4], p: [f32; 2]) -> u32 {
+    if p[0] < bounds[0] || p[1] < bounds[1] || p[0] > bounds[2] || p[1] > bounds[3] {
+        return MASK_TILE_OUTSIDE;
+    }
+    let size = [(bounds[2] - bounds[0]).max(1.0e-4), (bounds[3] - bounds[1]).max(1.0e-4)];
+    let x = (((p[0] - bounds[0]) / size[0] * OCEAN_MASK_TILE_AXIS as f32).floor() as i32)
+        .clamp(0, OCEAN_MASK_TILE_AXIS as i32 - 1) as usize;
+    let y = (((p[1] - bounds[1]) / size[1] * OCEAN_MASK_TILE_AXIS as f32).floor() as i32)
+        .clamp(0, OCEAN_MASK_TILE_AXIS as i32 - 1) as usize;
+    let bit = (y * OCEAN_MASK_TILE_AXIS + x) * 2;
+    (words[bit / 32] >> (bit % 32)) & 3
+}
+
+fn packed_tile_code(words: &[u32], tile: usize) -> u32 {
+    let bit = tile * 2;
+    (words[bit / 32] >> (bit % 32)) & 3
 }
 
 /// Whether a promoted surface actually needs the per-fragment outline mask.
@@ -622,6 +1036,14 @@ pub fn promoted_outline_needs_mask(
 }
 
 impl OceanMasks {
+    pub fn push_footprint(&mut self, slot: usize, footprint: &WaterFootprint) -> bool {
+        if slot >= OCEAN_MAX_SURFACES {
+            return false;
+        }
+        self.footprints[slot] = Some(std::sync::Arc::new(footprint.clone()));
+        self.push_surface(slot, &footprint.triangles)
+    }
+
     /// Stores `triangles` for `slot`. Returns false, leaving the slot unmasked,
     /// when they do not fit; the surface then fills its bounding box.
     pub fn push_surface(&mut self, slot: usize, triangles: &[MaskTriangle]) -> bool {
@@ -630,6 +1052,19 @@ impl OceanMasks {
         {
             return false;
         }
+        let minimum: [f32; 2] = std::array::from_fn(|axis| {
+            triangles.iter().flat_map(|t| t.iter()).map(|p| p[axis]).fold(f32::INFINITY, f32::min)
+        });
+        let maximum: [f32; 2] = std::array::from_fn(|axis| {
+            triangles.iter().flat_map(|t| t.iter()).map(|p| p[axis]).fold(f32::NEG_INFINITY, f32::max)
+        });
+        self.bounds[slot] = [minimum[0], minimum[1], maximum[0], maximum[1]];
+        self.tiles[slot] = build_mask_tiles::<OCEAN_MASK_TILE_AXIS, 4>(
+            triangles, minimum, maximum,
+        );
+        self.prune_tiles[slot] = build_mask_tiles::<OCEAN_PRUNE_TILE_AXIS, OCEAN_PRUNE_TILE_WORDS>(
+            triangles, minimum, maximum,
+        );
         self.ranges[slot] = [(self.triangles.len() / 2) as f32, triangles.len() as f32, 0.0, 0.0];
         for t in triangles {
             self.triangles.push([t[0][0], t[0][1], t[1][0], t[1][1]]);
@@ -650,7 +1085,11 @@ impl OceanMasks {
         if !self.is_masked(slot) {
             return true;
         }
-        const TOLERANCE: f32 = 0.75;
+        match mask_tile_code(self.bounds[slot], self.tiles[slot], p) {
+            MASK_TILE_OUTSIDE => return false,
+            MASK_TILE_INSIDE => return true,
+            _ => {}
+        }
         let first = self.ranges[slot][0] as usize;
         let count = self.ranges[slot][1] as usize;
         for i in first..first + count {
@@ -660,22 +1099,87 @@ impl OceanMasks {
             };
             let (a, b, c) = ([t0[0], t0[1]], [t0[2], t0[3]], [t1[0], t1[1]]);
             if (0..2).any(|axis| {
-                p[axis] < a[axis].min(b[axis]).min(c[axis]) - TOLERANCE
-                    || p[axis] > a[axis].max(b[axis]).max(c[axis]) + TOLERANCE
+                p[axis] < a[axis].min(b[axis]).min(c[axis]) - MASK_TOLERANCE
+                    || p[axis] > a[axis].max(b[axis]).max(c[axis]) + MASK_TOLERANCE
             }) {
                 continue;
             }
-            let edge = |from: [f32; 2], to: [f32; 2]| {
-                let d = [to[0] - from[0], to[1] - from[1]];
-                (d[0] * (p[1] - from[1]) - d[1] * (p[0] - from[0]))
-                    / (d[0].hypot(d[1])).max(1.0e-4)
-            };
-            let e = [edge(a, b), edge(b, c), edge(c, a)];
-            if e.iter().all(|&v| v >= -TOLERANCE) || e.iter().all(|&v| v <= TOLERANCE) {
+            if mask_triangle_contains([a, b, c], p) {
                 return true;
             }
         }
         false
+    }
+
+    /// Conservative cell/footprint overlap used to remove dry clipmap cells.
+    /// Fine-grid boundary tiles remain present for the fragment mask to trim;
+    /// only cells covered entirely by proven-dry tiles are omitted.
+    pub fn rect_may_contain(&self, slot: usize, lo: [f32; 2], hi: [f32; 2]) -> bool {
+        if let Some(footprint) = self.footprints.get(slot).and_then(Option::as_deref) {
+            let intersects_sparse_tile = footprint.tiles.iter().any(|tile| {
+                hi[0] >= tile.minimum[0]
+                    && hi[1] >= tile.minimum[1]
+                    && lo[0] <= tile.maximum[0]
+                    && lo[1] <= tile.maximum[1]
+            });
+            if !intersects_sparse_tile {
+                return false;
+            }
+        }
+        if !self.is_masked(slot) {
+            return true;
+        }
+        let bounds = self.bounds[slot];
+        if hi[0] < bounds[0] || hi[1] < bounds[1] || lo[0] > bounds[2] || lo[1] > bounds[3] {
+            return false;
+        }
+        let size = [(bounds[2] - bounds[0]).max(1.0e-4), (bounds[3] - bounds[1]).max(1.0e-4)];
+        let cell = |value: f32, axis: usize| {
+            (((value - bounds[axis]) / size[axis] * OCEAN_PRUNE_TILE_AXIS as f32).floor() as i32)
+                .clamp(0, OCEAN_PRUNE_TILE_AXIS as i32 - 1) as usize
+        };
+        let x0 = cell(lo[0], 0);
+        let x1 = cell(hi[0], 0);
+        let y0 = cell(lo[1], 1);
+        let y1 = cell(hi[1], 1);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if packed_tile_code(&self.prune_tiles[slot], y * OCEAN_PRUNE_TILE_AXIS + x)
+                    != MASK_TILE_OUTSIDE
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn closest_point(&self, slot: usize, p: [f32; 2]) -> Option<[f32; 2]> {
+        let footprint = self.footprints.get(slot)?.as_deref()?;
+        let mut best = None::<([f32; 2], f32)>;
+        for triangle in &footprint.triangles {
+            if mask_triangle_contains(*triangle, p) {
+                return Some(p);
+            }
+            for edge in 0..3 {
+                let a = triangle[edge];
+                let b = triangle[(edge + 1) % 3];
+                let ab = [b[0] - a[0], b[1] - a[1]];
+                let length_sq = ab[0] * ab[0] + ab[1] * ab[1];
+                let t = if length_sq > 1.0e-8 {
+                    (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / length_sq)
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let q = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+                let distance_sq = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2);
+                if best.is_none_or(|(_, old)| distance_sq < old) {
+                    best = Some((q, distance_sq));
+                }
+            }
+        }
+        best.map(|(point, _)| point)
     }
 }
 
@@ -705,7 +1209,9 @@ impl WaterVolume {
     }
 }
 
-pub use jka_assets::bsp::bathymetry::{cluster_water_faces, WaterFace};
+pub use jka_assets::bsp::bathymetry::{
+    build_water_footprints, cluster_water_faces, WaterFace, WaterFootprint,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CascadeSettings {
@@ -917,6 +1423,8 @@ pub struct OceanRenderUniform {
     pub authored_bounds: [f32;4],
     pub authored_plane: [f32;4], // bounds enabled, height, manual appearance, promoted view
     pub mask_ranges: [[f32; 4]; OCEAN_MAX_SURFACES], // first triangle, triangle count
+    pub mask_bounds: [[f32; 4]; OCEAN_MAX_SURFACES], // min xz, max xz for tile lookup
+    pub mask_tiles: [[u32; 4]; OCEAN_MAX_SURFACES], // 2-bit 8x8 classification
     pub mask_triangles: [[f32; 4]; OCEAN_MASK_VEC4S], // per triangle: a.xy b.xy / c.xy
 }
 
@@ -1333,6 +1841,8 @@ impl OceanGpu {
         uniform.wind_motion[1] = -wind[1] / OCEAN_UNITS_PER_METER;
         apply_scene_context(&mut uniform, self.environment, &self.surfaces, self.surface_count);
         uniform.mask_ranges = self.masks.ranges;
+        uniform.mask_bounds = self.masks.bounds;
+        uniform.mask_tiles = self.masks.tiles;
         uniform.mask_triangles[..self.masks.triangles.len()].copy_from_slice(&self.masks.triangles);
         queue.write_buffer(&self.render_buffer,0,bytemuck::bytes_of(&uniform));
         for surface in &self.promoted_surfaces {
@@ -1790,6 +2300,8 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         authored_bounds: settings.bounds.map(|b| [b.minimum[0],b.minimum[1],b.maximum[0],b.maximum[1]]).unwrap_or([0.0;4]),
         authored_plane: settings.bounds.map(|b| [1.0,b.plane_height,0.0,0.0]).unwrap_or([0.0;4]),
         mask_ranges: [[0.0; 4]; OCEAN_MAX_SURFACES],
+        mask_bounds: [[0.0; 4]; OCEAN_MAX_SURFACES],
+        mask_tiles: [[0; 4]; OCEAN_MAX_SURFACES],
         mask_triangles: [[0.0; 4]; OCEAN_MASK_VEC4S],
     }
 }
@@ -1844,6 +2356,8 @@ fn make_promoted_render_uniform(
         settings.authored.foam,
     ];
     local.mask_ranges = shared.mask_ranges;
+    local.mask_bounds = shared.mask_bounds;
+    local.mask_tiles = shared.mask_tiles;
     local.mask_triangles = shared.mask_triangles;
     local
 }
@@ -1964,6 +2478,176 @@ mod tests {
         // A slot that was never pushed contains everything.
         assert!(masks.contains(5, [50.0, 50.0]));
         assert!(!masks.is_masked(5));
+    }
+
+    #[test]
+    fn outline_tiles_are_exact_and_accelerate_interior_and_exterior() {
+        let masks = donut_masks();
+        let exact = |p: [f32; 2]| {
+            let first = masks.ranges[2][0] as usize;
+            let count = masks.ranges[2][1] as usize;
+            (first..first + count).any(|i| {
+                let a = masks.triangles[i * 2];
+                let b = masks.triangles[i * 2 + 1];
+                mask_triangle_contains(
+                    [[a[0], a[1]], [a[2], a[3]], [b[0], b[1]]],
+                    p,
+                )
+            })
+        };
+        let mut outside = 0;
+        let mut inside = 0;
+        for y in 0..OCEAN_MASK_TILE_AXIS {
+            for x in 0..OCEAN_MASK_TILE_AXIS {
+                let p = [(x as f32 + 0.5) * 12.5, (y as f32 + 0.5) * 12.5];
+                match mask_tile_code(masks.bounds[2], masks.tiles[2], p) {
+                    MASK_TILE_OUTSIDE => outside += 1,
+                    MASK_TILE_INSIDE => inside += 1,
+                    _ => {}
+                }
+                assert_eq!(masks.contains(2, p), exact(p), "tile sample {x},{y}");
+            }
+        }
+        for y in 0..=200 {
+            for x in 0..=200 {
+                let p = [x as f32 * 0.5, y as f32 * 0.5];
+                assert_eq!(masks.contains(2, p), exact(p), "dense sample {x},{y}");
+            }
+        }
+        assert!(outside > 0, "the island hollow should have fast dry tiles");
+        assert!(inside > 0, "the water slabs should have fast wet tiles");
+        assert!(!masks.rect_may_contain(2, [45.0, 45.0], [55.0, 55.0]));
+        assert!(masks.rect_may_contain(2, [5.0, 45.0], [15.0, 55.0]));
+    }
+
+    #[test]
+    fn promoted_clipmap_prunes_dry_cells_only_when_its_snapped_centre_moves() {
+        let masks = donut_masks();
+        let surface = OceanSurface {
+            plane_height: 0.0,
+            minimum: [0.0, 0.0],
+            maximum: [100.0, 100.0],
+        };
+        let runtime = build_runtime_promoted_clipmap(1.0, 0.0, surface.minimum,
+            surface.maximum, Some(2), appearance::MIN_PROMOTED_AMPLITUDE);
+        let half = promoted_clipmap_half_cells(appearance::MIN_PROMOTED_AMPLITUDE);
+        let full = runtime.layout.indices_for(half, 0);
+        let centre = promoted_clipmap_centre(
+            [50.0, 0.0, 50.0],
+            surface,
+            32.0,
+            runtime.layout.outer_spacing_for_half_cells(half),
+        );
+        let pruned = runtime.layout.indices_for_footprint(
+            half, 0, centre, surface, &masks, Some(2), None,
+        );
+        assert!(pruned.len() < full.len(), "the dry island must remove draw cells");
+        assert!(!pruned.is_empty(), "the surrounding water ring remains drawable");
+
+        let same_snap = promoted_clipmap_centre(
+            [51.0, 0.0, 51.0],
+            surface,
+            32.0,
+            runtime.layout.outer_spacing_for_half_cells(half),
+        );
+        assert_eq!(centre, same_snap, "sub-lattice camera motion needs no rewrite");
+    }
+
+    #[test]
+    fn promoted_clipmap_centres_on_real_l_shaped_water() {
+        let rectangle = |lo: [f32; 2], hi: [f32; 2]| {
+            vec![
+                [lo, [hi[0], lo[1]], [lo[0], hi[1]]],
+                [[hi[0], lo[1]], hi, [lo[0], hi[1]]],
+            ]
+        };
+        let faces = [
+            WaterFace { plane: 0.0, minimum: [0.0, 0.0], maximum: [100.0, 20.0], authored_ocean: None, material: 1 },
+            WaterFace { plane: 0.0, minimum: [0.0, 20.0], maximum: [20.0, 100.0], authored_ocean: None, material: 1 },
+        ];
+        let triangles = [rectangle([0.0, 0.0], [100.0, 20.0]), rectangle([0.0, 20.0], [20.0, 100.0])];
+        let footprint = build_water_footprints(&faces, &triangles, 32.0).remove(0);
+        let mut masks = OceanMasks::default();
+        assert!(masks.push_footprint(0, &footprint));
+        let surface = OceanSurface { plane_height: 0.0, minimum: footprint.minimum, maximum: footprint.maximum };
+        let camera = [80.0, 0.0, 80.0];
+        assert_eq!(promoted_surface_distance(camera, surface), 0.0);
+        assert!(promoted_footprint_distance(camera, surface, &masks, 0) > 59.0);
+        let centre = promoted_footprint_clipmap_centre(camera, surface, 1.0, 1.0, &masks, 0);
+        assert!(centre[0] <= 21.0 || centre[1] <= 21.0, "centre {centre:?} must lie on an L arm");
+    }
+
+    #[test]
+    fn promoted_clipmap_prunes_to_the_current_full_pvs_pieces() {
+        let surface = OceanSurface {
+            plane_height: 0.0,
+            minimum: [0.0, 0.0],
+            maximum: [100.0, 100.0],
+        };
+        let rectangle = |lo: [f32; 2], hi: [f32; 2]| {
+            vec![
+                [lo, [hi[0], lo[1]], [lo[0], hi[1]]],
+                [[hi[0], lo[1]], hi, [lo[0], hi[1]]],
+            ]
+        };
+        let mut pvs = OceanPvsFootprints::with_batch_count(2);
+        pvs.add_piece(0, 0, surface, rectangle([0.0, 0.0], [40.0, 100.0]));
+        pvs.add_piece(1, 0, surface, rectangle([60.0, 0.0], [100.0, 100.0]));
+
+        let left_only = pvs.visible_tiles(&[0]);
+        let left = left_only[0].as_ref().expect("surface has exact PVS pieces");
+        assert!(rect_intersects_pvs_tiles(surface, left, [5.0, 45.0], [15.0, 55.0]));
+        assert!(!rect_intersects_pvs_tiles(surface, left, [85.0, 45.0], [95.0, 55.0]));
+        let both = pvs.visible_tiles(&[0, 1]);
+        assert!(rect_intersects_pvs_tiles(
+            surface,
+            both[0].as_ref().unwrap(),
+            [85.0, 45.0],
+            [95.0, 55.0],
+        ));
+        let neither = pvs.visible_tiles(&[]);
+        assert!(!rect_intersects_pvs_tiles(
+            surface,
+            neither[0].as_ref().unwrap(),
+            [5.0, 45.0],
+            [15.0, 55.0],
+        ));
+
+        let runtime = build_runtime_promoted_clipmap(
+            1.0,
+            0.0,
+            surface.minimum,
+            surface.maximum,
+            None,
+            appearance::MIN_PROMOTED_AMPLITUDE,
+        );
+        let half = promoted_clipmap_half_cells(appearance::MIN_PROMOTED_AMPLITUDE);
+        let centre = promoted_clipmap_centre(
+            [50.0, 0.0, 50.0],
+            surface,
+            32.0,
+            runtime.layout.outer_spacing_for_half_cells(half),
+        );
+        let full = runtime.layout.indices_for_footprint(
+            half,
+            0,
+            centre,
+            surface,
+            &OceanMasks::default(),
+            None,
+            None,
+        );
+        let visible = runtime.layout.indices_for_footprint(
+            half,
+            0,
+            centre,
+            surface,
+            &OceanMasks::default(),
+            None,
+            Some(left),
+        );
+        assert!(!visible.is_empty());
+        assert!(visible.len() < full.len());
     }
 
     #[test]
@@ -2193,6 +2877,9 @@ mod tests {
         let too_many = vec![tri; OCEAN_MASK_VEC4S / 2];
         assert!(!masks.push_surface(2, &too_many), "overflow leaves the slot unmasked");
         assert_eq!(masks.ranges[2], [0.0; 4]);
+        assert_eq!(masks.bounds[2], [0.0; 4]);
+        assert_eq!(masks.tiles[2], [0; 4]);
+        assert_eq!(masks.prune_tiles[2], [0; OCEAN_PRUNE_TILE_WORDS]);
     }
 
     #[test]

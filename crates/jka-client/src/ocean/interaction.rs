@@ -139,6 +139,8 @@ struct Params {
     source: [f32; 4], // previous origin XZ, reset, simulation dt
     bounds: [f32; 4],
     indices: [u32; 4], // layer, input count, mask first triangle, count
+    mask_bounds: [f32; 4], // exact triangle bounds used by mask_tiles
+    mask_tiles: [u32; 4], // 2-bit 8x8 exact footprint accelerator
     tuning: [f32; 4],  // velocity damping, height damping, edge fraction, spare
     inputs: [Input; INPUTS],
 }
@@ -971,6 +973,8 @@ impl InteractionGpu {
                         range[0] as u32,
                         range[1] as u32,
                     ],
+                    mask_bounds: slot.mask.map_or([0.0; 4], |i| masks.bounds[i]),
+                    mask_tiles: slot.mask.map_or([0; 4], |i| masks.tiles[i]),
                     inputs: slot.inputs,
                     tuning: [
                         self.damping,

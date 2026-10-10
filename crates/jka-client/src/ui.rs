@@ -63,7 +63,7 @@ use hud::scores::{build_game_timer, build_mini_scores};
 use hud::siege::build_siege_hud;
 use hud::team::{build_prediction_debug, build_team_overlay, player_icon_atlas_cell};
 use inspector::surface_inspector_frame;
-use loading::{build_background_progress, build_loading_screen, build_splash_background};
+use loading::{build_background_progress, build_loading_screen, build_shader_compile_progress, build_splash_background};
 use scoreboard::build_scoreboard;
 pub use settings::environment::{
     CloudRenderResolution, CloudType, FogMode, FootprintMode, PuddleQuality, RainIntensity,
@@ -86,7 +86,7 @@ pub use settings::environment::{
 };
 pub use settings::rendering::{
     ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
-    DetailTextureMode, DofQuality, DynamicLightsMode, GlowMode,
+    DofQuality, DynamicLightsMode, GlowMode,
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FullscreenMode,
     FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode,
     PlanarReflectionMode, PvsMode, ReflectionQuality, RendererBackend, SunVisibilityMode,
@@ -169,6 +169,8 @@ pub enum OverlayMode {
     /// The `/trace` results menu: a clickable list of everything traced this
     /// session, with a full-info inspector and solo-server actions.
     Trace,
+    /// `/dev`: mouse-driven wheel for developer tooling, rendered over the live scene.
+    DevRadial,
     /// Loaded/live jaPRO strafe trails and asynchronous trail-file browser.
     StrafeTrails,
     /// Remote/local race demo browser and synchronized visual ghosts.
@@ -1011,6 +1013,8 @@ pub struct UiSnapshot {
     pub startup_splash: bool,
     pub loading: Option<MapLoadingUi>,
     pub static_ao_progress: Option<MapLoadingBar>,
+    /// Renderer-owned status of asynchronously compiled shader/PSO pipelines.
+    pub shader_compile_progress: Option<MapLoadingBar>,
 }
 impl Default for UiSnapshot {
     fn default() -> Self {
@@ -1073,6 +1077,7 @@ impl Default for UiSnapshot {
             startup_splash: false,
             loading: None,
             static_ao_progress: None,
+            shader_compile_progress: None,
         }
     }
 }

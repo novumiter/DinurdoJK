@@ -1,64 +1,21 @@
 //! Rebind a Source 1 model onto Jedi Academy's `_humanoid.gla` skeleton.
 //!
-//! The result is an ordinary [`GlmModel`] whose vertex weights address GLA bone
-//! indices, so every existing Ghoul2 consumer - animation, torso/legs blending,
-//! bolts, saber and weapon attachment, ragdoll, gore, shadows, ray tracing -
-//! works unchanged. Nothing downstream needs to know the geometry came from a
-//! `.mdl`.
+//! `Direction` is a rest-pose **animation of the SOURCE skeleton** into JKA's
+//! anatomical limb directions, NOT independent per-JKA-joint translations.
+//! We retain the Source hierarchy, its original segment lengths, shoulder/hip
+//! location, vertex skin weights, and bone-local offsets; only upper/lower limbs
+//! are rotated at their own native pivots toward the corresponding GLA segment
+//! directions. The Source geometry is baked in this posed shape and influences
+//! are THEN remapped onto GLA indices for ordinary Ghoul2 runtime animation.
 //!
-//! The baked mesh must end up in *base-pose space*, which is the space a stock
-//! GLM's vertices already live in: a Ghoul2 pose matrix is
-//! `world_animated * inverse(basePose)`, so skinning reduces to the shared
-//! Ghoul2 root matrix whenever the animation sits at its reference
-//! configuration, and every animated frame is a rigid motion away from that.
-//! Keeping the Source bind pose unchanged would reference every animation delta
-//! against the wrong rest configuration - `_humanoid`'s base pose has notably
-//! splayed legs, so a straight-legged Source bind pose would walk with its knees
-//! crossed.
+//! This avoids the mismatched-body-proportion shearing introduced by seating
+//! every Source joint at the stock GLA position: Juliet's neck, pelvis and belt
+//! are especially sensitive to those unrelated joint translations.
 //!
-//! What that does **not** require is for the geometry to adopt the GLA bone's
-//! *axes*. The obvious-looking re-rig
-//!
-//! ```text
-//! p_bake = sum_b w_b * ( GLA_basePose[map(b)] * scale * inverse(SRC_rest[b]) * p_src )
-//! ```
-//!
-//! is wrong for exactly that reason, and wrong by a lot. It re-interprets
-//! Source-bone-local coordinates as GLA-bone-local ones, so it rotates every
-//! vertex about its joint by the difference between the two rest *conventions*.
-//! ValveBiped puts X down the bone; `_humanoid` does not, and measured on
-//! HEV MK2 that difference is **100 to 145 degrees per bone** while the real
-//! joint-position disagreement is only about 1 to 2 units. On a 63-unit-tall
-//! model it moved the median vertex 6.7 units and the worst 14.7. Because
-//! `world_animated * inverse(basePose)` cancels the convention at runtime, none
-//! of that rotation buys anything.
-//!
-//! So the rebind keeps the authored Source orientation and corrects only what
-//! actually matters - where the joint is, and which way the bone points:
-//!
-//! ```text
-//! M_j = T(GLA_joint[j]) * R_align * T(-fit(SRC_joint[owner(j)])) * fit
-//! ```
-//!
-//! `fit` is the fitted global similarity (yaw, uniform scale, translation);
-//! `T(-fit(joint))` then `T(GLA_joint)` move the joint onto the GLA joint so
-//! animation pivots about the right point; and `R_align` is the *minimal*
-//! rotation taking the bone's rest direction onto the mapped GLA bone's rest
-//! direction, which is convention-free because both directions are derived from
-//! joint positions.
-//!
-//! Note the matrix is indexed by *`_humanoid` joint*, not by Source bone. Many
-//! Source bones share one joint - the toe on the ankle, a five-bone spine on
-//! three lumbar bones, two fingers on one digit, every helper on its nearest
-//! mapped ancestor - and they all animate as that one GLA bone, so they must
-//! share its matrix too. Giving each bone its own would substitute its own rest
-//! joint for `SRC_joint` and seat *that* on the shared GLA joint, translating the
-//! parts onto each other: the front of the foot collapses into the ankle, the
-//! ears into the skull, a tunic skirt into the pelvis. See [`joint_owners`].
-//!
-//! See [`SourceRebindMode`] for the two comparison modes, and
-//! `tools/source1/rebind_probe.py` to measure any of them against a real `.mdl`
-//! without building the client.
+//! Because JKA animation still uses `_humanoid` joints, extreme differences in
+//! character proportions can leave the runtime pivot offset from the mesh.
+//! Neutral silhouette parity is not proof of animation parity; animate actual
+//! stock GLA frames before releasing a finished model.
 use crate::ghoul2::{
     GlaAnimation, GlmLod, GlmModel, GlmSurface, GlmSurfaceHierarchy, GlmVertex, GlmWeight,
     Matrix3x4,
@@ -77,13 +34,12 @@ const MAX_WEIGHTS: usize = 4;
 /// correct, and therefore in how much they reshape the model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SourceRebindMode {
-    /// Move the joint and align the bone direction. The default: animation pivots
-    /// about the right point *and* each limb starts out pointing the way the GLA
-    /// bone it is driven by points, so rest-relative animation deltas land
-    /// correctly. Measured on HEV MK2: median vertex moves 2.5 units.
+    /// Pose the Source skeleton with hierarchical forward kinematics into JKA
+    /// arm/leg aim directions, preserving original segment lengths and shape.
+    /// The rest mesh is baked before Source weights are mapped to GLA joints.
     #[default]
     Direction,
-    /// Move the joint only. Preserves the authored Source shape most closely
+    /// LEGACY diagnostic: move each GLA joint independently. Preserves Source shape
     /// (median 1.3 units on HEV MK2) but leaves limbs pointing along the Source
     /// rest pose, so where the two rest poses genuinely disagree - `_humanoid`
     /// splays the legs, most Source bind poses do not - animation is applied to a
@@ -192,6 +148,10 @@ pub struct SourceRigDiagnostics {
 
 pub struct SourceRig {
     pub glm: GlmModel,
+    /// Per-model, anatomical GLA joint anchors in the newly posed Source mesh.
+    /// Pass to `rebase_source_ghoul2_pose` AFTER normal Ghoul2 evaluation.
+    /// `None` for diagnostic legacy rebind modes.
+    pub native_pivots: Option<Vec<[f32; 3]>>,
     /// Indexed by GLM surface index.
     pub surfaces: Vec<SourceRigSurface>,
     pub diagnostics: SourceRigDiagnostics,
@@ -314,6 +274,46 @@ fn minimal_rotation(from: [f32; 3], to: [f32; 3]) -> Matrix3x4 {
     out
 }
 
+/// A palm's forward and across axes can be recovered from joint landmarks;
+/// comparing these directions, rather than Source/Ghoul2 bone frame matrices,
+/// removes the characteristic backwards-rolled Source wrist. Both skeletons
+/// use their OWN anatomical joint positions, so no segment length is changed.
+fn palm_frame(wrist: [f32; 3], index: [f32; 3], outer: [f32; 3]) -> Option<[[f32; 3]; 3]> {
+    let forward = normalized(std::array::from_fn(|k| (index[k] + outer[k]) * 0.5 - wrist[k]))?;
+    let side: [f32; 3] = std::array::from_fn(|k| outer[k] - index[k]);
+    let projection = (0..3).map(|k| side[k] * forward[k]).sum::<f32>();
+    let side = normalized(std::array::from_fn(|k| side[k] - projection * forward[k]))?;
+    let normal = normalized(cross(forward, side))?;
+    Some([forward, side, normal])
+}
+
+fn rotation_between_frames(from: [[f32; 3]; 3], to: [[f32; 3]; 3]) -> Matrix3x4 {
+    let mut rotation = identity();
+    for row in 0..3 {
+        for col in 0..3 {
+            rotation[row][col] = (0..3).map(|axis| to[axis][row] * from[axis][col]).sum();
+        }
+    }
+    rotation
+}
+
+/// Extract the Source digit and its level. Five Source digits map to JKA's
+/// three animated digits; each Source digit keeps its own native mesh offsets.
+fn source_digit(name: &str) -> Option<(char, u8, u8)> {
+    let side = name.chars().next()?;
+    if side != 'l' && side != 'r' { return None; }
+    let tail = name.get(1..)?.strip_prefix("finger")?;
+    let mut bytes = tail.bytes();
+    let digit = bytes.next()?.wrapping_sub(b'0');
+    if digit > 4 { return None; }
+    let level = match bytes.next() {
+        None => 0,
+        Some(b'1') if bytes.next().is_none() => 1,
+        _ => return None,
+    };
+    Some((side, digit, level))
+}
+
 fn quaternion_matrix(q: [f32; 4], position: [f32; 3]) -> Result<Matrix3x4, String> {
     let [x, y, z, w] = q;
     let norm = x * x + y * y + z * z + w * w;
@@ -380,18 +380,31 @@ fn quat_conjugate(q: [f32; 4]) -> [f32; 4] {
     [-q[0], -q[1], -q[2], q[3]]
 }
 
-/// A rigid transform as a dual quaternion: `real` is its rotation, `dual`
-/// encodes its translation (`dual = 0.5 * [t, 0] * real`). Blending these
-/// instead of blending transformed vertex positions directly is the standard
-/// fix for the "candy wrapper" bulge/pinch linear blend skinning produces
-/// when two blended bones differ by a large rotation - exactly what the
-/// rebind introduces by correcting a Source T-pose onto `_humanoid`'s A-pose,
-/// independently per bone. See [`blend_dual_quats`].
-fn dual_quat_from_matrix(m: &Matrix3x4) -> ([f32; 4], [f32; 4]) {
-    let real = matrix_to_quaternion(m);
+/// Decompose a uniform-scale affine transform into a unit-length rigid dual
+/// quaternion and a *separate* positive uniform scale. A dual quaternion does
+/// not encode scale. Feeding the scaled 3x3 directly into Shepperd's rotation
+/// decoder silently produces the wrong rotation; converting it back to a rigid
+/// matrix then also drops the fitted Source->JKA scale entirely.
+///
+/// Every rebind_matrix mode currently creates a rotation times a uniform scale
+/// (BoneFrame additionally carries the authored GLA base-pose scale). Recover
+/// that scale from the matrix itself rather than assuming the fitted scale is
+/// also the complete per-bone scale.
+fn dual_quat_from_scaled_matrix(m: &Matrix3x4) -> ([f32; 4], [f32; 4], f32) {
+    let scale = (0..3).map(|r| m[r][0] * m[r][0]).sum::<f32>().sqrt();
+    // build_source_rig checks its fitted scale, and rebind matrices only contain
+    // proper positive uniform scales; retain explicit protection in debug builds.
+    debug_assert!(scale.is_finite() && scale > 1e-6);
+    let mut rigid = *m;
+    for row in &mut rigid {
+        for component in &mut row[..3] {
+            *component /= scale;
+        }
+    }
+    let real = matrix_to_quaternion(&rigid);
     let t = [m[0][3], m[1][3], m[2][3], 0.0];
     let dual = quat_mul(t, real).map(|c| c * 0.5);
-    (real, dual)
+    (real, dual, scale)
 }
 
 /// Weighted blend of dual quaternions representing several bones' rebind
@@ -826,6 +839,268 @@ fn joint_owners(gla_for_bone: &[Option<usize>]) -> BTreeMap<usize, usize> {
     owners
 }
 
+/// Pose the complete Source bind hierarchy into JKA's anatomical limb
+/// directions WITHOUT independently translating bones to GLA joint positions.
+///
+/// Source rest transforms are world-space and topologically sorted. Parent->
+/// child FK retains each authored local transform, with a correction rotation
+/// attached to the SOURCE upperarm/forearm/thigh/calf pivot only. Children,
+/// outfits, hair, toes, fingers and their weights ride the correctly propagated
+/// hierarchy (unlike separately fitted GLA-joint matrices).
+///
+/// Return one Source->JKA bake transform PER SOURCE BONE, not per mapped GLA
+/// bone. Multiple Source bones can share one GLA animation target, but their
+/// different Source rest positions must be preserved until pose baking ends.
+fn source_fk_rebinds(
+    skeleton: &SourceSkeleton,
+    rest_world: &[Matrix3x4],
+    gla: &GlaAnimation,
+    gla_for_bone: &[Option<usize>],
+    placement: &Matrix3x4,
+) -> (Vec<Matrix3x4>, usize) {
+    let names: Vec<String> = skeleton.bones.iter()
+        .map(|bone| normalize_source_bone(&bone.name)).collect();
+    let mut posed = Vec::<Matrix3x4>::with_capacity(rest_world.len());
+    let mut corrected = 0usize;
+
+    for (index, bone) in skeleton.bones.iter().enumerate() {
+        // Parent-local composition first. This is the essential difference
+        // from independent pelvis/neck/shoulder GLA joint relocation.
+        let mut current = if let Some(parent) = bone.parent {
+            let authored_local = mul(&rigid_inverse(&rest_world[parent]), &rest_world[index]);
+            mul(&posed[parent], &authored_local)
+        } else {
+            mul(placement, &rest_world[index])
+        };
+        // A wrist has no unique bone direction; its palm orientation comes
+        // from the index/outer knuckles, not the forearm axis. This matches
+        // both flexion AND roll of the stock JKA palm without imposing an
+        // arbitrary local bone-frame convention on Source.
+        if names[index] == "lhand" || names[index] == "rhand" {
+            let side = &names[index][..1];
+            let source_knuckle = |digit: u8| {
+                let name = format!("{side}finger{digit}");
+                skeleton.bones.iter().enumerate()
+                    .find(|(child, bone)| bone.parent == Some(index) && names[*child] == name)
+                    .map(|(child, _)| {
+                        let local = mul(&rigid_inverse(&rest_world[index]), &rest_world[child]);
+                        transform(&current, origin(&local))
+                    })
+            };
+            let target_knuckle = |digit: u8| {
+                let name = format!("{side}_d{digit}_j1");
+                gla_bone_index(gla, &name).map(|bone| origin(&gla.skeleton[bone].base_pose))
+            };
+            // Several Source models carry only two or three digit chains.
+            // The most outboard surviving chain still gives a palm roll axis.
+            let source_outer = source_knuckle(4)
+                .or_else(|| source_knuckle(3))
+                .or_else(|| source_knuckle(2));
+            if let (Some(si), Some(so), Some(ti), Some(to)) = (
+                source_knuckle(1), source_outer,
+                target_knuckle(2), target_knuckle(4),
+            ) {
+                if let (Some(from), Some(to)) = (
+                    palm_frame(origin(&current), si, so),
+                    gla_bone_index(gla, &format!("{side}hand")).and_then(|j| {
+                        palm_frame(origin(&gla.skeleton[j].base_pose), ti, to)
+                    }),
+                ) {
+                    let turn = rotation_between_frames(from, to);
+                    let previous = current;
+                    for row in 0..3 {
+                        for col in 0..3 {
+                            current[row][col] = (0..3)
+                                .map(|k| turn[row][k] * previous[k][col]).sum();
+                        }
+                    }
+                    corrected += 1;
+                }
+            }
+        }
+        // Only anatomically comparable axes are used. Non-limb helpers,
+        // clavicles, faces and clothing retain their authored Source frame.
+        let continuation = match names[index].as_str() {
+            "lupperarm" => Some(("lforearm", "lradius")),
+            "rupperarm" => Some(("rforearm", "rradius")),
+            "lforearm" => Some(("lhand", "lhand")),
+            "rforearm" => Some(("rhand", "rhand")),
+            "lthigh" => Some(("lcalf", "ltibia")),
+            "rthigh" => Some(("rcalf", "rtibia")),
+            "lcalf" => Some(("lfoot", "ltalus")),
+            "rcalf" => Some(("rfoot", "rtalus")),
+            _ => None,
+        };
+        // Aim each Source finger's two real phalanges independently toward
+        // JKA's joint-to-joint curl, while leaving thumb/index/middle/ring/pinky
+        // spacing intact. The last Source phalanx maps to the same GLA j2 and
+        // retains a little additional inward curl in the rest shape.
+        let digit_aim = source_digit(&names[index]).and_then(|(side, digit, level)| {
+            let next = format!("{side}finger{digit}{}", level + 1);
+            let target_digit = match digit { 0 => 1, 1 | 2 => 2, _ => 4 };
+            let joint1 = gla_bone_index(gla, &format!("{side}_d{target_digit}_j1"))?;
+            let joint2 = gla_bone_index(gla, &format!("{side}_d{target_digit}_j2"))?;
+            Some((next, joint1, joint2, level))
+        });
+        let child_info = if let Some((name, target_name)) = continuation {
+            gla_bone_index(gla, target_name).and_then(|child| {
+                gla_for_bone[index].map(|here| (name.to_owned(), here, child, false))
+            })
+        } else {
+            digit_aim.map(|(next, j1, j2, level)| (next, j1, j2, level == 1))
+        };
+        if let Some((child_name, target_here, target_child, distal_finger)) = child_info {
+            let source_child = skeleton.bones.iter().enumerate().find(|(child_id, child)| {
+                child.parent == Some(index) && names[*child_id] == child_name
+            }).map(|(child_id, _)| child_id);
+            if let Some(source_child) = source_child {
+                // Position the real Source child by the currently posed
+                // parent bone. Reorient about THIS bone's own joint, never
+                // about the target skeleton's differently proportioned pivot.
+                let source_child_local = mul(
+                    &rigid_inverse(&rest_world[index]), &rest_world[source_child]
+                );
+                let child_here = transform(&current, origin(&source_child_local));
+                let here = origin(&current);
+                let from = std::array::from_fn(|k| child_here[k] - here[k]);
+                let a = origin(&gla.skeleton[target_here].base_pose);
+                let b = origin(&gla.skeleton[target_child].base_pose);
+                let mut to: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
+                if distal_finger {
+                    // JKA has only j1/j2; Source has a third phalanx. Nudge
+                    // that tip toward the inward-facing (-Y) palm rather than
+                    // letting it extend backwards out of the grip.
+                    if let Some(direction) = normalized(to) {
+                        to = [direction[0], direction[1] - 0.28, direction[2]];
+                    }
+                }
+                if normalized(from).is_some() && normalized(to).is_some() {
+                    let turn = minimal_rotation(from, to);
+                    // Apply rotational correction, retaining the existing
+                    // joint translation and the global model fit scale.
+                    let previous = current;
+                    for row in 0..3 {
+                        for col in 0..3 {
+                            current[row][col] = (0..3)
+                                .map(|k| turn[row][k] * previous[k][col]).sum();
+                        }
+                    }
+                    corrected += 1;
+                }
+            }
+        }
+        posed.push(current);
+    }
+    let bake = rest_world.iter().enumerate().map(|(index, rest)| {
+        mul(&posed[index], &rigid_inverse(rest))
+    }).collect();
+    (bake, corrected)
+}
+
+/// Map the posed Source joint centres to the corresponding GLA bone anchors.
+/// The JKA skeleton is untouched; these pivots are model-specific skinning
+/// metadata. Unrepresented JKA helpers (e.g. twist and face) inherit their
+/// parent model-space offset, including GLA's non-topological face indices.
+fn source_native_pivots(
+    gla: &GlaAnimation,
+    owner_of_gla: &BTreeMap<usize, usize>,
+    rest_world: &[Matrix3x4],
+    per_source_bake: &[Matrix3x4],
+) -> Vec<[f32; 3]> {
+    let count = gla.skeleton.len();
+    let mut pivot = vec![[0.0; 3]; count];
+    let mut known = vec![false; count];
+    for (&target, &source) in owner_of_gla {
+        if target < count && gla.skeleton[target].parent >= 0 {
+            pivot[target] = transform(&per_source_bake[source], origin(&rest_world[source]));
+            known[target] = true;
+        }
+    }
+    for (j, bone) in gla.skeleton.iter().enumerate() {
+        if bone.parent < 0 {
+            pivot[j] = origin(&bone.base_pose);
+            known[j] = true;
+        }
+    }
+    // Some authored GLA bones precede their parents in the file: face children
+    // 16..23 are parented to index 52. Never assume index order = hierarchy.
+    for _ in 0..count {
+        if known.iter().all(|&v| v) { break; }
+        for (j, bone) in gla.skeleton.iter().enumerate() {
+            if known[j] { continue; }
+            let Ok(parent) = usize::try_from(bone.parent) else { continue; };
+            if parent >= count || !known[parent] { continue; }
+            let parent_gl = origin(&gla.skeleton[parent].base_pose);
+            let here_gl = origin(&bone.base_pose);
+            for axis in 0..3 {
+                pivot[j][axis] = pivot[parent][axis] + here_gl[axis] - parent_gl[axis];
+            }
+            known[j] = true;
+        }
+    }
+    pivot
+}
+
+/// Move normal Ghoul2 skin transforms from stock GLA rest joints to this
+/// model's native Source-FK joints. The authored animation rotations, frame
+/// translations and GLA hierarchy are preserved; only the lever arm (rest
+/// bone lengths) changes. Keep the same rebased pose for GPU skinning, tags,
+/// ragdolls and effects to avoid bolt/mesh disagreement.
+///
+/// Unlike rebuilding each bone as `T(native) * R * T(-native)`, this also
+/// carries each child's parent motion and preserves animation translation
+/// residuals, so elbows/knees do not drift away from their parent limbs.
+/// An identity stock pose MUST remain identity for every valid pivot set.
+pub fn rebase_source_ghoul2_pose(
+    gla: &GlaAnimation,
+    stock: &[Matrix3x4],
+    pivots: &[[f32; 3]],
+) -> Result<Vec<Matrix3x4>, String> {
+    let n = gla.skeleton.len();
+    if stock.len() != n || pivots.len() != n {
+        return Err(format!("Source pose / GLA pivot count mismatch: stock={} pivot={} gla={n}", stock.len(), pivots.len()));
+    }
+    fn visit(
+        j: usize, gla: &GlaAnimation, stock: &[Matrix3x4],
+        pivots: &[[f32; 3]], output: &mut [Matrix3x4],
+        joints: &mut [[f32; 3]], state: &mut [u8],
+    ) -> Result<(), String> {
+        if state[j] == 2 { return Ok(()); }
+        if state[j] == 1 { return Err(format!("Cyclic GLA ancestry at bone {j}")); }
+        state[j] = 1;
+        let here = origin(&gla.skeleton[j].base_pose);
+        let animated_here = transform(&stock[j], here);
+        let parent = gla.skeleton[j].parent;
+        if parent < 0 {
+            joints[j] = transform(&stock[j], pivots[j]);
+        } else {
+            let p = usize::try_from(parent).map_err(|_| "Invalid GLA parent".to_owned())?;
+            if p >= stock.len() { return Err(format!("Invalid GLA parent {p} for bone {j}")); }
+            visit(p, gla, stock, pivots, output, joints, state)?;
+            let parent_rest = origin(&gla.skeleton[p].base_pose);
+            let animated_parent = transform(&stock[p], parent_rest);
+            let expected = rotate(&stock[p], std::array::from_fn(|k| here[k] - parent_rest[k]));
+            let model_link = rotate(&stock[p], std::array::from_fn(|k| pivots[j][k] - pivots[p][k]));
+            for k in 0..3 {
+                let residual = animated_here[k] - animated_parent[k] - expected[k];
+                joints[j][k] = joints[p][k] + model_link[k] + residual;
+            }
+        }
+        output[j] = stock[j];
+        let rotated_pivot = rotate(&stock[j], pivots[j]);
+        for k in 0..3 { output[j][k][3] = joints[j][k] - rotated_pivot[k]; }
+        state[j] = 2;
+        Ok(())
+    }
+    let mut result = stock.to_vec();
+    let mut joints = vec![[0.0; 3]; n];
+    let mut state = vec![0u8; n];
+    for j in 0..n {
+        visit(j, gla, stock, pivots, &mut result, &mut joints, &mut state)?;
+    }
+    Ok(result)
+}
+
 /// One Source bone's model-space-to-base-pose-space transform.
 ///
 /// `placement` is the global similarity (yaw, uniform scale, translation) that
@@ -1028,52 +1303,43 @@ pub fn build_source_rig(
     let owner_of_gla = joint_owners(&gla_for_bone);
     let twist_blend = twist_blend_table(gla);
 
-    // A joint with no continuing child of its own (a hand, a foot, the skull -
-    // anything `bone_direction_pair` can't find a differently-mapped child
-    // for) gets no rotation correction of its own; it keeps the authored
-    // Source orientation. This used to stretch a vertex blended between two
-    // such differently-rotated joints (the neck/skull seam is the model case)
-    // to bridge the gap between them, which read as the neck sticking out.
-    // The real fix is in how blended vertices are combined below (dual
-    // quaternion skinning, see `blend_dual_quats`) rather than here: forcing
-    // every leaf joint to inherit an ancestor's rotation was only a
-    // workaround for the blending bug, and cost leaf joints their own
-    // correct, independent orientation (Han Solo's head tilting back to match
-    // his neck's rotation, though his head itself needed none).
-    let mut direction_corrected = 0usize;
-    let mut matrix_of_gla = BTreeMap::<usize, Matrix3x4>::new();
-    for (&gla_bone, &owner) in &owner_of_gla {
-        let align = if options.rebind == SourceRebindMode::Direction {
-            let pair = bone_direction_pair(owner, skeleton, &rest_world, gla, &gla_for_bone, &fit);
-            if pair.is_some() {
-                direction_corrected += 1;
-            }
-            pair.map(|(source, target)| minimal_rotation(source, target))
-        } else {
-            None
-        };
-        matrix_of_gla.insert(
-            gla_bone,
-            rebind_matrix(
-                options.rebind,
-                &placement,
-                scale,
-                &rest_world[owner],
-                &gla.skeleton[gla_bone].base_pose,
-                align,
-            ),
+    // The standard mode poses the ORIGINAL Source hierarchy, retaining body
+    // proportions and joint-local clothing/hair offsets. All other modes remain
+    // comparison controls; they are not used for normal model conversion.
+    let (source_bake, direction_corrected) = if options.rebind == SourceRebindMode::Direction {
+        let (matrices, count) = source_fk_rebinds(
+            skeleton, &rest_world, gla, &gla_for_bone, &placement,
         );
+        (Some(matrices), count)
+    } else {
+        (None, 0)
+    };
+    let native_pivots = source_bake.as_ref().map(|matrices| {
+        source_native_pivots(gla, &owner_of_gla, &rest_world, matrices)
+    });
+    let mut matrix_of_gla = BTreeMap::<usize, Matrix3x4>::new();
+    if source_bake.is_none() {
+        for (&gla_bone, &owner) in &owner_of_gla {
+            matrix_of_gla.insert(gla_bone, rebind_matrix(
+                options.rebind, &placement, scale, &rest_world[owner],
+                &gla.skeleton[gla_bone].base_pose, None,
+            ));
+        }
     }
-
-    let rebinds: Vec<BoneRebind> = gla_for_bone
-        .iter()
-        .map(|slot| {
-            let gla_bone = slot.expect("every bone is mapped above");
-            BoneRebind {
-                gla_bone,
-                matrix: matrix_of_gla[&gla_bone],
-            }
-        })
+    let rebinds: Vec<BoneRebind> = gla_for_bone.iter().map(|slot| {
+        let gla_bone = slot.expect("every bone is mapped above");
+        BoneRebind {
+            gla_bone,
+            matrix: if let Some(ref src_matrices) = source_bake {
+                // Legacy caller only needs GLA ownership in this mode.
+                src_matrices[owner_of_gla[&gla_bone]]
+            } else { matrix_of_gla[&gla_bone] },
+        }
+    }).collect();
+    let dual_quat_of_source: Option<Vec<([f32; 4], [f32; 4], f32)>> = source_bake
+        .as_ref().map(|mats| mats.iter().map(dual_quat_from_scaled_matrix).collect());
+    let dual_quat_of_gla: BTreeMap<usize, ([f32; 4], [f32; 4], f32)> = matrix_of_gla
+        .iter().map(|(&bone, matrix)| (bone, dual_quat_from_scaled_matrix(matrix)))
         .collect();
 
     // Surface identity must be stable across LODs, so it is keyed on the MDL
@@ -1186,6 +1452,7 @@ pub fn build_source_rig(
                         // so `blend_dual_quats` flips every other quaternion
                         // into its hemisphere, not an arbitrary bone-table one.
                         let mut parts: Vec<(f32, [f32; 4], [f32; 4])> = Vec::with_capacity(influences);
+                        let mut scale_sum = 0.0f32;
                         for k in 0..influences {
                             let bone = source.bones[k] as usize;
                             let rebind = rebinds.get(bone).ok_or_else(|| {
@@ -1210,8 +1477,13 @@ pub fn build_source_rig(
                             // that joint's single matrix, so merging their
                             // influence here only compacts the weight list.
                             *merged.entry(rebind.gla_bone).or_default() += weight;
-                            let (real, dual) = dual_quat_from_matrix(&rebind.matrix);
+                            let &(real, dual, part_scale) = if let Some(ref per_source) = dual_quat_of_source {
+                                &per_source[bone]
+                            } else {
+                                &dual_quat_of_gla[&rebind.gla_bone]
+                            };
                             parts.push((weight, real, dual));
+                            scale_sum += weight * part_scale;
                         }
                         if total <= 1e-6 || merged.is_empty() {
                             return Err(format!(
@@ -1232,7 +1504,11 @@ pub fn build_source_rig(
                         parts.sort_by(|a, b| b.0.total_cmp(&a.0));
                         let (blended_real, blended_dual) = blend_dual_quats(&parts);
                         let blended = dual_quat_to_matrix(blended_real, blended_dual);
-                        let position = transform(&blended, source.position);
+                        // DQ is a *rigid* transform. Apply the positive
+                        // weighted uniform scale to Source positions before
+                        // the rigid transform; normals must not be scaled.
+                        let vertex_scale = scale_sum / total;
+                        let position = transform(&blended, source.position.map(|v| v * vertex_scale));
                         let normal = rotate(&blended, source.normal);
                         // See `twist_blend_table`: ease each chain-bone's
                         // weight toward its twist-helper sibling by how far
@@ -1367,6 +1643,7 @@ pub fn build_source_rig(
         lods: lod_stats,
     };
     Ok(SourceRig {
+        native_pivots,
         glm: GlmModel {
             name: model_qpath.to_owned(),
             anim_name: "models/players/_humanoid/_humanoid".to_owned(),
@@ -1405,6 +1682,58 @@ pub fn attach_humanoid_bolts(
     let Some(donor_lod) = donor.lods.first() else {
         return Err("bolt donor GLM has no LODs".into());
     };
+    // Native JKA player meshes use approximately the same height. A least-
+    // squares fit across shoulders/hands/legs does NOT constrain total height:
+    // the included Juliet and Shrek Source examples are conspicuously short.
+    // Normalize to the actual donor GLM mesh, not a guessed magic number.
+    // Respect an explicitly configured `source_model.json` scale.
+    if rig.diagnostics.scale_was_fitted {
+        let bounds = |model: &GlmModel| -> Option<(f32, f32)> {
+            let lod = model.lods.first()?;
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for surface in &lod.surfaces {
+                if model.hierarchy.get(surface.surface_index)
+                    .is_some_and(|h| h.name.starts_with('*')) { continue; }
+                for vertex in &surface.vertices {
+                    let z = vertex.position[2];
+                    if !z.is_finite() { return None; }
+                    lo = lo.min(z);
+                    hi = hi.max(z);
+                }
+            }
+            (hi > lo + 1.0).then_some((lo, hi))
+        };
+        if let (Some((source_lo, source_hi)), Some((donor_lo, donor_hi))) =
+            (bounds(&rig.glm), bounds(donor))
+        {
+            let ratio = (donor_hi - donor_lo) / (source_hi - source_lo);
+            if ratio.is_finite() && (0.5..=2.0).contains(&ratio) {
+                let floor_offset = donor_lo - ratio * source_lo;
+                for lod in &mut rig.glm.lods {
+                    for surface in &mut lod.surfaces {
+                        for vertex in &mut surface.vertices {
+                            for k in 0..3 { vertex.position[k] *= ratio; }
+                            vertex.position[2] += floor_offset;
+                        }
+                    }
+                }
+                if let Some(pivots) = &mut rig.native_pivots {
+                    for pivot in pivots {
+                        for k in 0..3 { pivot[k] *= ratio; }
+                        pivot[2] += floor_offset;
+                    }
+                }
+                for k in 0..3 {
+                    rig.diagnostics.rest_bounds.0[k] *= ratio;
+                    rig.diagnostics.rest_bounds.1[k] *= ratio;
+                }
+                rig.diagnostics.rest_bounds.0[2] += floor_offset;
+                rig.diagnostics.rest_bounds.1[2] += floor_offset;
+                rig.diagnostics.scale *= ratio;
+            }
+        }
+    }
     let mut attached = 0usize;
     for (donor_index, hierarchy) in donor.hierarchy.iter().enumerate() {
         if !hierarchy.name.starts_with('*') {
@@ -1442,12 +1771,56 @@ pub fn attach_humanoid_bolts(
             parent_index: -1,
             children: Vec::new(),
         });
+        // Hand tags must follow the model-specific palm pivot. Copying the
+        // stock donor coordinates unchanged positions a saber in the STOCK
+        // hand, even when the converted Source hand is elsewhere. Preserve
+        // the authored Ghoul2 bolt triangle's orientation and adjust only its
+        // neutral placement (and reach proportional to palm length).
+        let mut bolt_vertices = surface.vertices.clone();
+        let hand = match hierarchy.name.to_ascii_lowercase().as_str() {
+            "*r_hand" => Some(("rhand", "r_d2_j1", "r_d4_j1")),
+            "*l_hand" => Some(("lhand", "l_d2_j1", "l_d4_j1")),
+            _ => None,
+        };
+        if let (Some((hand_name, index_name, outer_name)), Some(pivots)) =
+            (hand, rig.native_pivots.as_ref())
+        {
+            if let (Some(hand_idx), Some(index_idx), Some(outer_idx)) = (
+                gla_bone_index(gla, hand_name),
+                gla_bone_index(gla, index_name),
+                gla_bone_index(gla, outer_name),
+            ) {
+                if let (Some(&wrist), Some(&knuckle), Some(&outer)) = (
+                    pivots.get(hand_idx), pivots.get(index_idx), pivots.get(outer_idx),
+                ) {
+                    let stock_wrist = origin(&gla.skeleton[hand_idx].base_pose);
+                    let stock_index = origin(&gla.skeleton[index_idx].base_pose);
+                    let stock_outer = origin(&gla.skeleton[outer_idx].base_pose);
+                    let avg = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
+                        std::array::from_fn(|k| (a[k] + b[k]) * 0.5)
+                    };
+                    let length = |a: [f32; 3], b: [f32; 3]| -> f32 {
+                        (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f32>().sqrt()
+                    };
+                    let donor_len = length(stock_wrist, avg(stock_index, stock_outer));
+                    let palm_len = length(wrist, avg(knuckle, outer));
+                    let reach = if donor_len > 1e-4 {
+                        (palm_len / donor_len).clamp(0.75, 1.4)
+                    } else { 1.0 };
+                    for vertex in &mut bolt_vertices {
+                        for k in 0..3 {
+                            vertex.position[k] = wrist[k] + reach * (vertex.position[k] - stock_wrist[k]);
+                        }
+                    }
+                }
+            }
+        }
         // Every LOD: a bolt is looked up in LOD 0, but dismemberment and effects
         // resolve surfaces against whichever LOD is current.
         for lod in rig.glm.lods.iter_mut() {
             lod.surfaces.push(GlmSurface {
                 surface_index,
-                vertices: surface.vertices.clone(),
+                vertices: bolt_vertices.clone(),
                 texcoords: surface.texcoords.clone(),
                 triangles: surface.triangles.clone(),
                 bone_references: surface.bone_references.clone(),
@@ -1540,6 +1913,36 @@ mod tests {
 
     fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
         (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn source_digit_excludes_tip_bones_and_unrelated_names() {
+        assert_eq!(source_digit("lfinger0"), Some(('l', 0, 0)));
+        assert_eq!(source_digit("rfinger11"), Some(('r', 1, 1)));
+        assert_eq!(source_digit("lfinger12"), None);
+        assert_eq!(source_digit("lforearm"), None);
+    }
+
+    #[test]
+    fn palm_alignment_preserves_joint_distances_and_handedness() {
+        let wrist = [10.0, 0.0, 40.0];
+        let index = [12.5, -0.8, 40.0];
+        let outer = [12.5, 0.8, 40.0];
+        let target_wrist = [20.0, 0.0, 40.0];
+        let target_index = [22.0, -0.8, 37.5];
+        let target_outer = [22.0, 0.8, 37.5];
+        let from = palm_frame(wrist, index, outer).unwrap();
+        let to = palm_frame(target_wrist, target_index, target_outer).unwrap();
+        let rotation = rotation_between_frames(from, to);
+        let source_forward = std::array::from_fn(|k| (index[k] + outer[k]) * 0.5 - wrist[k]);
+        let rotated_forward = normalized(rotate(&rotation, source_forward)).unwrap();
+        let target_forward = normalized(std::array::from_fn(|k| {
+            (target_index[k] + target_outer[k]) * 0.5 - target_wrist[k]
+        })).unwrap();
+        assert!(distance(rotated_forward, target_forward) < 1e-4);
+        let p = [12.2, 1.1, 40.4];
+        assert!((distance(rotate(&rotation, std::array::from_fn(|k| p[k] - wrist[k])), [0., 0., 0.])
+            - distance(p, wrist)).abs() < 1e-4);
     }
 
     #[test]
@@ -1761,6 +2164,7 @@ mod tests {
 
     fn empty_rig() -> SourceRig {
         SourceRig {
+            native_pivots: None,
             glm: GlmModel {
                 name: "source".into(),
                 anim_name: "models/players/_humanoid/_humanoid".into(),
@@ -1902,6 +2306,35 @@ mod tests {
     }
 
     #[test]
+    fn source_pose_rebase_is_exact_identity_with_anatomical_pivots() {
+        let gla = stub_gla(53);
+        let n = gla.skeleton.len();
+        let stock = vec![identity(); n];
+        let native: Vec<[f32; 3]> = gla.skeleton.iter().enumerate().map(|(i, bone)| {
+            let mut p = origin(&bone.base_pose);
+            // Make the character intentionally different from the stock GLA.
+            p[2] += 2.0 + (i % 7) as f32 * 0.1;
+            p
+        }).collect();
+        let adjusted = rebase_source_ghoul2_pose(&gla, &stock, &native).unwrap();
+        for (j, m) in adjusted.iter().enumerate() {
+            for row in 0..3 {
+                for col in 0..4 {
+                    assert!((m[row][col] - stock[j][row][col]).abs() < 0.001,
+                        "rest pose moved at bone={j} row={row} col={col}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_pose_rebase_reports_inconsistent_bone_counts() {
+        let gla = stub_gla(53);
+        let n = gla.skeleton.len();
+        assert!(rebase_source_ghoul2_pose(&gla, &vec![identity(); n], &[]).is_err());
+    }
+
+    #[test]
     fn fit_recovers_a_known_similarity() {
         // Build anchors from a synthetic skeleton transformed by a known yaw and
         // scale; the fit must recover both.
@@ -1947,4 +2380,53 @@ mod tests {
         )];
         assert!(fit_skeletons(&anchors).unwrap_err().contains("humanoid"));
     }
+
+    #[test]
+    fn dual_quat_decomposes_scale_before_extracting_rotation() {
+        // A model-space point must remain scaled around a rotated bone's pivot.
+        // The historical path fed scale*rotation to matrix_to_quaternion and
+        // then dropped scale when materializing the blended rigid transform.
+        for scale in [0.5f32, 0.793_993_8, 1.0, 1.7] {
+            let angle = std::f32::consts::FRAC_PI_3;
+            let (sn, cs) = angle.sin_cos();
+            let transform_matrix = [
+                [scale * cs, -scale * sn, 0.0, 3.0],
+                [scale * sn, scale * cs, 0.0, -5.0],
+                [0.0, 0.0, scale, 7.0],
+            ];
+            let (real, dual, recovered_scale) =
+                dual_quat_from_scaled_matrix(&transform_matrix);
+            let (real, dual) = blend_dual_quats(&[(1.0, real, dual)]);
+            let rigid = dual_quat_to_matrix(real, dual);
+            let p = [12.0, -4.0, 10.0];
+            let expected = transform(&transform_matrix, p);
+            let got = transform(&rigid, p.map(|x| x * recovered_scale));
+            assert!((recovered_scale - scale).abs() < 1e-6);
+            for axis in 0..3 {
+                assert!((got[axis] - expected[axis]).abs() < 1e-4,
+                    "axis {axis}, scale {scale}: {} vs {}", got[axis], expected[axis]);
+            }
+        }
+    }
+
+    #[test]
+    fn dual_quat_uses_weighted_scale_without_changing_normals() {
+        let mut first = identity();
+        let mut second = identity();
+        for axis in 0..3 {
+            first[axis][axis] = 0.5;
+            second[axis][axis] = 1.5;
+        }
+        first[0][3] = 3.0;
+        second[0][3] = 3.0;
+        let (r0, d0, s0) = dual_quat_from_scaled_matrix(&first);
+        let (r1, d1, s1) = dual_quat_from_scaled_matrix(&second);
+        let (r, d) = blend_dual_quats(&[(0.25, r0, d0), (0.75, r1, d1)]);
+        let rigid = dual_quat_to_matrix(r, d);
+        let p = transform(&rigid, [2.0 * (0.25 * s0 + 0.75 * s1), 0.0, 0.0]);
+        assert!((p[0] - 5.5).abs() < 1e-5);
+        let normal = rotate(&rigid, [0.0, 0.0, 1.0]);
+        assert!((normal[2] - 1.0).abs() < 1e-5);
+    }
+
 }

@@ -1,5 +1,13 @@
 # Reference provenance
 
+The conservative coastal shallow-water solver in `jka-water::coastal` adapts the
+staggered pressure update, terrain-dependent face crest/depth, donor-cell
+flux, shared outgoing-volume limiter, divergence update, and wet-neighbour
+surface reconstruction from [Saltreach](https://github.com/iamtechartist/coastal-simulation)
+(MIT, Copyright (c) 2026 Techartist). The full notice is in
+`crates/jka-water/LICENSE-Saltreach-MIT`; pinned local source hashes and the
+arithmetic/layout translation are recorded in `docs/coastal-checkpoint2.md`.
+
 The optional nearby ocean interaction field (`ocean/interaction.rs` and
 `ocean_interaction.wgsl`) adapts the height/velocity finite-difference update
 and height-derived normals from [jeantimex/webgpu-water](https://github.com/jeantimex/webgpu-water),
