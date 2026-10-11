@@ -1,3 +1,20 @@
+// TaystJK RB_CalcStretchTexCoords: reciprocal waveform scaled about (0.5, 0.5).
+// Only evaluated for kind 6 (tcMod stretch).
+fn rt_tc_stretch_wave(kind: u32, phase: f32) -> f32 {
+    let x = fract(phase);
+    if (kind == 0u) { return sin(x * 6.28318530718); }
+    if (kind == 1u) { return select(select(2.0 - 4.0*x, 4.0*x - 4.0, x >= 0.75), 4.0*x, x < 0.25); }
+    if (kind == 2u) { return select(-1.0, 1.0, x < 0.5); }
+    if (kind == 3u) { return x; }
+    if (kind == 4u) { return 1.0 - x; }
+    // Stable noise approximation for GF_NOISE, where the reference uses a LUT.
+    let n0 = floor(phase);
+    let t = fract(phase);
+    let a = fract(sin(n0 * 127.1) * 43758.5453) * 2.0 - 1.0;
+    let b = fract(sin((n0 + 1.0) * 127.1) * 43758.5453) * 2.0 - 1.0;
+    return mix(a, b, t*t*(3.0 - 2.0*t));
+}
+
 // Ported from Bevy Solari directional-light sampling:
 // - bevy_solari/src/scene/sampling.wesl::resolve_light_sample
 // - bevy_pbr/src/render/utils.wesl::{rand_f, rand_vec2f}
@@ -208,7 +225,7 @@ fn rt_alpha_generated_uv(
         uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
     }
 
-    let time = (camera.camera_pos_time.w - material.params.w);
+    let time = min(camera.camera_pos_time.w - material.params.w, select(3.402823e38, material.vector_t.w, material.vector_t.w > 0.0));
     for (var i = 0u; i < 4u; i = i + 1u) {
         if (i >= material.header.y) {
             break;
@@ -234,6 +251,12 @@ fn rt_alpha_generated_uv(
                 uv.x * a.y + uv.y * a.z + a.w,
                 uv.x * b.x + uv.y * b.y + b.z
             );
+        }
+        if (kind == 6u) {
+            let value = a.y + a.z * rt_tc_stretch_wave(u32(b.y + 0.5), select(a.w + time*b.x, (time+a.w)*b.x, u32(b.y + 0.5) == 5u));
+            if (abs(value) > 1.0e-6) {
+                uv = (uv - vec2<f32>(0.5)) / value + vec2<f32>(0.5);
+            }
         }
         if (kind == 5u) {
             // Matches OpenJK's RB_CalcTurbulentTexCoords: driven by vertex
@@ -298,7 +321,7 @@ fn rt_alpha_candidate_blocks(candidate: RayIntersection) -> bool {
         alpha_multiplier *= (1.0 - vertex_alpha);
     }
     let alpha = rt_sample_alpha(material.texture.x, uv) * alpha_multiplier;
-    return alpha >= material.params.x;
+    return select(alpha >= material.params.x, alpha < -material.params.x, material.params.x < 0.0);
 }
 
 // Source texture RGB is sRGB like the ordinary BSP diffuse sampler. Convert

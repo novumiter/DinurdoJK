@@ -1617,6 +1617,12 @@ pub(in crate::renderer) fn create_world_pipeline(
                     dst_factor: gpu_blend_factor(dst),
                     operation: wgpu::BlendOperation::Add,
                 };
+                // TaystJK rd-vanilla uses glBlendFunc(src, dst), so the same
+                // factors apply to RGB and destination alpha. Keep exact factors
+                // for e.g. GL_SRC_ALPHA GL_ONE additive BSP materials; do not
+                // "improve" them to separate alpha factors or override BSP
+                // vertex alpha. Modern linear/sRGB compositing is a separate
+                // display-compatibility investigation, not a blend-state hack.
                 Some(wgpu::BlendState {
                     color: component,
                     alpha: component,

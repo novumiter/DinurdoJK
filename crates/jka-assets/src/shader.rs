@@ -1,6 +1,16 @@
 //! Native interpretation of common JKA/Q3 shader material declarations.
 use std::collections::BTreeMap;
 
+/// JaPro RB_BeginSurface: subtract the remap offset before applying clampTime.
+/// A zero limit disables clamping in the reference renderer.
+pub fn shader_time(seconds: f32, time_offset: f32, clamp_time: Option<f32>) -> f32 {
+    let time = seconds - time_offset;
+    match clamp_time.filter(|limit| limit.is_finite() && *limit > 0.0) {
+        Some(limit) => time.min(limit),
+        None => time,
+    }
+}
+
 /// Periodic function of a `rgbGen wave` / `alphaGen wave` (id Tech 3's
 /// GF_SIN .. GF_NOISE).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +134,7 @@ pub enum TcMod {
     Scale(f32, f32),
     Rotate(f32),
     Transform([f32; 6]),
+    Stretch(Wave),
     Turb {
         base: f32,
         amplitude: f32,
@@ -318,6 +329,15 @@ pub struct Shader {
     /// normally bakes this into dsurface.fogNum; retaining the directive lets
     /// the runtime safely repair malformed/legacy global-fog assignments.
     pub no_fog: bool,
+    /// Runtime fog exemption (`noglfog`), distinct from q3map_nofog.
+    pub no_gl_fog: bool,
+    /// Authored image loading controls; runtime support depends on the rendering path.
+    pub no_mipmaps: bool,
+    pub no_picmip: bool,
+    pub no_tc: bool,
+    pub entity_mergable: bool,
+    /// Maximum shader time in seconds, or None for an unbounded clock.
+    pub clamp_time: Option<f32>,
     /// Authored `surfaceparm water`; retained separately from generic translucency.
     pub water: bool,
     /// q3map gameplay/content metadata needed when previewing an uncompiled .map.
@@ -932,6 +952,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                                 (v.len() == 6)
                                     .then(|| TcMod::Transform([v[0], v[1], v[2], v[3], v[4], v[5]]))
                             }
+                            "stretch" => parse_wave(&args[1..]).map(TcMod::Stretch),
                             "turb" => {
                                 let v = numbers(&args[1..])?;
                                 (v.len() == 4).then(|| TcMod::Turb {
@@ -1064,6 +1085,8 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                     "depthwrite" => stage.depth_write = true,
                     "glow" => stage.glow = true,
                     "depthfunc" if first == "equal" => stage.depth_equal = true,
+                    // The ordinary LEQUAL comparison is already the WGPU default.
+                    "depthfunc" if first == "lequal" => stage.depth_equal = false,
                     "depthfunc" => stage.unsupported.push(format!("depthfunc {first}")),
                     "detail" => stage.detail = true,
                     _ => stage.unsupported.push(key),
@@ -1155,6 +1178,15 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                             .filter(|value| value.is_finite() && *value > 0.0);
                     }
                     "q3map_nofog" => shader.no_fog = true,
+                    "noglfog" => shader.no_gl_fog = true,
+                    "nomipmaps" => { shader.no_mipmaps = true; shader.no_picmip = true; },
+                    "nopicmip" => shader.no_picmip = true,
+                    "notc" => shader.no_tc = true,
+                    "entitymergable" => shader.entity_mergable = true,
+                    "clamptime" => {
+                        shader.clamp_time = args.first().and_then(|arg| arg.parse::<f32>().ok())
+                            .filter(|value| value.is_finite() && *value > 0.0);
+                    },
                     "sort" => {
                         // The `portal` keyword is only shorthand for `sort portal`
                         // in the original renderer. Accept both authoring styles
@@ -1185,7 +1217,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                             shader.unsupported.push(format!("sort {first}"));
                         }
                     }
-                    "deformvertexes" if first == "bulge" => {
+                    "deformvertexes" | "deform" if first == "bulge" => {
                         let values = numbers(&args[1..])?;
                         if values.len() == 3 && values.iter().all(|value| value.is_finite()) {
                             shader.bulge = Some(Bulge { width: values[0], height: values[1], speed: values[2] });
@@ -1193,7 +1225,7 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                             shader.unsupported.push(format!("deformvertexes bulge {}", args[1..].join(" ")));
                         }
                     }
-                    "deformvertexes" if first == "wave" => {
+                    "deformvertexes" | "deform" if first == "wave" => {
                         let div = args.get(1).and_then(|value| value.parse::<f32>().ok());
                         let wave = args.get(2..).and_then(parse_wave);
                         match (div, wave) {
@@ -1203,10 +1235,10 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                             _ => shader.unsupported.push(format!("deformvertexes wave {}", args[1..].join(" "))),
                         }
                     }
-                    "deformvertexes" if first == "autosprite2" && args.len() == 1 => {
+                    "deformvertexes" | "deform" if first == "autosprite2" && args.len() == 1 => {
                         shader.auto_sprite2 = true;
                     }
-                    "deformvertexes" => shader.unsupported.push(format!("deformvertexes {}", args.join(" "))),
+                    "deformvertexes" | "deform" => shader.unsupported.push(format!("deformvertexes {}", args.join(" "))),
                     _ => (),
                 }
             }
@@ -1843,4 +1875,67 @@ map models/players/test/torso_04
         assert!(fallback.is_ok());
     }
 
+}
+
+#[cfg(test)]
+mod additional_shader_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn clamp_time_follows_the_remap_clock_and_zero_disables_it() {
+        assert_eq!(shader_time(10.0, 9.0, Some(2.0)), 1.0);
+        assert_eq!(shader_time(10.0, 3.0, Some(2.0)), 2.0);
+        assert_eq!(shader_time(1.0, 3.0, Some(2.0)), -2.0);
+        assert_eq!(shader_time(10.0, 3.0, Some(0.0)), 7.0);
+        assert_eq!(shader_time(10.0, 3.0, None), 7.0);
+        let shaders = parse("test {\nclampTime 0\n}\n").unwrap();
+        assert_eq!(shaders["test"].clamp_time, None);
+    }
+
+    #[test]
+    fn parses_stretch_wave_with_authored_phase() {
+        let shaders = parse("textures/test/stretcher {\n{\nmap textures/test/a\ntcMod stretch sin 1 0.5 0.25 2\n}\n}\n").unwrap();
+        let stage = shaders["textures/test/stretcher"].primary().unwrap();
+        assert!(stage.unsupported.is_empty());
+        assert_eq!(stage.tc_mods, vec![TcMod::Stretch(Wave {
+            func: WaveFunc::Sin, base: 1.0, amplitude: 0.5,
+            phase: 0.25, frequency: 2.0,
+        })]);
+    }
+
+    #[test]
+    fn additive_ocean_keeps_five_authored_stages_and_vertex_alpha() {
+        let mut src = String::from("textures/sephtestmap/oceanwater {\nsort additive\n");
+        for frame in 0..5 {
+            src.push_str(&format!(
+                "{{\nmap textures/sephtestmap/water{frame}\nblendFunc GL_SRC_ALPHA GL_ONE\nalphaGen vertex\nrgbGen identity\ntcMod scroll {} {}\n}}\n",
+                frame as f32 * 0.1, frame as f32 * -0.1
+            ));
+        }
+        src.push_str("}\n");
+        let shaders = parse(&src).unwrap();
+        let water = &shaders["textures/sephtestmap/oceanwater"];
+        assert_eq!(water.sort, Some(15.0));
+        assert_eq!(water.stages.len(), 5, "no additive layer may be folded or dropped");
+        for (idx, stage) in water.stages.iter().enumerate() {
+            assert_eq!(stage.alpha_gen, AlphaGen::Vertex);
+            assert_eq!(stage.rgb_gen, RgbGen::Identity);
+            assert_eq!(stage.blend.to_ascii_lowercase(), "gl_src_alpha gl_one");
+            assert_eq!(stage.tc_mods.len(), 1);
+            assert_eq!(stage.image, format!("textures/sephtestmap/water{idx}"));
+            assert!(stage.unsupported.is_empty());
+        }
+    }
+
+    #[test]
+    fn parses_deform_alias_depth_lequal_and_runtime_shader_flags() {
+        let shaders = parse("textures/test/flags {\nnoMipMaps\nnoTC\nentityMergable\nnoglfog\nclampTime 2\ndeform wave 32 sin 0 1 0 2\n{\nmap textures/test/a\ndepthFunc lequal\n}\n}\n").unwrap();
+        let shader = &shaders["textures/test/flags"];
+        assert!(shader.unsupported.is_empty());
+        assert!(shader.no_mipmaps && shader.no_picmip && shader.no_tc);
+        assert!(shader.no_gl_fog && shader.entity_mergable);
+        assert_eq!(shader.clamp_time, Some(2.0));
+        assert!(shader.vertex_wave.is_some());
+        assert!(shader.stages[0].unsupported.is_empty());
+    }
 }

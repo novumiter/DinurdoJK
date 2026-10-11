@@ -4,7 +4,10 @@
 use super::{appearance::PromotedOcean, OceanRenderUniform, OCEAN_UNITS_PER_METER};
 use bytemuck::{Pod, Zeroable};
 use jka_assets::bsp::bathymetry::{Atlas, Boundary, Class};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
 use wgpu::util::DeviceExt;
 
 const NONE: u32 = u32::MAX;
@@ -20,7 +23,7 @@ mod tests;
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct RenderParams {
     pub grid: [f32; 4],    // spacing units, tile axis, level units, promoted slot
-    pub control: [u32; 4], // enabled, hash mask, cell count, reserved
+    pub control: [u32; 4], // enabled, hash mask, cell count, cell indirection
     pub limits: [f32; 4],  // presentation interpolation, reserved
 }
 
@@ -83,6 +86,9 @@ pub struct Prepared {
     pub cells: Vec<CellGpu>,
     pub depth: Vec<f32>,
     pub lookup: Vec<[i32; 4]>,
+    pub lookup_mask: u32,
+    pub cell_indirection: bool,
+    pub tiled_coverage: usize,
     pub max_depth: f32,
     pub active: usize,
     pub shoreline: usize,
@@ -95,6 +101,14 @@ fn hash(x: i32, y: i32) -> u32 {
 /// Adapt supported shallow cells, dry banks, and a one-cell FFT interface ring.
 /// Intermediate/deep water beyond that ring continues to use the FFT renderer.
 pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String> {
+    let patch_radius = atlas
+        .shoreline_bands
+        .iter()
+        .find(|b| b.slot as usize == ocean.index)
+        .map_or(0, |b| b.patch_radius_cells);
+    if patch_radius > 32 {
+        return Err("invalid shoreline patch radius".into());
+    }
     if let Some(band) = atlas
         .shoreline_bands
         .iter()
@@ -182,7 +196,75 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
                 && c.depth / ocean.heuristic.wavelength.max(1.0) <= 0.05
         })
         .collect();
-    let mut active = shallow.clone();
+    let connected = |k: usize, q: usize, axis: usize| {
+        matches!(sources[k].1[axis], Boundary::Open | Boundary::Bank)
+            && matches!(sources[q].1[axis ^ 1], Boundary::Open | Boundary::Bank)
+            && (if axis & 1 == 1 {
+                sources[k].2[axis / 2]
+            } else {
+                sources[q].2[axis / 2]
+            })
+            .is_finite()
+    };
+    let mut core = shallow.clone();
+    let mut distance = vec![u32::MAX; count];
+    if patch_radius > 0 {
+        let mut queue = VecDeque::new();
+        for k in 0..count {
+            if shallow[k] && sources[k].1.contains(&Boundary::Bank) {
+                distance[k] = 0;
+                queue.push_back(k);
+            }
+        }
+        while let Some(k) = queue.pop_front() {
+            if distance[k] >= patch_radius {
+                continue;
+            }
+            for axis in 0..4 {
+                if let Some(q) = adjacent(k, axis) {
+                    if shallow[q] && distance[q] == u32::MAX && connected(k, q, axis) {
+                        distance[q] = distance[k] + 1;
+                        queue.push_back(q);
+                    }
+                }
+            }
+        }
+        for k in 0..count {
+            core[k] = distance[k] <= patch_radius;
+        }
+    }
+    let mut active = core.clone();
+    if patch_radius > 0 {
+        for k in 0..count {
+            if !core[k] {
+                continue;
+            }
+            for axis in 0..4 {
+                if adjacent(k, axis).is_some() {
+                    continue;
+                }
+                let mut p = coordinates[k].map(|v| (v as f64 + 0.5) * f64::from(spacing));
+                p[axis / 2] += if axis & 1 == 0 {
+                    -f64::from(spacing)
+                } else {
+                    f64::from(spacing)
+                };
+                let covered = grids[k / 256].footprint.iter().any(|t| {
+                    let edge = |a: [f32; 2], b: [f32; 2]| {
+                        (f64::from(b[0]) - f64::from(a[0])) * (p[1] - f64::from(a[1]))
+                            - (f64::from(b[1]) - f64::from(a[1])) * (p[0] - f64::from(a[0]))
+                    };
+                    let values = [edge(t[0], t[1]), edge(t[1], t[2]), edge(t[2], t[0])];
+                    values.iter().all(|&v| v >= -0.001) || values.iter().all(|&v| v <= 0.001)
+                });
+                if covered {
+                    return Err(
+                        "shoreline patch reaches an unbaked footprint tile; retain FFT".into(),
+                    );
+                }
+            }
+        }
+    }
     // Retain only finite dry terrain adjacent to a sampled bank. Do not mark
     // all dry land in a tile active just because a nearby pool exists.
     for k in 0..count {
@@ -192,35 +274,84 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
         if sources[k].0.class == Class::Dry {
             active[k] = (0..4).any(|axis| {
                 sources[k].1[axis] == Boundary::Bank
-                    && adjacent(k, axis).is_some_and(|q| shallow[q])
+                    && adjacent(k, axis).is_some_and(|q| core[q] && connected(k, q, axis))
             });
-        } else if !shallow[k] {
+        } else if !core[k] {
             active[k] = (0..4).any(|axis| {
                 sources[k].1[axis] == Boundary::Open
-                    && adjacent(k, axis).is_some_and(|q| shallow[q])
+                    && adjacent(k, axis).is_some_and(|q| core[q] && connected(k, q, axis))
             });
         }
     }
     let shoreline = (0..count)
-        .filter(|&k| shallow[k] && sources[k].1.contains(&Boundary::Bank))
+        .filter(|&k| core[k] && sources[k].1.contains(&Boundary::Bank))
         .count();
     if shoreline == 0 {
         return Err("no resolved shallow bank cells (h/L <= 0.05) in this pool".into());
     }
-    // Allocate GPU storage only for tiles touched by shallow physics, dry
-    // banks or the FFT forcing ring. Keep complete tiles for shader lookup,
-    // but never charge unused offshore bathymetry against the live budget.
+    if patch_radius > 0 {
+        // Every simulated wet component needs a resolved FFT reservoir with
+        // a geometrically open continuation into supported, unsimulated water.
+        // No forcing is invented across an unknown, wall or missing tile.
+        let mut visited = vec![false; count];
+        for seed in 0..count {
+            if !active[seed] || visited[seed] || sources[seed].0.class != Class::Wet {
+                continue;
+            }
+            let mut queue = VecDeque::from([seed]);
+            visited[seed] = true;
+            let mut forcing = false;
+            while let Some(k) = queue.pop_front() {
+                for axis in 0..4 {
+                    if let Some(q) = adjacent(k, axis) {
+                        if !connected(k, q, axis) || !safe(q) || sources[q].0.class != Class::Wet {
+                            continue;
+                        }
+                        if !core[k] && !active[q] && sources[k].1[axis] == Boundary::Open {
+                            forcing = true;
+                        }
+                        if active[q] && !visited[q] {
+                            visited[q] = true;
+                            queue.push_back(q);
+                        }
+                    }
+                }
+            }
+            if !forcing {
+                return Err("bank-seeded patch has no geometrically validated offshore FFT reservoir; retain FFT".into());
+            }
+        }
+    }
+    // Retain tile addresses touched by physics, dry banks or FFT reservoirs.
+    // Complete bands keep tiled records; bank patches store only active cells
+    // and map the remaining tile positions to NONE through cell indirection.
     let retained_tiles: Vec<_> = (0..grids.len())
         .filter(|&tile| active[tile * 256..(tile + 1) * 256].iter().any(|&v| v))
         .collect();
-    let live_count = retained_tiles.len() * 256;
+    let tiled_coverage = retained_tiles.len() * 256;
+    let cell_indirection = patch_radius > 0;
+    let live_count = if cell_indirection {
+        active.iter().filter(|&&v| v).count()
+    } else {
+        tiled_coverage
+    };
     if live_count > MAX_CELLS {
-        return Err(format!("{live_count} shallow-band tiled cells exceed the live {MAX_CELLS}-cell budget; retain FFT"));
+        return Err(format!("{live_count} shallow-band stored cells exceed the live {MAX_CELLS}-cell budget; retain FFT"));
     }
     let mut remap = vec![NONE; count];
-    for (packed, &tile) in retained_tiles.iter().enumerate() {
-        for local in 0..256 {
-            remap[tile * 256 + local] = (packed * 256 + local) as u32;
+    if cell_indirection {
+        let mut packed = 0;
+        for k in 0..count {
+            if active[k] {
+                remap[k] = packed;
+                packed += 1;
+            }
+        }
+    } else {
+        for (packed, &tile) in retained_tiles.iter().enumerate() {
+            for local in 0..256 {
+                remap[tile * 256 + local] = (packed * 256 + local) as u32;
+            }
         }
     }
     let mut cells = Vec::with_capacity(live_count);
@@ -256,11 +387,14 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
         });
         let interface = active[k]
             && c.class == Class::Wet
-            && (!shallow[k]
+            && ((patch_radius == 0 && !core[k])
                 || (0..4).any(|axis| {
                     boundaries[axis] == Boundary::Open
                         && adjacent(k, axis).is_some_and(|q| {
-                            safe(q) && !active[q] && sources[q].0.class == Class::Wet
+                            safe(q)
+                                && !active[q]
+                                && sources[q].0.class == Class::Wet
+                                && (patch_radius == 0 || connected(k, q, axis))
                         })
                 }));
         let crest = [0, 1].map(|axis| {
@@ -278,8 +412,12 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
                 xy[0],
                 xy[1],
                 if active[k] { 1.0 } else { 0.0 },
-                if active[k] && (shallow[k] || c.class == Class::Dry) {
-                    1.0
+                if active[k] && (core[k] || c.class == Class::Dry) {
+                    if patch_radius > 0 && core[k] {
+                        ((patch_radius + 1 - distance[k]) as f32 / 3.0).min(1.0)
+                    } else {
+                        1.0
+                    }
                 } else {
                     0.0
                 },
@@ -290,8 +428,12 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
     if !cells.iter().any(|c| c.metric[3] > 0.0) {
         return Err("shallow bank has no resolved FFT interface; retain FFT until a forcing boundary is available".into());
     }
-    let mut lookup = vec![[0i32; 4]; (retained_tiles.len() * 2).next_power_of_two().max(4)];
-    let mask = lookup.len() - 1;
+    let table_len = (retained_tiles.len() * 2).next_power_of_two().max(4);
+    let mask = table_len - 1;
+    let mut lookup = vec![[0i32; 4]; table_len];
+    if cell_indirection {
+        lookup.resize(table_len + tiled_coverage / 4, [-1; 4]);
+    }
     for (tile, &original) in retained_tiles.iter().enumerate() {
         let g = grids[original];
         let x = (g.origin[0] / (spacing * 16.0)).round() as i32;
@@ -300,7 +442,22 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
         while lookup[index][3] != 0 {
             index = (index + 1) & mask;
         }
-        lookup[index] = [x, y, (tile * 256) as i32, 1];
+        lookup[index] = [
+            x,
+            y,
+            (if cell_indirection {
+                table_len * 4 + tile * 256
+            } else {
+                tile * 256
+            }) as i32,
+            1,
+        ];
+        if cell_indirection {
+            for local in 0..256 {
+                lookup[table_len + tile * 64 + local / 4][local % 4] =
+                    remap[original * 256 + local] as i32;
+            }
+        }
     }
     Ok(Prepared {
         slot: ocean.index,
@@ -309,6 +466,9 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
         cells,
         depth,
         lookup,
+        lookup_mask: mask as u32,
+        cell_indirection,
+        tiled_coverage,
         max_depth,
         active: active.iter().filter(|&&v| v).count(),
         shoreline,
@@ -374,7 +534,12 @@ impl Gpu {
         let dt = (0.42 * dx / (2.0 * (5.0 + (9.81 * depth_bound).sqrt()))).min(1.0 / 60.0);
         let render_params = RenderParams {
             grid: [prepared.spacing, 16.0, prepared.level, prepared.slot as f32],
-            control: [1, prepared.lookup.len() as u32 - 1, cell_count, 0],
+            control: [
+                1,
+                prepared.lookup_mask,
+                cell_count,
+                u32::from(prepared.cell_indirection),
+            ],
             limits: [0.0; 4],
         };
         // Two presentation levels per cell allow interpolation at render FPS.
@@ -594,7 +759,7 @@ impl Gpu {
                 ],
             })
         });
-        let summary=format!("pool {}: {} shallow bank cells, {} active / {cell_count} tiled cells; GPU fixed dt {:.3} ms; maximum {MAX_STEPS} steps/frame",prepared.slot+1,prepared.shoreline,prepared.active,dt*1000.0);
+        let summary=format!("pool {}: {} shallow bank cells, {} active / {cell_count} stored cells / {} tile-addressed cells; GPU fixed dt {:.3} ms; maximum {MAX_STEPS} steps/frame",prepared.slot+1,prepared.shoreline,prepared.active,prepared.tiled_coverage,dt*1000.0);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Coastal asynchronous safety flag"),
             size: 16,

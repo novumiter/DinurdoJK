@@ -1,10 +1,10 @@
 //! Diagnostics inspector.
 use crate::renderer::{
-    barycentric_coordinates, legacy_dlight_diagnostic, legacy_dlight_surface_mask, ray_hits_aabb,
+    barycentric_coordinates, legacy_dlight_diagnostic, legacy_dlight_surface_mask, ocean_surface_key, ray_hits_aabb,
     scene, vertex_dlight_cpu, BlendMode, Camera, DrawClass, DynamicLightsMode, DynamicModelSurface,
     DynamicShadowsMode, DynamicWireframeClass, InspectorEntityHint, Mat4, PathBuf, Renderer,
     SurfaceInspectorInfo, SurfaceInspectorSection, TcGen, TextureData, Vec2, Vec3, Vec4,
-    WorldShaderFamily, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
+    WorldShaderFamily, OceanPromotionDecision, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,
     RT_SUN_ANGULAR_DIAMETER_RADIANS, SHADOW_CASCADES,
 };
 
@@ -100,6 +100,80 @@ pub(in crate::renderer) fn inspector_texture_meta(texture: &TextureData) -> Insp
         sampled_luma_mean: mean,
         sampled_luma_stddev: stddev,
     }
+}
+
+/// Reconstruct the *exact* key used in world upload from the traced batch's
+/// original vertices (not its FFT-padded render bounds). Shader stages sharing
+/// the same face therefore find the same promotion decision.
+fn inspector_ocean_face_key(vertices: &[InspectorVertex], material: u32) -> Option<[u32; 6]> {
+    if vertices.is_empty() { return None; }
+    let mut low = [f32::INFINITY; 3];
+    let mut high = [f32::NEG_INFINITY; 3];
+    for v in vertices {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(v.position[axis]);
+            high[axis] = high[axis].max(v.position[axis]);
+        }
+    }
+    if !low.iter().chain(high.iter()).all(|x| x.is_finite()) { return None; }
+    Some(ocean_surface_key(high[1], [low[0], low[2]], [high[0], high[2]], material))
+}
+
+fn inspector_ocean_is_upward(vertices: &[InspectorVertex]) -> bool {
+    let mut lowest = f32::INFINITY;
+    let mut highest = f32::NEG_INFINITY;
+    let mut facing = 0.0;
+    for v in vertices {
+        lowest = lowest.min(v.position[1]);
+        highest = highest.max(v.position[1]);
+        facing += v.normal[1];
+    }
+    lowest.is_finite() && facing > 0.0 && lowest >= highest - 1.0
+}
+
+/// Generated only when Trace is invoked; zero formatting in the frame loop.
+fn ocean_promotion_report(
+    map_built: bool,
+    ocean_enabled: bool,
+    water_primary: bool,
+    upward: bool,
+    ocean_replaced: bool,
+    decision: Option<OceanPromotionDecision>,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("OCEAN: runtime={} map_clipmap_prep={} capacity={}",
+            if ocean_enabled { "ON" } else { "OFF" },
+            if map_built { "YES" } else { "NO" },
+            crate::ocean::OCEAN_MAX_SURFACES),
+        format!("WATER FACE: upward={} primary_stage={} BATCH_OWNED_BY_OCEAN={}",
+            if upward { "YES" } else { "NO" },
+            if water_primary { "YES" } else { "NO" },
+            if ocean_replaced { "YES" } else { "NO" }),
+    ];
+    if !map_built {
+        lines.push("PROMOTION: NOT EVALUATED (ocean clipmaps were not built for this map; enable ocean and reload)".into());
+    } else if let Some(decision) = decision {
+        let detail = format!("rank {}/{} by triangle area {:.0} u^2; {} face(s)",
+            decision.rank, decision.total, decision.area, decision.faces);
+        if let Some(slot) = decision.slot {
+            lines.push(format!("PROMOTION: SELECTED slot {} ({detail})", slot));
+            lines.push(format!("REPLACEMENT DRAW: {}",
+                if ocean_enabled && ocean_replaced { "ACTIVE" }
+                else if !ocean_enabled { "INACTIVE (r_ocean is OFF)" }
+                else { "NOT OWNED BY THIS BATCH (check stage/face association)" }));
+        } else {
+            lines.push(format!("PROMOTION: REJECTED: SURFACE CAP ({detail}; only top {} selected)",
+                crate::ocean::OCEAN_MAX_SURFACES));
+            lines.push("REPLACEMENT DRAW: AUTHORED STAGES (no ocean slot)".into());
+        }
+    } else if !upward {
+        lines.push("PROMOTION: NOT ELIGIBLE (side/underside or non-horizontal water geometry)".into());
+    } else if !water_primary {
+        lines.push("PROMOTION: NOT A PRIMARY WATER STAGE (no matching promoted face key)".into());
+    } else {
+        lines.push("PROMOTION: NO MATCHING FOOTPRINT (eligible-looking face not collected; inspect grouping/key)".into());
+    }
+    lines
 }
 
 impl Renderer {
@@ -683,19 +757,43 @@ impl Renderer {
             if pvs_visible { "YES" } else { "NO" },
         ));
         lines.push(format!(
-            "PLANAR: {}    ENV CANDIDATE: {}    REFLECTION PROBE: {:?}",
-            source.planar_reflection, source.planar_environment_candidate, source.reflection_probe,
+            "PLANAR: {}    ENV CANDIDATE: {}    AUTHORED ENV EFFECT: {}    REFLECTION PROBE: {:?}",
+            source.planar_reflection,
+            source.planar_environment_candidate,
+            source.authored_environment_composite,
+            source.reflection_probe,
         ));
         lines.push(format!(
             "REFLECTION POLICY: quality={}    planar_mode={}    tcGen environment={}",
             self.reflection_quality.label(),
             self.planar_reflection_mode.label(),
             if self.reflection_quality.omits_environment_stages() {
-                "STRIPPED (absolute OFF)"
+                if source.authored_environment_composite {
+                    "PRESERVED (integral authored effect; enhancements OFF)"
+                } else {
+                    "STRIPPED (standalone environment stage; reflections OFF)"
+                }
             } else {
                 "PRESERVED"
             },
         ));
+        let ocean_report = if source.water {
+            let source_vertices = world.inspector_vertices.get(range_start..range_end).unwrap_or(&[]);
+            let key = inspector_ocean_face_key(source_vertices, source.bsp_shader_index);
+            let decision = key.and_then(|key| world.ocean_promotion_decisions.get(&key).copied());
+            Some(ocean_promotion_report(
+                world.ocean_meshes_built,
+                self.ocean_enabled,
+                source.water_primary,
+                inspector_ocean_is_upward(source_vertices),
+                batch.ocean_replaced,
+                decision,
+            ))
+        } else { None };
+        if let Some(report) = &ocean_report {
+            lines.push("WATER PROMOTION (map-load decision)".into());
+            lines.extend(report.iter().cloned());
+        }
         lines.push(format!(
             "BOUNDS MIN: {:.1}, {:.1}, {:.1}",
             batch.bounds_min[0], batch.bounds_min[1], batch.bounds_min[2]
@@ -980,6 +1078,12 @@ impl Renderer {
                 ],
             },
         ];
+        if let Some(report) = ocean_report {
+            sections.push(SurfaceInspectorSection {
+                title: "WATER PROMOTION".into(),
+                lines: report,
+            });
+        }
         if let Some(definition_text) =
             debug_entry.and_then(|entry| entry.definition_text.as_deref())
         {
@@ -1278,4 +1382,53 @@ pub(in crate::renderer) fn ray_triangle_distance(
     }
     let distance = edge2.dot(q) * inverse;
     (distance > 0.001 && distance.is_finite()).then_some(distance)
+}
+
+#[cfg(test)]
+mod ocean_promotion_diagnostic_tests {
+    use super::{inspector_ocean_face_key, inspector_ocean_is_upward, ocean_promotion_report,
+        InspectorVertex, OceanPromotionDecision};
+
+    fn example() -> OceanPromotionDecision {
+        OceanPromotionDecision { rank: 12, total: 23, area: 5248.0, faces: 2, slot: None }
+    }
+
+    #[test]
+    fn reports_cap_rejection_from_actual_rank() {
+        let report = ocean_promotion_report(true, true, true, true, false, Some(example())).join(" ");
+        assert!(report.contains("REJECTED: SURFACE CAP"));
+        assert!(report.contains("rank 12/23"));
+        assert!(report.contains("AUTHORED STAGES"));
+    }
+
+    #[test]
+    fn selected_but_runtime_off_is_not_a_cap_rejection() {
+        let report = ocean_promotion_report(true, false, true, true, true,
+            Some(OceanPromotionDecision { rank: 3, slot: Some(2), ..example() })).join(" ");
+        assert!(report.contains("SELECTED slot 2"));
+        assert!(report.contains("INACTIVE (r_ocean is OFF)"));
+    }
+
+    #[test]
+    fn handles_no_map_clipmaps_and_non_upward_faces() {
+        let unbuilt = ocean_promotion_report(false, false, true, true, false, None).join(" ");
+        assert!(unbuilt.contains("NOT EVALUATED"));
+        let side = ocean_promotion_report(true, true, false, false, false, None).join(" ");
+        assert!(side.contains("side/underside"));
+    }
+
+    #[test]
+    fn shader_stage_key_uses_real_geometry_not_padded_bounds() {
+        let vertex = |position, normal| InspectorVertex {
+            position, normal, uv: [0.0; 2], lightmap_uv: [0.0; 2], color: [1.0; 4],
+        };
+        let vertices = [
+            vertex([4.0, 20.0, 6.0], [0.0, 1.0, 0.0]),
+            vertex([8.0, 20.0, 6.0], [0.0, 1.0, 0.0]),
+            vertex([4.0, 20.0, 9.0], [0.0, 1.0, 0.0]),
+        ];
+        assert!(inspector_ocean_is_upward(&vertices));
+        assert_eq!(inspector_ocean_face_key(&vertices, 277),
+            Some(super::ocean_surface_key(20.0, [4.0, 6.0], [8.0, 9.0], 277)));
+    }
 }

@@ -1269,7 +1269,7 @@ impl Renderer {
                             continue;
                         }
                         match batch.source.pipeline.class {
-                            DrawClass::Opaque if batch.source.alpha_cutoff <= 0.0 => {
+                            DrawClass::Opaque if batch.source.alpha_cutoff == 0.0 => {
                                 if mask_pipeline_active {
                                     if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                     pass.set_pipeline(&self.shadow_resources.bevy_pipeline);
@@ -1278,7 +1278,7 @@ impl Renderer {
                                 if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
-                            DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => {
+                            DrawClass::Mask if batch.source.alpha_cutoff != 0.0 => {
                                 if !mask_pipeline_active {
                                     if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                     pass.set_pipeline(&self.shadow_resources.bevy_mask_pipeline);
@@ -1478,7 +1478,7 @@ impl Renderer {
                             if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
                             draw_world_batch(&mut pass, batch, 0..1, None);
                         }
-                        DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => {
+                        DrawClass::Mask if batch.source.alpha_cutoff != 0.0 => {
                             if plan.rain_only_linear_depth && self.weather.rain.opaque_depth {
                                 continue;
                             }
@@ -1592,7 +1592,7 @@ impl Renderer {
                         }
                         let is_mask = match batch.source.pipeline.class {
                             DrawClass::Opaque => false,
-                            DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => true,
+                            DrawClass::Mask if batch.source.alpha_cutoff != 0.0 => true,
                             _ => continue,
                         };
                         if current_is_mask != Some(is_mask) {
@@ -2469,13 +2469,31 @@ impl Renderer {
                 let cluster = world.visibility.as_ref().and_then(|vis| {
                     vis.cluster_at(scene::jka_position(portal_position.to_array()))
                 });
-                let indices: &[usize] = match cluster {
-                    Some(cluster) if self.pvs_mode != PvsMode::Off => world
-                        .coarse_visible_batches_by_cluster
-                        .get(cluster)
-                        .unwrap_or(&world.coarse_all_batches),
-                    _ => &world.coarse_all_batches,
-                };
+                // Do not use coarse batches in the sky-portal view. Their PVS
+                // bitset is the OR of all merged BSP polygons: a single visible
+                // beach_sky polygon can pull in a remote sky from another area.
+                // FULL keeps the exact per-piece PVS and still shares vertex /
+                // index buffers and materials with the ordinary world path.
+                let (portal_batches, indices): (&[WorldBatch], &[usize]) =
+                    if !world.full_batches.is_empty() {
+                        let indices = match cluster {
+                            Some(cluster) if self.pvs_mode != PvsMode::Off => world
+                                .full_visible_batches_by_cluster
+                                .get(cluster)
+                                .unwrap_or(&world.full_all_batches),
+                            _ => &world.full_all_batches,
+                        };
+                        (&world.full_batches, indices)
+                    } else {
+                        let indices = match cluster {
+                            Some(cluster) if self.pvs_mode != PvsMode::Off => world
+                                .coarse_visible_batches_by_cluster
+                                .get(cluster)
+                                .unwrap_or(&world.coarse_all_batches),
+                            _ => &world.coarse_all_batches,
+                        };
+                        (&world.coarse_batches, indices)
+                    };
                 if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
                 let mut sky_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("JKA sky portal"),
@@ -2535,7 +2553,7 @@ impl Renderer {
                 sky_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 let mut current_pipeline = None;
                 for &batch_index in indices {
-                    let batch = &world.coarse_batches[batch_index];
+                    let batch = &portal_batches[batch_index];
                     if batch.is_inline_entity
                         || ocean_suppresses_batch(render_ocean, batch)
                         || (batch.source.pipeline.class != DrawClass::Sky
@@ -2708,17 +2726,16 @@ impl Renderer {
                 && world.inline_group_count != 0;
             let mut inline_visible = std::mem::take(&mut self.inline_visible_scratch);
             inline_visible.clear();
-            // Godot water is a depth-writing surface drawn after the scene-color
-            // capture. Alpha-blended BSP stages cannot be drawn before it because
-            // they intentionally leave no depth behind for the later water test.
-            // Partition them while walking the already-selected visible list, then
-            // consume only this retained queue after ocean depth exists. This moves
-            // the same draw encoding work without another active/PVS traversal or
-            // per-frame allocation churn.
-            let defer_transparent_for_ocean = optical_volumes.is_some();
-            let mut post_ocean_transparent =
+            // Alpha-blended BSP stages must render AFTER opaque dynamic models:
+            // transparent world shaders (e.g. lakewater_other) do not write depth,
+            // so rendering a medpack later would overwrite the water even when
+            // the model is behind it. Reuse the ocean-path deferred draw queue for
+            // both ordinary and ocean frames. Keep the already PVS/frustum-selected
+            // active-list order, without a new render pass or visibility traversal.
+            let mut deferred_transparent =
                 std::mem::take(&mut self.post_ocean_transparent_scratch);
-            post_ocean_transparent.clear();
+            deferred_transparent.clear();
+            let mut transparency_order = super::plan::WorldTransparencyOrder::default();
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) {
@@ -2765,7 +2782,13 @@ impl Renderer {
                         continue;
                     }
                 }
-                if inline_grouping && batch.is_inline_entity && batch.inline_group != u32::MAX {
+                let defer_batch = transparency_order.defer_stage(&batch.source.vertices,
+                    batch.source.bsp_shader_index, batch.source.pipeline.class);
+                if inline_grouping
+                    && batch.is_inline_entity
+                    && batch.inline_group != u32::MAX
+                    && !defer_batch
+                {
                     inline_visible.push(batch_index);
                     continue;
                 }
@@ -2813,10 +2836,8 @@ impl Renderer {
                         continue;
                     }
                 }
-                if defer_transparent_for_ocean
-                    && batch.source.pipeline.class == DrawClass::Transparent
-                {
-                    post_ocean_transparent.push(active_pos);
+                if defer_batch {
+                    deferred_transparent.push(active_pos);
                     continue;
                 }
                 if use_cpu_compaction {
@@ -3303,131 +3324,137 @@ impl Renderer {
                 }
             }
             self.inline_visible_scratch = inline_visible;
-            // OpenJK projects legacy dynamic lights as another rendering pass
-            // after the authored material stages. The normal BSP pipelines above
-            // compile with ENABLE_LEGACY_DLIGHTS=false; redraw only authored
-            // surface runs whose CPU mirror of the dlight mask is non-zero.
-            if world.active_pipeline_variant.legacy_dlights
-                && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
-                && !active_pipeline_variant.legacy_dlight_pipelines.is_empty()
-            {
-                if let Ok(surface_masks) = world.legacy_dlight_surface_masks_cpu.lock() {
-                    if surface_masks.iter().any(|&mask| mask != 0) {
-                        self.gpu_profiler.write_render_pass_timestamp(
-                            &mut pass,
-                            GpuPass::LegacyDlights,
-                            false,
-                        );
-                        if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                        if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                        pass.set_bind_group(
-                            2,
-                            if enhanced_world_shader {
-                                &world.lighting_bind_group
-                            } else {
-                                &world.lighting_bind_group_lean
-                            },
-                            &[],
-                        );
-                        if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                        pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
-                        if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                        pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
-                        if enhanced_world_shader {
+            // Keep projected lighting after authored world stages. The ocean
+            // capture needs it before water; ordinary frames need it after the
+            // deferred world queue, including any final opaque replacement.
+            let draw_legacy_dlights = |pass: &mut wgpu::RenderPass<'_>,
+                gpu_profiler: &mut crate::renderer::GpuProfiler, info: &mut FrameInfo| {
+                if world.active_pipeline_variant.legacy_dlights
+                    && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+                    && !active_pipeline_variant.legacy_dlight_pipelines.is_empty()
+                {
+                    if let Ok(surface_masks) = world.legacy_dlight_surface_masks_cpu.lock() {
+                        if surface_masks.iter().any(|&mask| mask != 0) {
+                            gpu_profiler.write_render_pass_timestamp(
+                                pass,
+                                GpuPass::LegacyDlights,
+                                false,
+                            );
                             if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                            pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
-                        }
-                        if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
-                        pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
-                        if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
-                        pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
-                        if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
-                        pass.set_index_buffer(
-                            world.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-
-                        let dlight_active = legacy_dlight_batch_selection(world, self.pvs_mode);
-                        let mut current_dlight_pipeline = None;
-                        for &batch_index in dlight_active.indices {
-                            let batch = &dlight_active.batches[batch_index];
-                            if !legacy_dlight_receives(&batch.source)
-                                || !batch_area_visible(batch, effective_area_mask)
-                                || ocean_suppresses_batch(render_ocean, batch)
-                                || !aabb_intersects_clip_frustum(
-                                    batch.bounds_min,
-                                    batch.bounds_max,
-                                    view_proj,
-                                )
-                            {
-                                continue;
-                            }
-                            let Some(dlight_pipeline) = active_pipeline_variant
-                                .legacy_dlight_pipelines
-                                .get(&batch.source.pipeline)
-                            else {
-                                continue;
-                            };
-
-                            let has_touched_run = batch.is_inline_entity
-                                || batch.legacy_dlight_runs.iter().any(|run| {
-                                    run.surface_id != u32::MAX
-                                        && surface_masks
-                                            .get(run.surface_id as usize)
-                                            .is_some_and(|&mask| mask != 0)
-                                });
-                            if !has_touched_run {
-                                continue;
-                            }
-
-                            if current_dlight_pipeline != Some(batch.source.pipeline) {
-                                if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
-                                pass.set_pipeline(dlight_pipeline);
-                                current_dlight_pipeline = Some(batch.source.pipeline);
-                            }
+                            pass.set_bind_group(0, &self.camera_bind_group, &[]);
                             if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                            pass.set_bind_group(1, &batch.bind_group, &[]);
+                            pass.set_bind_group(
+                                2,
+                                if enhanced_world_shader {
+                                    &world.lighting_bind_group
+                                } else {
+                                    &world.lighting_bind_group_lean
+                                },
+                                &[],
+                            );
+                            if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                            pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
+                            if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                            pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                             if enhanced_world_shader {
                                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                                pass.set_bind_group(
-                                    6,
-                                    Self::ocean_bind_group_for(
-                                        batch,
-                                        &self.authored_oceans,
-                                        &self.ocean,
-                                        &self.ocean_inert_bind_group,
-                                    ),
-                                    &[],
-                                );
+                                pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
                             }
+                            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
+                            pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                            if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
+                            pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                            if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
+                            pass.set_index_buffer(
+                                world.index_buffer.slice(..),
+                                wgpu::IndexFormat::Uint32,
+                            );
 
-                            if batch.is_inline_entity {
-                                // Inline BSP models use the existing conservative
-                                // unknown-surface fallback (all transient dlights).
-                                if capture_api_calls { info.perf_encode_calls.draw_indexed = info.perf_encode_calls.draw_indexed.saturating_add(1); }
-                                pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
-                            } else {
-                                for run in &batch.legacy_dlight_runs {
-                                    if run.surface_id == u32::MAX
-                                        || !surface_masks
-                                            .get(run.surface_id as usize)
-                                            .is_some_and(|&mask| mask != 0)
-                                    {
-                                        continue;
-                                    }
+                            let dlight_active = legacy_dlight_batch_selection(world, self.pvs_mode);
+                            let mut current_dlight_pipeline = None;
+                            for &batch_index in dlight_active.indices {
+                                let batch = &dlight_active.batches[batch_index];
+                                if !legacy_dlight_receives(&batch.source)
+                                    || !batch_area_visible(batch, effective_area_mask)
+                                    || ocean_suppresses_batch(render_ocean, batch)
+                                    || !aabb_intersects_clip_frustum(
+                                        batch.bounds_min,
+                                        batch.bounds_max,
+                                        view_proj,
+                                    )
+                                {
+                                    continue;
+                                }
+                                let Some(dlight_pipeline) = active_pipeline_variant
+                                    .legacy_dlight_pipelines
+                                    .get(&batch.source.pipeline)
+                                else {
+                                    continue;
+                                };
+
+                                let has_touched_run = batch.is_inline_entity
+                                    || batch.legacy_dlight_runs.iter().any(|run| {
+                                        run.surface_id != u32::MAX
+                                            && surface_masks
+                                                .get(run.surface_id as usize)
+                                                .is_some_and(|&mask| mask != 0)
+                                    });
+                                if !has_touched_run {
+                                    continue;
+                                }
+
+                                if current_dlight_pipeline != Some(batch.source.pipeline) {
+                                    if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                                    pass.set_pipeline(dlight_pipeline);
+                                    current_dlight_pipeline = Some(batch.source.pipeline);
+                                }
+                                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                                pass.set_bind_group(1, &batch.bind_group, &[]);
+                                if enhanced_world_shader {
+                                    if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                                    pass.set_bind_group(
+                                        6,
+                                        Self::ocean_bind_group_for(
+                                            batch,
+                                            &self.authored_oceans,
+                                            &self.ocean,
+                                            &self.ocean_inert_bind_group,
+                                        ),
+                                        &[],
+                                    );
+                                }
+
+                                if batch.is_inline_entity {
+                                    // Inline BSP models use the existing conservative
+                                    // unknown-surface fallback (all transient dlights).
                                     if capture_api_calls { info.perf_encode_calls.draw_indexed = info.perf_encode_calls.draw_indexed.saturating_add(1); }
-                                    pass.draw_indexed(run.indexed_range.clone(), 0, 0..1);
+                                    pass.draw_indexed(batch.indexed_range.clone(), 0, 0..1);
+                                } else {
+                                    for run in &batch.legacy_dlight_runs {
+                                        if run.surface_id == u32::MAX
+                                            || !surface_masks
+                                                .get(run.surface_id as usize)
+                                                .is_some_and(|&mask| mask != 0)
+                                        {
+                                            continue;
+                                        }
+                                        if capture_api_calls { info.perf_encode_calls.draw_indexed = info.perf_encode_calls.draw_indexed.saturating_add(1); }
+                                        pass.draw_indexed(run.indexed_range.clone(), 0, 0..1);
+                                    }
                                 }
                             }
+                            gpu_profiler.write_render_pass_timestamp(
+                                pass,
+                                GpuPass::LegacyDlights,
+                                true,
+                            );
                         }
-                        self.gpu_profiler.write_render_pass_timestamp(
-                            &mut pass,
-                            GpuPass::LegacyDlights,
-                            true,
-                        );
                     }
                 }
+
+            };
+            if optical_volumes.is_some() {
+                draw_legacy_dlights(&mut pass, &mut self.gpu_profiler, &mut info);
             }
 
             if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
@@ -3516,17 +3543,17 @@ impl Renderer {
                     false,
                 );
             } else {
-                for depth_writing_phase in [true, false] {
-                    self.dynamic_model_renderer.draw_phase(
-                        &mut pass,
-                        &self.camera_bind_group,
-                        depth_writing_phase,
-                        None,
-                        Some(&mut self.gpu_profiler),
-                        None,
-                        false,
-                    );
-                }
+                // On the non-ocean path, postpone the non-depth-writing entity
+                // phase until after the deferred transparent world shaders.
+                self.dynamic_model_renderer.draw_phase(
+                    &mut pass,
+                    &self.camera_bind_group,
+                    true,
+                    None,
+                    Some(&mut self.gpu_profiler),
+                    None,
+                    false,
+                );
             }
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, true);
@@ -3793,11 +3820,11 @@ impl Renderer {
                     .write_render_pass_timestamp(&mut pass, GpuPass::OceanSurface, true);
             }
 
-            if defer_transparent_for_ocean && !post_ocean_transparent.is_empty() {
-                // The ocean pass replaced the BSP pipeline. Re-establish the world
-                // bindings once, then consume only the transparent queue collected
-                // during the original visibility walk. The batches are not culled or
-                // classified again here; their original active-list order is retained.
+            if !deferred_transparent.is_empty() {
+                // Opaque dynamic models have populated depth (and, when enabled,
+                // the ocean has already rendered). Restore BSP state and draw the
+                // transparency queue with its authored stage / fog ordering.
+                // The visibility walk has already selected these exact batches.
                 current_pipeline = None;
                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -3826,7 +3853,7 @@ impl Renderer {
                 if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-                for &active_pos in &post_ocean_transparent {
+                for &active_pos in &deferred_transparent {
                     let batch_index = active.indices[active_pos];
                     let batch = &active.batches[batch_index];
                     if current_pipeline != Some(batch.source.pipeline) {
@@ -3922,7 +3949,10 @@ impl Renderer {
                     }
                 }
             }
-            self.post_ocean_transparent_scratch = post_ocean_transparent;
+            if optical_volumes.is_none() {
+                draw_legacy_dlights(&mut pass, &mut self.gpu_profiler, &mut info);
+            }
+            self.post_ocean_transparent_scratch = deferred_transparent;
             // Ground truth, for the next frame's gates. `clipmaps_drawn` is NOT
             // usable here: a promoted surface's bounds routinely surround the
             // camera, so it reads 1 while the mask and world occluders leave
@@ -3951,7 +3981,10 @@ impl Renderer {
                 );
             }
 
-            if split_dynamic_for_ocean {
+            // In the ordinary path this phase used to run immediately after
+            // opaque models, before transparent BSP water. Match the ocean path:
+            // composite non-depth-writing FX only after world transparency.
+            {
                 self.gpu_profiler.write_render_pass_timestamp(
                     &mut pass,
                     GpuPass::DynamicModelsTranslucent,
@@ -3961,16 +3994,20 @@ impl Renderer {
                     &mut pass,
                     &self.camera_bind_group,
                     false,
-                    self.ray_traced_shadows
-                        .as_ref()
-                        .filter(|_| {
-                            self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
-                        })
-                        .and_then(|rt| {
-                            rt.model_receivers
-                                .as_ref()
-                                .map(|models| (models, &rt.receiver_bind_group))
-                        }),
+                    if split_dynamic_for_ocean {
+                        self.ray_traced_shadows
+                            .as_ref()
+                            .filter(|_| {
+                                self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware
+                            })
+                            .and_then(|rt| {
+                                rt.model_receivers
+                                    .as_ref()
+                                    .map(|models| (models, &rt.receiver_bind_group))
+                            })
+                    } else {
+                        None
+                    },
                     Some(&mut self.gpu_profiler),
                     None,
                     false,

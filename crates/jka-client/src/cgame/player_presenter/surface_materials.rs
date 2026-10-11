@@ -1,6 +1,6 @@
 //! Materials.
 use crate::cgame::player_presenter::{
-    stage_uv_xform, wave_value, Arc, Bulge, DynamicModelAlphaMode, PlayerPresenter, Shader, Stage,
+    stage_uv_affine, wave_value, Arc, Bulge, DynamicModelAlphaMode, PlayerPresenter, Shader, Stage,
     TcGen, TextureData,
 };
 
@@ -40,21 +40,22 @@ impl PlayerPresenter {
         )
     }
 
-    /// A refEntity customShader's `tcMod scroll`/`scale` chain (e.g. the Rage
+    /// A refEntity customShader's authored affine `tcMod` chain (e.g. the Rage
     /// shells' `gfx/misc/electric`/`fullbodyelectric2`, which scroll+tile the
     /// lightning texture instead of mapping it 1:1 onto the body's own UVs).
     pub(in crate::cgame::player_presenter) fn custom_shader_uv_xform(
         &self,
         shader_name: &str,
         seconds: f32,
-    ) -> [f32; 4] {
+    ) -> [f32; 6] {
         let effective = self.shader_remaps.effective_name(shader_name);
-        let tc_mods = jka_assets::shader::find_shader(&self.shaders, effective.as_ref())
-            .and_then(Shader::primary)
-            .map(|stage| stage.tc_mods.clone())
-            .unwrap_or_default();
-        let seconds = seconds - self.shader_remaps.time_offset_for(effective.as_ref());
-        stage_uv_xform(&tc_mods, seconds)
+        let shader = jka_assets::shader::find_shader(&self.shaders, effective.as_ref());
+        let tc_mods = shader.and_then(Shader::primary)
+            .map(|stage| stage.tc_mods.as_slice()).unwrap_or_default();
+        let seconds = jka_assets::shader::shader_time(seconds,
+            self.shader_remaps.time_offset_for(effective.as_ref()),
+            shader.and_then(|shader| shader.clamp_time));
+        stage_uv_affine(tc_mods, seconds)
     }
 
     /// A refEntity customShader's `deformVertexes bulge` offset (e.g. the Rage
@@ -76,7 +77,8 @@ impl PlayerPresenter {
         let Some(shader) = jka_assets::shader::find_shader(&self.shaders, effective.as_ref()) else {
             return 0.0;
         };
-        let seconds = seconds - self.shader_remaps.time_offset_for(effective.as_ref());
+        let seconds = jka_assets::shader::shader_time(seconds,
+            self.shader_remaps.time_offset_for(effective.as_ref()), shader.clamp_time);
         if let Some(bulge) = shader.bulge.filter(Bulge::is_static) {
             return bulge.height;
         }
@@ -113,13 +115,14 @@ impl PlayerPresenter {
         shader_name: &str,
         seconds: f32,
         force_alpha_blend: bool,
-    ) -> Vec<(Option<Arc<TextureData>>, DynamicModelAlphaMode, [f32; 4], bool)> {
+    ) -> Vec<(Option<Arc<TextureData>>, DynamicModelAlphaMode, [f32; 6], bool)> {
         use crate::fx::draw::FxBlend;
         let effective = self.shader_remaps.effective_name(shader_name);
         let Some(shader) = jka_assets::shader::find_shader(&self.shaders, effective.as_ref()) else {
             return Vec::new();
         };
-        let seconds = seconds - self.shader_remaps.time_offset_for(effective.as_ref());
+        let seconds = jka_assets::shader::shader_time(seconds,
+            self.shader_remaps.time_offset_for(effective.as_ref()), shader.clamp_time);
         let Some(primary) = shader.primary() else {
             return Vec::new();
         };
@@ -161,7 +164,7 @@ impl PlayerPresenter {
                 } else {
                     FxBlend::from_blend_func(&stage.blend).custom_shader_alpha_mode()
                 };
-                let uv_xform = stage_uv_xform(&stage.tc_mods, seconds);
+                let uv_xform = stage_uv_affine(&stage.tc_mods, seconds);
                 (texture, alpha_mode, uv_xform, stage.glow)
             })
             .collect()

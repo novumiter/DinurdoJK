@@ -175,6 +175,10 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
         && a.alpha_gen == b.alpha_gen
         && a.color == b.color
         && a.alpha_cutoff == b.alpha_cutoff
+        && a.shader_time_offset == b.shader_time_offset
+        && a.shader_clamp_time == b.shader_clamp_time
+        && a.no_picmip == b.no_picmip
+        && a.authored_environment_composite == b.authored_environment_composite
         && a.fog == b.fog
         && a.fog_is_global == b.fog_is_global
         && a.fog_color_override == b.fog_color_override

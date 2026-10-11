@@ -8,7 +8,7 @@ use crate::renderer::{
     DYNAMIC_MODEL_ALPHA_ORDER,
 };
 use wgpu::util::DeviceExt;
-use super::submission::{fx_runs, model_runs, ModelPhaseCalls};
+use super::submission::{fx_runs, model_runs, model_phase_runs, compositing_requires_order, ModelPhaseCalls};
 use super::prepare::{pack_jobs, CpuPackJob, PreparePerf};
 use std::time::Instant;
 
@@ -315,6 +315,7 @@ impl DynamicModelRenderer {
                         })
                         .unwrap_or([0.0; 4]),
                     uv_xform: skin.uv_xform,
+                    uv_cross: skin.uv_cross,
                     spec_light: ghoul2_specular_light(skin.specular),
                     spec_viewer: ghoul2_specular_viewer(skin.specular, skin.bulge_height),
                     jiggle0: skin.jiggle_offsets[0],
@@ -677,11 +678,10 @@ impl DynamicModelRenderer {
             let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
             let mut cpu_buffers_bound = false;
 
-            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
-                .into_iter()
-                .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
-                // Pipelines are lazy: only modes with draws were compiled.
-                .filter(|mode| self.model_alpha_mask & (1 << mode.index()) != 0)
+            let preserve_order = !depth_writing_phase && self.draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
+            for (alpha_mode, draw_range) in model_phase_runs(
+                self.draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
+            ).filter(|(mode, _)| self.model_alpha_mask & (1 << mode.index()) != 0)
             {
                 let pipeline = if authored_glow_only {
                     self.model_glow_pipelines[alpha_mode.index()].as_ref()
@@ -691,7 +691,7 @@ impl DynamicModelRenderer {
                 let Some(pipeline) = pipeline else {
                     continue;
                 };
-                if self.model_render_bundles
+                if self.model_render_bundles && !preserve_order
                     && super::bundles::eligible_pass(self.rt_prepared, excluded_entity, authored_glow_only)
                 {
                     if let Some((bundle, represented_draws, last_texture)) = self.model_bundles.executable(
@@ -760,7 +760,7 @@ impl DynamicModelRenderer {
                 // Track only this pipeline's bindings: subsequent pipelines,
                 // draw_phase invocations and passes always start afresh.
                 let mut current_texture = None;
-                for (draw, indices) in model_runs(self.draws.iter().filter(|draw| {
+                for (draw, indices) in model_runs(self.draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
                     draw.alpha_mode == alpha_mode
                         && Some(draw.entity_num) != excluded_entity
                         && (!authored_glow_only || draw.authored_glow)
@@ -801,14 +801,15 @@ impl DynamicModelRenderer {
             pass.set_vertex_buffer(0, self.fx_sprite_instance_buffer.slice(..));
             if capture_calls { calls.set_bind_group += 1; }
             pass.set_bind_group(0, camera, &[]);
-            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
-                .into_iter()
-                .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
+            let preserve_order = !depth_writing_phase && self.fx_sprite_draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
+            for (alpha_mode, draw_range) in model_phase_runs(
+                self.fx_sprite_draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
+            )
                 // FX sprite pipelines are intentionally lazy.  Only visit alpha
                 // modes that actually have sprite draws this frame; otherwise a
                 // missing (correctly-unbuilt) pipeline would be mistaken for an
                 // error when GPU FX is enabled.
-                .filter(|mode| {
+                .filter(|(mode, _)| {
                     self.fx_sprite_draws.iter().any(|draw| {
                         draw.alpha_mode == *mode
                             && Some(draw.entity_num) != excluded_entity
@@ -829,7 +830,7 @@ impl DynamicModelRenderer {
                 if capture_calls { calls.set_pipeline += 1; }
                 pass.set_pipeline(pipeline);
                 let mut current_texture = None;
-                for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().filter(|draw| {
+                for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
                     draw.alpha_mode == alpha_mode
                         && Some(draw.entity_num) != excluded_entity
                         && (!authored_glow_only || draw.authored_glow)
@@ -858,10 +859,10 @@ impl DynamicModelRenderer {
         if !self.skin_draws.is_empty() {
             if capture_calls { calls.set_bind_group += 1; }
             pass.set_bind_group(0, camera, &[]);
-            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
-                .into_iter()
-                .filter(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
-                .filter(|mode| self.skin_alpha_mask & (1 << mode.index()) != 0)
+            let preserve_order = !depth_writing_phase && self.skin_draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
+            for (alpha_mode, draw_range) in model_phase_runs(
+                self.skin_draws.iter().map(|draw| draw.alpha_mode), preserve_order, depth_writing_phase,
+            ).filter(|(mode, _)| self.skin_alpha_mask & (1 << mode.index()) != 0)
             {
                 // Source 1 materials need their own pipeline, so this mode is
                 // submitted twice when the frame has both kinds. A frame with no
@@ -891,7 +892,7 @@ impl DynamicModelRenderer {
                     pass.set_bind_group(2, &self.skin_bind_group, &[]);
                     let mut current_texture = None;
                     let mut current_mesh = None;
-                    for draw in self.skin_draws.iter().filter(|draw| {
+                    for draw in self.skin_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
                         draw.alpha_mode == alpha_mode
                             && draw.source_material == source_material
                             && Some(draw.entity_num) != excluded_entity

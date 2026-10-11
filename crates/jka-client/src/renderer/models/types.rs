@@ -24,6 +24,7 @@ pub(in crate::renderer) struct Ghoul2GpuDrawUniform {
     /// Per-draw texture-coordinate transform `uv * xy + zw` (shader tcMod
     /// scale/scroll); identity is [1, 1, 0, 0].
     pub(in crate::renderer) uv_xform: [f32; 4],
+    pub(in crate::renderer) uv_cross: [f32; 4],
     /// xyz = light point, w = 1 when `alphaGen lightingSpecular` applies.
     pub(in crate::renderer) spec_light: [f32; 4],
     pub(in crate::renderer) spec_viewer: [f32; 4],

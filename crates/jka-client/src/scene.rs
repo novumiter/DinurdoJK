@@ -72,6 +72,7 @@ use lightmaps::{
 pub(crate) use material_batches::append_sky_batches;
 use material_batches::{
     append_material_batches, class_for, material_debug_info,
+    material_has_promotable_environment_stage,
     material_render_is_guaranteed_discarded, prepared_stages, resolved_bsp_surface_fog,
     stage_batch,
 };
@@ -80,7 +81,7 @@ use material_batches::can_fold_jka_lightmap_pair;
 use shader_remap::fold_reverse_lightmap_batches;
 #[cfg(test)]
 use material_batches::{
-    blend_for, can_fold_openjk_reverse_lightmap_modulate_pair,
+    authored_environment_composite, blend_for, can_fold_openjk_reverse_lightmap_modulate_pair,
     effective_world_cull, stage_class, stage_pipeline, stage_audit_class,
 };
 #[cfg(test)]
@@ -288,6 +289,8 @@ pub struct DrawBatch {
     /// This is resolved on the cold remap path, so normal draw submission has
     /// no shader-name lookup or remap branch.
     pub shader_time_offset: f32,
+    pub shader_clamp_time: Option<f32>,
+    pub no_picmip: bool,
     /// Exact JKA shader-stage `glow` marker.
     pub authored_glow: bool,
     /// Map-authored fog color and distance-to-opaque for the surface.
@@ -322,6 +325,10 @@ pub struct DrawBatch {
     /// A `tcGen environment` stage whose source geometry is sufficiently planar
     /// to be promoted to the exact planar-reflection path when requested.
     pub planar_environment_candidate: bool,
+    /// This authored material has a composite environment/blend effect.
+    /// Ultra must not substitute a live planar image for any of its environment
+    /// stages, even if another selected reflection plane crosses its triangles.
+    pub authored_environment_composite: bool,
     pub planar_plane: [f32; 4],
     /// Origin of the untargeted misc_portal_surface that authorizes this mirror.
     /// id Tech 3 uses this portal entity position as the reflected view's PVS origin.
@@ -1317,6 +1324,7 @@ pub struct PreparedSteamAudioScene {
 /// triangle/material draw batches and reused by the independent flare renderer.
 #[derive(Debug, Clone)]
 pub struct WorldFlare {
+    pub shader_clamp_time: Option<f32>,
     pub surface_id: u32,
     pub origin: [f32; 3],
     pub normal: [f32; 3],

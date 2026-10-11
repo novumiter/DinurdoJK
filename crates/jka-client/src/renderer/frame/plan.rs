@@ -4,6 +4,62 @@ use crate::renderer::{
     PlanarReflectionDebugMode, Renderer, WorldRenderPath,
 };
 
+/// Once a surface starts blending, defer its remaining stages together. An
+/// opaque replacement after a blend must not jump ahead of that blend. The
+/// key matches same_world_surface, without borrowing GPU batches across draws.
+#[derive(Default)]
+pub(super) struct WorldTransparencyOrder {
+    surface: Option<(std::ops::Range<u32>, u32)>,
+    deferred: bool,
+}
+
+impl WorldTransparencyOrder {
+    pub(super) fn defer_stage(
+        &mut self, vertices: &std::ops::Range<u32>, shader: u32, class: crate::scene::DrawClass,
+    ) -> bool {
+        let same_surface = self.surface.as_ref().is_some_and(|(previous, previous_shader)|
+            previous == vertices && *previous_shader == shader);
+        if !same_surface {
+            self.surface = Some((vertices.clone(), shader));
+            self.deferred = false;
+        }
+        self.deferred |= class == crate::scene::DrawClass::Transparent;
+        self.deferred
+    }
+}
+
+#[cfg(test)]
+mod transparency_order_tests {
+    use super::WorldTransparencyOrder;
+    use crate::scene::DrawClass::{Opaque, Transparent};
+
+    #[test]
+    fn opaque_entities_render_before_water_without_reversing_later_shader_stages() {
+        let mut order = WorldTransparencyOrder::default();
+        let stages = [(0..3, 0, Opaque), (3..6, 1, Transparent),
+            (3..6, 1, Opaque), (6..9, 2, Opaque)];
+        let (mut before_entities, mut after_entities) = (Vec::new(), Vec::new());
+        for (index, (vertices, shader, class)) in stages.iter().enumerate() {
+            if order.defer_stage(vertices, *shader, *class) {
+                after_entities.push(index);
+            } else {
+                before_entities.push(index);
+            }
+        }
+        assert_eq!(before_entities, [0, 3]);
+        assert_eq!(after_entities, [1, 2], "the replacement must remain after its blend");
+    }
+
+    #[test]
+    fn distinct_materials_do_not_inherit_another_surfaces_deferred_state() {
+        let mut order = WorldTransparencyOrder::default();
+        assert!(order.defer_stage(&(0..3), 0, Transparent));
+        assert!(!order.defer_stage(&(0..3), 1, Opaque));
+        assert!(order.defer_stage(&(0..3), 1, Transparent));
+        assert!(!order.defer_stage(&(3..6), 1, Opaque));
+    }
+}
+
 impl Renderer {
     pub(in crate::renderer) fn rebuild_frame_plan(&mut self) {
         let fog_enabled = self.weather.fog.volumetric_effective();

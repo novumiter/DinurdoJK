@@ -384,6 +384,7 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
             alpha_mode: material.alpha_mode,
             authored_glow: false,
             shader_time_offset: 0.0,
+            shader_clamp_time: None,
             fallback_gray: false,
             entity_tint: false,
             overlay: None,

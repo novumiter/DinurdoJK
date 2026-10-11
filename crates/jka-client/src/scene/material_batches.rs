@@ -14,6 +14,48 @@ pub(in crate::scene) fn stage_is_opaque_replacement(stage: &MaterialStage) -> bo
         })
 }
 
+/// Is this stage part of a composed, authored environment effect rather than
+/// a free-standing surface reflection that we can replace with a planar view?
+///
+/// This is *not* a name/texture blacklist. Some custom glass uses the same
+/// image both for the background-filter pass and its additive environment pass;
+/// other materials use different images with similarly interdependent blends.
+/// In both cases, keep TaystJK's original stage sampling and framebuffer math.
+///
+/// A blended environment overlay over an ordinary opaque base is still eligible
+/// for the existing enhanced-planar path (e.g. polished floors). Mirrors remain
+/// explicitly controlled by `portal`, never by this inference.
+pub(in crate::scene) fn authored_environment_composite(
+    material: &SurfaceMaterial,
+    stage: &MaterialStage,
+) -> bool {
+    if !material.explicit || material.planar_reflection || material.water {
+        return false;
+    }
+    // Share the exact classification with parsed-shader preparation. Off must
+    // not delete a stage that the Ultra guard considers part of the material.
+    materials::authored_environment_composite_stage(
+        &material.stages,
+        stage,
+        |stage| matches!(stage.tc_gen, TcGen::Environment),
+        |stage| stage.blend,
+        |a, b| matches!(a.texture, StageTexture::Image(_)) && a.texture == b.texture,
+    )
+}
+
+pub(in crate::scene) fn material_is_authored_environment_composite(
+    material: &SurfaceMaterial,
+) -> bool {
+    material.stages.iter().any(|stage| authored_environment_composite(material, stage))
+}
+
+pub(in crate::scene) fn material_has_promotable_environment_stage(
+    material: &SurfaceMaterial,
+) -> bool {
+    !material_is_authored_environment_composite(material)
+        && material.stages.iter().any(|stage| matches!(stage.tc_gen, TcGen::Environment))
+}
+
 pub(in crate::scene) fn stage_class(stage: &MaterialStage) -> DrawClass {
     // GL_ONE GL_ZERO is authored through blendFunc, but it does not actually
     // blend with the framebuffer: src * 1 + dst * 0 is a full replacement.
@@ -22,7 +64,7 @@ pub(in crate::scene) fn stage_class(stage: &MaterialStage) -> DrawClass {
     // later translucent surfaces show through it.
     if stage.blend.is_some() && !stage_is_opaque_replacement(stage) {
         DrawClass::Transparent
-    } else if stage.alpha_cutoff > 0.0 {
+    } else if stage.alpha_cutoff != 0.0 {
         DrawClass::Mask
     } else {
         DrawClass::Opaque
@@ -77,7 +119,7 @@ pub(in crate::scene) fn stage_is_light_only_black_additive(
                 dst: BlendFactor::One,
             })
         && !stage.depth_write
-        && stage.alpha_cutoff <= 0.0
+        && stage.alpha_cutoff == 0.0
 }
 
 /// Map-load-only render cull for explicit shader geometry whose ordinary
@@ -173,6 +215,12 @@ pub(in crate::scene) fn resolved_bsp_surface_fog(
     global_fog_num: Option<i32>,
     global_fog: Option<[f32; 4]>,
 ) -> ([f32; 4], bool) {
+    // TaystJK `noglfog` disables runtime GL fog for this material even when
+    // the compiled BSP provides a valid fog index. q3map_nofog has already
+    // opted out at compile time, but is also safe to respect at runtime.
+    if material.no_fog {
+        return ([0.0; 4], false);
+    }
     let authored = bsp_fog_params(bsp, library, fog_num);
     if authored[3] > 0.001 {
         return (authored, global_fog_num == Some(fog_num));
@@ -227,6 +275,7 @@ pub(in crate::scene) fn stage_batch(
     fog: [f32; 4],
     fog_is_global: bool,
 ) -> DrawBatch {
+    let authored_environment_composite = material_is_authored_environment_composite(material);
     let (texture, texture_is_lightmap, texture_is_white) = match stage.texture {
         StageTexture::Image(index) => (Some(index), false, false),
         StageTexture::Lightmap => (None, true, false),
@@ -283,6 +332,8 @@ pub(in crate::scene) fn stage_batch(
         ],
         alpha_cutoff: stage.alpha_cutoff,
         shader_time_offset: 0.0,
+        shader_clamp_time: material.clamp_time,
+        no_picmip: material.no_picmip,
         authored_glow: stage.glow,
         fog,
         fog_is_global,
@@ -310,7 +361,11 @@ pub(in crate::scene) fn stage_batch(
         light_filter: material.light_filter,
         water_primary: material.water && first,
         authored_ocean: None,
-        planar_environment_candidate: matches!(stage.tc_gen, TcGen::Environment),
+        planar_environment_candidate: matches!(stage.tc_gen, TcGen::Environment)
+            && !authored_environment_composite,
+        // Record at material scope, so the Trace Inspector reports it even
+        // when the user selects the base (non-environment) stage.
+        authored_environment_composite,
         planar_plane: [0.0; 4],
         planar_pvs_origin: [0.0; 3],
         skybox: material.skybox,

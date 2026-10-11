@@ -127,19 +127,43 @@ impl FxBlend {
     }
 }
 
+/// Immutable animation frames loaded once with an FX shader. The stage's
+/// current image is chosen at presentation time, not during material caching.
+/// This mirrors TaystJK R_BindAnimatedImage without reloading images per frame.
+#[derive(Clone, Debug)]
+pub struct FxTextureAnimation {
+    pub fps: f32,
+    pub one_shot: bool,
+    pub frames: Vec<Arc<TextureData>>,
+}
+
+impl FxTextureAnimation {
+    pub fn frame_index(&self, shader_time: f32) -> usize {
+        crate::materials::animation_frame_index(self.frames.len(), self.fps, self.one_shot, shader_time)
+    }
+}
+
 /// The subset of a shader's primary stage an FX sprite needs.
 #[derive(Clone, Debug)]
 pub struct FxMaterial {
     pub texture: Option<Arc<TextureData>>,
+    pub animation: Option<FxTextureAnimation>,
     pub blend: FxBlend,
     /// rgbGen vertex/exactVertex (FX shaders normally use vertex color).
     pub rgb_vertex: bool,
     pub alpha_vertex: bool,
     pub rgb_const: [f32; 3],
     pub alpha_const: f32,
+    /// Per-stage colour generators evaluated at TaystJK shader time.
+    pub rgb_wave: Option<jka_assets::shader::Wave>,
+    pub alpha_wave: Option<jka_assets::shader::Wave>,
+    /// oneMinusVertex inverts the vertex RGB/alpha; it is not vertex itself.
+    pub rgb_one_minus_vertex: bool,
+    pub alpha_one_minus_vertex: bool,
     pub tc_mods: Vec<jka_assets::shader::TcMod>,
     /// OpenJK shader_t::timeOffset, subtracted from refdef time.
     pub shader_time_offset: f32,
+    pub shader_clamp_time: Option<f32>,
     /// Exact JKA shader-stage `glow` marker.
     pub authored_glow: bool,
 }
@@ -173,20 +197,62 @@ pub enum ScreenFxAnchor {
 }
 
 impl FxMaterial {
+    fn shader_time(&self, seconds: f32) -> f32 {
+        jka_assets::shader::shader_time(seconds, self.shader_time_offset, self.shader_clamp_time)
+    }
+
+    /// Select the animation frame using the shader's *own* time origin.
+    /// No work is performed for the overwhelmingly common static stage.
+    pub fn texture_at_time(&self, seconds: f32) -> Option<Arc<TextureData>> {
+        if let Some(animation) = &self.animation {
+            if let Some(texture) = animation.frames.get(animation.frame_index(self.shader_time(seconds))) {
+                return Some(Arc::clone(texture));
+            }
+        }
+        self.texture.clone()
+    }
+
     /// shaderRGBA through rgbGen/alphaGen to the vertex color the dynamic
     /// pipeline multiplies with the texture.
-    fn vertex_color(&self, rgba: [u8; 4]) -> [f32; 4] {
-        self.float_vertex_color([
+    fn vertex_color(&self, rgba: [u8; 4], seconds: f32) -> [f32; 4] {
+        self.float_vertex_color_at_time([
             f32::from(rgba[0]) / 255.0,
             f32::from(rgba[1]) / 255.0,
             f32::from(rgba[2]) / 255.0,
             f32::from(rgba[3]) / 255.0,
-        ])
+        ], seconds)
     }
 
-    /// Same shader stage color semantics for CGame's float R_SetColor path.
+    /// The screen-space UI fallback has no shader clock; authored FX geometry
+    /// uses `float_vertex_color_at_time` with the CGame view's time instead.
     pub(crate) fn float_vertex_color(&self, rgba: [f32; 4]) -> [f32; 4] {
-        let rgb = if self.rgb_vertex { [rgba[0], rgba[1], rgba[2]] } else { self.rgb_const };
+        self.float_vertex_color_at_time(rgba, 0.0)
+    }
+
+    fn float_vertex_color_at_time(&self, rgba: [f32; 4], seconds: f32) -> [f32; 4] {
+        let seconds = self.shader_time(seconds);
+        let mut rgb = if self.rgb_vertex {
+            if self.rgb_one_minus_vertex {
+                [1.0 - rgba[0], 1.0 - rgba[1], 1.0 - rgba[2]]
+            } else {
+                [rgba[0], rgba[1], rgba[2]]
+            }
+        } else {
+            self.rgb_const
+        };
+        if let Some(wave) = self.rgb_wave {
+            let value = (wave.base + wave.amplitude *
+                fx_wave(wave.func, fx_wave_phase(wave, seconds))).clamp(0.0, 1.0);
+            rgb = [value; 3];
+        }
+        let generated_alpha = if let Some(wave) = self.alpha_wave {
+            (wave.base + wave.amplitude *
+                fx_wave(wave.func, fx_wave_phase(wave, seconds))).clamp(0.0, 1.0)
+        } else if self.alpha_vertex {
+            if self.alpha_one_minus_vertex { 1.0 - rgba[3] } else { rgba[3] }
+        } else {
+            self.alpha_const
+        };
         let alpha = match self.blend {
             // GL_ONE-style stages ignore source alpha in their blend equation.
             FxBlend::Add
@@ -194,8 +260,7 @@ impl FxMaterial {
             | FxBlend::DstColorAdd
             | FxBlend::Modulate2x
             | FxBlend::Darken => 1.0,
-            _ if self.alpha_vertex => rgba[3],
-            _ => self.alpha_const,
+            _ => generated_alpha,
         };
         [rgb[0], rgb[1], rgb[2], alpha]
     }
@@ -288,7 +353,7 @@ pub fn tessellate(
             rt_skinned_key: None,
             ghoul2_gpu: None,
             fx_gpu_sprites: None,
-            texture: mat.texture.clone(),
+            texture: mat.texture_at_time(view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
             authored_glow: mat.authored_glow,
         })
@@ -396,7 +461,7 @@ pub fn tessellate_workers(
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
                 fx_gpu_sprites: None,
-                texture: mat.texture.clone(),
+                texture: mat.texture_at_time(view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
             })
@@ -465,7 +530,7 @@ pub fn tessellate_gpu_particles(
                         origin: [origin[0], origin[1], origin[2], 0.0],
                         left: [left[0], left[1], left[2], 0.0],
                         up: [up[0], up[1], up[2], 0.0],
-                        color: mat.vertex_color(*rgba),
+                        color: mat.vertex_color(*rgba, view.seconds),
                     });
             } else {
                 let entry = cpu_batches
@@ -491,7 +556,7 @@ pub fn tessellate_gpu_particles(
             rt_skinned_key: None,
             ghoul2_gpu: None,
             fx_gpu_sprites: None,
-            texture: mat.texture.clone(),
+            texture: mat.texture_at_time(view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
             authored_glow: mat.authored_glow,
         })
@@ -513,7 +578,7 @@ pub fn tessellate_gpu_particles(
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
                 fx_gpu_sprites: Some(FxGpuSprites { instances: Arc::new(instances), blob_shadow: false }),
-                texture: mat.texture.clone(),
+                texture: mat.texture_at_time(view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
             }),
@@ -593,14 +658,14 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
     match draw {
         FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
-            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba));
+            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, view.seconds));
         }
         FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } => {
             // TaystJK/OpenJK RB_SurfaceSaberGlow. The renderer receives one
             // RT_SABER_GLOW entity, then walks billboards from blade tip back
             // toward the hilt. Radius grows by exactly 0.017 per blob and the
             // step is exactly 65% of the current radius; do not clamp it here.
-            let color = mat.vertex_color(*rgba);
+            let color = mat.vertex_color(*rgba, view.seconds);
             let mut distance = *length;
             let mut glow_radius = *radius;
             while distance > 0.0 {
@@ -620,12 +685,12 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         }
         FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
-            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba));
+            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, view.seconds));
         }
         FxDraw::Line { start, end, width, rgba, .. } => {
             // RB_SurfaceLine: right = normalize((start-view) x (end-view)).
             let right = normalize(cross(sub(*start, view.origin), sub(*end, view.origin)));
-            let color = mat.vertex_color(*rgba);
+            let color = mat.vertex_color(*rgba, view.seconds);
             let v0 = batch.vertex(add(*start, scale(right, *width)), [0.0, 0.0], color);
             let v1 = batch.vertex(sub(*start, scale(right, *width)), [1.0, 0.0], color);
             let v2 = batch.vertex(add(*end, scale(right, *width)), [0.0, 1.0], color);
@@ -634,7 +699,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             batch.triangle(v2, v1, v3);
         }
         FxDraw::Quad { positions, uvs, rgba, .. } => {
-            let color = mat.vertex_color(*rgba);
+            let color = mat.vertex_color(*rgba, view.seconds);
             let v0 = batch.vertex(positions[0], uvs[0], color);
             let v1 = batch.vertex(positions[1], uvs[1], color);
             let v2 = batch.vertex(positions[2], uvs[2], color);
@@ -653,7 +718,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             }
             let base = batch.vertices.len() as u32;
             for ((position, uv), color) in positions.iter().zip(uvs).zip(rgba) {
-                batch.vertex(*position, *uv, mat.vertex_color(*color));
+                batch.vertex(*position, *uv, mat.vertex_color(*color, view.seconds));
             }
             for triangle in indices.chunks_exact(3) {
                 let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
@@ -665,7 +730,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         // Built into its own lit surface by the tessellators, never batched.
         FxDraw::LitMesh { .. } => {}
         FxDraw::Cylinder { start, end, axis, start_radius, end_radius, rgba, .. } => {
-            cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba), view);
+            cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba, view.seconds), view);
         }
     }
     for modifier in &mat.tc_mods {
@@ -674,8 +739,35 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
                 vertex.uv,
                 vertex.position,
                 *modifier,
-                view.seconds - mat.shader_time_offset,
+                mat.shader_time(view.seconds),
             );
+        }
+    }
+}
+
+// Evaluate authored stretch waveforms on the FX CPU vertex path.
+fn fx_wave_phase(wave: jka_assets::shader::Wave, seconds: f32) -> f32 {
+    if matches!(wave.func, jka_assets::shader::WaveFunc::Noise) {
+        (seconds + wave.phase) * wave.frequency
+    } else {
+        wave.phase + seconds * wave.frequency
+    }
+}
+
+fn fx_wave(kind: jka_assets::shader::WaveFunc, phase: f32) -> f32 {
+    use jka_assets::shader::WaveFunc;
+    let x = phase.rem_euclid(1.0);
+    match kind {
+        WaveFunc::Sin => (x * std::f32::consts::TAU).sin(),
+        WaveFunc::Triangle => if x < 0.25 { 4.0*x } else if x < 0.75 { 2.0 - 4.0*x } else { 4.0*x - 4.0 },
+        WaveFunc::Square => if x < 0.5 { 1.0 } else { -1.0 },
+        WaveFunc::Sawtooth => x,
+        WaveFunc::InverseSawtooth => 1.0-x,
+        WaveFunc::Noise => { // Smooth deterministic GF_NOISE approximation.
+            let n = phase.floor();
+            let t = x*x*(3.0 - 2.0*x);
+            let noise = |i: f32| ((i * 127.1).sin() * 43758.547).fract().rem_euclid(1.0)*2.0-1.0;
+            noise(n) * (1.0-t) + noise(n+1.0)*t
         }
     }
 }
@@ -695,6 +787,11 @@ fn modified_uv(uv: [f32; 2], position: [f32; 3], modifier: jka_assets::shader::T
              centered[0] * sin + centered[1] * cos + 0.5]
         }
         TcMod::Transform(m) => [uv[0] * m[0] + uv[1] * m[2] + m[4], uv[0] * m[1] + uv[1] * m[3] + m[5]],
+        TcMod::Stretch(wave) => {
+            let value = wave.base + wave.amplitude * fx_wave(wave.func, fx_wave_phase(wave, seconds));
+            let scale = if value.abs() <= 1.0e-6 { 1.0 } else { 1.0 / value };
+            [(uv[0] - 0.5) * scale + 0.5, (uv[1] - 0.5) * scale + 0.5]
+        }
         TcMod::Turb { amplitude, phase, frequency, .. } => {
             let position = scene::jka_position(position);
             let phase = phase + seconds * frequency;
@@ -783,12 +880,169 @@ fn normalize(a: [f32; 3]) -> [f32; 3] {
 mod tests {
     use super::*;
 
-    fn white(blend: FxBlend) -> FxMaterial {
-        FxMaterial { texture: None, blend, rgb_vertex: true, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0, tc_mods: Vec::new(), shader_time_offset: 0.0, authored_glow: false }
+    #[test]
+    fn stretch_uses_phase_and_scales_about_the_texture_center() {
+        use jka_assets::shader::{TcMod, Wave, WaveFunc};
+        let stretch = TcMod::Stretch(Wave {
+            func: WaveFunc::Sin, base: 1.0, amplitude: 1.0,
+            phase: 0.25, frequency: 1.0,
+        });
+        assert_eq!(modified_uv([0.0, 1.0], [0.0; 3], stretch, 0.0), [0.25, 0.75]);
+        assert_eq!(modified_uv([0.5, 0.5], [0.0; 3], stretch, 0.0), [0.5, 0.5]);
+        // A waveform crossing zero must not inject NaNs into FX geometry.
+        assert_eq!(modified_uv([0.0, 1.0], [0.0; 3], stretch, 0.5), [0.0, 1.0]);
     }
+
+    fn white(blend: FxBlend) -> FxMaterial {
+        FxMaterial { animation: None, texture: None, blend, rgb_vertex: true, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0, rgb_wave: None, alpha_wave: None, rgb_one_minus_vertex: false, alpha_one_minus_vertex: false, tc_mods: Vec::new(), shader_time_offset: 0.0, shader_clamp_time: None, authored_glow: false }
+    }
+
+    #[test]
+    fn authored_fx_rgb_and_alpha_waves_use_shader_time() {
+        use jka_assets::shader::{Wave, WaveFunc};
+        let wave = Wave { func: WaveFunc::Sin, base: 0.5, amplitude: 0.5, phase: 0.0, frequency: 1.0 };
+        let material = FxMaterial {
+            rgb_vertex: false, alpha_vertex: false,
+            rgb_wave: Some(wave), alpha_wave: Some(wave),
+            shader_time_offset: 0.25,
+            ..white(FxBlend::AddAlpha)
+        };
+        let low = material.vertex_color([255, 0, 0, 255], 0.0);
+        let high = material.vertex_color([255, 0, 0, 255], 0.5);
+        assert!((low[0] - 0.0).abs() < 1e-5);
+        assert!((low[3] - 0.0).abs() < 1e-5);
+        assert!((high[0] - 1.0).abs() < 1e-5);
+        assert!((high[3] - 1.0).abs() < 1e-5);
+        let clamped = FxMaterial { shader_clamp_time: Some(0.25), ..material };
+        assert_eq!(clamped.vertex_color([255; 4], 0.5), clamped.vertex_color([255; 4], 9.0));
+    }
+
+    #[test]
+    fn authored_fx_one_minus_vertex_is_not_plain_vertex() {
+        let material = FxMaterial {
+            rgb_one_minus_vertex: true, alpha_one_minus_vertex: true,
+            ..white(FxBlend::Alpha)
+        };
+        let color = material.vertex_color([64, 128, 255, 192], 0.0);
+        assert!((color[0] - (1.0 - 64.0/255.0)).abs() < 1e-6);
+        assert!((color[1] - (1.0 - 128.0/255.0)).abs() < 1e-6);
+        assert_eq!(color[2], 0.0);
+        assert!((color[3] - (1.0 - 192.0/255.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fx_wave_generators_match_on_cpu_and_gpu_sprite_submission() {
+        use jka_assets::shader::{Wave, WaveFunc};
+        let wave = Wave { func: WaveFunc::Triangle, base: 0.5, amplitude: 0.5, phase: 0.0, frequency: 1.0 };
+        let material = FxMaterial {
+            rgb_wave: Some(wave), alpha_wave: Some(wave),
+            shader_time_offset: 0.25, shader_clamp_time: Some(0.25),
+            ..white(FxBlend::AddAlpha)
+        };
+        let draws = [FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0,
+            rgba: [64, 128, 192, 255], shader: "test".into() }];
+        let camera = FxView { seconds: 3.0, ..view() };
+        let cpu = tessellate(&draws, &camera, &mut |_| vec![material.clone()]);
+        let gpu = tessellate_gpu_particles(&draws, &camera, &mut |_| vec![material.clone()]);
+        let gpu = &gpu[0].fx_gpu_sprites.as_ref().unwrap().instances[0];
+        assert_eq!(cpu[0].vertices[0].color, [1.0; 4]);
+        assert_eq!(gpu.color, cpu[0].vertices[0].color);
+        let noise = Wave { func: WaveFunc::Noise, phase: 0.25, frequency: 2.0, ..wave };
+        assert_eq!(fx_wave_phase(noise, 1.0), 2.5);
+    }
+
+    #[test]
+    fn fx_clamptime_freezes_wave_color_and_tcmod_timeline() {
+        use jka_assets::shader::{TcMod, Wave, WaveFunc};
+        let wave = Wave {
+            func: WaveFunc::Sin, base: 0.5, amplitude: 0.5,
+            phase: 0.0, frequency: 1.0,
+        };
+        let mat = FxMaterial {
+            rgb_vertex: false,
+            rgb_wave: Some(wave),
+            shader_time_offset: 2.0,
+            shader_clamp_time: Some(0.25),
+            tc_mods: vec![TcMod::Scroll(1.0, 0.0)],
+            ..white(FxBlend::Alpha)
+        };
+        let at_limit = mat.vertex_color([255; 4], 2.25);
+        let after_limit = mat.vertex_color([255; 4], 50.0);
+        assert_eq!(at_limit, after_limit);
+        assert!((at_limit[0] - 1.0).abs() < 1e-6);
+        let uv1 = modified_uv([0.0, 0.0], [0.0; 3], mat.tc_mods[0], mat.shader_time(2.25));
+        let uv2 = modified_uv([0.0, 0.0], [0.0; 3], mat.tc_mods[0], mat.shader_time(50.0));
+        assert_eq!(uv1, uv2);
+    }
+
 
     fn view() -> FxView {
         FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0 }
+    }
+
+    #[test]
+    fn fx_animmap_frame_selection_matches_taystjk_and_remap_time() {
+        let frames: Vec<Arc<TextureData>> = (0..4).map(|_| {
+            Arc::new(crate::materials::missing_texture_data())
+        }).collect();
+        let looping = FxTextureAnimation {
+            fps: 10.0,
+            one_shot: false,
+            frames: frames.clone(),
+        };
+        assert_eq!(looping.frame_index(0.0), 0);
+        assert_eq!(looping.frame_index(0.099), 0);
+        assert_eq!(looping.frame_index(0.100), 1);
+        assert_eq!(looping.frame_index(0.399), 3);
+        assert_eq!(looping.frame_index(0.400), 0);
+        assert_eq!(looping.frame_index(-3.0), 0);
+        let mat = FxMaterial {
+            animation: Some(looping),
+            shader_time_offset: 2.0,
+            ..white(FxBlend::Alpha)
+        };
+        let frame = mat.texture_at_time(2.35).unwrap();
+        assert!(Arc::ptr_eq(&frame, &frames[3]));
+        let first = mat.texture_at_time(1.0).unwrap();
+        assert!(Arc::ptr_eq(&first, &frames[0]));
+        let once = FxTextureAnimation { fps: 10.0, one_shot: true, frames };
+        assert_eq!(once.frame_index(3.0), 3);
+        let frozen = FxMaterial { shader_clamp_time: Some(0.15), animation: Some(once.clone()), ..white(FxBlend::Alpha) };
+        assert_eq!(frozen.animation.as_ref().unwrap().frame_index(frozen.shader_time(100.0)), 1);
+        assert_eq!(once.frame_index(f32::NAN), 0);
+        assert_eq!(FxTextureAnimation { fps: 0.0, ..once.clone() }.frame_index(1.0), 0);
+        let empty = FxMaterial {
+            texture: Some(Arc::clone(&once.frames[0])),
+            animation: Some(FxTextureAnimation { frames: Vec::new(), ..once }),
+            ..white(FxBlend::Alpha)
+        };
+        assert!(Arc::ptr_eq(&empty.texture_at_time(1.0).unwrap(), empty.texture.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn fx_animation_selects_the_same_image_in_all_submission_paths() {
+        let frames: Vec<_> = (0..4).map(|_| Arc::new(crate::materials::missing_texture_data())).collect();
+        let material = FxMaterial {
+            texture: Some(Arc::clone(&frames[0])),
+            animation: Some(FxTextureAnimation { fps: 10.0, one_shot: false, frames: frames.clone() }),
+            shader_time_offset: 1.0, shader_clamp_time: Some(0.25),
+            ..white(FxBlend::Alpha)
+        };
+        let draw = FxDraw::Sprite { origin: [100.0, 0.0, 0.0], radius: 2.0, rotation: 0.0,
+            rgba: [255; 4], shader: "test".into() };
+        // Reach the worker implementation rather than its small-input fallback.
+        let draws = vec![draw; 64];
+        let camera = FxView { seconds: 20.0, ..view() };
+        for surfaces in [
+            tessellate(&draws, &camera, &mut |_| vec![material.clone()]),
+            tessellate_workers(&draws, &camera, &mut |_| vec![material.clone()]),
+            tessellate_gpu_particles(&draws, &camera, &mut |_| vec![material.clone()]),
+        ] {
+            assert!(!surfaces.is_empty());
+            for surface in surfaces {
+                assert!(Arc::ptr_eq(surface.texture.as_ref().unwrap(), &frames[2]));
+            }
+        }
     }
 
     #[test]

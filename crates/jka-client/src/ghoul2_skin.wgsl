@@ -44,6 +44,7 @@ struct SkinDraw {
     classic_sun_directed: vec4<f32>,
     classic_sun_direction: vec4<f32>,
     uv_xform: vec4<f32>,
+    uv_cross: vec4<f32>,
     spec_light: vec4<f32>,
     spec_viewer: vec4<f32>,
     jiggle0: vec4<f32>,
@@ -269,7 +270,8 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
         let reflected = render_normal * d - viewer;
         output.uv = vec2<f32>(0.5 - reflected.z * 0.5, 0.5 - reflected.y * 0.5);
     } else {
-        output.uv = input.uv * draw.uv_xform.xy + draw.uv_xform.zw;
+        output.uv = input.uv * draw.uv_xform.xy + draw.uv_xform.zw
+            + vec2<f32>(input.uv.y * draw.uv_cross.x, input.uv.x * draw.uv_cross.y);
     }
     output.normal = render_normal;
     output.draw_index = draw_index;

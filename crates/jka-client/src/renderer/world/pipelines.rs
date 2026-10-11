@@ -621,6 +621,11 @@ pub(in crate::renderer) fn material_uniform(
                 out.mods[a] = [4.0, v[0], v[2], v[4]];
                 out.mods[a + 1] = [v[1], v[3], v[5], 0.0];
             }
+            TcMod::Stretch(wave) => {
+                // Store the authored waveform in the existing two-vec4 mod slot.
+                out.mods[a] = [6.0, wave.base, wave.amplitude, wave.phase];
+                out.mods[a + 1] = [wave.frequency, wave.func.id() as f32, 0.0, 0.0];
+            }
             TcMod::Turb {
                 base,
                 amplitude,
@@ -666,6 +671,8 @@ pub(in crate::renderer) fn material_uniform(
     // params.w was intentionally unused by world materials, so carrying it
     // here does not grow MaterialUniform or alter bind-group layouts.
     out.params[3] = source.shader_time_offset;
+    // tcGen vector uses xyz only; the reserved w lane also exists in depth/shadow/RT materials.
+    out.vector_t[3] = source.shader_clamp_time.unwrap_or(0.0);
     out.pbr_params0 = [
         source.normal_scale[0],
         source.normal_scale[1],
@@ -687,6 +694,11 @@ pub(in crate::renderer) fn material_uniform(
     }
     if (source.reflection_cache_flags & scene::REFLECTION_CACHE_SSR) != 0 {
         out.header[2] |= 4194304;
+    }
+    // header.w bit 2 is free. header.z bit 23 already marks explicit lightmaps.
+    // This authored-material guard requires no new bindings or pipeline variants.
+    if source.authored_environment_composite {
+        out.header[3] |= 1 << 2;
     }
     if source.planar_reflection {
         out.header[2] |= 4096;

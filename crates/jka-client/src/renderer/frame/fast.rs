@@ -359,7 +359,13 @@ impl Renderer {
             let mut current_pipeline = None;
             let mut grass_drawn = false;
             let mut snow_shell_drawn = false;
-            for &batch_index in active.indices {
+            // Reuse retained storage: transparent BSP stages must run after
+            // depth-writing dynamic models even in the fast baseline.
+            let mut deferred_transparent =
+                std::mem::take(&mut self.post_ocean_transparent_scratch);
+            deferred_transparent.clear();
+            let mut transparency_order = super::plan::WorldTransparencyOrder::default();
+            for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) {
                     continue;
@@ -431,6 +437,11 @@ impl Renderer {
                     }
                     grass_drawn = true;
                 }
+                if transparency_order.defer_stage(&batch.source.vertices,
+                    batch.source.bsp_shader_index, batch.source.pipeline.class) {
+                    deferred_transparent.push(active_pos);
+                    continue;
+                }
                 if current_pipeline != Some(batch.source.pipeline) {
                     if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                     pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
@@ -499,10 +510,48 @@ impl Renderer {
             }
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, false);
-            self.dynamic_model_renderer
-                .draw(&mut pass, &self.camera_bind_group);
+            self.dynamic_model_renderer.draw_phase(
+                &mut pass, &self.camera_bind_group, true, None, None, None, false,
+            );
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, true);
+            if !deferred_transparent.is_empty() {
+                // The model renderer changed the vertex/index streams and bind
+                // groups. Restore the fast world state once, then draw the
+                // originally visible transparent batches in authored order.
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
+                pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
+                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
+                pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                current_pipeline = None;
+                for &active_pos in &deferred_transparent {
+                    let batch = &active.batches[active.indices[active_pos]];
+                    if current_pipeline != Some(batch.source.pipeline) {
+                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                        pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
+                        current_pipeline = Some(batch.source.pipeline);
+                    }
+                    if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                    pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+                    if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
+                    draw_world_batch(&mut pass, batch, 0..1, self.ocean_clipmap_quality());
+                }
+            }
+            self.post_ocean_transparent_scratch = deferred_transparent;
+            // Alpha-blended entities/FX remain after world transparency.
+            self.gpu_profiler.write_render_pass_timestamp(
+                &mut pass, GpuPass::DynamicModelsTranslucent, false,
+            );
+            self.dynamic_model_renderer.draw_phase(
+                &mut pass, &self.camera_bind_group, false, None, None, None, false,
+            );
+            self.gpu_profiler.write_render_pass_timestamp(
+                &mut pass, GpuPass::DynamicModelsTranslucent, true,
+            );
             self.weather
                 .wind_visuals
                 .render(&mut pass, &self.camera_bind_group);

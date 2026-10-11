@@ -1383,14 +1383,20 @@ impl EntityPresenter {
         }
         let texture = self.load_texture_arc(&effective, false)?;
         let materials = vec![FxMaterial {
+            animation: None,
             texture: Some(texture),
             blend: FxBlend::Alpha,
             rgb_vertex: true,
             alpha_vertex: true,
             rgb_const: [1.0; 3],
             alpha_const: 1.0,
+            rgb_wave: None,
+            alpha_wave: None,
+            rgb_one_minus_vertex: false,
+            alpha_one_minus_vertex: false,
             tc_mods: Vec::new(),
             shader_time_offset: self.shader_remaps.time_offset_for(&effective),
+            shader_clamp_time: None,
             authored_glow: false,
         }];
         self.fx_materials.insert(key, materials.clone());
@@ -1408,14 +1414,20 @@ impl EntityPresenter {
         // saber melt glow). Not an authored shader, so it never hits the loaders.
         if key == "$melt_glow" {
             return vec![FxMaterial {
+                animation: None,
                 texture: None,
                 blend: FxBlend::Add,
                 rgb_vertex: true,
                 alpha_vertex: false,
                 rgb_const: [1.0; 3],
                 alpha_const: 1.0,
+                rgb_wave: None,
+                alpha_wave: None,
+                rgb_one_minus_vertex: false,
+                alpha_one_minus_vertex: false,
                 tc_mods: Vec::new(),
                 shader_time_offset: 0.0,
+                shader_clamp_time: None,
                 authored_glow: false,
             }];
         }
@@ -1425,6 +1437,7 @@ impl EntityPresenter {
 
         let effective = self.shader_remaps.effective_name(&key).into_owned();
         let shader_time_offset = self.shader_remaps.time_offset_for(&effective);
+        let shader_clamp_time = jka_assets::shader::find_shader(&self.shaders, &effective).and_then(|shader| shader.clamp_time);
 
         let has_shader_definition = jka_assets::shader::find_shader(&self.shaders, &effective).is_some();
         let stages = jka_assets::shader::find_shader(&self.shaders, &effective).map(|shader| {
@@ -1441,30 +1454,37 @@ impl EntityPresenter {
             let texture = if stage.image.eq_ignore_ascii_case("$whiteimage") || stage.image.eq_ignore_ascii_case("$lightmap") {
                 None
             } else {
-                let texture = self.load_texture_arc_or_missing(&stage.image, stage.clamp, "FX");
-                if FxBlend::from_blend_func(&stage.blend) == FxBlend::Modulate2x && texture.srgb {
-                    // Doubled-modulation textures encode a multiplier, not light.
-                    // Stock shock_ball/shock_ripple use 128 grey as the neutral
-                    // background. sRGB decoding turns it into ~0.216, causing
-                    // every overlapping quad/pass to darken the scene by ~57%.
-                    // Keep these bytes linear and keep the cached color texture
-                    // intact for stages that use it as ordinary color.
-                    let mut multiplier = (*texture).clone();
-                    multiplier.srgb = false;
-                    Some(Arc::new(multiplier))
-                } else {
-                    Some(texture)
-                }
+                Some(self.load_fx_texture_arc(&stage.image, stage.clamp, FxBlend::from_blend_func(&stage.blend)))
             };
+            // Cache every authored animMap frame once. The actual frame is
+            // chosen from FxView.seconds during draw preparation, so the
+            // cached material remains stable across map/FX animation frames.
+            let animation = stage.animation.as_ref().map(|animation| {
+                let frames = animation.frames.iter().map(|path| {
+                    self.load_fx_texture_arc(path, stage.clamp, FxBlend::from_blend_func(&stage.blend))
+                }).collect();
+                crate::fx::draw::FxTextureAnimation {
+                    fps: animation.fps,
+                    one_shot: animation.one_shot,
+                    frames,
+                }
+            });
             materials.push(FxMaterial {
+                animation,
                 texture,
                 blend: FxBlend::from_blend_func(&stage.blend),
-                rgb_vertex: stage.rgb_gen.uses_vertex_color(),
-                alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex),
+                rgb_vertex: stage.rgb_gen.uses_vertex_color() || stage.entity_rgb,
+                alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex)
+                    || (stage.alpha_gen == AlphaGen::Identity && stage.rgb_gen == RgbGen::Vertex),
                 rgb_const: if stage.rgb_gen == RgbGen::Const { stage.color.unwrap_or([1.0; 3]) } else { [1.0; 3] },
                 alpha_const: stage.alpha.unwrap_or(1.0),
+                rgb_wave: match stage.rgb_gen { RgbGen::Wave(wave) => Some(wave), _ => None },
+                alpha_wave: match stage.alpha_gen { AlphaGen::Wave(wave) => Some(wave), _ => None },
+                rgb_one_minus_vertex: stage.rgb_gen == RgbGen::OneMinusVertex,
+                alpha_one_minus_vertex: stage.alpha_gen == AlphaGen::OneMinusVertex,
                 tc_mods: stage.tc_mods.clone(),
                 shader_time_offset,
+                shader_clamp_time,
                 authored_glow: stage.glow,
             });
         }
@@ -1479,14 +1499,20 @@ impl EntityPresenter {
                     "FX MATERIAL WARNING: {shader_name}: shader has no renderable image stage; using shared missing texture placeholder"
                 );
                 materials.push(FxMaterial {
+                    animation: None,
                     texture: Some(Arc::clone(&self.missing_texture)),
                     blend: FxBlend::Opaque,
                     rgb_vertex: true,
                     alpha_vertex: true,
                     rgb_const: [1.0; 3],
                     alpha_const: 1.0,
+                    rgb_wave: None,
+                    alpha_wave: None,
+                    rgb_one_minus_vertex: false,
+                    alpha_one_minus_vertex: false,
                     tc_mods: Vec::new(),
                     shader_time_offset,
+                    shader_clamp_time,
                     authored_glow: false,
                 });
             } else {
@@ -1498,27 +1524,39 @@ impl EntityPresenter {
                 // remain transparent/dark instead of becoming opaque gray.
                 match self.load_texture_arc(&effective, false) {
                     Some(texture) => materials.push(FxMaterial {
+                        animation: None,
                         texture: Some(texture),
                         blend: FxBlend::Alpha,
                         rgb_vertex: true,
                         alpha_vertex: true,
                         rgb_const: [1.0; 3],
                         alpha_const: 1.0,
+                        rgb_wave: None,
+                        alpha_wave: None,
+                        rgb_one_minus_vertex: false,
+                        alpha_one_minus_vertex: false,
                         tc_mods: Vec::new(),
                         shader_time_offset,
+                        shader_clamp_time,
                         authored_glow: false,
                     }),
                     None => {
                         if let Some(texture) = self.rgb_saber_fallback_texture(&effective) {
                             materials.push(FxMaterial {
+                                animation: None,
                                 texture: Some(texture),
                                 blend: FxBlend::Add,
                                 rgb_vertex: true,
                                 alpha_vertex: false,
                                 rgb_const: [1.0; 3],
                                 alpha_const: 1.0,
+                                rgb_wave: None,
+                                alpha_wave: None,
+                                rgb_one_minus_vertex: false,
+                                alpha_one_minus_vertex: false,
                                 tc_mods: Vec::new(),
                                 shader_time_offset,
+                                shader_clamp_time,
                                 authored_glow: false,
                             });
                         } else {
@@ -1530,14 +1568,20 @@ impl EntityPresenter {
                                 "FX MATERIAL WARNING: {shader_name}: no shader definition or implicit image; using shared missing texture placeholder"
                             );
                             materials.push(FxMaterial {
+                                animation: None,
                                 texture: Some(Arc::clone(&self.missing_texture)),
                                 blend: FxBlend::Opaque,
                                 rgb_vertex: true,
                                 alpha_vertex: true,
                                 rgb_const: [1.0; 3],
                                 alpha_const: 1.0,
+                                rgb_wave: None,
+                                alpha_wave: None,
+                                rgb_one_minus_vertex: false,
+                                alpha_one_minus_vertex: false,
                                 tc_mods: Vec::new(),
                                 shader_time_offset,
+                                shader_clamp_time,
                                 authored_glow: false,
                             });
                         }
@@ -1576,6 +1620,20 @@ impl EntityPresenter {
             texel[..3].fill(grey);
         }
         Some(Arc::new(texture))
+    }
+
+    fn load_fx_texture_arc(&mut self, image: &str, clamp: bool, blend: crate::fx::draw::FxBlend) -> Arc<TextureData> {
+        let texture = self.load_texture_arc_or_missing(image, clamp, "FX");
+        if blend == crate::fx::draw::FxBlend::Modulate2x && texture.srgb {
+            // Doubled-modulation images encode multipliers. Their 128-grey
+            // borders must remain neutral on every animMap frame. Keep the
+            // ordinary color cache intact for other materials sharing the image.
+            let mut multiplier = (*texture).clone();
+            multiplier.srgb = false;
+            Arc::new(multiplier)
+        } else {
+            texture
+        }
     }
 
     fn load_texture_arc_or_missing(
@@ -1849,6 +1907,31 @@ mod tests {
             }],
         }));
         (fixture, presenter)
+    }
+
+    #[test]
+    fn animated_fx_frames_keep_modulation_policy_and_cached_images() {
+        use crate::fx::draw::FxBlend;
+        let fixture = crate::cvar_compatibility::Fixture::new();
+        std::fs::create_dir_all(fixture.0.join("textures/test")).unwrap();
+        std::fs::create_dir_all(fixture.0.join("shaders")).unwrap();
+        for name in ["a", "b"] {
+            image::save_buffer(fixture.0.join(format!("textures/test/{name}.png")),
+                &[128, 128, 128, 255], 1, 1, image::ColorType::Rgba8).unwrap();
+        }
+        std::fs::write(fixture.0.join("shaders/animation.shader"),
+            "test {\nclampTime 0.15\n{\nclampAnimMap 10 textures/test/a textures/test/b\nblendFunc GL_DST_COLOR GL_SRC_COLOR\n}\n}\n").unwrap();
+        let mut presenter = EntityPresenter::new(AssetSearchPath::open(&fixture.0).unwrap(), false).unwrap();
+        let stages = presenter.fx_material_stages("test");
+        assert_eq!(stages[0].blend, FxBlend::Modulate2x);
+        let frames = &stages[0].animation.as_ref().unwrap().frames;
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| !frame.srgb && frame.clamp));
+        assert_eq!(stages[0].shader_clamp_time, Some(0.15));
+        assert!(Arc::ptr_eq(&stages[0].texture_at_time(10.0).unwrap(), &frames[1]));
+        let cached = presenter.fx_material_stages("test");
+        assert!(Arc::ptr_eq(&cached[0].animation.as_ref().unwrap().frames[1], &frames[1]));
+        assert!(presenter.load_texture_arc("textures/test/b", true).unwrap().srgb);
     }
 
     #[test]

@@ -308,6 +308,74 @@ fn stage_tc_mods_compose_in_order_and_scroll_wraps() {
 }
 
 #[test]
+fn ghoul2_affine_tcmods_follow_reference_rotation_and_transform() {
+    let rotation = stage_uv_affine(&[TcMod::Rotate(90.0)], 1.0);
+    let uv = [1.0_f32, 0.5_f32];
+    let rotated = [rotation[0]*uv[0] + rotation[2]*uv[1] + rotation[4],
+                   rotation[1]*uv[0] + rotation[3]*uv[1] + rotation[5]];
+    assert!((rotated[0] - 0.5).abs() < 1e-5);
+    assert!((rotated[1] - 0.0).abs() < 1e-5);
+
+    let affine = stage_uv_affine(&[TcMod::Transform([2.0, 3.0, 4.0, 5.0, 6.0, 7.0])], 1.0);
+    assert_eq!(affine, [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    let uv = [1.0, 2.0];
+    assert_eq!([affine[0]*uv[0] + affine[2]*uv[1] + affine[4],
+                affine[1]*uv[0] + affine[3]*uv[1] + affine[5]], [16.0, 20.0]);
+
+    // Authored order: scroll first, rotate second (not vice versa).
+    let combined = stage_uv_affine(&[TcMod::Scroll(0.25, 0.0), TcMod::Rotate(90.0)], 1.0);
+    let p = [combined[0]*0.5 + combined[2]*0.5 + combined[4],
+             combined[1]*0.5 + combined[3]*0.5 + combined[5]];
+    assert!((p[0] - 0.5).abs() < 1e-5);
+    assert!((p[1] - 0.25).abs() < 1e-5);
+}
+
+#[test]
+fn ghoul2_multipass_keeps_authored_modulation_stages() {
+    let shaders = jka_assets::shader::parse(
+        "models/players/test/reflective
+{
+    {
+        map models/players/test/base
+        rgbGen lightingDiffuse
+    }
+    {
+        map models/players/test/filter
+        blendFunc GL_DST_COLOR GL_SRC_COLOR
+    }
+    {
+        map models/players/test/glow
+        blendFunc GL_ONE GL_ONE
+    }
+}",
+    ).unwrap();
+    let material = material_layers(&shaders, "models/players/test/reflective");
+    assert_eq!(material.stages.len(), 3);
+    assert_eq!(material.stages[0].1, DynamicModelAlphaMode::Opaque);
+    assert_eq!(material.stages[1].1, DynamicModelAlphaMode::Modulate2x);
+    assert_eq!(material.stages[2].1, DynamicModelAlphaMode::AdditiveOne);
+    assert!(!resolved_stage(material.stages[0].0, material.stages[0].1, None).unlit);
+    assert!(resolved_stage(material.stages[1].0, material.stages[1].1, None).unlit,
+        "identity modulation must not be multiplied by entity lighting again");
+}
+
+#[test]
+fn standalone_player_tcmods_reach_the_stage_submission_path() {
+    for blend in ["", "blendFunc blend\n"] {
+        let shaders = jka_assets::shader::parse(&format!(
+            "models/players/test/rotating {{\n{{\nmap $whiteimage\n{blend}rgbGen identity\ntcMod rotate 90\n}}\n}}\n"
+        )).unwrap();
+        let layers = material_layers(&shaders, "models/players/test/rotating");
+        assert_eq!(layers.stages.len(), 1, "tcMods must run without a later overlay");
+        let stage = resolved_stage(layers.stages[0].0, layers.stages[0].1, None);
+        assert!(stage.unlit);
+        let matrix = stage_uv_affine(&stage.tc_mods, 1.0);
+        assert!((matrix[1] + 1.0).abs() < 1e-5);
+        assert!((matrix[2] - 1.0).abs() < 1e-5);
+    }
+}
+
+#[test]
 fn opaque_base_player_shaders_keep_the_single_stage_path() {
     let shaders = jka_assets::shader::parse(
         "models/players/TinkerBell/newer

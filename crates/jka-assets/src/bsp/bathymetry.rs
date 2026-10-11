@@ -25,7 +25,7 @@ mod tests;
 pub const CONTENTS_WATER: u32 = 0x0000_0004;
 const LIQUIDS: u32 = CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
 const EPS: f64 = 0.001;
-pub const CACHE_VERSION: u32 = 4;
+pub const CACHE_VERSION: u32 = 5;
 
 pub type FootprintTriangle = [[f32; 2]; 3];
 
@@ -150,8 +150,9 @@ pub struct Atlas {
     pub grids: Vec<Grid>,
     pub warnings: Vec<String>,
     pub bake_ms: f64,
-    /// Present only for pools whose offshore tiles were screened out. Runtime
-    /// wavelength overrides must not extend physics beyond this depth proof.
+    /// Present only for pools whose offshore tiles were screened out. Records
+    /// the depth proof and, when necessary, the explicit bank patch policy.
+    /// Runtime wavelength overrides must not exceed the screened depth.
     pub shoreline_bands: Vec<ShorelineBand>,
 }
 
@@ -161,6 +162,9 @@ pub struct ShorelineBand {
     pub full_tiles: u32,
     pub retained_tiles: u32,
     pub max_depth: f32,
+    /// Zero retains all screened shallows. Otherwise physics is restricted to
+    /// this many cell steps from resolved banks, followed by an FFT reservoir.
+    pub patch_radius_cells: u32,
 }
 
 impl Atlas {

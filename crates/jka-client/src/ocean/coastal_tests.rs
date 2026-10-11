@@ -148,6 +148,7 @@ fn coastal_screened_pool_rejects_wavelength_beyond_baked_depth() {
             full_tiles: 5000,
             retained_tiles: 2,
             max_depth: 38.4,
+            patch_radius_cells: 0,
         });
     assert!(prepare(&atlas, &ocean).is_ok());
     ocean.heuristic.wavelength = 800.0;
@@ -155,6 +156,135 @@ fn coastal_screened_pool_rejects_wavelength_beyond_baked_depth() {
         .err()
         .unwrap()
         .contains("screened shoreline band"));
+}
+
+fn shallow_patch_fixture() -> (Atlas, PromotedOcean) {
+    let (mut atlas, ocean) = tiled_bank();
+    for grid in &mut atlas.grids {
+        for cell in &mut grid.cells {
+            if cell.depth > 20.0 {
+                cell.bed = -16.0;
+                cell.depth = 16.0;
+                cell.bed_min = -16.0;
+                cell.bed_max = -16.0;
+            }
+        }
+    }
+    atlas
+        .shoreline_bands
+        .push(jka_assets::bsp::bathymetry::ShorelineBand {
+            slot: 2,
+            full_tiles: 5000,
+            retained_tiles: 2,
+            max_depth: 38.4,
+            patch_radius_cells: 2,
+        });
+    (atlas, ocean)
+}
+
+#[test]
+fn coastal_bank_patch_has_accounted_fft_reservoir_in_shallow_water() {
+    let (mut atlas, ocean) = shallow_patch_fixture();
+    let prepared = prepare(&atlas, &ocean).unwrap();
+    assert!(prepared.cell_indirection);
+    assert_eq!(prepared.cells.len(), 160);
+    assert_eq!(prepared.tiled_coverage, 512);
+    let find = |x: usize| {
+        let address =
+            prepared.lookup[(hash(-1, 0) & prepared.lookup_mask) as usize][2] as usize + x;
+        prepared.lookup[address / 4][address % 4] as u32
+    };
+    assert_eq!(
+        find(0),
+        NONE,
+        "far shallows remain FFT without a solver allocation"
+    );
+    let ring = find(6) as usize;
+    let core = find(7) as usize;
+    let bank = find(10) as usize;
+    assert!(
+        prepared.cells[ring].metric[3] > 0.0,
+        "shallow cut uses an explicit FFT source"
+    );
+    assert_eq!(
+        prepared.cells[ring].position[3], 0.0,
+        "FFT reservoir presents FFT"
+    );
+    assert_eq!(
+        prepared.cells[ring].neighbours[1], core as u32,
+        "reservoir shares a real conservative face with the patch"
+    );
+    assert_eq!(prepared.cells[core].neighbours[0], ring as u32);
+    assert!(prepared.cells[core].position[3] > 0.0 && prepared.cells[core].position[3] < 1.0);
+    assert!(
+        prepared.cells[bank].position[2] > 0.5,
+        "finite dry bank stays active"
+    );
+    for grid in &mut atlas.grids {
+        for y in 0..16 {
+            grid.cells[y * 16 + 5].class = Class::NoFloor;
+            grid.cells[y * 16 + 5].bed = f32::NAN;
+        }
+    }
+    assert!(
+        prepare(&atlas, &ocean)
+            .err()
+            .unwrap()
+            .contains("validated offshore FFT reservoir"),
+        "unknown offshore continuation rejects the whole pool"
+    );
+}
+
+#[test]
+fn coastal_compact_patches_still_reject_an_oversized_live_domain() {
+    let (mut atlas, ocean) = shallow_patch_fixture();
+    let template = atlas.grids[0].clone();
+    atlas.grids.clear();
+    atlas.shoreline_bands[0].patch_radius_cells = 8;
+    atlas.shoreline_bands[0].retained_tiles = 800;
+    for y in 0..400 {
+        let mut bank = template.clone();
+        bank.origin[1] = y as f32 * 256.0;
+        let mut offshore = bank.clone();
+        offshore.origin[0] -= 256.0;
+        for c in &mut offshore.cells {
+            c.class = Class::Wet;
+            c.bed = -16.0;
+            c.depth = 16.0;
+            c.bed_min = -16.0;
+            c.bed_max = -16.0;
+        }
+        for face in offshore.faces_x.iter_mut().chain(&mut offshore.faces_y) {
+            face.boundary = Boundary::Open;
+            face.crest = -16.0;
+        }
+        atlas.grids.extend([offshore, bank]);
+    }
+    assert!(
+        prepare(&atlas, &ocean)
+            .err()
+            .unwrap()
+            .contains("live 65536-cell budget"),
+        "compaction cannot raise the fixed live cell cap"
+    );
+}
+
+#[test]
+fn coastal_patch_rejects_a_cut_through_unbaked_source_coverage() {
+    let (mut atlas, ocean) = shallow_patch_fixture();
+    for grid in &mut atlas.grids {
+        grid.footprint = vec![
+            [[-256.0, 0.0], [0.0, 0.0], [0.0, 1024.0]],
+            [[-256.0, 0.0], [0.0, 1024.0], [-256.0, 1024.0]],
+        ];
+    }
+    assert!(
+        prepare(&atlas, &ocean)
+            .err()
+            .unwrap()
+            .contains("unbaked footprint tile"),
+        "an artificial allocation edge cannot seal a physical patch"
+    );
 }
 
 #[test]
@@ -192,6 +322,45 @@ fn coastal_large_pool_runtime_maps() {
             &triangles,
             super::super::WATER_FOOTPRINT_TILE_SIZE,
         );
+        if std::env::var_os("JKA_COASTAL_SCREEN_REPORT").is_some() {
+            let mut assets = jka_assets::pk3::AssetSearchPath::open_game(
+                &workspace.join("target/release/base"),
+                Some(&workspace.join("target/release/japro")),
+            )
+            .unwrap();
+            let asset = assets
+                .read(&format!("maps/{name}.bsp"), jka_assets::bsp::MAX_FILE_BYTES)
+                .unwrap()
+                .unwrap();
+            let bsp = jka_assets::bsp::Bsp::parse(&asset.bytes).unwrap();
+            let geometry = jka_assets::bsp::bathymetry::Geometry::from_bsp(&bsp).unwrap();
+            let footprint = &footprints[0];
+            let exact: Vec<_> = footprint
+                .triangles
+                .iter()
+                .map(|t| t.map(|[x, z]| [x, -z]))
+                .collect();
+            let regions: Vec<_> = footprint
+                .tiles
+                .iter()
+                .map(|t| jka_assets::bsp::bathymetry::Region {
+                    slot: 0,
+                    level: footprint.plane,
+                    triangles: t.triangles.iter().map(|&i| exact[i as usize]).collect(),
+                    bounds: Some([[t.minimum[0], -t.maximum[1]], [t.maximum[0], -t.minimum[1]]]),
+                })
+                .collect();
+            let report = geometry
+                .shoreline_screening_report(
+                    &regions,
+                    super::super::bathymetry::SHORELINE_SCREENING_DEPTH,
+                )
+                .unwrap();
+            let directory = workspace.join("target/coastal-large-pool-analysis");
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(format!("{name}-screen.txt")), &report).unwrap();
+            eprintln!("{name}: {report}");
+        }
         let job = map
             .coastal_bathymetry
             .as_ref()
@@ -265,13 +434,25 @@ fn coastal_large_pool_runtime_maps() {
                         };
                         let baked = atlas.grids.iter().filter(|g| g.slot == slot as u32).count();
                         let result = match prepare(atlas, &ocean) {
-                            Ok(p) => format!(
-                                "LIVE {} cells / {} active / {} bank cells",
-                                p.cells.len(),
-                                p.active,
-                                p.shoreline
-                            ),
-                            Err(e) => format!("FFT: {e}"),
+                            Ok(p) => {
+                                if name == "racearena_pro" && slot == 0 {
+                                    assert!(footprint.tiles.len() * 256 > MAX_BAKED_CELLS);
+                                    assert!(p.cell_indirection);
+                                    assert!(
+                                        p.tiled_coverage > MAX_CELLS,
+                                        "real pool must exercise cell compaction"
+                                    );
+                                    assert!(p.cells.len() <= MAX_CELLS && p.shoreline > 0);
+                                }
+                                format!("LIVE {} stored cells / {} tile-addressed / {} active / {} bank cells", p.cells.len(),p.tiled_coverage,p.active,p.shoreline)
+                            }
+                            Err(e) => {
+                                assert!(
+                                    name != "racearena_pro" || slot != 0,
+                                    "huge installed RaceArena pool must be eligible: {e}"
+                                );
+                                format!("FFT: {e}")
+                            }
                         };
                         eprintln!("{name} Pool {}: level {}u; full {} tiles / {} baked tiles; wavelength {:.2}u; {result}",
                             slot + 1, footprint.plane, footprint.tiles.len(), baked, ocean.heuristic.wavelength);
@@ -578,6 +759,9 @@ fn rectangular_fixture(case: usize) -> (Prepared, jka_water::coastal::Solver) {
         cells,
         depth,
         lookup: vec![[0; 4]; 4],
+        lookup_mask: 3,
+        cell_indirection: false,
+        tiled_coverage: n,
         max_depth: 1.1,
         active: n,
         shoreline: 1,
@@ -682,129 +866,157 @@ fn coastal_gpu_matches_cpu_conservation_wall_and_wet_front() {
         }
         // A source-accounted FFT target drives actual bank wetting across two
         // atlas tiles. It also validates sparse global neighbour indexing.
-        let (atlas, ocean) = tiled_bank();
-        let prepared = prepare(&atlas, &ocean).unwrap();
-        let active: Vec<_> = prepared.cells.iter().map(|c| c.position[2] > 0.5).collect();
-        let bed: Vec<_> = prepared.cells.iter().map(|c| c.metric[0]).collect();
-        let wall_x: Vec<_> = prepared
-            .cells
-            .iter()
-            .map(|c| c.neighbours[1] == NONE)
-            .collect();
-        let wall_y: Vec<_> = prepared
-            .cells
-            .iter()
-            .map(|c| c.neighbours[3] == NONE)
-            .collect();
-        let domain = jka_water::coastal::Domain::with_geometry(
-            jka_water::coastal::Grid::new(16, 32, 0.4, 0.4).unwrap(),
-            bed,
-            active,
-            wall_x,
-            wall_y,
-        )
-        .unwrap();
-        let targets: Vec<_> = prepared
-            .cells
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.metric[3] > 0.0)
-            .map(|(k, c)| jka_water::coastal::BoundaryTarget {
-                cell: k,
-                surface: 0.04,
-                rate: f64::from(c.metric[3]),
-                velocity_x: 0.0,
-                velocity_y: 0.0,
-                transverse_velocity_blend: 1.0,
-            })
-            .collect();
-        let mut cpu = jka_water::coastal::Solver::new(domain, prepared.depth.clone()).unwrap();
-        let mut gpu = Gpu::new(&device, prepared, &view, &sampler, 1.6);
-        let mut wave = OceanRenderUniform::zeroed();
-        wave.ocean_info[2] = 40.0;
-        wave.swell[3] = 0.04;
-        wave.swell_motion[0] = 1.0;
-        wave.swell_motion[3] = -std::f32::consts::FRAC_PI_2;
-        for _ in 0..400 {
-            cpu.step_with_boundaries(f64::from(gpu.dt), &targets);
+        for compact in [false, true] {
+            let (atlas, ocean) = if compact {
+                shallow_patch_fixture()
+            } else {
+                tiled_bank()
+            };
+            let prepared = prepare(&atlas, &ocean).unwrap();
+            // Scatter the packed GPU cells into an independently indexed dense
+            // CPU domain. Do not give the reference the GPU neighbour remap.
+            let dense: Vec<usize> = prepared
+                .cells
+                .iter()
+                .map(|c| {
+                    ((c.position[1] / 16.0).floor() as usize) * 16
+                        + ((c.position[0] + 256.0) / 16.0).floor() as usize
+                })
+                .collect();
+            let bank = dense.iter().position(|&k| k == 10).unwrap();
+            let mut active = vec![false; 512];
+            let mut bed = vec![0.0; 512];
+            let mut initial_depth = vec![0.0; 512];
+            let mut wall_x = vec![true; 512];
+            let mut wall_y = vec![true; 512];
+            for (k, c) in prepared.cells.iter().enumerate() {
+                let d = dense[k];
+                active[d] = c.position[2] > 0.5;
+                bed[d] = c.metric[0];
+                initial_depth[d] = prepared.depth[k];
+                wall_x[d] = c.neighbours[1] == NONE;
+                wall_y[d] = c.neighbours[3] == NONE;
+                for (axis, &q) in c.neighbours.iter().enumerate() {
+                    if q != NONE {
+                        let offset = [-1i32, 1, -16, 16][axis];
+                        assert_eq!(
+                            dense[q as usize] as i32,
+                            d as i32 + offset,
+                            "packed face must reference the same physical CPU cell"
+                        );
+                    }
+                }
+            }
+            let domain = jka_water::coastal::Domain::with_geometry(
+                jka_water::coastal::Grid::new(16, 32, 0.4, 0.4).unwrap(),
+                bed,
+                active,
+                wall_x,
+                wall_y,
+            )
+            .unwrap();
+            let targets: Vec<_> = prepared
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.metric[3] > 0.0)
+                .map(|(k, c)| jka_water::coastal::BoundaryTarget {
+                    cell: dense[k],
+                    surface: 0.04,
+                    rate: f64::from(c.metric[3]),
+                    velocity_x: 0.0,
+                    velocity_y: 0.0,
+                    transverse_velocity_blend: 1.0,
+                })
+                .collect();
+            let mut cpu = jka_water::coastal::Solver::new(domain, initial_depth).unwrap();
+            let mut gpu = Gpu::new(&device, prepared, &view, &sampler, 1.6);
+            let mut wave = OceanRenderUniform::zeroed();
+            wave.ocean_info[2] = 40.0;
+            wave.swell[3] = 0.04;
+            wave.swell_motion[0] = 1.0;
+            wave.swell_motion[3] = -std::f32::consts::FRAC_PI_2;
+            for _ in 0..400 {
+                cpu.step_with_boundaries(f64::from(gpu.dt), &targets);
+                let mut encoder = device.create_command_encoder(&Default::default());
+                gpu.encode(&queue, &mut encoder, gpu.dt, &wave);
+                queue.submit([encoder.finish()]);
+            }
+            let depth = read_f32(&device, &queue, &gpu.depths[gpu.front]);
+            let max_error = depth
+                .iter()
+                .enumerate()
+                .map(|(k, a)| (a - cpu.depth()[dense[k]]).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error < 2e-5,
+                "FFT interface max depth error {max_error}"
+            );
+            assert!(
+                depth[bank] > 0.0005,
+                "FFT-fed water must wet the initially dry bank"
+            );
+            let samples = read_f32(&device, &queue, &gpu.render.surface);
+            assert!(
+                samples[4 + bank * 16 + 5] > 0.02,
+                "reconstructed bank must present positive water depth"
+            );
+            let sample = sample_render_field(&device, &queue, &gpu, 2.0);
+            assert!(
+                (sample[3] - if compact { 1.0 / 3.0 } else { 1.0 }).abs() < 0.001,
+                "shader must find negative-X tiles across their shared seam: {sample:?}"
+            );
+            assert!(
+                sample[0] > 0.01 && sample[1] > 0.0,
+                "shader must see the solved free surface"
+            );
+            let wrong_pool = sample_render_field(&device, &queue, &gpu, 3.0);
+            assert_eq!(
+                wrong_pool[3], 0.0,
+                "another pool must not sample this body's field"
+            );
+            let diagnostics = cpu.diagnostics();
+            let gpu_source = samples[4..]
+                .chunks_exact(16)
+                .map(|c| f64::from(c[12]))
+                .sum::<f64>();
+            let gpu_volume = samples[4..]
+                .chunks_exact(16)
+                .map(|c| f64::from(c[13]) * 0.16)
+                .sum::<f64>();
+            assert!(
+                (gpu_source - diagnostics.accounted_source_volume).abs() < 3e-6,
+                "FFT source accounting must match the CPU reference"
+            );
+            assert!(
+                (gpu_volume - diagnostics.volume).abs() < 3e-6,
+                "source-accounted live volume must match the CPU reference"
+            );
+            assert_eq!(diagnostics.non_finite, 0);
+            println!("FFT target / two-tile wetting: max depth error {max_error:.9} m; wetted-bank depth {:.6} m; source volume {:.9} m3",depth[bank],diagnostics.accounted_source_volume);
+            let mut encoder = device.create_command_encoder(&Default::default());
+            gpu.encode(&queue, &mut encoder, 2.0, &wave);
+            queue.submit([encoder.finish()]);
+            assert!(
+                gpu.dropped_time > 1.9,
+                "large frame gaps must drop debt instead of unbounded catch-up"
+            );
+            wave.swell[3] = 1e6;
             let mut encoder = device.create_command_encoder(&Default::default());
             gpu.encode(&queue, &mut encoder, gpu.dt, &wave);
             queue.submit([encoder.finish()]);
+            let failed = read_f32(&device, &queue, &gpu.render.surface);
+            assert_ne!(
+                failed[0].to_bits(),
+                0,
+                "excessive forcing must latch a numerical failure"
+            );
+            assert_eq!(
+                sample_render_field(&device, &queue, &gpu, 2.0)[3],
+                0.0,
+                "unsafe state must fall back to FFT immediately on the GPU"
+            );
         }
-        let depth = read_f32(&device, &queue, &gpu.depths[gpu.front]);
-        let max_error = depth
-            .iter()
-            .zip(cpu.depth())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(
-            max_error < 2e-5,
-            "FFT interface max depth error {max_error}"
-        );
-        assert!(
-            depth[10] > 0.0005,
-            "FFT-fed water must wet the initially dry bank"
-        );
-        let samples = read_f32(&device, &queue, &gpu.render.surface);
-        assert!(
-            samples[4 + 10 * 16 + 5] > 0.02,
-            "reconstructed bank must present positive water depth"
-        );
-        let sample = sample_render_field(&device, &queue, &gpu, 2.0);
-        assert!(
-            (sample[3] - 1.0).abs() < 0.001,
-            "shader must find negative-X tiles across their shared seam: {sample:?}"
-        );
-        assert!(
-            sample[0] > 0.01 && sample[1] > 0.0,
-            "shader must see the solved free surface"
-        );
-        let wrong_pool = sample_render_field(&device, &queue, &gpu, 3.0);
-        assert_eq!(
-            wrong_pool[3], 0.0,
-            "another pool must not sample this body's field"
-        );
-        let diagnostics = cpu.diagnostics();
-        let gpu_source = samples[4..]
-            .chunks_exact(16)
-            .map(|c| f64::from(c[12]))
-            .sum::<f64>();
-        let gpu_volume = samples[4..]
-            .chunks_exact(16)
-            .map(|c| f64::from(c[13]) * 0.16)
-            .sum::<f64>();
-        assert!(
-            (gpu_source - diagnostics.accounted_source_volume).abs() < 3e-6,
-            "FFT source accounting must match the CPU reference"
-        );
-        assert!(
-            (gpu_volume - diagnostics.volume).abs() < 3e-6,
-            "source-accounted live volume must match the CPU reference"
-        );
-        assert_eq!(diagnostics.non_finite, 0);
-        println!("FFT target / two-tile wetting: max depth error {max_error:.9} m; wetted-bank depth {:.6} m; source volume {:.9} m3",depth[10],diagnostics.accounted_source_volume);
-        let mut encoder = device.create_command_encoder(&Default::default());
-        gpu.encode(&queue, &mut encoder, 2.0, &wave);
-        queue.submit([encoder.finish()]);
-        assert!(
-            gpu.dropped_time > 1.9,
-            "large frame gaps must drop debt instead of unbounded catch-up"
-        );
-        wave.swell[3] = 1e6;
-        let mut encoder = device.create_command_encoder(&Default::default());
-        gpu.encode(&queue, &mut encoder, gpu.dt, &wave);
-        queue.submit([encoder.finish()]);
-        let failed = read_f32(&device, &queue, &gpu.render.surface);
-        assert_ne!(
-            failed[0].to_bits(),
-            0,
-            "excessive forcing must latch a numerical failure"
-        );
-        assert_eq!(
-            sample_render_field(&device, &queue, &gpu, 2.0)[3],
-            0.0,
-            "unsafe state must fall back to FFT immediately on the GPU"
-        );
         assert!(
             scope.pop().await.is_none(),
             "live coastal pipelines and bindings must validate"

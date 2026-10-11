@@ -66,6 +66,7 @@ struct TestRay { origin: vec4<f32>, direction: vec4<f32> };
         "rt_rgba_texel",
         "rt_sample_rgba",
         "rt_sample_alpha",
+        "rt_tc_stretch_wave",
         "rt_alpha_generated_uv",
         "rt_alpha_candidate_blocks",
         "rt_candidate_glass_throughput",

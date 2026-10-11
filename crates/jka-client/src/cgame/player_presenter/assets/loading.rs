@@ -169,6 +169,7 @@ impl ModelSource for WorkerModelSource<'_> {
         let effective = shared.shader_remaps.effective_name(shader_name);
         let layers = material_layers(&shared.shaders, effective.as_ref());
         let shader_time_offset = shared.shader_remaps.time_offset_for(effective.as_ref());
+        let shader_clamp_time = jka_assets::shader::find_shader(&shared.shaders, effective.as_ref()).and_then(|shader| shader.clamp_time);
         let (mut texture, mut alpha_mode) = self.load_stage(&layers.base);
         let overlay = layers.overlay.as_ref().map(|stage| {
             let (texture, alpha_mode) = self.load_stage(stage);
@@ -204,6 +205,7 @@ impl ModelSource for WorkerModelSource<'_> {
             two_sided: layers.two_sided,
             authored_glow: layers.base.authored_glow,
             shader_time_offset,
+            shader_clamp_time,
         }
     }
 }
@@ -310,15 +312,17 @@ fn blended_alpha_mode(stage: &jka_assets::shader::Stage) -> DynamicModelAlphaMod
 }
 
 /// The pass mode of one stage of a blended player shader, or `None` when this
-/// path cannot draw it. Not drawn: environment/vector coordinates, alpha tests
-/// and `GL_DST_COLOR` filters.
+/// path cannot draw it.  Preserve TaystJK's framebuffer-dependent blend stages
+/// (filter/modulate/darken) in their authored order; silently dropping these
+/// changes the appearance of the remaining passes.  Non-base tcGen and alpha
+/// tests still need a dedicated GPU implementation.
 pub(in crate::cgame::player_presenter) fn blended_stage_mode(
     stage: &jka_assets::shader::Stage,
     allow_opaque: bool,
 ) -> Option<DynamicModelAlphaMode> {
     use crate::fx::draw::FxBlend;
     if stage.image.is_empty()
-        || stage.image.starts_with('$')
+        || (stage.image.starts_with('$') && !stage.image.eq_ignore_ascii_case("$whiteimage"))
         || stage.entity_rgb
         || !stage.alpha_test.trim().is_empty()
         || !matches!(stage.tc_gen, TcGen::Base)
@@ -329,7 +333,11 @@ pub(in crate::cgame::player_presenter) fn blended_stage_mode(
         FxBlend::Opaque => allow_opaque.then_some(DynamicModelAlphaMode::Opaque),
         FxBlend::Add => Some(DynamicModelAlphaMode::AdditiveOne),
         FxBlend::AddAlpha => Some(DynamicModelAlphaMode::Additive),
-        _ => {
+        FxBlend::Modulate => Some(DynamicModelAlphaMode::Modulate),
+        FxBlend::DstColorAdd => Some(DynamicModelAlphaMode::DstColorAdd),
+        FxBlend::Modulate2x => Some(DynamicModelAlphaMode::Modulate2x),
+        FxBlend::Darken => Some(DynamicModelAlphaMode::Darken),
+        FxBlend::Alpha => {
             let blend = stage
                 .blend
                 .split_whitespace()
@@ -343,8 +351,8 @@ pub(in crate::cgame::player_presenter) fn blended_stage_mode(
 }
 
 /// Stage list for the glow/sparkle shaders of custom player models: a shader
-/// whose primary stage is blended (not masked or a filter) and has at least one
-/// additive stage, or whose primary stage is a plain opaque one (ShadowTink's
+/// whose primary stage is blended and has subsequent compositing stages, or
+/// whose primary stage is a plain opaque one (ShadowTink's
 /// dark `rgbGen const` body, an eye with a `glow` map) with further drawable
 /// stages on top. Alpha-tested primaries keep the single-stage path.
 pub(in crate::cgame::player_presenter) fn blended_stages<'a>(
@@ -355,11 +363,7 @@ pub(in crate::cgame::player_presenter) fn blended_stages<'a>(
     if primary.entity_rgb || !primary.alpha_test.trim().is_empty() {
         return Vec::new();
     }
-    let opaque_primary = match FxBlend::from_blend_func(&primary.blend) {
-        FxBlend::Opaque => true,
-        FxBlend::Modulate | FxBlend::Modulate2x | FxBlend::Darken => return Vec::new(),
-        _ => false,
-    };
+    let opaque_primary = FxBlend::from_blend_func(&primary.blend) == FxBlend::Opaque;
     let stages = shader
         .stages
         .iter()
@@ -370,11 +374,11 @@ pub(in crate::cgame::player_presenter) fn blended_stages<'a>(
         .collect::<Vec<_>>();
     if opaque_primary {
         // The opaque base must itself be drawable, else the overlays would
-        // replace it, and a lone base stays on the single-stage path.
+        // replace it. A lone base without tcMods keeps the compact path.
         let base_drawn = stages
             .first()
             .is_some_and(|&(stage, _)| std::ptr::eq(stage, primary));
-        return if base_drawn && stages.len() > 1 {
+        return if base_drawn && (stages.len() > 1 || !primary.tc_mods.is_empty()) {
             stages
         } else {
             Vec::new()
@@ -389,10 +393,12 @@ pub(in crate::cgame::player_presenter) fn blended_stages<'a>(
     // Do not silently discard single-stage alpha/wave semantics just because
     // there is no later additive pass. This is also how standalone
     // depth-writing translucent materials retain their explicit first pass.
-    if additive
+    if (stages.len() > 1)
+        || additive
         || primary.depth_write
         || matches!(primary.rgb_gen, RgbGen::Wave(_))
         || matches!(primary.alpha_gen, AlphaGen::Wave(_))
+        || !primary.tc_mods.is_empty()
     {
         stages
     } else {
@@ -419,7 +425,7 @@ pub(in crate::cgame::player_presenter) fn resolved_stage(
         } else {
             1.0
         },
-        unlit: const_rgb || matches!(stage.rgb_gen, RgbGen::Wave(_)),
+        unlit: !matches!(stage.rgb_gen, RgbGen::LightingDiffuse | RgbGen::LightingDiffuseEntity),
         rgb_wave: match stage.rgb_gen {
             RgbGen::Wave(wave) => Some(wave),
             _ => None,
@@ -481,24 +487,69 @@ pub(in crate::cgame::player_presenter) fn specular_alpha(
     }
 }
 
-/// `uv * xy + zw` for a stage's `tcMod scale`/`scroll` chain at `seconds`
-/// (scroll wraps like the engine's, so the offset never loses precision).
-pub(in crate::cgame::player_presenter) fn stage_uv_xform(mods: &[TcMod], seconds: f32) -> [f32; 4] {
-    let (mut scale, mut offset) = ([1.0_f32; 2], [0.0_f32; 2]);
+/// Compose id Tech 3 affine tcMods in authored order.  The 2x3 matrix
+/// [m00,m01,m10,m11,tx,ty] maps [s,t] -> [m00*s+m10*t+tx,
+/// m01*s+m11*t+ty]. Turbulence is position-dependent, not affine, and is
+/// intentionally left for the per-vertex deformation implementation.
+pub(in crate::cgame::player_presenter) fn stage_uv_affine(mods: &[TcMod], seconds: f32) -> [f32; 6] {
+    let mut result = [1.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     for tc_mod in mods {
-        match *tc_mod {
-            TcMod::Scale(x, y) => {
-                scale = [scale[0] * x, scale[1] * y];
-                offset = [offset[0] * x, offset[1] * y];
-            }
+        let op = match *tc_mod {
+            TcMod::Scale(x, y) => [x, 0.0, 0.0, y, 0.0, 0.0],
             TcMod::Scroll(x, y) => {
                 let (sx, sy) = (x * seconds, y * seconds);
-                offset = [offset[0] + sx - sx.floor(), offset[1] + sy - sy.floor()];
+                [1.0, 0.0, 0.0, 1.0, sx - sx.floor(), sy - sy.floor()]
             }
-            _ => {}
-        }
+            TcMod::Transform(transform) => transform,
+            TcMod::Rotate(degrees) => {
+                // Same negative rotation sign and pivot (0.5,0.5) as
+                // TaystJK RB_CalcRotateTexCoords.
+                let (s, c) = (-degrees * seconds).to_radians().sin_cos();
+                [c, s, -s, c, 0.5 - 0.5*c + 0.5*s, 0.5 - 0.5*s - 0.5*c]
+            }
+            TcMod::Stretch(wave) => {
+                let phase = if matches!(wave.func, WaveFunc::Noise) {
+                    (seconds + wave.phase) * wave.frequency
+                } else { wave.phase + seconds * wave.frequency };
+                let x = phase.rem_euclid(1.0);
+                let signal = match wave.func {
+                    WaveFunc::Sin => (x * std::f32::consts::TAU).sin(),
+                    WaveFunc::Triangle => if x < 0.25 { 4.0*x } else if x < 0.75 { 2.0 - 4.0*x } else { 4.0*x - 4.0 },
+                    WaveFunc::Square => if x < 0.5 { 1.0 } else { -1.0 },
+                    WaveFunc::Sawtooth => x,
+                    WaveFunc::InverseSawtooth => 1.0 - x,
+                    WaveFunc::Noise => {
+                        let n = phase.floor();
+                        let t = x*x*(3.0 - 2.0*x);
+                        let hash = |i: f32| ((i * 127.1).sin() * 43758.547).fract().rem_euclid(1.0)*2.0 - 1.0;
+                        hash(n)*(1.0-t) + hash(n+1.0)*t
+                    }
+                };
+                let value = wave.base + wave.amplitude * signal;
+                let factor = if value.abs() <= 1.0e-6 { 1.0 } else { 1.0/value };
+                [factor, 0.0, 0.0, factor, 0.5-0.5*factor, 0.5-0.5*factor]
+            }
+            TcMod::Turb { .. } => continue,
+        };
+        let prev = result;
+        result = [
+            op[0]*prev[0] + op[2]*prev[1],
+            op[1]*prev[0] + op[3]*prev[1],
+            op[0]*prev[2] + op[2]*prev[3],
+            op[1]*prev[2] + op[3]*prev[3],
+            op[0]*prev[4] + op[2]*prev[5] + op[4],
+            op[1]*prev[4] + op[3]*prev[5] + op[5],
+        ];
     }
-    [scale[0], scale[1], offset[0], offset[1]]
+    result
+}
+
+/// Regression-test the original four-float scale/scroll API. Runtime shader
+/// stages now carry the full affine matrix, including cross-axis coefficients.
+#[cfg(test)]
+pub(in crate::cgame::player_presenter) fn stage_uv_xform(mods: &[TcMod], seconds: f32) -> [f32; 4] {
+    let matrix = stage_uv_affine(mods, seconds);
+    [matrix[0], matrix[3], matrix[4], matrix[5]]
 }
 
 pub(in crate::cgame::player_presenter) fn stage_material(
@@ -840,6 +891,7 @@ fn build_character_model(
             alpha_mode: material.alpha_mode,
             authored_glow: material.authored_glow,
             shader_time_offset: material.shader_time_offset,
+            shader_clamp_time: material.shader_clamp_time,
             entity_tint: material.entity_tint,
             overlay: material.overlay,
             stages: material.stages,
@@ -1046,6 +1098,7 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
             alpha_mode: material.alpha_mode,
             authored_glow: material.authored_glow,
             shader_time_offset: material.shader_time_offset,
+            shader_clamp_time: material.shader_clamp_time,
             entity_tint: material.entity_tint,
             overlay: material.overlay,
             stages: material.stages,
@@ -1660,6 +1713,7 @@ impl PlayerPresenter {
         // immutable borrow of self.shader_remaps alive through MaterialLayers.
         let effective = self.shader_remaps.effective_name(shader_name).into_owned();
         let shader_time_offset = self.shader_remaps.time_offset_for(&effective);
+        let shader_clamp_time = jka_assets::shader::find_shader(&shaders, &effective).and_then(|shader| shader.clamp_time);
         let layers = material_layers(&shaders, &effective);
         let (mut texture, mut alpha_mode) = self.load_stage_texture(&layers.base);
         let overlay = layers.overlay.as_ref().map(|stage| {
@@ -1696,6 +1750,7 @@ impl PlayerPresenter {
             two_sided: layers.two_sided,
             authored_glow: layers.base.authored_glow,
             shader_time_offset,
+            shader_clamp_time,
         }
     }
 

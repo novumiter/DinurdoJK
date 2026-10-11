@@ -610,7 +610,10 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
             frequency: 2.0,
         }),
         tc_gen: TcGen::Base,
-        tc_mods: Vec::new(),
+        tc_mods: vec![TcMod::Stretch(Wave {
+            func: WaveFunc::Triangle, base: 1.0, amplitude: 0.5,
+            phase: 0.25, frequency: 2.0,
+        })],
         depth_write: false,
         depth_equal: false,
             glow: false,
@@ -620,6 +623,7 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
         sky_cloud_height: 512.0,
         explicit: true,
         stages: vec![stage],
+        clamp_time: Some(2.0),
         ..Default::default()
     };
     let mut batches = Vec::new();
@@ -642,6 +646,40 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
     assert_eq!(uniform.wave_rgb, [0.2, 0.03, 0.5, 0.04]);
     assert_eq!(uniform.wave_alpha, [0.5, 0.25, 0.1, 2.0]);
     assert_eq!(uniform.wave_funcs[..2], [0, 4]);
+    assert_eq!(uniform.vector_t[3], 2.0);
+    assert_eq!(uniform.mods[0], [6.0, 1.0, 0.5, 0.25]);
+    assert_eq!(uniform.mods[1], [2.0, 1.0, 0.0, 0.0]);
+    // The clock limit shares a vector lane, so it must survive both tcGen
+    // basis packing and the compact ray-tracing material conversion.
+    let mut vector_batch = batches[1].clone();
+    vector_batch.tc_gen = TcGen::Vector([1.0, 2.0, 3.0], [4.0, 5.0, 6.0]);
+    vector_batch.shader_time_offset = 1.5;
+    let vector_uniform = material_uniform(&vector_batch, false);
+    assert_eq!(vector_uniform.vector_s, [1.0, 3.0, -2.0, 0.0]);
+    assert_eq!(vector_uniform.vector_t, [4.0, 6.0, -5.0, 2.0]);
+    assert_eq!(vector_uniform.params[3], 1.5);
+    use crate::renderer::lighting::ray_tracing::{RtAlphaMaterialSource,
+        rt_alpha_material_gpu, rt_alpha_texture_source, rt_alpha_dynamic_material};
+    let rt = rt_alpha_material_gpu(&RtAlphaMaterialSource {
+        uniform: vector_uniform, texture: rt_alpha_texture_source(None),
+        glass: false, was_opaque: false,
+    }, 0);
+    assert_eq!(rt.vector_t, vector_uniform.vector_t);
+    assert_eq!(rt.params[3], 1.5);
+    assert_eq!(rt_alpha_dynamic_material(0).vector_t[3], 0.0,
+        "non-authored dynamic masks must keep an unbounded shader clock");
+    let mut guarded = vector_batch.clone();
+    guarded.authored_environment_composite = true;
+    let guarded_uniform = material_uniform(&guarded, false);
+    assert_ne!(guarded_uniform.header[3] & 4, 0);
+    assert_eq!(guarded_uniform.header[2] & 8_388_608, 0,
+        "the environment guard must not turn ordinary stages into explicit lightmap stages");
+    guarded.authored_environment_composite = false;
+    guarded.texture_is_lightmap = true;
+    let lightmap_uniform = material_uniform(&guarded, false);
+    assert_ne!(lightmap_uniform.header[2] & 8_388_608, 0);
+    assert_eq!(lightmap_uniform.header[3] & 4, 0,
+        "a real lightmap must not inherit the environment guard");
     // The outer box (no generators) leaves the wave flags clear.
     assert_eq!(
         material_uniform(&batches[0], false).header[2] & (134217728 | 268435456),
@@ -971,6 +1009,8 @@ fn dynamic_model_depth_phase_places_saber_fx_after_gpu_skinned_opaque_geometry()
 fn hiz_occlusion_shaders_validate() {
     for (name, source) in [
         ("depth_prepass", include_str!("../../depth_prepass.wgsl")),
+        ("shadow", include_str!("../../shadow.wgsl")),
+        ("world_flares", include_str!("../../world_flares.wgsl")),
         ("gpu_cull", include_str!("../../gpu_cull.wgsl")),
         ("hiz_build", include_str!("../../hiz_build.wgsl")),
         ("hiz_reduce", include_str!("../../hiz_reduce.wgsl")),
@@ -1422,6 +1462,7 @@ fn ghoul2_draw_uniform_matches_the_skin_draw_wgsl_struct() {
             offset_of!(Ghoul2GpuDrawUniform, classic_ambient),
         ),
         ("uv_xform", offset_of!(Ghoul2GpuDrawUniform, uv_xform)),
+        ("uv_cross", offset_of!(Ghoul2GpuDrawUniform, uv_cross)),
         ("jiggle3", offset_of!(Ghoul2GpuDrawUniform, jiggle3)),
         (
             "source_phong",

@@ -23,6 +23,7 @@ struct SkinDraw {
     classic_sun_directed: vec4<f32>,
     classic_sun_direction: vec4<f32>,
     uv_xform: vec4<f32>,
+    uv_cross: vec4<f32>,
     spec_light: vec4<f32>,
     spec_viewer: vec4<f32>,
     jiggle0: vec4<f32>,
@@ -247,6 +248,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);
-    let uv = vec2<f32>(input.position_uv_x.w, input.normal_uv_y.w) * draw.uv_xform.xy + draw.uv_xform.zw;
+    let original_uv = vec2<f32>(input.position_uv_x.w, input.normal_uv_y.w);
+    let uv = original_uv * draw.uv_xform.xy + draw.uv_xform.zw
+        + vec2<f32>(original_uv.y * draw.uv_cross.x, original_uv.x * draw.uv_cross.y);
     write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv, draw_color);
 }

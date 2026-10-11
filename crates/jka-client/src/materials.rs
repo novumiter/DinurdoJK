@@ -109,15 +109,20 @@ impl MaterialAnimation {
     /// TaystJK R_BindAnimatedImage uses integer shader-time * fps, clamps
     /// negative remap offsets to frame zero, then loops or holds the last.
     pub fn frame_index(&self, shader_time: f32) -> usize {
-        if self.frames.len() <= 1 || !shader_time.is_finite() || !self.fps.is_finite() || self.fps <= 0.0 {
-            return 0;
-        }
-        let frame = (shader_time.max(0.0) as f64 * self.fps as f64).floor();
-        if self.one_shot {
-            frame.min((self.frames.len() - 1) as f64) as usize
-        } else {
-            (frame % self.frames.len() as f64) as usize
-        }
+        animation_frame_index(self.frames.len(), self.fps, self.one_shot, shader_time)
+    }
+}
+
+/// Shared world/FX animMap clock. Callers apply remap offsets and clampTime first.
+pub(crate) fn animation_frame_index(frame_count: usize, fps: f32, one_shot: bool, shader_time: f32) -> usize {
+    if frame_count <= 1 || !shader_time.is_finite() || !fps.is_finite() || fps <= 0.0 {
+        return 0;
+    }
+    let frame = (shader_time.max(0.0) as f64 * fps as f64).floor();
+    if one_shot {
+        frame.min((frame_count - 1) as f64) as usize
+    } else {
+        (frame % frame_count as f64) as usize
     }
 }
 
@@ -208,6 +213,10 @@ pub struct SurfaceSpriteEffectMaterial {
 
 #[derive(Debug, Clone)]
 pub struct SurfaceMaterial {
+    /// Authored image resolution exemption, also implied by noMipMaps.
+    pub no_picmip: bool,
+    /// Positive shader animation limit, applied after a remap's time offset.
+    pub clamp_time: Option<f32>,
     pub stages: Vec<MaterialStage>,
     pub surface_material: u8,
     pub cull: CullMode,
@@ -226,8 +235,7 @@ pub struct SurfaceMaterial {
     pub alpha_shadow: bool,
     /// q3map2 `surfaceparm lightfilter`.
     pub light_filter: bool,
-    /// q3map2 `q3map_nofog`: compiler metadata saying this material must not
-    /// participate in local/global BSP fog.
+    /// q3map_nofog or runtime noglfog exemption from local/global BSP fog.
     pub no_fog: bool,
     pub sky: bool,
     pub skybox: Option<[usize; 6]>,
@@ -270,6 +278,8 @@ pub struct SurfaceMaterial {
 impl Default for SurfaceMaterial {
     fn default() -> Self {
         Self {
+            no_picmip: false,
+            clamp_time: None,
             stages: Vec::new(),
             surface_material: 0,
             cull: CullMode::Back,
@@ -492,8 +502,9 @@ fn shader_library_internal(
     jobs: Option<&MapJobPool>,
     enable_mtr: bool,
 ) -> Result<(BTreeMap<String, Shader>, ShaderLibraryDiagnostics), String> {
-    // Rend2 .mtr files are renderer-specific material overrides. Load ordinary
-    // .shader definitions first, then replace matching definitions from .mtr.
+    // Load ordinary .shader definitions, Rend2's optional .mtr overrides,
+    // then renderer-independent JaPro .oshader overrides. Within the override
+    // group the first file wins, matching JaPro's prepended shader text.
     // File IO remains serialized through one AssetSearchPath (ZipArchive is
     // stateful); the CPU-heavy tokenization/parser work can run on map workers.
     let shader_files: Vec<_> = assets
@@ -501,6 +512,11 @@ fn shader_library_internal(
         .filter(|name| name.starts_with("shaders/") && name.ends_with(".shader"))
         .map(str::to_owned)
         .collect();
+    let override_shader_files: Vec<_> = assets
+        .names()
+        .filter(|name| name.starts_with("shaders/") && name.ends_with(".oshader"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>().into_iter().rev().collect();
     let available_material_files: Vec<_> = assets
         .names()
         .filter(|name| name.starts_with("shaders/") && name.ends_with(".mtr"))
@@ -513,7 +529,7 @@ fn shader_library_internal(
     };
 
     let mut diagnostics = ShaderLibraryDiagnostics {
-        shader_files: shader_files.len(),
+        shader_files: shader_files.len() + override_shader_files.len(),
         mtr_files: material_files.len(),
         ..Default::default()
     };
@@ -522,15 +538,20 @@ fn shader_library_internal(
         name: String,
         source: PathBuf,
         override_existing: bool,
+        mtr_override: bool,
         parsed: Result<BTreeMap<String, Shader>, String>,
         parse_ms: f64,
     }
 
     let parse_wall_started = Instant::now();
-    let mut parsed_files = Vec::with_capacity(shader_files.len() + material_files.len());
+    let mut parsed_files = Vec::with_capacity(shader_files.len() + override_shader_files.len() + material_files.len());
     if let Some(jobs) = jobs {
-        let mut handles = Vec::with_capacity(shader_files.len() + material_files.len());
-        for (files, override_existing) in [(&shader_files, false), (&material_files, true)] {
+        let mut handles = Vec::with_capacity(shader_files.len() + override_shader_files.len() + material_files.len());
+        for (files, override_existing, mtr_override) in [
+            (&shader_files, false, false),
+            (&material_files, true, true),
+            (&override_shader_files, true, false),
+        ] {
             for name in files {
                 let read_started = Instant::now();
                 let asset = assets
@@ -548,6 +569,7 @@ fn shader_library_internal(
                         name,
                         source,
                         override_existing,
+                        mtr_override,
                         parsed,
                         parse_ms: started.elapsed().as_secs_f64() * 1000.0,
                     }
@@ -560,7 +582,11 @@ fn shader_library_internal(
             parsed_files.push(handle.join()?);
         }
     } else {
-        for (files, override_existing) in [(&shader_files, false), (&material_files, true)] {
+        for (files, override_existing, mtr_override) in [
+            (&shader_files, false, false),
+            (&material_files, true, true),
+            (&override_shader_files, true, false),
+        ] {
             for name in files {
                 let read_started = Instant::now();
                 let asset = assets
@@ -574,6 +600,7 @@ fn shader_library_internal(
                     name: name.clone(),
                     source: asset.source,
                     override_existing,
+                    mtr_override,
                     parsed,
                     parse_ms: started.elapsed().as_secs_f64() * 1000.0,
                 });
@@ -587,7 +614,7 @@ fn shader_library_internal(
         diagnostics.parse_cpu_ms += file.parse_ms;
         match file.parsed {
             Ok(parsed) => {
-                if file.override_existing {
+                if file.mtr_override {
                     diagnostics.mtr_definitions += parsed.len();
                 } else {
                     diagnostics.shader_definitions += parsed.len();
@@ -600,7 +627,7 @@ fn shader_library_internal(
                             ShaderDefinitionOrigin {
                                 file: file.name.clone(),
                                 source: file.source.clone(),
-                                mtr_override: true,
+                                mtr_override: file.mtr_override,
                             },
                         );
                     } else if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -621,6 +648,12 @@ fn shader_library_internal(
             Err(error) => warnings.push(format!("{}: {error}", file.name)),
         }
     }
+    if !override_shader_files.is_empty() {
+        warnings.push(format!(
+            "TaystJK compatibility: loaded {} .oshader override file(s)",
+            override_shader_files.len()
+        ));
+    }
     if !material_files.is_empty() {
         warnings.push(format!(
             "Rend2: loaded {} .mtr file(s), {} material definition(s)",
@@ -637,6 +670,7 @@ fn shader_library_internal(
 }
 
 pub struct Textures {
+    shader_policy_cache: BTreeMap<(usize, bool, bool), usize>,
     pub images: Vec<TextureData>,
     cache: BTreeMap<(String, bool, bool), Option<usize>>,
     /// Source-affine cache for active `.mtr` dependencies. The same qpath may
@@ -686,6 +720,7 @@ impl Textures {
 
     pub fn new() -> Self {
         Self {
+            shader_policy_cache: BTreeMap::new(),
             seed: None,
             hashes: Vec::new(),
             last_hash: 0,
@@ -698,6 +733,33 @@ impl Textures {
             warnings: Vec::new(),
             load_stats: TextureLoadStats::default(),
         }
+    }
+
+    /// Keep authored loading policies separate when shaders share an image qpath.
+    fn shader_texture(&mut self, index: usize, no_mipmaps: bool, no_picmip: bool) -> usize {
+        if !no_mipmaps && !no_picmip {
+            return index;
+        }
+        // Cinematics must retain the texture index updated by the video player.
+        if self.videos.iter().any(|video| video.texture == index) {
+            return index;
+        }
+        let key = (index, no_mipmaps, no_picmip);
+        if let Some(&cached) = self.shader_policy_cache.get(&key) {
+            return cached;
+        }
+        let mut image = self.images[index].clone();
+        if no_mipmaps {
+            image.mip_level_count = 1;
+            image.rgba.truncate(image.width as usize * image.height as usize * 4);
+            if let Some(pixels) = image.rgba16f.as_mut() {
+                pixels.truncate(image.width as usize * image.height as usize * 4);
+            }
+        }
+        let variant = self.images.len();
+        self.push_image(image);
+        self.shader_policy_cache.insert(key, variant);
+        variant
     }
 
     /// Register a `videoMap` cinematic and return its placeholder texture index.
@@ -1752,12 +1814,65 @@ fn stage_blend(stage: &shader::Stage) -> Option<BlendFunc> {
     }
 }
 
+/// Shared authored-stage topology check for both parsed shaders and resolved
+/// material stages. The same classification drives the Off material variant
+/// and the Ultra planar-substitution guard; neither needs a shader-name list.
+/// Run only during map/material preparation, never in a draw loop.
+pub(crate) fn authored_environment_composite_stage<T>(
+    stages: &[T],
+    stage: &T,
+    is_environment: impl Fn(&T) -> bool,
+    blend: impl Fn(&T) -> Option<BlendFunc>,
+    same_image: impl Fn(&T, &T) -> bool,
+) -> bool {
+    if stages.len() < 2 || !is_environment(stage) {
+        return false;
+    }
+    let Some(env_blend) = blend(stage) else {
+        return false;
+    };
+    if env_blend == (BlendFunc { src: BlendFactor::One, dst: BlendFactor::Zero }) {
+        return false;
+    }
+    stages.iter().any(|other| {
+        if is_environment(other) {
+            return false;
+        }
+        let coupled_blend = blend(other).is_some_and(|b| {
+            b != (BlendFunc { src: BlendFactor::One, dst: BlendFactor::Zero })
+        });
+        same_image(stage, other) || coupled_blend
+    })
+}
+
+/// An authored composite uses environment UVs as a mandatory part of its
+/// shader, not as an interchangeable optional reflection technique. Keep it
+/// even when enhanced reflections are Off, just as Ultra must not replace it.
+/// Explicit portals and water are separately handled by the renderer.
+fn preserves_authored_environment_composite(shader: &Shader) -> bool {
+    if shader.portal || shader.water {
+        return false;
+    }
+    shader.stages.iter().any(|stage| {
+        authored_environment_composite_stage(
+            &shader.stages,
+            stage,
+            |stage| matches!(stage.tc_gen, TcGen::Environment),
+            stage_blend,
+            |a, b| !a.image.is_empty() && a.image.eq_ignore_ascii_case(&b.image),
+        )
+    })
+}
+
 fn alpha_cutoff(stage: &shader::Stage) -> f32 {
     match stage.alpha_test.as_str() {
         "ge128" => 0.5,
         // GLS_ATEST_GE_C0 (OpenJK `GE192`): alpha >= 0xC0 / 255.
         "ge192" => 0.75,
         "gt0" => 1.0 / 255.0,
+        // JaPro GL_LESS uses 0.5, including filtered (non-byte) alpha values.
+        // A negative cutoff denotes the reverse test.
+        "lt128" => -0.5,
         _ => 0.0,
     }
 }
@@ -2144,8 +2259,12 @@ pub fn primary_texture_requests(
                         push(&format!("{prefix}_{suffix}"), true, true);
                     }
                 }
+                let keep_authored_env = preserves_authored_environment_composite(shader);
                 for stage in &shader.stages {
-                    if omit_environment_stages && matches!(stage.tc_gen, TcGen::Environment) {
+                    if omit_environment_stages
+                        && !keep_authored_env
+                        && matches!(stage.tc_gen, TcGen::Environment)
+                    {
                         continue;
                     }
                     if stage.surface_sprite.is_some_and(|sprite| {
@@ -2275,8 +2394,14 @@ pub fn describe(
     let empty = Shader::default();
     let definition = definition.unwrap_or(&empty);
     let explicit = !definition.stages.is_empty();
+    // Off still strips standalone environment stages, but not the authored
+    // multistage composites that rely on those stages to be visible at all.
+    // This uses the same semantic topology as the Ultra planar guard.
+    let keep_authored_env = preserves_authored_environment_composite(definition);
     let stage_is_omitted = |stage: &shader::Stage| {
-        omit_environment_stages && matches!(stage.tc_gen, TcGen::Environment)
+        omit_environment_stages
+            && !keep_authored_env
+            && matches!(stage.tc_gen, TcGen::Environment)
     };
     let preferred_source = origin
         .filter(|origin| origin.mtr_override)
@@ -2325,7 +2450,7 @@ pub fn describe(
             inferred_from_emissive: false,
         }
     });
-    let skybox = if sky {
+    let mut skybox = if sky {
         definition
             .sky_box
             .as_deref()
@@ -2607,6 +2732,24 @@ pub fn describe(
             .push(format!("{name}: approximated/unsupported {unsupported}"));
     }
 
+    // Resolve policies after stage interpretation so animation frames share the
+    // same policy as their base image, without mutating another shader's texture.
+    if definition.no_mipmaps || definition.no_picmip {
+        let mut apply = |index| textures.shader_texture(index, definition.no_mipmaps, definition.no_picmip);
+        for stage in &mut stages {
+            if let StageTexture::Image(index) = &mut stage.texture {
+                *index = apply(*index);
+            }
+            if let Some(animation) = &mut stage.animation {
+                for index in &mut animation.frames { *index = apply(*index); }
+            }
+        }
+        for effect in &mut surface_sprite_effects { effect.texture = apply(effect.texture); }
+        if let Some(faces) = &mut skybox {
+            for index in faces { *index = apply(*index); }
+        }
+    }
+
     SurfaceMaterial {
         surface_material: (flags & MATERIAL_MASK) as u8,
         hidden: !sky
@@ -2628,7 +2771,9 @@ pub fn describe(
         water_deformed: crate::ocean::appearance::deformation_amplitude(definition).is_some(),
         alpha_shadow: definition.alpha_shadow,
         light_filter: definition.light_filter,
-        no_fog: definition.no_fog,
+        no_fog: definition.no_fog || definition.no_gl_fog,
+        clamp_time: definition.clamp_time,
+        no_picmip: definition.no_picmip,
         sky,
         skybox,
         sky_cloud_height: if sky { definition.sky_cloud_height } else { 0.0 },
@@ -2646,6 +2791,53 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authored_texture_policies_do_not_mutate_shared_images() {
+        let mut textures = Textures::new();
+        let mut image = missing_texture_data();
+        (image.rgba, image.mip_level_count) = build_mip_chain(image.width, image.height, image.rgba);
+        textures.push_image(image.clone());
+        let single_mip = textures.shader_texture(0, true, true);
+        let full_resolution = textures.shader_texture(0, false, true);
+        assert_ne!(single_mip, 0);
+        assert_ne!(full_resolution, single_mip);
+        assert_eq!(textures.images[0].mip_level_count, image.mip_level_count);
+        assert_eq!(textures.images[0].rgba, image.rgba);
+        assert_eq!(textures.images[single_mip].mip_level_count, 1);
+        assert_eq!(textures.images[single_mip].rgba.len(), (image.width * image.height * 4) as usize);
+        assert_eq!(textures.images[full_resolution].mip_level_count, image.mip_level_count);
+        assert_eq!(textures.shader_texture(0, true, true), single_mip);
+        assert_eq!(textures.shader_texture(0, false, false), 0);
+    }
+
+    #[test]
+    fn oshader_overrides_are_renderer_independent_and_first_file_wins() {
+        let root = std::env::temp_dir().join(format!("jka-oshader-{}-{}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(root.join("shaders")).unwrap();
+        for (name, limit) in [("base.shader", 1), ("rend2.mtr", 2), ("a.oshader", 3), ("b.oshader", 4)] {
+            std::fs::write(root.join("shaders").join(name),
+                format!("test {{\nclampTime {limit}\n{{\nmap $whiteimage\n}}\n}}\n")).unwrap();
+        }
+        let mut assets = AssetSearchPath::open(&root).unwrap();
+        for enable_mtr in [false, true] {
+            let (library, diagnostics) = shader_library(&mut assets, &mut Vec::new(), enable_mtr).unwrap();
+            assert_eq!(library["test"].clamp_time, Some(3.0));
+            assert_eq!(diagnostics.origins["test"].file, "shaders/a.oshader");
+            assert!(!diagnostics.origins["test"].mtr_override);
+        }
+        drop(assets);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_fog_exemption_is_distinct_from_compiler_metadata() {
+        let shaders = shader::parse("test {\nnoglfog\n{\nmap $whiteimage\n}\n}\n").unwrap();
+        assert!(shaders["test"].no_gl_fog);
+        assert!(!shaders["test"].no_fog);
+        assert!(material("test {\nnoglfog\n{\nmap $whiteimage\n}\n}\n").no_fog);
+    }
 
     #[test]
     fn mip_chain_matches_the_reference_for_odd_and_thin_sizes() {
@@ -2675,6 +2867,8 @@ mod tests {
         assert_eq!(cutoff("ge128"), 0.5);
         assert_eq!(cutoff("ge192"), 0.75);
         assert_eq!(cutoff("gt0"), 1.0 / 255.0);
+        // The sign encodes reverse alpha test while retaining a packed f32.
+        assert_eq!(cutoff("lt128"), -0.5);
         assert_eq!(cutoff(""), 0.0);
     }
 
@@ -2700,6 +2894,36 @@ mod tests {
 
     fn material(text: &str) -> SurfaceMaterial {
         material_with_environment_policy(text, false)
+    }
+
+    #[test]
+    fn authored_clamptime_survives_material_preparation() {
+        let m = material("test {\nclampTime 1.25\n{\nmap $whiteimage\n}\n}\n");
+        assert_eq!(m.clamp_time, Some(1.25));
+        let unlimited = material("test {\nclampTime 0\n{\nmap $whiteimage\n}\n}\n");
+        assert_eq!(unlimited.clamp_time, None, "TaystJK disables clampTime at zero");
+    }
+
+    #[test]
+    fn five_stage_additive_shader_retains_authored_alpha_and_independent_uvs() {
+        let mut script = String::from("test {\nsort additive\n");
+        for layer in 0..5 {
+            script.push_str(&format!(
+                "{{\nmap $whiteimage\nblendFunc GL_SRC_ALPHA GL_ONE\nalphaGen vertex\nrgbGen identity\ntcMod scroll {} 0\n}}\n",
+                (layer + 1) as f32 * 0.125
+            ));
+        }
+        script.push_str("}\n");
+        let material = material(&script);
+        assert_eq!(material.stages.len(), 5);
+        for (index, stage) in material.stages.iter().enumerate() {
+            assert_eq!(stage.blend, Some(BlendFunc {
+                src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+            }));
+            assert_eq!(stage.alpha_gen, AlphaGen::Vertex);
+            assert_eq!(stage.rgb_gen, RgbGen::Identity);
+            assert_eq!(stage.tc_mods, [TcMod::Scroll((index + 1) as f32 * 0.125, 0.0)]);
+        }
     }
 
     #[test]
@@ -2775,41 +2999,76 @@ mod tests {
         assert_eq!(legacy.stages[1].tc_gen, TcGen::Environment);
         assert_eq!(legacy.stages[1].alpha_gen, AlphaGen::Const);
         assert!((legacy.stages[1].opacity - 0.05).abs() < 1.0e-5);
-        // Reflections OFF intentionally removes tcGen environment by policy;
-        // it must not silently turn the surviving base into identity/fullbright.
+        // This is an authored translucent composite. Off disables enhanced
+        // reflections but must not strip its custom environment overlay.
         let off = material_with_environment_policy(script, true);
-        assert_eq!(off.stages.len(), 1);
+        assert_eq!(off.stages.len(), 2);
         assert_eq!(off.stages[0].rgb_gen, RgbGen::LightingDiffuse);
+        assert_eq!(off.stages[1].tc_gen, TcGen::Environment);
     }
 
     #[test]
-    fn reflection_off_omits_environment_stage_without_touching_siblings() {
+    fn reflection_off_preserves_multistage_environment_composite() {
         let material = material_with_environment_policy(
             "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA\n}\n{\nmap $lightmap\nblendFunc GL_DST_COLOR GL_ZERO\n}\n}",
             true,
         );
         assert!(material.explicit);
-        assert_eq!(material.stages.len(), 2);
-        assert!(material
-            .stages
-            .iter()
-            .all(|stage| !matches!(stage.tc_gen, TcGen::Environment)));
-        assert!(matches!(material.stages[1].tc_gen, TcGen::Lightmap));
+        assert_eq!(material.stages.len(), 3);
+        assert!(matches!(material.stages[0].tc_gen, TcGen::Environment));
+        assert!(matches!(material.stages[2].tc_gen, TcGen::Lightmap));
     }
 
     #[test]
     fn reflection_off_promotes_survivor_after_opaque_environment_base() {
+        // Only an ordinary opaque replacement follows the environment base;
+        // this is not a coupled/authored environment composite.
         let material = material_with_environment_policy(
-            "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc blend\ndepthFunc equal\n}\n{\nmap $lightmap\nblendFunc filter\n}\n}",
+            "test {\n{\nmap textures/factory/enviro\ntcGen environment\n}\n{\nmap textures/imperial/square\nblendFunc GL_ONE GL_ZERO\ndepthFunc equal\n}\n}",
             true,
         );
-        assert_eq!(material.stages.len(), 2);
+        assert_eq!(material.stages.len(), 1);
         assert!(material.stages[0].blend.is_none());
         assert!(material.stages[0].depth_write);
         assert!(!material.stages[0].depth_equal);
         assert!(matches!(material.stages[0].tc_gen, TcGen::Base));
-        assert!(material.stages[1].blend.is_some());
-        assert!(matches!(material.stages[1].tc_gen, TcGen::Lightmap));
+    }
+
+    #[test]
+    fn reflection_off_preserves_exact_glass_no_tess_blends() {
+        let script = "test {\nsurfaceparm nonopaque\nsurfaceparm trans\n{\nmap textures/common/glass2\nblendFunc GL_ZERO GL_ONE_MINUS_SRC_COLOR\n}\n{\nmap textures/common/glass2\nblendFunc GL_ONE GL_ONE\ntcGen environment\n}\n}";
+        let legacy = material_with_environment_policy(script, false);
+        let off = material_with_environment_policy(script, true);
+        assert_eq!(legacy.stages.len(), 2);
+        assert_eq!(off.stages.len(), 2, "Off must preserve the integral environment overlay");
+        for (a, b) in legacy.stages.iter().zip(off.stages.iter()) {
+            assert_eq!(a.tc_gen, b.tc_gen);
+            assert_eq!(a.blend, b.blend);
+        }
+        assert_eq!(off.stages[0].blend, Some(BlendFunc {
+            src: BlendFactor::Zero, dst: BlendFactor::OneMinusSrcColor,
+        }));
+        assert_eq!(off.stages[1].blend, Some(BlendFunc {
+            src: BlendFactor::One, dst: BlendFactor::One,
+        }));
+    }
+
+    #[test]
+    fn reflection_off_strips_optional_environment_overlay_after_opaque_base() {
+        let script = "test {\n{\nmap textures/floor/base\n}\n{\nmap textures/floor/env\nblendFunc GL_ONE GL_ONE\ntcGen environment\n}\n}";
+        let material = material_with_environment_policy(script, true);
+        assert_eq!(material.stages.len(), 1);
+        assert_eq!(material.stages[0].tc_gen, TcGen::Base);
+    }
+
+    #[test]
+    fn reflection_off_texture_preload_preserves_integral_environment_image() {
+        let shaders = shader::parse("test {\n{\nmap textures/glass/base\nblendFunc GL_ZERO GL_ONE_MINUS_SRC_COLOR\n}\n{\nmap textures/glass/reflection\nblendFunc GL_ONE GL_ONE\ntcGen environment\n}\n}").unwrap();
+        let requests = primary_texture_requests(&["test".into()], &shaders, true);
+        assert!(requests.iter().any(|(path, _, _)| path == "textures/glass/reflection"));
+        let plain = shader::parse("test {\n{\nmap textures/floor/base\n}\n{\nmap textures/floor/reflection\nblendFunc add\ntcGen environment\n}\n}").unwrap();
+        let requests = primary_texture_requests(&["test".into()], &plain, true);
+        assert!(!requests.iter().any(|(path, _, _)| path == "textures/floor/reflection"));
     }
 
     #[test]

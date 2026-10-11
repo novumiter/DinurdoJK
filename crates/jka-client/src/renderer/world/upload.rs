@@ -17,7 +17,7 @@ use crate::renderer::{
     DrawBatch, DrawClass, DrawIndexedIndirectArgs, GpuCullRecord, GpuImage, GpuPointLight,
     GpuVertex, GrassRenderer, HashMap, IndexedGeometryBuilder, InlineModelGpu, InspectorVertex,
     Instant, MaterialUniform, Mutex, PreparedMap, PreparedPortalPlanBatchRef, RtAlphaMaskSource,
-    RuntimeOceanClipmap,
+    RuntimeOceanClipmap, OceanPromotionDecision,
     StaticAoBaseLightmap, StaticAoWorldSource, SurfaceSpriteEffectGpu, SurfaceSpriteEffectRenderer,
     TextureData, UniformArena, WorldBatch, WorldGpu, WorldPipelineVariant, WorldShaderVariantKey,
     WorldUploadTimings, AUTO4_COLLAPSE_CACHE_BYTES, AUTO_DETAIL_ENABLED_BIT, CLUSTER_COUNT,
@@ -175,6 +175,7 @@ pub(in crate::renderer) fn build_world(
     // outline travels as triangle masks the fragment shader cuts back to.
     let mut ocean_clipmaps = BTreeMap::<[u32; 6], ([std::ops::Range<u32>; 2], u8)>::new();
     let mut ocean_surfaces = Vec::<crate::ocean::OceanSurface>::new();
+    let mut ocean_promotion_decisions = BTreeMap::<[u32; 6], OceanPromotionDecision>::new();
     let mut ocean_appearances = BTreeMap::new();
     let mut ocean_masks = crate::ocean::OceanMasks::default();
     let mut runtime_ocean_clipmaps = Vec::<RuntimeOceanClipmap>::new();
@@ -221,6 +222,21 @@ pub(in crate::renderer) fn build_world(
                 water_faces.len(),
                 footprints.len() - MAX_OCEAN_SURFACES,
             );
+        }
+        // Preserve the actual map-load selection decision for every candidate.
+        // Both chosen and over-cap faces use the same keys as ocean_clipmaps,
+        // so Trace never has to infer a rank from shader names or bounds.
+        for (index, footprint) in footprints.iter().enumerate() {
+            let decision = OceanPromotionDecision {
+                rank: index + 1,
+                total: footprints.len(),
+                area: footprint.area(),
+                faces: footprint.members.len(),
+                slot: (index < MAX_OCEAN_SURFACES).then_some(index as u8),
+            };
+            for &member in &footprint.members {
+                ocean_promotion_decisions.insert(water_face_keys[member], decision);
+            }
         }
         for (slot, footprint) in footprints.iter().take(MAX_OCEAN_SURFACES).enumerate() {
             let authored = water_faces[footprint.members[0]].authored_ocean.is_some();
@@ -476,6 +492,7 @@ pub(in crate::renderer) fn build_world(
     // by normalHeightMap and rmosMap) without changing shader decoding.
     const TEX_USE_COMPANION: u8 = 1;
     const TEX_USE_COLOR: u8 = 2;
+    const TEX_NO_PICMIP: u8 = 4;
     let mut texture_usage = vec![0u8; texture_data.len()];
     let mut mark = |index: Option<usize>, usage: u8| {
         if let Some(index) = index {
@@ -485,8 +502,17 @@ pub(in crate::renderer) fn build_world(
         }
     };
     let mut skybox_faces: Vec<usize> = Vec::new();
-    for source in coarse_sources.iter().chain(full_sources.iter()) {
+    for source in coarse_sources.iter().chain(full_sources.iter()).chain(inline_batch_sources.iter()) {
         mark(source.texture, TEX_USE_COLOR);
+        if source.no_picmip {
+            mark(source.texture, TEX_NO_PICMIP);
+            if let Some(animation) = &source.animation {
+                for &index in &animation.frames { mark(Some(index), TEX_NO_PICMIP); }
+            }
+            if let Some(skybox) = source.skybox {
+                for index in skybox { mark(Some(index), TEX_NO_PICMIP); }
+            }
+        }
         mark(source.emissive_texture, TEX_USE_COLOR);
         mark(source.normal_texture, TEX_USE_COMPANION);
         mark(source.roughness_texture, TEX_USE_COMPANION);
@@ -523,7 +549,7 @@ pub(in crate::renderer) fn build_world(
             // image whose qpath is not under textures/. Keep that compatibility
             // rule rather than degrading videoMap/gfx/UI-style dependencies that
             // merely happen to be referenced by a world shader.
-            let texture_picmip = if data
+            let texture_picmip = if texture_usage[index] & TEX_NO_PICMIP == 0 && data
                 .label
                 .get(..9)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("textures/"))
@@ -1653,6 +1679,13 @@ pub(in crate::renderer) fn build_world(
 
     let visibility_started = Instant::now();
     let coarse_all_batches: Vec<usize> = (0..coarse_batches.len()).collect();
+    // Only a map with a sky portal needs the FULL no-PVS fallback list.
+    // Keep its allocation out of ordinary maps and the hot frame path.
+    let full_all_batches: Vec<usize> = if sky_portal.is_some() {
+        (0..full_batches.len()).collect()
+    } else {
+        Vec::new()
+    };
     let coarse_visible_batches_by_cluster = visibility
         .as_ref()
         .map(|vis| visible_batches_by_cluster(&coarse_batches, vis))
@@ -1844,6 +1877,8 @@ pub(in crate::renderer) fn build_world(
             sky_portal,
             primary_skybox,
             ocean_surfaces,
+            ocean_meshes_built: build_ocean_meshes,
+            ocean_promotion_decisions,
             promoted_oceans: upload_timings.promoted_oceans.clone(),
             ocean_masks: Arc::new(ocean_masks),
             ocean_pvs_footprints,
@@ -1923,6 +1958,7 @@ pub(in crate::renderer) fn build_world(
             auto4_inline_full_start: inline_full_start,
             auto4_collapse_cache,
             coarse_all_batches,
+            full_all_batches,
             last_cluster: None,
             textures,
             footprint_mark_textures,

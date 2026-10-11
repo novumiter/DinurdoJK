@@ -3,10 +3,112 @@
 use super::*;
 use std::collections::HashSet;
 
+#[path = "screen_report.rs"]
+mod screen_report;
+
+/// Explicit fixed-width policy for pools whose complete shallow band cannot
+/// fit. Include every geometric waterline seed; never choose a subset of banks.
+const PATCH_RADIUS_CELLS: u32 = 8;
+
+struct Candidate {
+    polygon: Vec<[f64; 2]>,
+    height: [f64; 3],
+    source: String,
+}
+
 impl Geometry {
+    fn shoreline_candidates(
+        &self,
+        level: f32,
+        max_depth: f32,
+        pool_bounds: [[f32; 2]; 2],
+    ) -> Vec<Candidate> {
+        let lower = f64::from(level) - f64::from(max_depth) - EPS;
+        let upper = f64::from(level) + EPS;
+        let mut candidates = Vec::new();
+        for (id, solid) in self.solids.iter().enumerate() {
+            if (0..2).any(|a| {
+                solid.bounds[1][a] < pool_bounds[0][a] || solid.bounds[0][a] > pool_bounds[1][a]
+            }) {
+                continue;
+            }
+            for (face, plane) in solid.planes.iter().enumerate() {
+                if solid.sky[face] || f64::from(plane.normal[2]) <= EPS {
+                    continue;
+                }
+                let z = [
+                    -f64::from(plane.normal[0]) / f64::from(plane.normal[2]),
+                    -f64::from(plane.normal[1]) / f64::from(plane.normal[2]),
+                    f64::from(plane.distance) / f64::from(plane.normal[2]),
+                ];
+                let [a, b] = solid.bounds;
+                let mut polygon = vec![
+                    a.map(f64::from),
+                    [f64::from(b[0]), f64::from(a[1])],
+                    b.map(f64::from),
+                    [f64::from(a[0]), f64::from(b[1])],
+                ];
+                for p in &solid.planes {
+                    polygon = clip(
+                        &polygon,
+                        [
+                            f64::from(p.normal[0]) + f64::from(p.normal[2]) * z[0],
+                            f64::from(p.normal[1]) + f64::from(p.normal[2]) * z[1],
+                        ],
+                        f64::from(p.distance) - f64::from(p.normal[2]) * z[2] + EPS,
+                    );
+                    if polygon.is_empty() {
+                        break;
+                    }
+                }
+                polygon = clip(&polygon, [-z[0], -z[1]], z[2] - lower);
+                polygon = clip(&polygon, [z[0], z[1]], upper - z[2]);
+                if !polygon.is_empty() {
+                    candidates.push(Candidate {
+                        polygon,
+                        height: z,
+                        source: format!("solid {id} face {face}"),
+                    });
+                }
+            }
+        }
+        for (id, t) in self.triangles.iter().enumerate() {
+            if t.normal[2] <= EPS
+                || (0..2).any(|a| {
+                    t.bounds[1][a] < pool_bounds[0][a] || t.bounds[0][a] > pool_bounds[1][a]
+                })
+            {
+                continue;
+            }
+            let p = t.points[0].map(f64::from);
+            let z = [
+                -t.normal[0] / t.normal[2],
+                -t.normal[1] / t.normal[2],
+                p[2] + t.normal[0] * p[0] / t.normal[2] + t.normal[1] * p[1] / t.normal[2],
+            ];
+            let polygon: Vec<_> = t
+                .points
+                .iter()
+                .map(|p| [f64::from(p[0]), f64::from(p[1])])
+                .collect();
+            let polygon = clip(&polygon, [-z[0], -z[1]], z[2] - lower);
+            let polygon = clip(&polygon, [z[0], z[1]], upper - z[2]);
+            if !polygon.is_empty() {
+                candidates.push(Candidate {
+                    polygon,
+                    height: z,
+                    source: format!("triangle {id}"),
+                });
+            }
+        }
+        candidates
+    }
+
     /// Small pools keep their complete diagnostic atlas. Large pools retain
     /// every upward solid/terrain surface in the shallow-depth slab, plus a
-    /// whole-tile halo for dry-bank and deeper FFT-interface samples. A missed
+    /// whole-tile halo for dry-bank and deeper FFT-interface samples. When this
+    /// exceeds the budget, retain fixed-width patches around every candidate
+    /// bank crossing, with a guard for validated offshore FFT coupling. A missed
     /// narrow bank is not ruled out by a handful of coarse column probes.
     /// The full rendering footprint is owned separately by the caller.
     pub fn bake_shoreline_bands(
@@ -134,78 +236,68 @@ impl Geometry {
                     }
                 }
             };
-            let lower = f64::from(first.level) - f64::from(max_depth) - EPS;
-            let upper = f64::from(first.level) + EPS;
-            for solid in &self.solids {
-                if (0..2).any(|a| {
-                    solid.bounds[1][a] < pool_bounds[0][a] || solid.bounds[0][a] > pool_bounds[1][a]
-                }) {
-                    continue;
-                }
-                for (face, plane) in solid.planes.iter().enumerate() {
-                    if solid.sky[face] || f64::from(plane.normal[2]) <= EPS {
+            let candidates = self.shoreline_candidates(first.level, max_depth, pool_bounds);
+            for candidate in &candidates {
+                visit(&candidate.polygon);
+            }
+            let mut patch_radius_cells = 0;
+            if over_budget {
+                selected.clear();
+                over_budget = false;
+                // A four-cell guard covers seed sampling offsets, the one-cell
+                // FFT reservoir and its exterior validation cell. Allocation
+                // cuts stay outside the physical patch and coupling ring.
+                let margin = (PATCH_RADIUS_CELLS + 4) as f32 * options.cell_size;
+                for c in &candidates {
+                    let [x, y, z] = c.height;
+                    let slope2 = x * x + y * y;
+                    if slope2 < 1e-12 || 1.0 / (1.0 + slope2).sqrt() <= WALL_NORMAL_Z_MAX {
+                        continue; // horizontal platforms and rigid walls are not banks
+                    }
+                    let bank = clip(&c.polygon, [-x, -y], z - f64::from(first.level) + EPS);
+                    if bank.is_empty() {
                         continue;
                     }
-                    let z = [
-                        -f64::from(plane.normal[0]) / f64::from(plane.normal[2]),
-                        -f64::from(plane.normal[1]) / f64::from(plane.normal[2]),
-                        f64::from(plane.distance) / f64::from(plane.normal[2]),
-                    ];
-                    let [a, b] = solid.bounds;
-                    let mut polygon = vec![
-                        a.map(f64::from),
-                        [f64::from(b[0]), f64::from(a[1])],
-                        b.map(f64::from),
-                        [f64::from(a[0]), f64::from(b[1])],
-                    ];
-                    for p in &solid.planes {
-                        polygon = clip(
-                            &polygon,
-                            [
-                                f64::from(p.normal[0]) + f64::from(p.normal[2]) * z[0],
-                                f64::from(p.normal[1]) + f64::from(p.normal[2]) * z[1],
-                            ],
-                            f64::from(p.distance) - f64::from(p.normal[2]) * z[2] + EPS,
-                        );
-                        if polygon.is_empty() {
-                            break;
+                    let b = bounds(bank.iter().map(|p| p.map(|v| v as f32)));
+                    for (i, tile) in tiles.iter().enumerate() {
+                        let rectangle = tile.bounds.unwrap();
+                        if (0..2).any(|a| {
+                            b[1][a] + margin < rectangle[0][a] || b[0][a] - margin > rectangle[1][a]
+                        }) {
+                            continue;
+                        }
+                        let expanded = [
+                            rectangle[0].map(|v| v - margin),
+                            rectangle[1].map(|v| v + margin),
+                        ];
+                        if overlaps_polygon(&bank, expanded) {
+                            selected.insert(i);
                         }
                     }
-                    polygon = clip(&polygon, [-z[0], -z[1]], z[2] - lower);
-                    polygon = clip(&polygon, [z[0], z[1]], upper - z[2]);
-                    visit(&polygon);
+                    if selected.len() > limit {
+                        over_budget = true;
+                        break;
+                    }
                 }
-            }
-            for t in &self.triangles {
-                if t.normal[2] <= EPS {
-                    continue;
-                }
-                let p = t.points[0].map(f64::from);
-                let z = [
-                    -t.normal[0] / t.normal[2],
-                    -t.normal[1] / t.normal[2],
-                    p[2] + t.normal[0] * p[0] / t.normal[2] + t.normal[1] * p[1] / t.normal[2],
-                ];
-                let polygon: Vec<_> = t
-                    .points
-                    .iter()
-                    .map(|p| [f64::from(p[0]), f64::from(p[1])])
-                    .collect();
-                let polygon = clip(&polygon, [-z[0], -z[1]], z[2] - lower);
-                visit(&clip(&polygon, [z[0], z[1]], upper - z[2]));
+                patch_radius_cells = PATCH_RADIUS_CELLS;
             }
             if over_budget {
-                warnings.push(format!("slot {slot}: shallow bands plus halo exceed fixed {}-cell budget (full footprint {original} cells); retain FFT water", options.max_cells_per_region));
+                warnings.push(format!("slot {slot}: shallow bands plus halo exceed budget; all bank-seeded patches also exceed fixed {}-cell budget (full footprint {original} cells); retain FFT water", options.max_cells_per_region));
             } else if selected.is_empty() {
-                warnings.push(format!("slot {slot}: FFT-only; no bed surfaces within {max_depth:.1}u of water level; full footprint {original} cells"));
+                warnings.push(if patch_radius_cells == 0 {
+                    format!("slot {slot}: FFT-only; no bed surfaces within {max_depth:.1}u of water level; full footprint {original} cells")
+                } else {
+                    format!("slot {slot}: FFT-only; oversized shallow band has no geometric bank crossings; full footprint {original} cells")
+                });
             } else {
                 bands.push(ShorelineBand {
                     slot,
                     full_tiles: tiles.len() as u32,
                     retained_tiles: selected.len() as u32,
                     max_depth,
+                    patch_radius_cells,
                 });
-                warnings.push(format!("slot {slot}: shoreline bands; {} retained tiles / {} full footprint tiles; screening depth {max_depth:.1}u plus one-tile halo", selected.len(), tiles.len()));
+                warnings.push(format!("slot {slot}: shoreline bands; {} retained tiles / {} full footprint tiles; screening depth {max_depth:.1}u; bank patch radius {patch_radius_cells} cells (0 = complete shallow band)", selected.len(), tiles.len()));
                 for (i, r) in tiles.into_iter().enumerate() {
                     if selected.contains(&i) {
                         retained.push(r.clone());

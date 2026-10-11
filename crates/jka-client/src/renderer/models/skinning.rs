@@ -492,6 +492,7 @@ impl DynamicModelRenderer {
                         })
                         .unwrap_or([0.0; 4]),
                     uv_xform: skin.uv_xform,
+                    uv_cross: skin.uv_cross,
                     spec_light: ghoul2_specular_light(skin.specular),
                     spec_viewer: ghoul2_specular_viewer(skin.specular, skin.bulge_height),
                     jiggle0: skin.jiggle_offsets[0],

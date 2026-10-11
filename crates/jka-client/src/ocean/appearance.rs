@@ -129,7 +129,7 @@ fn base_uv_scroll_velocity(mods: &[TcMod]) -> Option<[f32; 2]> {
                     m[1][0] * velocity[0] + m[1][1] * velocity[1],
                 ];
             }
-            TcMod::Rotate(_) => return None,
+            TcMod::Rotate(_) | TcMod::Stretch(_) => return None,
             TcMod::Turb { .. } => {}
         }
     }

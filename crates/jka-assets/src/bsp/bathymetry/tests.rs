@@ -139,7 +139,101 @@ fn shoreline_screening_keeps_subcell_terrain_and_rejects_over_budget_band() {
         broad.grids.is_empty(),
         "do not silently truncate an oversized shallow domain"
     );
-    assert!(broad.warnings[0].contains("bands plus halo exceed"));
+    assert!(broad.warnings[0].contains("no geometric bank crossings"));
+}
+
+#[test]
+fn oversized_shallows_keep_all_internal_bank_seeds_with_bounded_patches() {
+    let mut bank = box_solid([720., 720., -256.], [820., 820., 64.]);
+    bank.planes[4] = Plane {
+        normal: [-1., 0., 1.],
+        distance: -800.,
+    };
+    let geometry = Geometry {
+        solids: vec![box_solid([-256., -256., -256.], [2304., 2304., -16.]), bank],
+        triangles: vec![],
+        liquids: vec![],
+    };
+    let tiles = large_pool_tiles();
+    let options = Options {
+        max_cells_per_region: 4096,
+        ..Default::default()
+    };
+    let complete = geometry.bake(&tiles, options).unwrap();
+    let patch = geometry
+        .bake_shoreline_bands(&tiles, options, 38.4)
+        .unwrap();
+    let band = &patch.shoreline_bands[0];
+    assert_eq!(band.patch_radius_cells, 8);
+    assert_eq!(band.full_tiles, 64);
+    assert!(patch.grids.len() * 256 <= options.max_cells_per_region);
+    for grid in &complete.grids {
+        if grid
+            .faces_x
+            .iter()
+            .chain(&grid.faces_y)
+            .any(|f| f.boundary == Boundary::Bank)
+        {
+            let retained = patch
+                .grids
+                .iter()
+                .find(|g| g.origin == grid.origin)
+                .expect("every bank seed must survive, including internal banks");
+            for (a, b) in grid.cells.iter().zip(&retained.cells) {
+                assert_eq!(a.class, b.class);
+                assert_eq!(a.bed.to_bits(), b.bed.to_bits());
+            }
+        }
+    }
+    let decoded = Atlas::decode(&patch.encode([4, 5]), [4, 5]).unwrap();
+    assert_eq!(decoded.shoreline_bands[0].patch_radius_cells, 8);
+    let mut invalid = patch.clone();
+    invalid.shoreline_bands[0].patch_radius_cells = 33;
+    assert!(Atlas::decode(&invalid.encode([4, 5]), [4, 5]).is_err());
+    assert!(
+        !patch.grids.iter().any(|g| g.origin == [0., 0.]),
+        "offshore shallows keep FFT"
+    );
+    let mut broken = tiles.clone();
+    broken
+        .iter_mut()
+        .find(|r| r.bounds.unwrap()[0] == patch.grids[0].origin)
+        .unwrap()
+        .triangles
+        .clear();
+    let rejected = geometry
+        .bake_shoreline_bands(&broken, options, 38.4)
+        .unwrap();
+    assert!(
+        rejected.grids.is_empty() && rejected.shoreline_bands.is_empty(),
+        "a failed required patch tile rejects every patch atomically"
+    );
+}
+
+#[test]
+fn oversized_bank_patch_set_rejects_every_bank_atomically() {
+    let mut bank = box_solid([-256., -256., -256.], [2304., 2304., 256.]);
+    bank.planes[4] = Plane {
+        normal: [-0.1, -0.1, 1.0],
+        distance: -204.8,
+    };
+    let geometry = Geometry {
+        solids: vec![bank],
+        triangles: vec![],
+        liquids: vec![],
+    };
+    let atlas = geometry
+        .bake_shoreline_bands(
+            &large_pool_tiles(),
+            Options {
+                max_cells_per_region: 4096,
+                ..Default::default()
+            },
+            38.4,
+        )
+        .unwrap();
+    assert!(atlas.grids.is_empty() && atlas.shoreline_bands.is_empty());
+    assert!(atlas.warnings[0].contains("all bank-seeded patches also exceed"));
 }
 
 #[test]

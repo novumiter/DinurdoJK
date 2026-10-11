@@ -546,8 +546,8 @@ fn build_debug_view(
             .iter()
             .find(|b| b.slot as usize == ocean.index)
         {
-            lines.push(format!("Pool {} allocation: shoreline bands + halo, {} / {} footprint tiles retained; screening depth {:.1}u; offshore stays FFT.",
-                ocean.index + 1, band.retained_tiles, band.full_tiles, band.max_depth));
+            lines.push(format!("Pool {} allocation: shoreline bands + halo, {} / {} footprint tiles retained; screening depth {:.1}u; bank patch radius {} cells (0 = full shallow band); offshore stays FFT.",
+                ocean.index + 1, band.retained_tiles, band.full_tiles, band.max_depth, band.patch_radius_cells));
         }
         // Float diagnostics above the promoted wave envelope so depth testing
         // does not make the overlay disappear under FFT crests.

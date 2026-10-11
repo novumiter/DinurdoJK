@@ -14,10 +14,10 @@ impl App {
         if let Some(target) = quality_table_row(
             ui,
             "Reflection quality",
-            "Master reflection policy. Off removes authored tcGen environment stages entirely; \
-             Legacy preserves those vanilla environment-mapped stages but enables no enhanced \
-             reflection technique. Low uses reflection probes only; Medium adds temporal \
-             screen-space reflections; High adds one dynamically selected planar reflector; \
+            "Master reflection policy. Off removes optional tcGen environment stages, but keeps \
+             integral authored multistage effects (such as custom glass). Legacy preserves \
+             authored environment maps with no enhanced reflections; Low enables probes, \
+             Medium adds screen-space reflections, and High adds one dynamically selected planar reflector; \
              Ultra raises SSR quality and allows up to four planar reflectors. Changes apply \
              live, except that raising to High/Ultra or crossing Off needs the map prepared \
              again (Off specializes the material set and planar modes preserve \

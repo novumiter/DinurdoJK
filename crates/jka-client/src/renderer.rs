@@ -264,7 +264,7 @@ use world::pipelines::{WorldPassPipelineIdentity, WorldPipelinePass};
 use world::types::{
     GpuReflectionProbe, InlineModelGpu, LegacyDlightRun, PlanarReflectionResources,
     PlanarReflectionView, PlanarReflector, PlanarReflectorKind, ReflectionProbeGpuSet,
-    RuntimeOceanClipmap,
+    RuntimeOceanClipmap, OceanPromotionDecision,
     StaticLightGridGpu, UniformArena, UniformSlot, VoxelProbeGiGpu, WorldBatch, WorldBatchSet,
     WorldAnimationFrame, WorldBatchAnimation,
     WorldDrawGroup, WorldGpu, WorldPipelineCompilePlan, WorldPipelineVariant,

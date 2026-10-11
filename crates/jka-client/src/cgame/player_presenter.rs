@@ -21,9 +21,9 @@ mod surface_materials;
 mod vehicles;
 mod view;
 #[cfg(test)]
-use assets::loading::{material_layers, resolved_stage};
+use assets::loading::{material_layers, resolved_stage, stage_uv_xform};
 use assets::loading::{
-    specular_alpha, stage_uv_xform, wave_value, ModelLoadShared, ModelResolution, StageFrame,
+    specular_alpha, stage_uv_affine, wave_value, ModelLoadShared, ModelResolution, StageFrame,
 };
 use assets::types::{
     fpls_mode3_surface_hidden, Ghoul2GpuMeshSource, PlayerModelAsset, PlayerSurfaceAsset,

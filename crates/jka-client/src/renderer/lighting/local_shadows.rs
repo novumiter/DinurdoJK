@@ -272,14 +272,14 @@ impl Renderer {
                             continue;
                         }
                         match batch.source.pipeline.class {
-                            DrawClass::Opaque if batch.source.alpha_cutoff <= 0.0 => {
+                            DrawClass::Opaque if batch.source.alpha_cutoff == 0.0 => {
                                 if mask_pipeline_active {
                                     pass.set_pipeline(&self.shadow_resources.pipeline);
                                     mask_pipeline_active = false;
                                 }
                                 draw_world_batch(&mut pass, batch, 0..1, None);
                             }
-                            DrawClass::Mask if batch.source.alpha_cutoff > 0.0 => {
+                            DrawClass::Mask if batch.source.alpha_cutoff != 0.0 => {
                                 if !mask_pipeline_active {
                                     pass.set_pipeline(&self.shadow_resources.mask_pipeline);
                                     mask_pipeline_active = true;

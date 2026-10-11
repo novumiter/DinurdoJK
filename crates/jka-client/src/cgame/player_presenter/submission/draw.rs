@@ -1,7 +1,7 @@
 //! Submission draw.
 use crate::cgame::player_presenter::{
     blend_for_alpha, gpu_bones_from_pose, skin_glm_surface, skin_surface_timed, specular_alpha,
-    stage_uv_xform, wave_value, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode,
+    stage_uv_affine, wave_value, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuSkinning,
     Ghoul2SkinnedSurface, Ghoul2SkinningMode, GlaAnimation, GlmModel, HashMap, HashSet, Instant,
     JiggleProfile, Matrix3x4, PlayerPresenter, PlayerSurfaceAsset, ResolvedStage, StageFrame,
@@ -284,7 +284,7 @@ impl PlayerPresenter {
                                 overlay_at,
                                 asset,
                                 rgba[3],
-                                stage_seconds - asset.shader_time_offset,
+                                jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time),
                                 &stage_frame,
                             );
                         }
@@ -316,6 +316,7 @@ impl PlayerPresenter {
                         origin,
                         color: surface_rgba,
                         uv_xform: [1.0, 1.0, 0.0, 0.0],
+                        uv_cross: [0.0; 4],
                         specular: None,
                         bulge_height: 0.0,
                         env_map: false,
@@ -341,7 +342,7 @@ impl PlayerPresenter {
                         overlay_at,
                         asset,
                         rgba[3],
-                        stage_seconds - asset.shader_time_offset,
+                        jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time),
                         &stage_frame,
                     );
                 }
@@ -469,7 +470,7 @@ impl PlayerPresenter {
                     overlay_at,
                     asset,
                     rgba[3],
-                    stage_seconds - asset.shader_time_offset,
+                    jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time),
                     &stage_frame,
                 );
             }
@@ -541,7 +542,9 @@ impl PlayerPresenter {
             rgb.unwrap_or(stage.rgb[2]),
             alpha * generated_alpha,
         ];
-        let xform = stage_uv_xform(&stage.tc_mods, seconds);
+        let affine = stage_uv_affine(&stage.tc_mods, seconds);
+        let xform = [affine[0], affine[3], affine[4], affine[5]];
+        let cross = [affine[2], affine[1], 0.0, 0.0];
         let specular = frame.specular_points().filter(|_| stage.specular_alpha);
         if stage.specular_alpha && specular.is_none() {
             // No viewer (asset preview): a constant mid glint instead of none.
@@ -553,6 +556,7 @@ impl PlayerPresenter {
         if let Some(skin) = surface.ghoul2_gpu.as_mut() {
             skin.color = color;
             skin.uv_xform = xform;
+            skin.uv_cross = cross;
             skin.specular = specular;
         } else {
             surface.vertices = Arc::new(
@@ -567,8 +571,8 @@ impl PlayerPresenter {
                         }
                         DynamicModelVertex {
                             uv: [
-                                vertex.uv[0] * xform[0] + xform[2],
-                                vertex.uv[1] * xform[1] + xform[3],
+                                vertex.uv[0] * xform[0] + vertex.uv[1] * cross[0] + xform[2],
+                                vertex.uv[0] * cross[1] + vertex.uv[1] * xform[1] + xform[3],
                             ],
                             color,
                             ..*vertex
@@ -631,7 +635,7 @@ impl PlayerPresenter {
         texture: Option<Arc<TextureData>>,
         alpha_mode: DynamicModelAlphaMode,
         color: [f32; 4],
-        uv_xform: Option<[f32; 4]>,
+        uv_xform: Option<[f32; 6]>,
         bulge_height: Option<f32>,
         env_map: Option<bool>,
     ) -> DynamicModelSurface {
@@ -643,7 +647,8 @@ impl PlayerPresenter {
             axis: skin.axis,
             origin: skin.origin,
             color,
-            uv_xform: uv_xform.unwrap_or(skin.uv_xform),
+            uv_xform: uv_xform.map_or(skin.uv_xform, |m| [m[0], m[3], m[4], m[5]]),
+            uv_cross: uv_xform.map_or(skin.uv_cross, |m| [m[2], m[1], 0.0, 0.0]),
             specular: skin.specular,
             bulge_height: bulge_height.unwrap_or(skin.bulge_height),
             env_map: env_map.unwrap_or(skin.env_map),
@@ -661,9 +666,9 @@ impl PlayerPresenter {
                     .iter()
                     .map(|vertex| DynamicModelVertex {
                         uv: match uv_xform {
-                            Some(xform) => [
-                                vertex.uv[0] * xform[0] + xform[2],
-                                vertex.uv[1] * xform[1] + xform[3],
+                            Some(m) => [
+                                vertex.uv[0] * m[0] + vertex.uv[1] * m[2] + m[4],
+                                vertex.uv[0] * m[1] + vertex.uv[1] * m[3] + m[5],
                             ],
                             None => vertex.uv,
                         },
@@ -689,5 +694,18 @@ impl PlayerPresenter {
             texture,
             alpha_mode,
         }
+    }
+}
+
+#[cfg(test)]
+mod shader_time_tests {
+    use jka_assets::shader::shader_time as shader_stage_time;
+
+    #[test]
+    fn ghoul2_clamptime_matches_taystjk_after_remap_offset() {
+        assert_eq!(shader_stage_time(9.0, 2.0, Some(3.0)), 3.0);
+        assert_eq!(shader_stage_time(4.0, 2.0, Some(3.0)), 2.0);
+        assert_eq!(shader_stage_time(9.0, 2.0, None), 7.0);
+        assert_eq!(shader_stage_time(1.0, 2.0, Some(3.0)), -1.0);
     }
 }

@@ -1598,14 +1598,20 @@ pub(in crate::app) fn generic_timer_bar(
     const BAR_X: f32 = 640.0 - BAR_W - 120.0;
     const BAR_Y: f32 = 480.0 - BAR_H - 20.0;
     let material = || FxMaterial {
+        animation: None,
         texture: None,
         blend: FxBlend::Alpha,
         rgb_vertex: true,
         alpha_vertex: true,
         rgb_const: [1.0; 3],
         alpha_const: 1.0,
+        rgb_wave: None,
+        alpha_wave: None,
+        rgb_one_minus_vertex: false,
+        alpha_one_minus_vertex: false,
         tc_mods: Vec::new(),
         shader_time_offset: 0.0,
+        shader_clamp_time: None,
         authored_glow: false,
     };
     let mut rect = |rect: [f32; 4], color: [f32; 4]| {

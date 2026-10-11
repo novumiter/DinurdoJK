@@ -6,13 +6,14 @@ use crate::scene::{
     map_asset_name, map_chunk_key, map_dynamic_lights, map_portal_surface_anchors,
     map_spawn_points, map_world_effect_registrations, map_world_lighting,
     map_worldspawn_distance_cull, mark_surfaces_from_batches,
-    material_debug_info, material_uv_size, materials, planar_group_key, prepare,
+    material_debug_info, material_has_promotable_environment_stage, material_uv_size,
+    materials, planar_group_key, prepare,
     prepare_with_jobs_options, prepared_stages, push_face_triangles, reconstruct_source_brushes,
     render_position, retain_authored_planar_mirrors, shader_is_render_utility,
     source_collision_brush, stage_batch, Arc, AssetSearchPath, BTreeMap, BTreeSet, DVec3,
     DrawClass, Instant, MapDocument, MapFileStats, MapGeometry, MapGroupKey, MapJobPool,
     MapLoadTimings, MapMaterial, MapPrepareOptions, MapSource, Path, PrepStageKeys, PreparedMap,
-    PreparedPortalDrawPlan, SpawnPoint, TcGen, Textures, MAX_MAP_FILE_BYTES,
+    PreparedPortalDrawPlan, SpawnPoint, Textures, MAX_MAP_FILE_BYTES,
 };
 
 pub fn prepare_source(
@@ -396,11 +397,8 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
             }
 
             let class = class_for(&map_material.material);
-            let has_environment_stage = map_material
-                .material
-                .stages
-                .iter()
-                .any(|stage| matches!(stage.tc_gen, TcGen::Environment));
+            let has_environment_stage =
+                material_has_promotable_environment_stage(&map_material.material);
             let planar_candidate = options.planar_reflections
                 && class != DrawClass::Transparent
                 && (map_material.material.planar_reflection

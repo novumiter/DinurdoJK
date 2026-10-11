@@ -83,7 +83,7 @@ struct VsOut {
 }
 fn texcoords(input: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = input;
-    let time = camera.viewport_time.z;
+    let time = min(camera.viewport_time.z, select(3.402823e38, stage.wave_funcs.z, stage.wave_funcs.z > 0.0));
     for (var i = 0u; i < 4u; i = i + 1u) {
         let tc = stage.tc[i];
         if (tc.x == 1.0) { uv += tc.yz * time; }
@@ -100,6 +100,13 @@ fn texcoords(input: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
             let p = stage.tc_extra[i];
             uv = vec2(uv.x * tc.y + uv.y * tc.z + p.z,
                       uv.x * p.x + uv.y * p.y + p.w);
+        }
+        if (tc.x == 6.0) {
+            let p = stage.tc_extra[i];
+            let value = wave_value(u32(tc.w + 0.5), vec4(tc.y, tc.z, p.x, p.y), time);
+            if (abs(value) > 1.0e-6) {
+                uv = (uv - vec2<f32>(0.5)) / value + vec2<f32>(0.5);
+            }
         }
         if (tc.x == 5.0) {
             let p = stage.tc_extra[i];
@@ -154,18 +161,19 @@ fn openjk_global_fog_alpha(forward_normalized: f32) -> f32 {
     if (stage.rgb.w == 1.0) { rgb *= v.facing; }
     if (stage.rgb.w == 2.0) { rgb *= 1.0 - v.facing; }
     if (stage.rgb.w == 3.0) { rgb *= stage.rgb.rgb; }
-    if (stage.rgb.w == 4.0) { rgb *= clamp(wave_value(u32(stage.wave_funcs.x), stage.rgb_wave, camera.viewport_time.z), 0.0, 1.0); }
+    if (stage.rgb.w == 4.0) { rgb *= clamp(wave_value(u32(stage.wave_funcs.x), stage.rgb_wave, min(camera.viewport_time.z, select(3.402823e38, stage.wave_funcs.z, stage.wave_funcs.z > 0.0))), 0.0, 1.0); }
     if (stage.rgb.w == 5.0) { rgb = vec3<f32>(0.0); } // worldEntity CGEN_LIGHTING_DIFFUSE
     var alpha = texel.a * stage.alpha.x;
     if (stage.alpha.z == 1.0) { alpha *= v.facing; }
     if (stage.alpha.z == 2.0) { alpha *= 1.0 - v.facing; }
     if (stage.alpha.z == 3.0) { alpha *= clamp(v.distance / max(stage.fade_control.z, 0.001), 0.0, 1.0); }
-    if (stage.alpha.z == 4.0) { alpha *= clamp(wave_value(u32(stage.wave_funcs.y), stage.alpha_wave, camera.viewport_time.z), 0.0, 1.0); }
+    if (stage.alpha.z == 4.0) { alpha *= clamp(wave_value(u32(stage.wave_funcs.y), stage.alpha_wave, min(camera.viewport_time.z, select(3.402823e38, stage.wave_funcs.z, stage.wave_funcs.z > 0.0))), 0.0, 1.0); }
     if (stage.alpha.w > 0.5) {
         let r = length(v.uv * 2.0 - vec2(1.0));
         alpha *= 1.0 - smoothstep(0.12, 1.0, r);
     }
-    if (alpha < stage.alpha.y) { discard; }
+    if ((stage.alpha.y > 0.0 && alpha < stage.alpha.y)
+        || (stage.alpha.y < 0.0 && alpha >= -stage.alpha.y)) { discard; }
     // Match the BSP legacy fog implementation rather than inventing an
     // exponential approximation: OpenJK fog texture for mode 1; EXP2 for
     // global mode 2; authored local brush fog uses the established linear ramp.

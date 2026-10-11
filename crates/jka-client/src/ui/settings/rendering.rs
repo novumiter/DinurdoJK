@@ -1080,8 +1080,9 @@ impl ReflectionQuality {
         }
     }
 
-    /// Runtime reflection-technique tier. Off is the explicit compatibility-breaking
-    /// "strip reflections" mode. Legacy preserves authored JKA reflection behavior
+    /// Runtime reflection-technique tier. Off strips standalone authored environment
+    /// stages, but preserves integral multistage effects needed for visible materials.
+    /// Legacy preserves all authored JKA reflection behavior
     /// (tcGen environment stages and portal mirrors) without promoting arbitrary
     /// environment-mapped surfaces into enhanced planar reflections.
     pub fn shader_value(self) -> u32 {

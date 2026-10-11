@@ -12,7 +12,8 @@ use crate::scene::{
     generate_grass_chunk, grass_fingerprint, grass_ground_albedo_tint, grass_lightmap_sources,
     grass_local_fog_slots, hdr_lightmap_indexed, load_external_lightmap,
     load_legacy_footprint_marks, load_movement, load_reflection_probes, log_reflection_cache,
-    map_asset_name, map_content_hash, material_debug_info, material_render_is_guaranteed_discarded,
+    map_asset_name, map_content_hash, material_debug_info, material_has_promotable_environment_stage,
+    material_render_is_guaranteed_discarded,
     materials, neutral_deluxemap, order_pvs_pieces, phase_lap, planar_group_key,
     prepare_static_light_grid, pvs_signature, render_position, resolved_bsp_surface_fog,
     retain_authored_planar_mirrors, static_bsp_ao_cache_info, try_load_external_deluxemap,
@@ -21,7 +22,7 @@ use crate::scene::{
     WorldFlare,
     Instant, LegacyDlightSurface, MapJobPool, MapLoadTimings, MapPrepareOptions, Path,
     PrepStageKeys, PreparedMap, PreparedPortalDrawPlan, SourceMapLighting, SpawnPoint,
-    StageFingerprint, SurfaceKind, SurfaceMaterial, Task, TcGen, TextureData, Textures, Vec3,
+    StageFingerprint, SurfaceKind, SurfaceMaterial, Task, TextureData, Textures, Vec3,
     WorldGeometryChunk, LIGHTMAP_BY_VERTEX, MAX_FILE_BYTES,
 };
 
@@ -847,10 +848,7 @@ pub(in crate::scene) fn prepare_internal(
             }
         }
 
-        let has_environment_stage = material
-            .stages
-            .iter()
-            .any(|stage| matches!(stage.tc_gen, TcGen::Environment));
+        let has_environment_stage = material_has_promotable_environment_stage(material);
         let planar_group = if options.planar_environment
             && has_environment_stage
             && class != DrawClass::Transparent
@@ -1087,29 +1085,26 @@ pub(in crate::scene) fn prepare_internal(
                 coarse_area_signature[word] |= area_signature[word];
             }
 
-            // FULL/AUTO normally split a MINIMAL batch by exact PVS signature.
-            // Do not do that for sky: the authored BSP sky polygons are the
-            // screen-space admission mask for the skybox, so removing only one
-            // PVS piece can cut a rectangular hole through an otherwise visible
-            // sky. MINIMAL already has the correct conservative behavior: if any
-            // constituent sky surface is visible, submit the whole coarse sky
-            // geometry. Build FULL/AUTO the same way for this domain, with the
-            // ORed signature emitted below after every piece has contributed.
-            if !material.sky {
-                append_material_batches(
-                    &mut pvs_batches,
-                    material,
-                    key.shader,
-                    material_debug_index,
-                    key.vertex_lit,
-                    piece_start..piece_end,
-                    key.lightmap,
-                    &signature,
-                    area_signature,
-                    fog,
-                    fog_is_global,
-                );
-            }
+            // FULL/AUTO must preserve the *exact* BSP PVS membership of sky
+            // polygons too. A merged sky batch is only conservatively visible:
+            // one nearby sky polygon would otherwise admit all polygons using
+            // the same shader, including other disconnected parts of the map.
+            // This is especially wrong in misc_skyportal's second camera view.
+            // OpenJK clips the sky from visible BSP surfaces, not the union of
+            // every surface that happens to share a material.
+            append_material_batches(
+                &mut pvs_batches,
+                material,
+                key.shader,
+                material_debug_index,
+                key.vertex_lit,
+                piece_start..piece_end,
+                key.lightmap,
+                &signature,
+                area_signature,
+                fog,
+                fog_is_global,
+            );
         }
 
         let coarse_end =
@@ -1135,21 +1130,6 @@ pub(in crate::scene) fn prepare_internal(
             fog,
             fog_is_global,
         );
-        if material.sky {
-            append_material_batches(
-                &mut pvs_batches,
-                material,
-                key.shader,
-                material_debug_index,
-                key.vertex_lit,
-                coarse_start..coarse_end,
-                key.lightmap,
-                &coarse_signature,
-                coarse_area_signature,
-                fog,
-                fog_is_global,
-            );
-        }
     }
     load_timings.geometry_detail_ms = [
         dlight_surfaces_ms,
@@ -1774,6 +1754,7 @@ pub(in crate::scene) fn prepare_internal(
         let surface = &bsp.surfaces[surface_id];
         let flare = surface.flare?;
         Some(WorldFlare {
+            shader_clamp_time: surface_materials[surface.shader].clamp_time,
             surface_id: surface_id as u32,
             origin: flare.origin,
             normal: flare.normal,

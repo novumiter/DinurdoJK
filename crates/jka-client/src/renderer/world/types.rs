@@ -7,6 +7,20 @@ use crate::renderer::{
     StaticAoWorldSource, SurfaceSpriteEffectGpu, TextureData, Vec3, WorldShaderVariantKey,
 };
 
+/// Map-load decision for a connected coplanar water footprint. The exact same
+/// sorted footprints and keys drive both ocean ownership and Trace diagnostics.
+/// Retaining only candidates avoids duplicating the BSP or water geometry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::renderer) struct OceanPromotionDecision {
+    /// One-based rank after sorting all connected footprints by triangle area.
+    pub(in crate::renderer) rank: usize,
+    pub(in crate::renderer) total: usize,
+    pub(in crate::renderer) area: f32,
+    pub(in crate::renderer) faces: usize,
+    /// A missing slot means this valid candidate lost the eight-slot selection.
+    pub(in crate::renderer) slot: Option<u8>,
+}
+
 #[derive(Clone)]
 pub(in crate::renderer) struct LegacyDlightRun {
     pub(in crate::renderer) surface_id: u32,
@@ -351,6 +365,11 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) primary_skybox: Option<[usize; 6]>,
     /// Distinct promoted water planes/footprints; also drives Godot-style spray placement.
     pub(in crate::renderer) ocean_surfaces: Vec<crate::ocean::OceanSurface>,
+    /// Whether FFT clipmaps were prepared when the map was loaded.
+    pub(in crate::renderer) ocean_meshes_built: bool,
+    /// All eligible faces (including candidates rejected by the surface cap).
+    /// Keys are the same face keys used by the actual promotion pass.
+    pub(in crate::renderer) ocean_promotion_decisions: BTreeMap<[u32; 6], OceanPromotionDecision>,
     pub(in crate::renderer) promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     /// Real outlines of `ocean_surfaces`, by the slot baked into each clipmap.
     pub(in crate::renderer) ocean_masks: Arc<crate::ocean::OceanMasks>,
@@ -462,6 +481,9 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) auto4_inline_full_start: usize,
     pub(in crate::renderer) auto4_collapse_cache: Auto4CollapseCache,
     pub(in crate::renderer) coarse_all_batches: Vec<usize>,
+    /// OFF/invalid-cluster fallback for the sky-portal camera. Its draw path
+    /// must use FULL geometry rather than reintroducing whole-map sky unions.
+    pub(in crate::renderer) full_all_batches: Vec<usize>,
     pub(in crate::renderer) last_cluster: Option<Option<usize>>,
     pub(in crate::renderer) textures: Vec<GpuImage>,
     pub(in crate::renderer) footprint_mark_textures: [Option<usize>; 2],

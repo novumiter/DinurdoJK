@@ -597,7 +597,8 @@ pub(in crate::renderer) fn advance_world_animations(world: &mut WorldGpu, shader
     for batch in world.coarse_batches.iter_mut().chain(world.full_batches.iter_mut()) {
         let Some(animation) = batch.animation.as_mut() else { continue };
         let Some(definition) = batch.source.animation.as_ref() else { continue };
-        let selected = definition.frame_index(shader_time - batch.source.shader_time_offset);
+        let time = jka_assets::shader::shader_time(shader_time, batch.source.shader_time_offset, batch.source.shader_clamp_time);
+        let selected = definition.frame_index(time);
         if animation.selected == selected { continue; }
         let frame = &animation.frames[selected];
         batch.bind_group = frame.full.clone();

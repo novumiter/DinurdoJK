@@ -184,6 +184,7 @@ impl PlayerPresenter {
                         origin: skin.origin,
                         color,
                         uv_xform: [1.0, 1.0, 0.0, 0.0],
+                        uv_cross: [0.0; 4],
                         specular: None,
                         bulge_height: 0.0,
                         env_map: false,

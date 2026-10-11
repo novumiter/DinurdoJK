@@ -109,6 +109,10 @@ fn stage_uniform(stage: &materials::MaterialStage, fallback: bool, portal_alpha:
                 result.tc_extra[slot] = [base, amplitude, phase, frequency];
                 [5.0, 0.0, 0.0, 0.0]
             }
+            TcMod::Stretch(wave) => {
+                result.tc_extra[slot] = [wave.phase, wave.frequency, 0.0, 0.0];
+                [6.0, wave.base, wave.amplitude, wave.func.id() as f32]
+            }
         };
     }
     result
@@ -288,7 +292,11 @@ impl WorldFlareRenderer {
                 };
                 let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("RBSP flare stage uniform"),
-                    contents: bytemuck::bytes_of(&stage_uniform(stage, fallback, portal_alpha)),
+                    contents: bytemuck::bytes_of(&{
+                        let mut uniform = stage_uniform(stage, fallback, portal_alpha);
+                        uniform.wave_funcs[2] = flare.shader_clamp_time.unwrap_or(0.0);
+                        uniform
+                    }),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {

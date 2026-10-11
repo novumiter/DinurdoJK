@@ -1,3 +1,20 @@
+// TaystJK RB_CalcStretchTexCoords: reciprocal waveform scaled about (0.5, 0.5).
+// Only evaluated for kind 6 (tcMod stretch).
+fn tc_stretch_wave(kind: u32, phase: f32) -> f32 {
+    let x = fract(phase);
+    if (kind == 0u) { return sin(x * 6.28318530718); }
+    if (kind == 1u) { return select(select(2.0 - 4.0*x, 4.0*x - 4.0, x >= 0.75), 4.0*x, x < 0.25); }
+    if (kind == 2u) { return select(-1.0, 1.0, x < 0.5); }
+    if (kind == 3u) { return x; }
+    if (kind == 4u) { return 1.0 - x; }
+    // Stable noise approximation for GF_NOISE, where the reference uses a LUT.
+    let n0 = floor(phase);
+    let t = fract(phase);
+    let a = fract(sin(n0 * 127.1) * 43758.5453) * 2.0 - 1.0;
+    let b = fract(sin((n0 + 1.0) * 127.1) * 43758.5453) * 2.0 - 1.0;
+    return mix(a, b, t*t*(3.0 - 2.0*t));
+}
+
 struct Camera {
     view_proj: mat4x4<f32>,
     camera_pos_time: vec4<f32>,
@@ -97,9 +114,16 @@ fn wave_value(func: u32, p: vec4<f32>, time: f32) -> f32 {
     return p.x + v * p.y;
 }
 
+// JaPro: subtract the remap offset, then apply a positive clampTime.
+// vector_t.w is reserved for the limit; zero leaves the clock unbounded.
+fn shader_stage_time() -> f32 {
+    let elapsed = camera.camera_pos_time.w - material.params.w;
+    return select(elapsed, min(elapsed, material.vector_t.w), material.vector_t.w > 0.0);
+}
+
 fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
-    let time = (camera.camera_pos_time.w - material.params.w);
+    let time = shader_stage_time();
     if ((material.header.z & 134217728u) != 0u) {
         let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
         out = vec4<f32>(vec3<f32>(g), out.a);
@@ -119,7 +143,7 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
 // using UV there aliases badly on any surface that tiles many times.
 fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
     var uv = base_uv;
-    let time = (camera.camera_pos_time.w - material.params.w);
+    let time = shader_stage_time();
     for (var i = 0u; i < 4u; i = i + 1u) {
         if (i >= material.header.y) {
             break;
@@ -145,6 +169,12 @@ fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
                 uv.x * a.y + uv.y * a.z + a.w,
                 uv.x * b.x + uv.y * b.y + b.z
             );
+        }
+        if (kind == 6u) {
+            let value = a.y + a.z * tc_stretch_wave(u32(b.y + 0.5), select(a.w + time*b.x, (time+a.w)*b.x, u32(b.y + 0.5) == 5u));
+            if (abs(value) > 1.0e-6) {
+                uv = (uv - vec2<f32>(0.5)) / value + vec2<f32>(0.5);
+            }
         }
         if (kind == 5u) {
             let now = a.w + time * b.x;
@@ -310,7 +340,7 @@ fn autosprite2_input(original: VertexIn) -> VertexIn {
     }
 
     var base = source_sample * stage_color;
-    if (material.params.x > 0.0 && base.a < material.params.x) {
+    if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
         discard;
     }
 
@@ -394,7 +424,7 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     }
     stage_color = apply_wave_gens(stage_color);
     let base = textureSample(base_texture, base_sampler, uv) * stage_color;
-    if (material.params.x > 0.0 && base.a < material.params.x) {
+    if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
         discard;
     }
     return base;

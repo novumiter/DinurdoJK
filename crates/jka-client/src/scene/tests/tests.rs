@@ -309,6 +309,11 @@ fn one_zero_world_base_is_opaque_and_seeds_depth() {
         !later.depth_write,
         "only a replacement base gets implicit depthWrite"
     );
+    let mut reverse_mask = stage.clone();
+    reverse_mask.alpha_cutoff = -0.5;
+    assert_eq!(stage_class(&reverse_mask), DrawClass::Mask);
+    assert_eq!(stage_pipeline(&material, &reverse_mask, true).class, DrawClass::Mask);
+    assert!(stage_pipeline(&material, &reverse_mask, true).depth_write);
 }
 
 fn sun_test_grid(cells: Vec<ClassicLightGridCell>) -> ClassicEntityLightGrid {
@@ -1527,4 +1532,109 @@ fn runtime_stage_collapse_keeps_other_geometry_and_followup_stages() {
     assert_eq!(derived[0].vertices, 0..3);
     assert_eq!(derived[1].vertices, 3..6);
     assert_eq!(derived[2].vertices, 3..6);
+}
+
+fn reflection_test_stage(texture: usize, tc_gen: TcGen, blend: Option<materials::BlendFunc>) -> MaterialStage {
+    MaterialStage {
+        texture: StageTexture::Image(texture),
+        animation: None,
+        enhancements: Default::default(),
+        blend,
+        alpha_cutoff: 0.0,
+        opacity: 1.0,
+        color: [1.0; 3],
+        rgb_gen: RgbGen::Identity,
+        alpha_gen: AlphaGen::Identity,
+        tc_gen,
+        tc_mods: Vec::new(),
+        depth_write: false,
+        depth_equal: false,
+        glow: false,
+    }
+}
+
+#[test]
+fn composed_glass_environment_keeps_authored_stage_at_ultra() {
+    // Exact blend topology of textures/common/glass_no_tess.
+    let base = reflection_test_stage(7, TcGen::Base, Some(materials::BlendFunc {
+        src: BlendFactor::Zero, dst: BlendFactor::OneMinusSrcColor,
+    }));
+    let env = reflection_test_stage(7, TcGen::Environment, Some(materials::BlendFunc {
+        src: BlendFactor::One, dst: BlendFactor::One,
+    }));
+    let material = SurfaceMaterial {
+        explicit: true,
+        stages: vec![base.clone(), env.clone()],
+        ..Default::default()
+    };
+    assert!(authored_environment_composite(&material, &env));
+    assert!(!material_has_promotable_environment_stage(&material));
+    let env_batch = stage_batch(&material, &env, false, true, 0..6, Some(281),
+        None, None, &[], [0; 4], [0.0; 4], false);
+    assert!(env_batch.authored_environment_composite);
+    assert!(!env_batch.planar_environment_candidate);
+    let mut unguarded = env_batch.clone();
+    unguarded.authored_environment_composite = false;
+    assert!(!crate::scene::visibility::draw_batches_share_state(&env_batch, &unguarded),
+        "one GPU uniform must not represent materials with different environment guards");
+    let base_batch = stage_batch(&material, &base, true, true, 0..6, Some(281),
+        None, None, &[], [0; 4], [0.0; 4], false);
+    assert!(base_batch.authored_environment_composite);
+
+    // Interdependent framebuffer blending matters even if the images differ.
+    let mut different_images = material.clone();
+    different_images.stages[0].texture = StageTexture::Image(42);
+    assert!(authored_environment_composite(&different_images, &env));
+}
+
+#[test]
+fn ordinary_environment_maps_and_authored_portals_remain_eligible() {
+    let base = reflection_test_stage(5, TcGen::Base, None);
+    let env = reflection_test_stage(9, TcGen::Environment, Some(materials::BlendFunc {
+        src: BlendFactor::One, dst: BlendFactor::One,
+    }));
+    let material = SurfaceMaterial {
+        explicit: true,
+        stages: vec![base, env.clone()],
+        ..Default::default()
+    };
+    assert!(!authored_environment_composite(&material, &env));
+    assert!(material_has_promotable_environment_stage(&material));
+    let env_batch = stage_batch(&material, &env, false, false, 0..6, None,
+        None, None, &[], [0; 4], [0.0; 4], false);
+    assert!(!env_batch.authored_environment_composite);
+    assert!(env_batch.planar_environment_candidate);
+
+    let one_stage = SurfaceMaterial { stages: vec![env.clone()], ..material.clone() };
+    assert!(material_has_promotable_environment_stage(&one_stage));
+    let portal = SurfaceMaterial { planar_reflection: true, ..material };
+    assert!(!authored_environment_composite(&portal, &env));
+}
+
+#[test]
+fn lightmapped_floor_environment_overlay_remains_promotable() {
+    let mut lightmap = reflection_test_stage(0, TcGen::Lightmap, None);
+    lightmap.texture = StageTexture::Lightmap;
+    let diffuse = reflection_test_stage(5, TcGen::Base, Some(materials::BlendFunc {
+        src: BlendFactor::DstColor, dst: BlendFactor::Zero,
+    }));
+    let env = reflection_test_stage(9, TcGen::Environment, Some(materials::BlendFunc {
+        src: BlendFactor::One, dst: BlendFactor::One,
+    }));
+    let material = SurfaceMaterial { explicit: true, stages: vec![lightmap, diffuse, env.clone()], ..Default::default() };
+    assert!(!authored_environment_composite(&material, &env));
+    assert!(material_has_promotable_environment_stage(&material));
+}
+
+#[test]
+fn multiple_environment_layers_remain_an_authored_effect() {
+    let first = reflection_test_stage(5, TcGen::Environment, Some(materials::BlendFunc {
+        src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+    }));
+    let second = reflection_test_stage(9, TcGen::Environment, Some(materials::BlendFunc {
+        src: BlendFactor::One, dst: BlendFactor::One,
+    }));
+    let material = SurfaceMaterial { explicit: true, stages: vec![first.clone(), second], ..Default::default() };
+    assert!(authored_environment_composite(&material, &first));
+    assert!(!material_has_promotable_environment_stage(&material));
 }

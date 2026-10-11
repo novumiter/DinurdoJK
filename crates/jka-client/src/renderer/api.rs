@@ -234,6 +234,8 @@ pub struct Ghoul2GpuSkinning {
     pub color: [f32; 4],
     /// Texture-coordinate transform `uv * xy + zw`; [1, 1, 0, 0] is identity.
     pub uv_xform: [f32; 4],
+    /// Off-diagonal UV coefficients; zero on the ordinary fast path.
+    pub uv_cross: [f32; 4],
     /// `alphaGen lightingSpecular`: JKA world-space (light, viewer) points. The
     /// shader multiplies the draw alpha by q3's `(R.V)^4` specular term.
     pub specular: Option<([f32; 3], [f32; 3])>,

@@ -23,6 +23,7 @@ impl Atlas {
                 out.extend(v.to_le_bytes());
             }
             out.extend(band.max_depth.to_le_bytes());
+            out.extend(band.patch_radius_cells.to_le_bytes());
         }
         for warning in &self.warnings {
             out.extend((warning.len() as u32).to_le_bytes());
@@ -100,11 +101,13 @@ impl Atlas {
                 full_tiles: reader.u32()?,
                 retained_tiles: reader.u32()?,
                 max_depth: reader.f32()?,
+                patch_radius_cells: reader.u32()?,
             };
             if band.retained_tiles == 0
                 || band.retained_tiles > band.full_tiles
                 || !band.max_depth.is_finite()
                 || band.max_depth <= 0.0
+                || band.patch_radius_cells > 32
                 || atlas.shoreline_bands.iter().any(|b| b.slot == band.slot)
             {
                 return Err(fail());

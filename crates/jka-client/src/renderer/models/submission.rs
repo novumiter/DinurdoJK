@@ -1,7 +1,37 @@
 //! Ordered submission runs. Filtering happens before merging so excluded
 //! entities and glow stages cannot be pulled back into a combined range.
-use crate::renderer::{DynamicPreparedDraw, FxGpuSpritePreparedDraw};
+use crate::renderer::{DynamicPreparedDraw, FxGpuSpritePreparedDraw, DynamicModelAlphaMode,
+    dynamic_model_writes_depth, DYNAMIC_MODEL_ALPHA_ORDER};
 use std::ops::Range;
+
+pub(in crate::renderer) fn compositing_requires_order(mode: DynamicModelAlphaMode) -> bool {
+    matches!(mode, DynamicModelAlphaMode::Modulate | DynamicModelAlphaMode::Modulate2x
+        | DynamicModelAlphaMode::DstColorAdd | DynamicModelAlphaMode::Darken)
+}
+
+/// Framebuffer filters do not commute with additive/alpha passes. Preserve
+/// their submission sequence, batching only consecutive modes. Other draws
+/// retain the existing mode grouping and bundle path without allocating.
+pub(in crate::renderer) fn model_phase_runs(
+    modes: impl Iterator<Item = DynamicModelAlphaMode>,
+    preserve_order: bool,
+    depth_writing_phase: bool,
+) -> impl Iterator<Item = (DynamicModelAlphaMode, Range<usize>)> {
+    let mut grouped = DYNAMIC_MODEL_ALPHA_ORDER.into_iter();
+    let mut ordered = modes.enumerate().peekable();
+    std::iter::from_fn(move || {
+        if !preserve_order {
+            return grouped.find(|mode| dynamic_model_writes_depth(*mode) == depth_writing_phase)
+                .map(|mode| (mode, 0..usize::MAX));
+        }
+        let (start, mode) = ordered.find(|(_, mode)| dynamic_model_writes_depth(*mode) == depth_writing_phase)?;
+        let mut end = start + 1;
+        while ordered.peek().is_some_and(|(_, next)| *next == mode) {
+            end = ordered.next().unwrap().0 + 1;
+        }
+        Some((mode, start..end))
+    })
+}
 
 /// Capture-only API calls in draw_phase, including repeated secondary/glow views.
 /// Does not include wireframe, shadow helpers, or compute skinning commands.
@@ -77,6 +107,18 @@ pub(in crate::renderer) fn fx_runs<'a>(
 mod tests {
     use super::*;
     use crate::renderer::{DynamicModelAlphaMode, DynamicWireframeClass};
+
+    #[test]
+    fn framebuffer_filters_keep_their_position_between_additive_passes() {
+        use DynamicModelAlphaMode::{Opaque, Modulate2x, AdditiveOne};
+        let modes = [Opaque, AdditiveOne, Modulate2x, AdditiveOne, AdditiveOne];
+        let runs: Vec<_> = model_phase_runs(modes.into_iter(), true, false).collect();
+        assert_eq!(runs, [(AdditiveOne, 1..2), (Modulate2x, 2..3), (AdditiveOne, 3..5)]);
+        let reversed = [Opaque, Modulate2x, AdditiveOne];
+        assert_eq!(model_phase_runs(reversed.into_iter(), true, false).collect::<Vec<_>>(),
+            [(Modulate2x, 1..2), (AdditiveOne, 2..3)]);
+        assert_eq!(model_phase_runs(modes.into_iter(), true, true).collect::<Vec<_>>(), [(Opaque, 0..1)]);
+    }
 
     fn model(entity_num: u16, first_index: u32, index_count: u32) -> DynamicPreparedDraw {
         DynamicPreparedDraw {
