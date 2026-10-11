@@ -147,6 +147,13 @@ impl Renderer {
                 .push((runtime.slot, runtime.quality, runtime.active_range.clone()));
         }
 
+        let centres=std::array::from_fn(|slot| {
+            world.runtime_ocean_clipmaps.iter().find(|r|r.quality==quality && r.slot as usize==slot)
+                .map(|r|r.current_centre).filter(|c|c.iter().all(|v|v.is_finite()))
+        });
+        if let Some(ocean)=self.ocean.as_mut() {
+            ocean.set_promoted_clipmap_centres(queue,centres);
+        }
         let Some(changed_ranges) = changed_ranges else { return; };
         let apply = |batches: &mut [WorldBatch]| {
             for batch in batches {

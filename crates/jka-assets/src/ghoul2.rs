@@ -67,8 +67,8 @@ pub struct GlmModel {
     pub name: String,
     /// OpenJK stores this without the `.gla` suffix and registers `<anim_name>.gla`.
     pub anim_name: String,
-    /// Required animation-skeleton size after legacy humanoid remapping.
-    /// A Jedi Outcast 72-bone humanoid GLM is normalized to 53 bones.
+    /// Mesh rig size. `parse_glm` normalizes a legacy humanoid to 53;
+    /// `parse_glm_native` retains the original authored 72-bone references.
     pub num_bones: usize,
     pub hierarchy: Vec<GlmSurfaceHierarchy>,
     pub lods: Vec<GlmLod>,
@@ -210,6 +210,21 @@ pub fn glm_animation_name(data: &[u8]) -> Result<String, String> {
 /// Parse a Ghoul2 GLM/MDXM version 6 mesh, remapping legacy Jedi Outcast
 /// humanoid bone references as OpenJK's `R_LoadMDXM` does.
 pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
+    parse_glm_with_mode(data, GlmLoadMode::LegacyCompatibility)
+}
+
+/// Keep the authored mesh rig independent of the animation source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlmLoadMode {
+    LegacyCompatibility,
+    Native,
+}
+
+pub fn parse_glm_native(data: &[u8]) -> Result<GlmModel, String> {
+    parse_glm_with_mode(data, GlmLoadMode::Native)
+}
+
+pub fn parse_glm_with_mode(data: &[u8], mode: GlmLoadMode) -> Result<GlmModel, String> {
     if data.len() < MDXM_HEADER_SIZE || &data[0..4] != b"2LGM" {
         return Err("expected Ghoul2 GLM/MDXM file".into());
     }
@@ -221,7 +236,8 @@ pub fn parse_glm(data: &[u8]) -> Result<GlmModel, String> {
     let anim_name = glm_animation_name(data)?;
     let num_bones = bounded_count(i32_at(data, 140, "GLM bone count")?, 4096, "GLM bone count")?;
     let legacy_humanoid =
-        num_bones == JK2_TO_JKA_HUMANOID_BONES.len() && anim_name.contains("_humanoid");
+        mode == GlmLoadMode::LegacyCompatibility
+            && num_bones == JK2_TO_JKA_HUMANOID_BONES.len() && anim_name.contains("_humanoid");
     let num_lods = bounded_count(i32_at(data, 144, "GLM LOD count")?, 64, "GLM LOD count")?;
     let ofs_lods = usize_i32(i32_at(data, 148, "GLM LOD offset")?, "GLM LOD offset")?;
     let num_surfaces = bounded_count(
@@ -2220,6 +2236,24 @@ mod tests {
                     assert_eq!(vertex.position, [1.0 + bone as f32, 2.0, 3.0]);
                     assert_eq!(vertex.normal, [0.0, 0.0, 1.0]);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn native_humanoid_loading_retains_every_reference_and_legacy_mode_is_unchanged() {
+        let references: Vec<i32> = (0..72).collect();
+        let bytes = humanoid_glm_fixture(72, "models/players/_humanoid/_humanoid", &references);
+        let native = parse_glm_native(&bytes).unwrap();
+        let legacy = parse_glm(&bytes).unwrap();
+        assert_eq!((native.num_bones, legacy.num_bones), (72, 53));
+        for (n, l) in native.lods.iter().zip(&legacy.lods) {
+            let actual: Vec<_> = n.surfaces.iter().flat_map(|s| s.bone_references.iter().copied()).collect();
+            let compat: Vec<_> = l.surfaces.iter().flat_map(|s| s.bone_references.iter().copied()).collect();
+            assert_eq!(actual, (0..72).collect::<Vec<_>>());
+            assert_eq!(compat, JK2_TO_JKA_HUMANOID_BONES);
+            for (a, b) in n.surfaces.iter().zip(&l.surfaces) {
+                assert_eq!(a.vertices[0].weights, b.vertices[0].weights);
             }
         }
     }

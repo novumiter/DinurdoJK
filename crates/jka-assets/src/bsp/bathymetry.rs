@@ -9,6 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 mod cache;
+mod bands;
 mod promotion;
 mod report;
 pub use cache::fingerprint;
@@ -24,7 +25,7 @@ mod tests;
 pub const CONTENTS_WATER: u32 = 0x0000_0004;
 const LIQUIDS: u32 = CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
 const EPS: f64 = 0.001;
-pub const CACHE_VERSION: u32 = 3;
+pub const CACHE_VERSION: u32 = 4;
 
 pub type FootprintTriangle = [[f32; 2]; 3];
 
@@ -149,6 +150,17 @@ pub struct Atlas {
     pub grids: Vec<Grid>,
     pub warnings: Vec<String>,
     pub bake_ms: f64,
+    /// Present only for pools whose offshore tiles were screened out. Runtime
+    /// wavelength overrides must not extend physics beyond this depth proof.
+    pub shoreline_bands: Vec<ShorelineBand>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShorelineBand {
+    pub slot: u32,
+    pub full_tiles: u32,
+    pub retained_tiles: u32,
+    pub max_depth: f32,
 }
 
 impl Atlas {

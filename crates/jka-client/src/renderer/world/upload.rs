@@ -3,6 +3,7 @@ use crate::renderer::{
     average_skybox_color, build_draw_compaction_groups, collect_planar_reflectors,
     collect_static_ao_lightmap_triangles, collect_static_ao_render_triangles,
     collect_static_ao_vertex_receivers, create_cull_debug_bind_group, create_fast_world_bind_group,
+    build_world_animation, WorldAnimationFrame,
     create_legacy_dlight_pass_pipelines, create_legacy_fog_pass_pipelines,
     create_local_shadow_resources, create_reflection_fog_pass_pipelines,
     create_reflection_pipelines, create_snow_shell_gpu, create_world_bind_group,
@@ -110,6 +111,7 @@ pub(in crate::renderer) fn build_world(
             normal: vertex.normal,
             uv: vertex.uv,
             lightmap_uv: vertex.lightmap_uv,
+            color: vertex.color,
         })
         .collect::<Vec<_>>();
     let inspector_textures = texture_data
@@ -257,7 +259,7 @@ pub(in crate::renderer) fn build_world(
                 } else {
                     // Rectangles still retain their exact CPU footprint for
                     // centering/distance even though fragment clipping is free.
-                    ocean_masks.footprints[slot] = Some(Arc::new(footprint.clone()));
+                    ocean_masks.set_footprint(slot,footprint);
                     None
                 }
             };
@@ -831,6 +833,39 @@ pub(in crate::renderer) fn build_world(
                 deformation_field_views,
                 deformation_field_sampler,
             );
+            let animation = build_world_animation(
+                &source, &bind_group, &fast_bind_group, &authored_glow_bind_group,
+                |frame_source| WorldAnimationFrame {
+                    full: create_world_bind_group(
+                        device, surface_layout, white, missing, flat_normal,
+                        repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
+                        lightmap_sampler, sky_sampler, selected_detail_texture,
+                        &textures, &lightmaps, &deluxemaps, &texture_clamp,
+                        primary_skybox, &footprint_marks, &reflection_probes,
+                        frame_source, &material_buffer, &fog_buffer,
+                        surface_deformation_buffer, deformation_field_views, deformation_field_sampler,
+                    ),
+                    fast: create_fast_world_bind_group(
+                        device, fast_surface_layout, white, missing, repeat_sampler,
+                        clamp_sampler, lightmap_sampler, sky_sampler, &textures, &lightmaps,
+                        &texture_clamp, primary_skybox, &footprint_marks, frame_source,
+                        &material_buffer, surface_deformation_buffer,
+                        deformation_field_views, deformation_field_sampler,
+                    ),
+                    glow: authored_glow_fog_buffer.as_ref().map(|glow_fog_buffer| {
+                        create_world_bind_group(
+                            device, surface_layout, white, missing, flat_normal,
+                            repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
+                            lightmap_sampler, sky_sampler, selected_detail_texture,
+                            &textures, &lightmaps, &deluxemaps, &texture_clamp,
+                            primary_skybox, &footprint_marks, &reflection_probes,
+                            frame_source, &material_buffer, glow_fog_buffer,
+                            surface_deformation_buffer, deformation_field_views,
+                            deformation_field_sampler,
+                        )
+                    }),
+                },
+            );
             let cull_index = u32::try_from(cull_records.len()).unwrap_or(u32::MAX);
             let record = make_cull_record(&source, source_vertices, &index_range);
             initial_indirect.push(DrawIndexedIndirectArgs {
@@ -862,6 +897,7 @@ pub(in crate::renderer) fn build_world(
                 ocean_replaced,
                 source,
                 bind_group,
+                animation,
                 authored_glow_bind_group,
                 ocean_surface_bind_group,
                 _ocean_material_buffer: ocean_material_buffer,

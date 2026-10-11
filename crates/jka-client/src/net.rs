@@ -42,6 +42,10 @@ pub struct NetworkSettings {
     pub saber2: String,
     pub color1: u8,
     pub color2: u8,
+    /// TaystJK global hat appended to color1 on non-jaPRO servers.
+    pub global_hat: String,
+    /// TaystJK global cape appended to color2 on non-jaPRO servers.
+    pub global_cape: String,
     /// jaPRO `cp_sbRGB1` / `cp_sbRGB2`: packed `r | g << 8 | b << 16` blade colour
     /// used when `color1` / `color2` is `SABER_RGB`.
     pub sb_rgb1: u32,
@@ -141,6 +145,8 @@ impl Default for NetworkSettings {
             saber2: "none".into(),
             color1: 4,
             color2: 4,
+            global_hat: String::new(),
+            global_cape: String::new(),
             sb_rgb1: 0,
             sb_rgb2: 0,
             forcepowers: "7-1-032330000000001333".into(),
@@ -206,8 +212,8 @@ impl NetworkSettings {
             ("teamoverlay", u8::from(self.team_overlay).to_string()),
             ("sex", self.sex.clone()),
             ("handicap", self.handicap.to_string()),
-            ("color2", self.color2.to_string()),
-            ("color1", self.color1.to_string()),
+            ("color2", crate::global_cosmetics::encode(self.color2, &self.global_cape)),
+            ("color1", crate::global_cosmetics::encode(self.color1, &self.global_hat)),
             ("forcepowers", self.forcepowers.clone()),
             ("model", model.to_owned()),
             ("snaps", self.snaps.to_string()),
@@ -258,8 +264,8 @@ impl NetworkSettings {
                     _ => color,
                 }
             };
-            set_info_value(&mut info, b"color1", base(self.color1, self.sb_rgb1).to_string().as_bytes());
-            set_info_value(&mut info, b"color2", base(self.color2, self.sb_rgb2).to_string().as_bytes());
+            set_info_value(&mut info, b"color1", crate::global_cosmetics::encode(base(self.color1, self.sb_rgb1), &self.global_hat).as_bytes());
+            set_info_value(&mut info, b"color2", crate::global_cosmetics::encode(base(self.color2, self.sb_rgb2), &self.global_cape).as_bytes());
         }
         // TaystJK declares cjp_client CVAR_USERINFO|CVAR_ROM, so it is present
         // on every connect. JA+ uses the value to enable plugin behavior including
@@ -612,6 +618,9 @@ pub struct LiveInput {
     was_pressed: i32,
     weapon_initialized: bool,
     last_spawn_count: i32,
+    /// Last authoritative delta_angles; cmd angles are relative to these.
+    delta_angles: [i32; 3],
+    emote_tx: Option<(u16, Instant)>,
 }
 
 pub struct CommandButtons<'a> {
@@ -628,7 +637,17 @@ pub struct CommandButtons<'a> {
 
 impl LiveInput {
     pub fn queue_generic_command(&mut self, value: u8) {
+        // Ordinary taunts must never inherit a stale custom-emote signature.
+        self.emote_tx = None;
         self.generic_command = Some(value);
+    }
+
+    /// Immediate, ordinary server-authoritative taunt. No preamble or wait.
+    pub fn queue_emote_taunt(&mut self, id: u16) -> bool {
+        if crate::emote_net_codec::payload(id).is_none() { return false; }
+        self.generic_command = Some(27); // stock GENCMD_TAUNT
+        self.emote_tx = Some((id, Instant::now()));
+        true
     }
 
     /// IN_KeyDown's wasPressed: a button tapped between frames still fires.
@@ -641,6 +660,8 @@ impl LiveInput {
     /// Seed cg.weaponSelect / forceSelect from the authoritative state
     /// (CG_SetInitialSnapshot and CG_Respawn).
     pub fn sync_selection(&mut self, ps: &PlayerState) {
+        self.delta_angles = ["delta_angles[0]", "delta_angles[1]", "delta_angles[2]"]
+            .map(|field| ps.field_i32(field).unwrap_or(0));
         let spawn_count = ps.persistant[4];
         if !self.weapon_initialized || spawn_count != self.last_spawn_count {
             self.weapon_select = ps.field_i32("weapon").unwrap_or(0).clamp(0, 18) as u8;
@@ -661,7 +682,18 @@ impl LiveInput {
     /// (tapped buttons, pending generic command).
     pub fn create_cmd(&mut self, buttons: &CommandButtons<'_>) -> UserCmd {
         self.view_angles[1] = self.view_angles[1].rem_euclid(360.0);
-        let cmd = self.build_cmd(buttons, self.was_pressed, self.generic_command.unwrap_or(0));
+        let mut cmd = self.build_cmd(buttons, self.was_pressed, self.generic_command.unwrap_or(0));
+        // Repeat only the same single-snapshot payload for a short bounded
+        // interval: remote snapshot cadence is not synchronized to usercmds.
+        if let Some((id, started)) = self.emote_tx {
+            if started.elapsed() <= std::time::Duration::from_millis(160) {
+                if !crate::emote_net_codec::encode_cmd_angles(&mut cmd.angles, self.delta_angles, id) {
+                    self.emote_tx = None; // pitch clamp: fail safely
+                }
+            } else {
+                self.emote_tx = None;
+            }
+        }
         self.was_pressed = 0;
         self.generic_command = None;
         cmd
@@ -2536,6 +2568,31 @@ mod tests {
     }
 
     #[test]
+    fn tayst_global_cosmetics_survive_vanilla_and_rgb_fallback() {
+        use mod_support::ServerMod;
+        let mut settings = NetworkSettings::default();
+        settings.set_cvar("color1", "4santahat").unwrap().unwrap();
+        settings.set_cvar("color2", "2vadercape").unwrap().unwrap();
+        assert_eq!(settings.color1, 4);
+        assert_eq!(settings.color2, 2);
+        assert_eq!(settings.cvar_value("color1").as_deref(), Some("4santahat"));
+        let info = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
+        assert_eq!(info_value(&info, b"color1"), Some(b"4santahat".as_slice()));
+        assert_eq!(info_value(&info, b"color2"), Some(b"2vadercape".as_slice()));
+        assert_eq!(info_value(&info, b"cp_cosmetics"), None);
+        settings.set_cvar("color1", "6santahat").unwrap().unwrap();
+        settings.set_cvar("cp_sbRGB1", "16711680").unwrap().unwrap();
+        let stock = settings.userinfo_for_mod("kyle/default", ServerMod::Base);
+        assert_eq!(info_value(&stock, b"color1"), Some(b"4santahat".as_slice()));
+        let rgb = settings.userinfo_for_mod("kyle/default", ServerMod::Japlus);
+        assert_eq!(info_value(&rgb, b"color1"), Some(b"6santahat".as_slice()));
+        settings.set_cvar("color1", "3").unwrap().unwrap();
+        assert!(settings.global_hat.is_empty());
+        assert_eq!(settings.cvar_value("color1").as_deref(), Some("3"));
+        assert!(settings.set_cvar("color2", "4../bad").unwrap().is_err());
+    }
+
+    #[test]
     fn char_color_is_a_userinfo_cvar_like_openjk() {
         use mod_support::ServerMod;
         let mut settings = NetworkSettings::default();
@@ -2811,6 +2868,72 @@ mod tests {
         let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
         assert_eq!(input.create_cmd(&buttons).generic_command, 5);
         assert_eq!(input.create_cmd(&buttons).generic_command, 0);
+    }
+
+    #[test]
+    fn emote_taunt_is_immediate_and_compensates_authoritative_angles() {
+        let mut input = LiveInput::default();
+        input.view_angles = [10.0, 120.0, 0.0];
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("delta_angles[0]", 124);
+        ps.set_field_bits("delta_angles[1]", 28000);
+        input.sync_selection(&ps);
+        let none = HashSet::new();
+        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        assert!(input.queue_emote_taunt(1799));
+        let cmd = input.create_cmd(&buttons);
+        assert_eq!(cmd.generic_command, 27);
+        let pitch = ((cmd.angles[0] + 124) as i16) as f32 * (360.0 / 65536.0);
+        let yaw = ((cmd.angles[1] + 28000) as i16) as f32 * (360.0 / 65536.0);
+        assert_eq!(crate::emote_net_codec::decode_snapshot_angles(yaw, pitch), Some(1799));
+        assert_eq!(input.create_cmd(&buttons).generic_command, 0);
+        assert_eq!(input.view_angles, [10.0, 120.0, 0.0]);
+    }
+
+    #[test]
+    fn ordinary_taunt_clears_emote_payload_without_changing_original_angles() {
+        let mut input = LiveInput::default();
+        input.view_angles = [10.0, 120.0, 0.0];
+        let none = HashSet::new();
+        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        let original = input.preview_cmd(&buttons).angles;
+        assert!(input.queue_emote_taunt(42));
+        input.queue_generic_command(27);
+        let cmd = input.create_cmd(&buttons);
+        assert_eq!(cmd.generic_command, 27);
+        assert_eq!(cmd.angles, original);
+        assert!(input.emote_tx.is_none());
+        assert_eq!(input.create_cmd(&buttons).angles, original);
+    }
+
+    #[test]
+    fn emote_pitch_clamp_and_expiry_preserve_normal_taunt() {
+        let none = HashSet::new();
+        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        for expired in [false, true] {
+            let mut input = LiveInput::default();
+            input.view_angles = [89.0, 120.0, 0.0];
+            let original = input.preview_cmd(&buttons).angles;
+            assert!(input.queue_emote_taunt(42));
+            if expired {
+                input.emote_tx = Some((42, Instant::now() - std::time::Duration::from_millis(161)));
+            }
+            let cmd = input.create_cmd(&buttons);
+            assert_eq!(cmd.generic_command, 27);
+            assert_eq!(cmd.angles, original);
+            assert!(input.emote_tx.is_none());
+        }
+    }
+
+    #[test]
+    fn invalid_emote_id_preserves_pending_generic_command() {
+        let mut input = LiveInput::default();
+        input.queue_generic_command(5);
+        assert!(!input.queue_emote_taunt(crate::emote_net_codec::EMOTE_CAPACITY));
+        let none = HashSet::new();
+        let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
+        assert_eq!(input.create_cmd(&buttons).generic_command, 5);
+        assert!(input.emote_tx.is_none());
     }
 
     #[test]

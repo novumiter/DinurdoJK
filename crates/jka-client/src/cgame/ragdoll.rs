@@ -1415,12 +1415,12 @@ impl RagdollWorld {
             .iter()
             .find(|driven| driven.bone_index == bone)
             .or_else(|| {
-                let mut parent = gla.skeleton.get(bone)?.parent;
-                while let Ok(index) = usize::try_from(parent) {
+                let mut parent = jka_assets::skeleton::mesh_pose_parent(&gla.skeleton, bone);
+                while let Some(index) = parent {
                     if let Some(driven) = instance.driven.iter().find(|driven| driven.bone_index == index) {
                         return Some(driven);
                     }
-                    parent = gla.skeleton.get(index)?.parent;
+                    parent = jka_assets::skeleton::mesh_pose_parent(&gla.skeleton, index);
                 }
                 None
             })?;
@@ -1641,12 +1641,12 @@ fn nearest_driven_parent(
     bone_index: usize,
     handles: &HashMap<usize, RigidBodyHandle>,
 ) -> Option<usize> {
-    let mut parent = gla.skeleton.get(bone_index)?.parent;
-    while let Ok(index) = usize::try_from(parent) {
+    let mut parent = jka_assets::skeleton::mesh_pose_parent(&gla.skeleton, bone_index);
+    while let Some(index) = parent {
         if handles.contains_key(&index) {
             return Some(index);
         }
-        parent = gla.skeleton.get(index)?.parent;
+        parent = jka_assets::skeleton::mesh_pose_parent(&gla.skeleton, index);
     }
     None
 }
@@ -1689,7 +1689,7 @@ fn ragdoll_driver_for_bone(
                 }
             }
         }
-        current = usize::try_from(bone.parent).ok();
+        current = jka_assets::skeleton::mesh_pose_parent(&gla.skeleton, index);
     }
     None
 }
@@ -1815,6 +1815,33 @@ fn pose_to_matrix(pose: &Pose) -> Matrix3x4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_jk2_ragdoll_digits_and_toes_follow_their_physical_limbs() {
+        use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+        let rig = humanoid_reference(HumanoidRig::Jk2_72);
+        let wrist = bone_index(&rig, "rhand").unwrap();
+        let ankle = bone_index(&rig, "ltalus").unwrap();
+        let torso = bone_index(&rig, "thoracic").unwrap();
+        let identity = [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]];
+        let deltas = HashMap::from([(wrist, identity), (ankle, identity), (torso, identity)]);
+        for name in ["r_d3_j3", "r_d5_j1", "mc7", "rhang_tag_bone"] {
+            assert_eq!(ragdoll_driver_for_bone(&rig, bone_index(&rig, name).unwrap(), &deltas), Some(wrist));
+        }
+        assert_eq!(ragdoll_driver_for_bone(&rig, bone_index(&rig, "ltarsal").unwrap(), &deltas), Some(ankle));
+        let upper_arm = bone_index(&rig, "rhumerus").unwrap();
+        let forearm = bone_index(&rig, "rradius").unwrap();
+        let mut bodies = RigidBodySet::new();
+        let handles = HashMap::from([
+            (upper_arm, bodies.insert(RigidBodyBuilder::dynamic().build())),
+            (torso, bodies.insert(RigidBodyBuilder::dynamic().build())),
+        ]);
+        assert_eq!(nearest_driven_parent(&rig, forearm, &handles), Some(upper_arm));
+        let jka = humanoid_reference(HumanoidRig::Jka53);
+        for (i, bone) in jka.skeleton.iter().enumerate() {
+            assert_eq!(jka_assets::skeleton::mesh_pose_parent(&jka.skeleton, i), usize::try_from(bone.parent).ok());
+        }
+    }
 
     #[test]
     fn affine_inverse_round_trip() {

@@ -9,6 +9,7 @@ use wgpu::util::DeviceExt;
 
 const NONE: u32 = u32::MAX;
 const MAX_CELLS: usize = 65_536;
+const MAX_BAKED_CELLS: usize = 262_144;
 const MAX_STEPS: usize = 8;
 
 #[cfg(test)]
@@ -94,6 +95,15 @@ fn hash(x: i32, y: i32) -> u32 {
 /// Adapt supported shallow cells, dry banks, and a one-cell FFT interface ring.
 /// Intermediate/deep water beyond that ring continues to use the FFT renderer.
 pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String> {
+    if let Some(band) = atlas
+        .shoreline_bands
+        .iter()
+        .find(|b| b.slot as usize == ocean.index)
+    {
+        if ocean.heuristic.wavelength.max(1.0) * 0.05 > band.max_depth + 0.001 {
+            return Err(format!("wavelength override requires deeper than the {:.1}u screened shoreline band; retain FFT", band.max_depth));
+        }
+    }
     let grids: Vec<_> = atlas
         .grids
         .iter()
@@ -109,9 +119,9 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
         return Err("coastal integration requires matching 16x16 footprint tiles".into());
     }
     let count = grids.len() * 256;
-    if count > MAX_CELLS {
+    if count > MAX_BAKED_CELLS {
         return Err(format!(
-            "{count} tiled cells exceed the live {MAX_CELLS}-cell budget"
+            "{count} tiled cells exceed the static {MAX_BAKED_CELLS}-cell budget"
         ));
     }
     let spacing = first.cell_size;
@@ -197,10 +207,29 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
     if shoreline == 0 {
         return Err("no resolved shallow bank cells (h/L <= 0.05) in this pool".into());
     }
-    let mut cells = Vec::with_capacity(count);
-    let mut depth = Vec::with_capacity(count);
+    // Allocate GPU storage only for tiles touched by shallow physics, dry
+    // banks or the FFT forcing ring. Keep complete tiles for shader lookup,
+    // but never charge unused offshore bathymetry against the live budget.
+    let retained_tiles: Vec<_> = (0..grids.len())
+        .filter(|&tile| active[tile * 256..(tile + 1) * 256].iter().any(|&v| v))
+        .collect();
+    let live_count = retained_tiles.len() * 256;
+    if live_count > MAX_CELLS {
+        return Err(format!("{live_count} shallow-band tiled cells exceed the live {MAX_CELLS}-cell budget; retain FFT"));
+    }
+    let mut remap = vec![NONE; count];
+    for (packed, &tile) in retained_tiles.iter().enumerate() {
+        for local in 0..256 {
+            remap[tile * 256 + local] = (packed * 256 + local) as u32;
+        }
+    }
+    let mut cells = Vec::with_capacity(live_count);
+    let mut depth = Vec::with_capacity(live_count);
     let mut max_depth = 0.0f32;
     for k in 0..count {
+        if remap[k] == NONE {
+            continue;
+        }
         let (c, boundaries, crests) = sources[k];
         let bed = if active[k] {
             (c.bed - first.level) / OCEAN_UNITS_PER_METER
@@ -216,9 +245,14 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
                         && active[q]
                         && matches!(boundaries[axis], Boundary::Open | Boundary::Bank)
                         && matches!(sources[q].1[axis ^ 1], Boundary::Open | Boundary::Bank)
-                        && (if axis&1==1 {crests[axis/2]} else {sources[q].2[axis/2]}).is_finite()
+                        && (if axis & 1 == 1 {
+                            crests[axis / 2]
+                        } else {
+                            sources[q].2[axis / 2]
+                        })
+                        .is_finite()
                 })
-                .map_or(NONE, |q| q as u32)
+                .map_or(NONE, |q| remap[q])
         });
         let interface = active[k]
             && c.class == Class::Wet
@@ -256,9 +290,10 @@ pub fn prepare(atlas: &Atlas, ocean: &PromotedOcean) -> Result<Prepared, String>
     if !cells.iter().any(|c| c.metric[3] > 0.0) {
         return Err("shallow bank has no resolved FFT interface; retain FFT until a forcing boundary is available".into());
     }
-    let mut lookup = vec![[0i32; 4]; (grids.len() * 2).next_power_of_two().max(4)];
+    let mut lookup = vec![[0i32; 4]; (retained_tiles.len() * 2).next_power_of_two().max(4)];
     let mask = lookup.len() - 1;
-    for (tile, g) in grids.iter().enumerate() {
+    for (tile, &original) in retained_tiles.iter().enumerate() {
+        let g = grids[original];
         let x = (g.origin[0] / (spacing * 16.0)).round() as i32;
         let y = (g.origin[1] / (spacing * 16.0)).round() as i32;
         let mut index = hash(x, y) as usize & mask;
@@ -355,9 +390,27 @@ impl Gpu {
                     c.position[3],
                 ];
                 [
-                    sample[0], sample[1], sample[2], sample[3], sample[0], sample[1], sample[2],
-                    sample[3], 0.0, 0.0, 0.0, 0.0, 0.0, h, 0.0,
-                    c.neighbours.iter().enumerate().fold(0u32,|flags,(axis,&q)|flags|if q!=NONE {1<<axis} else {0}) as f32,
+                    sample[0],
+                    sample[1],
+                    sample[2],
+                    sample[3],
+                    sample[0],
+                    sample[1],
+                    sample[2],
+                    sample[3],
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    h,
+                    0.0,
+                    c.neighbours
+                        .iter()
+                        .enumerate()
+                        .fold(0u32, |flags, (axis, &q)| {
+                            flags | if q != NONE { 1 << axis } else { 0 }
+                        }) as f32,
                 ]
             })
             .collect();

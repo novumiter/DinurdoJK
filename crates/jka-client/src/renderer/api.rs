@@ -944,11 +944,16 @@ pub enum RenderCommand {
     SetPom(bool),
     SetGpuTimings(bool),
     SetFxZeroAlphaDiscard(bool),
+    /// A/B diagnostic for BSP `alphaGen vertex`, no WGSL runtime branch.
+    SetDebugWorldVertexAlphaOne(bool),
     SetGhoul2BatchDraws(Ghoul2BatchMode),
     SetModelStateCache(bool),
     SetDynamicBatchDraws(bool),
     SetWorldCompactMinDraws(u32),
     SetModelPrepareThreads(u32),
+    SetMd3GeometryCache(bool),
+    SetModelRenderBundles(bool),
+    SetEncoderFinishThreads(u32),
     SetModelIndexUploadCache(bool),
     SetGhoul2BatchKeyCache(bool),
     SetGpuVisibility {
@@ -1029,7 +1034,7 @@ pub enum RenderCommand {
     },
     SetUiTelemetry {
         perf: ui::PerfStats,
-        threads: [ui::ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
+        threads: std::sync::Arc<[ui::ThreadPerfStats]>,
     },
     SetEgui(Option<EguiRenderData>),
     CreateCompanion {
@@ -1114,6 +1119,11 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) perf_encode_scene_ms: f64,
     pub(in crate::renderer) perf_encode_post_ui_ms: f64,
     pub(in crate::renderer) perf_encoder_finish_ms: f64,
+    pub(in crate::renderer) perf_encoder_split_active: bool,
+    pub(in crate::renderer) perf_encoder_prefix_finish_ms: f64,
+    pub(in crate::renderer) perf_encoder_tail_finish_ms: f64,
+    pub(in crate::renderer) perf_encoder_dispatch_ms: f64,
+    pub(in crate::renderer) perf_encoder_join_wait_ms: f64,
     pub(in crate::renderer) perf_profiler_readback_encode_ms: f64,
     /// Isolated first `queue.submit()` API call, not the old `cpu_submit_ms`.
     pub(in crate::renderer) perf_primary_submit_api_ms: f64,

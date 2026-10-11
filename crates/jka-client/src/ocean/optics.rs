@@ -279,6 +279,10 @@ pub fn shader_source(msaa: bool) -> String {
 }
 
 #[cfg(test)]
+#[path = "optics/boundary_tests.rs"]
+mod boundary_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

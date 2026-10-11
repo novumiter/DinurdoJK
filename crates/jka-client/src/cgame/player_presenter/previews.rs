@@ -8,6 +8,31 @@ use crate::cgame::player_presenter::{
 };
 
 impl PlayerPresenter {
+    /// Render one externally supplied pose using the model's native mesh rig.
+    /// This is the input seam for future animation decoders; sampling, timing
+    /// and clip playback remain the caller's responsibility.
+    #[allow(dead_code)]
+    pub fn present_player_pose_preview(
+        &mut self,
+        info: &crate::cgame::ClientInfo,
+        source_skeleton: &[jka_assets::ghoul2::GlaBone],
+        input: jka_assets::skeleton::PoseInput<'_>,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let model = self.load_model(info)?;
+        let plan = jka_assets::skeleton::cached_retargeter(source_skeleton, &model.gla.skeleton)?;
+        let mut pose = plan.retarget(input)?;
+        if let Some(pivots) = &model.source_native_pivots {
+            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(&model.gla, &pose, pivots)?;
+        }
+        self.render_glm_surfaces(
+            0, &info.model_qpath(), &model.glm, &model.gla, &model.surfaces,
+            self.jiggle_profile_for_sex(model.jiggle.as_deref(), model.female),
+            &pose, 0, axis, origin, [1.0; 4], None, true,
+        )
+    }
+
     /// Submit a Ghoul2 model in its default pose as one refEntity: `axis` may
     /// carry a non-uniform scale (CG_Item's 1.5x weapons), `rgba` is the
     /// RF_RGB_TINT/RF_FORCE_ENT_ALPHA shaderRGBA and `custom_shader` replaces
@@ -41,7 +66,7 @@ impl PlayerPresenter {
         }
         let pose_started = Instant::now();
         let pose =
-            Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
+            model.bind_animation_pose(Ghoul2Animator::new(&model.animation_gla).evaluate_pose_openjk_root(&model.animation_gla, current_time)?)?;
         record_pose_eval(&mut self.perf, pose_started);
         let custom = custom_shader.map(|shader| self.custom_shader_material(shader));
         let draws = self.render_glm_surfaces(
@@ -76,17 +101,8 @@ impl PlayerPresenter {
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let model = self.load_model(info)?;
         let pose_started = Instant::now();
-        let mut pose =
-            Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
-        // Match the live player path: Source models animate around their
-        // native-FK joint pivots before geometry and attachment sampling.
-        if let Some(ref pivots) = model.source_native_pivots {
-            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(
-                &model.gla,
-                &pose,
-                pivots.as_slice(),
-            )?;
-        }
+        let pose =
+            model.bind_animation_pose(Ghoul2Animator::new(&model.animation_gla).evaluate_pose_openjk_root(&model.animation_gla, current_time)?)?;
         record_pose_eval(&mut self.perf, pose_started);
         self.render_glm_surfaces(
             0,
@@ -155,14 +171,14 @@ impl PlayerPresenter {
             BONE_ANIM_OVERRIDE_FREEZE
         };
 
-        let mut animator = Ghoul2Animator::new(&model.gla);
+        let mut animator = Ghoul2Animator::new(&model.animation_gla);
         // CG_Player uses model_root for legs and lower_lumbar for torso. For a
         // full-body menu stand both use the same authored animation; Motion is
         // updated too, matching the same-animation branch in CG_PlayerAnimation.
         for bone in ["model_root", "lower_lumbar", "Motion"] {
-            if Ghoul2Animator::bone_index(&model.gla, bone).is_some() {
+            if Ghoul2Animator::bone_index(&model.animation_gla, bone).is_some() {
                 animator.set_bone_anim(
-                    &model.gla,
+                    &model.animation_gla,
                     bone,
                     first_frame,
                     last_frame,
@@ -180,9 +196,9 @@ impl PlayerPresenter {
         let pitch = (-head_look[1] * 15.0).clamp(-15.0, 15.0);
         let yaw = (head_look[0] * 24.0).clamp(-24.0, 24.0);
         for (bone, weight) in [("cervical", 0.34), ("cranium", 0.66)] {
-            if Ghoul2Animator::bone_index(&model.gla, bone).is_some() {
+            if Ghoul2Animator::bone_index(&model.animation_gla, bone).is_some() {
                 animator.set_bone_angles_postmult(
-                    &model.gla, bone, [pitch * weight, yaw * weight, 0.0],
+                    &model.animation_gla, bone, [pitch * weight, yaw * weight, 0.0],
                     jka_movement::G2_POSITIVE_X,
                     jka_movement::G2_NEGATIVE_Y,
                     jka_movement::G2_NEGATIVE_Z,
@@ -190,15 +206,9 @@ impl PlayerPresenter {
             }
         }
         let pose_started = Instant::now();
-        let mut pose = animator.evaluate_pose_openjk_root(&model.gla, current_time.max(0))?;
-        // Match the live player path: Source models must animate around their
-        // native-FK joint pivots, not stock JKA rest-joint positions. Rebase
-        // before both geometry and saber/cosmetic bolt sampling below.
-        if let Some(ref pivots) = model.source_native_pivots {
-            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(
-                &model.gla, &pose, pivots.as_slice(),
-            )?;
-        }
+        let pose = model.bind_animation_pose(
+            animator.evaluate_pose_openjk_root(&model.animation_gla, current_time.max(0))?,
+        )?;
         // The UI anchors use the *same animated Ghoul2 pose* as skinning,
         // including cursor-driven cranium/cervical edits and model yaw.
         // No fixed screen percentages or arbitrary player-space guesses.
@@ -257,9 +267,9 @@ impl PlayerPresenter {
                     continue;
                 };
                 let hilt = self.load_saber_model(&definition)?;
-                let mut hilt_animator = Ghoul2Animator::new(&hilt.gla);
+                let mut hilt_animator = Ghoul2Animator::new(&hilt.animation_gla);
                 let pose_started = Instant::now();
-                let hilt_pose = hilt_animator.evaluate_pose(&hilt.gla, current_time, hand_bolt)?;
+                let hilt_pose = hilt.bind_animation_pose(hilt_animator.evaluate_pose(&hilt.animation_gla, current_time, hand_bolt)?)?;
                 record_pose_eval(&mut self.perf, pose_started);
                 let mut hilt_draws = self.render_glm_surfaces(
                     0,
@@ -418,7 +428,7 @@ impl PlayerPresenter {
         let model = self.load_saber_model(&definition)?;
         let pose_started = Instant::now();
         let pose =
-            Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
+            model.bind_animation_pose(Ghoul2Animator::new(&model.animation_gla).evaluate_pose_openjk_root(&model.animation_gla, current_time)?)?;
         record_pose_eval(&mut self.perf, pose_started);
         self.render_glm_surfaces(
             0,
@@ -464,7 +474,7 @@ impl PlayerPresenter {
         )?;
         let pose_started = Instant::now();
         let pose =
-            Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
+            model.bind_animation_pose(Ghoul2Animator::new(&model.animation_gla).evaluate_pose_openjk_root(&model.animation_gla, current_time)?)?;
         record_pose_eval(&mut self.perf, pose_started);
         self.render_glm_surfaces(
             entity_num,

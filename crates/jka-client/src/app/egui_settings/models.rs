@@ -46,7 +46,7 @@ impl App {
         if let Some(target) = segmented_row(
             ui,
             "Ghoul2 draw batching",
-            "GPU-skinning draw-call batching. Adaptive is the default: it skips batching below 32 GPU-skinned surfaces, samples at most 64 surfaces for a real 3-instance match, and only then groups matching opaque/masked mesh, material and LOD draws. Force always attempts grouping for profiling.",
+            "GPU-skinning draw-call batching. Force is the default. Adaptive skips batching below 32 GPU-skinned surfaces, samples at most 64 surfaces for a real 3-instance match, and only then groups matching opaque/masked mesh, material and LOD draws. Force always attempts compatible grouping.",
             theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_BATCH_DRAWS),
             self.video.ghoul2_batch_draws,
             &GHOUL2_BATCHING,

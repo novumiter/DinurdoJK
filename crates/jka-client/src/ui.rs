@@ -838,9 +838,10 @@ pub struct PerfStats {
     pub input_latency_samples: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ThreadPerfStats {
-    pub name: &'static str,
+    pub id: u32,
+    pub name: std::sync::Arc<str>,
     pub task: &'static str,
     pub active: bool,
     pub busy_percent: f32,
@@ -849,7 +850,8 @@ pub struct ThreadPerfStats {
 impl Default for ThreadPerfStats {
     fn default() -> Self {
         Self {
-            name: "THREAD",
+            name: "THREAD".into(),
+            id: 0,
             task: "IDLE",
             active: false,
             busy_percent: 0.0,
@@ -1005,7 +1007,7 @@ pub struct UiSnapshot {
     pub lagometer: Option<crate::lagometer::Ui>,
     pub video: VideoSettings,
     pub perf: PerfStats,
-    pub threads: [ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
+    pub threads: std::sync::Arc<[ThreadPerfStats]>,
     pub surface_inspector: Option<crate::runtime::SurfaceInspectorInfo>,
     /// One deliberately presented frame of the preloaded static splash before
     /// startup kicks the first map request. This prevents the first visible WGPU
@@ -1074,7 +1076,7 @@ impl Default for UiSnapshot {
             lagometer: None,
             video: VideoSettings::default(),
             perf: PerfStats::default(),
-            threads: [ThreadPerfStats::default(); crate::thread_activity::SLOT_COUNT],
+            threads: std::sync::Arc::from([]),
             surface_inspector: None,
             startup_splash: false,
             loading: None,

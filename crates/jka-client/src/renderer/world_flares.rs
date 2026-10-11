@@ -271,6 +271,7 @@ impl WorldFlareRenderer {
             let fallback = flare.stages.is_empty();
             let default_stage = materials::MaterialStage {
                 texture: StageTexture::White, enhancements: Default::default(),
+                animation: None,
                 blend: Some(DEFAULT_FLARE_BLEND), alpha_cutoff: 0.0, opacity: 1.0,
                 color: [1.0; 3], rgb_gen: RgbGen::Vertex, alpha_gen: AlphaGen::Identity,
                 tc_gen: Default::default(), tc_mods: Vec::new(),

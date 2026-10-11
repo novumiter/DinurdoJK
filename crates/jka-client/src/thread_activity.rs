@@ -1,10 +1,13 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
     OnceLock,
 };
 use std::time::Instant;
 
 pub const SLOT_COUNT: usize = 22;
+
+#[cfg(windows)]
+mod windows;
 const RECENT_NS: u64 = 750_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +170,8 @@ impl Task {
 }
 
 struct SlotState {
+    thread_id: AtomicU32,
+    thread_created: AtomicU64,
     active: AtomicBool,
     task: AtomicU8,
     last_task: AtomicU8,
@@ -178,6 +183,8 @@ struct SlotState {
 impl SlotState {
     const fn new() -> Self {
         Self {
+            thread_id: AtomicU32::new(0),
+            thread_created: AtomicU64::new(0),
             active: AtomicBool::new(false),
             task: AtomicU8::new(Task::Idle as u8),
             last_task: AtomicU8::new(Task::Idle as u8),
@@ -253,6 +260,17 @@ impl Drop for ActivityGuard {
 }
 
 pub fn activity(slot: ThreadSlot, task: Task) -> ActivityGuard {
+    #[cfg(windows)]
+    {
+        thread_local! { static ID: (u32, u64) = windows::current_identity(); }
+        ID.with(|&(id, created)| {
+            let slot = state(slot);
+            if slot.thread_id.load(Ordering::Relaxed) != id || slot.thread_created.load(Ordering::Relaxed) != created {
+                slot.thread_created.store(created, Ordering::Relaxed);
+                slot.thread_id.store(id, Ordering::Release);
+            }
+        });
+    }
     let now = now_ns();
     let state = state(slot);
     if state.active.load(Ordering::Acquire) {
@@ -363,7 +381,9 @@ pub const fn slot_label(slot: ThreadSlot) -> &'static str {
     }
 }
 
+#[cfg(not(windows))]
 static SAMPLE_LAST_NS: AtomicU64 = AtomicU64::new(0);
+#[cfg(not(windows))]
 static SAMPLE_BUSY_NS: [AtomicU64; SLOT_COUNT] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -389,15 +409,17 @@ static SAMPLE_BUSY_NS: [AtomicU64; SLOT_COUNT] = [
     AtomicU64::new(0),
 ];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ThreadActivitySample {
-    pub slot: ThreadSlot,
+    pub id: u32,
+    pub name: std::sync::Arc<str>,
     pub active: bool,
-    pub task: Task,
+    pub task: &'static str,
     pub busy_percent: f32,
 }
 
-pub fn sample() -> [ThreadActivitySample; SLOT_COUNT] {
+#[cfg(not(windows))]
+fn scoped_sample() -> [ThreadActivitySample; SLOT_COUNT] {
     let now = now_ns();
     let previous_time = SAMPLE_LAST_NS.swap(now, Ordering::Relaxed);
     let elapsed = now.saturating_sub(previous_time).max(1);
@@ -412,10 +434,43 @@ pub fn sample() -> [ThreadActivitySample; SLOT_COUNT] {
             (busy_delta as f64 * 100.0 / elapsed as f64).clamp(0.0, 100.0) as f32
         };
         ThreadActivitySample {
-            slot: entry.slot,
+            id: 0,
+            name: slot_label(entry.slot).into(),
             active: entry.active,
-            task: entry.task,
+            task: entry.task.label(),
             busy_percent,
         }
     })
+}
+
+/// Only the advanced HUD requests sampling. Windows measures kernel + user CPU
+/// time, excluding channel waits, joins, sleeping and GPU waits. Other platforms
+/// retain the explicitly labelled scoped wall-time fallback.
+pub fn sample(enabled: bool) -> std::sync::Arc<[ThreadActivitySample]> {
+    #[cfg(windows)]
+    { windows::sample(enabled) }
+    #[cfg(not(windows))]
+    { if enabled { std::sync::Arc::from(scoped_sample()) } else { std::sync::Arc::from([]) } }
+}
+
+pub const CPU_SAMPLE_LABEL: &str = if cfg!(windows) { "THREAD CPU / CORE" } else { "THREAD SCOPED BUSY" };
+
+/// Label the otherwise unnamed global Rayon threads on their first job. Named
+/// dedicated pools keep their identity, and the caller helping a pool stays MAIN.
+pub fn label_rayon_worker() {
+    #[cfg(windows)]
+    {
+        thread_local! { static LABELLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        LABELLED.with(|labelled| {
+            if labelled.get() { return; }
+            if let Some(index) = rayon::current_thread_index() {
+                if std::thread::current().name().is_none() {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadDescription};
+                    let name: Vec<u16> = format!("jka-rayon-{index}").encode_utf16().chain(Some(0)).collect();
+                    unsafe { SetThreadDescription(GetCurrentThread(), name.as_ptr()); }
+                }
+                labelled.set(true);
+            }
+        });
+    }
 }

@@ -1,5 +1,5 @@
 //! Asynchronous static geometry plus the opt-in Phase 2.5 debug overlay.
-//! There is still no coastal simulation or change to normal FFT rendering.
+//! Also supplies immutable geometry to the opt-in coastal simulation.
 use crate::scene::{DrawBatch, GpuVertex};
 use jka_assets::bsp::{
     bathymetry::{self, Atlas, Boundary, Class, Geometry, Grid, Options, Region},
@@ -10,6 +10,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Instant,
 };
+
+// Promotion's authored-image heuristic spans wavelengths 256..768u. Keep
+// bathymetry for its entire shallow-depth range, independent of pool selection.
+pub const SHORELINE_SCREENING_DEPTH: f32 = 768.0 * 0.05;
 
 pub enum Status {
     Pending,
@@ -47,16 +51,17 @@ pub fn start(
     let entries = super::surfaces::collect(vertices, coarse, full);
     let faces: Vec<_> = entries.iter().map(|e| e.face).collect();
     let triangle_sets: Vec<_> = entries.iter().map(|e| e.triangles.clone()).collect();
-    let footprints = super::build_water_footprints(
-        &faces,
-        &triangle_sets,
-        super::WATER_FOOTPRINT_TILE_SIZE,
-    );
+    let footprints =
+        super::build_water_footprints(&faces, &triangle_sets, super::WATER_FOOTPRINT_TILE_SIZE);
     let options = Options::default();
     let mut regions = Vec::new();
     let mut debug_footprints = Vec::new();
     let mut warnings = Vec::new();
-    for (slot, footprint) in footprints.iter().take(super::OCEAN_MAX_SURFACES).enumerate() {
+    for (slot, footprint) in footprints
+        .iter()
+        .take(super::OCEAN_MAX_SURFACES)
+        .enumerate()
+    {
         if faces[footprint.members[0]].authored_ocean.is_some() {
             continue;
         }
@@ -75,15 +80,6 @@ pub fn start(
         if !planar {
             warnings.push(format!(
                 "slot {slot}: nonplanar promoted surface; retain legacy water"
-            ));
-            continue;
-        }
-        let tile_axis = (footprint.tile_size / options.cell_size).ceil() as usize;
-        let allocated = footprint.tiles.len().saturating_mul(tile_axis.saturating_mul(tile_axis));
-        if allocated > options.max_cells_per_region {
-            warnings.push(format!(
-                "slot {slot}: {allocated} occupied-tile cells exceed fixed {}-cell budget at {} units; retain legacy water",
-                options.max_cells_per_region, options.cell_size
             ));
             continue;
         }
@@ -119,6 +115,7 @@ pub fn start(
         options.cell_size.to_bits(),
         options.padding_cells,
         options.max_cells_per_region as u32,
+        SHORELINE_SCREENING_DEPTH.to_bits(),
     ] {
         descriptor.extend(v.to_le_bytes());
     }
@@ -171,7 +168,11 @@ pub fn start(
                         atlas
                     } else {
                         let geometry = Geometry::from_bsp(&bsp)?;
-                        let mut atlas = geometry.bake(&regions, options)?;
+                        let mut atlas = geometry.bake_shoreline_bands(
+                            &regions,
+                            options,
+                            SHORELINE_SCREENING_DEPTH,
+                        )?;
                         atlas.warnings.extend(warnings);
                         atlas.bake_ms = started.elapsed().as_secs_f64() * 1000.0;
                         atlas
@@ -444,7 +445,16 @@ fn build_debug_view(
                 .find(|warning| warning.starts_with(&format!("slot {}:", ocean.index)))
                 .map(String::as_str)
                 .unwrap_or("no bathymetry grid was produced");
-            lines.push(format!("{}: UNSUPPORTED - {reason}", ocean.label()));
+            let selected = if reason.contains("FFT-only") {
+                Treatment::FftOnly
+            } else {
+                Treatment::Unsupported
+            };
+            lines.push(format!(
+                "{}: {} - {reason}",
+                ocean.label(),
+                selected.label()
+            ));
             let debug_z = ocean.surface.plane_height + ocean.heuristic.amplitude.max(2.0) + 4.0;
             if mode == 1 || mode == 3 {
                 if let Some((_, _, triangles)) = exact {
@@ -452,7 +462,7 @@ fn build_debug_view(
                         push_triangle_fill(
                             &mut mesh,
                             triangle.map(|point| [point[0], point[1], debug_z]),
-                            Treatment::Unsupported.color(),
+                            selected.color(),
                         );
                     }
                 } else {
@@ -461,7 +471,7 @@ fn build_debug_view(
                         [polygon[0], polygon[1], polygon[2]],
                         [polygon[0], polygon[2], polygon[3]],
                     ] {
-                        push_triangle_fill(&mut mesh, triangle, Treatment::Unsupported.color());
+                        push_triangle_fill(&mut mesh, triangle, selected.color());
                     }
                 }
             } else if mode == 2 {
@@ -473,21 +483,16 @@ fn build_debug_view(
                                 &mut mesh,
                                 points[edge],
                                 points[(edge + 1) % 3],
-                                Treatment::Unsupported.color(),
+                                selected.color(),
                             );
                         }
                     }
                 } else {
                     let polygon = promoted_rectangle(ocean, debug_z);
                     for edge in polygon.windows(2) {
-                        push_line(&mut mesh, edge[0], edge[1], Treatment::Unsupported.color());
+                        push_line(&mut mesh, edge[0], edge[1], selected.color());
                     }
-                    push_line(
-                        &mut mesh,
-                        polygon[3],
-                        polygon[0],
-                        Treatment::Unsupported.color(),
-                    );
+                    push_line(&mut mesh, polygon[3], polygon[0], selected.color());
                 }
             }
             continue;
@@ -536,6 +541,14 @@ fn build_debug_view(
             counts.outline as f32 * grids[0].cell_size,
             counts.unsupported as f32 * grids[0].cell_size,
         ));
+        if let Some(band) = atlas
+            .shoreline_bands
+            .iter()
+            .find(|b| b.slot as usize == ocean.index)
+        {
+            lines.push(format!("Pool {} allocation: shoreline bands + halo, {} / {} footprint tiles retained; screening depth {:.1}u; offshore stays FFT.",
+                ocean.index + 1, band.retained_tiles, band.full_tiles, band.max_depth));
+        }
         // Float diagnostics above the promoted wave envelope so depth testing
         // does not make the overlay disappear under FFT crests.
         let z = grids[0].level + ocean.heuristic.amplitude.max(2.0) + 4.0;

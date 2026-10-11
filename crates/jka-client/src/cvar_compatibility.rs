@@ -31,11 +31,18 @@ pub(crate) fn digest(text: &str) -> String {
     // compatibility digest focused on pre-existing behavior; each addition has
     // a dedicated load/archive test below.
     let projected = text
-        // Session-only encoding experiments default to baseline and did not
-        // exist in the frozen settings Debug layout. Their live setters are
-        // verified in the headless runtime test, without changing old hashes.
+        // These fields were added after the frozen Debug layout. Project them
+        // out for legacy fixtures; promoted defaults and live A/B setters are
+        // checked by the headless runtime test. Ghoul2's intentional default
+        // change remains visible to the old fixtures.
         .replace(", model_state_cache: false, dynamic_batch_draws: false, world_compact_min_draws: 1", "")
+        .replace(", md3_geometry_cache: false", "")
+        .replace(", md3_geometry_cache: true", "")
+        .replace(", model_render_bundles: false", "")
+        .replace(", encoder_finish_threads: 2", "")
         .replace(", model_prepare_threads: 0, model_index_upload_cache: false, ghoul2_batch_key_cache: false", "")
+        .replace(", model_prepare_threads: 2, model_index_upload_cache: false, ghoul2_batch_key_cache: false", "")
+        .replace(", model_state_cache: false, dynamic_batch_draws: true, world_compact_min_draws: 1", "")
         .replace(", dynamic_light_falloff: ", ", rt_denoiser_mode: 0, dynamic_light_falloff: ")
         .replace("OceanSettings { interaction: false, interaction_strength: 1.0, interaction_splash_mode: 3, interaction_debug: false, ", "OceanSettings { ")
         .replace("interaction_splash_mode: 3, ", "")

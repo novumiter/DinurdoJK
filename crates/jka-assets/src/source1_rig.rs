@@ -1,4 +1,7 @@
-//! Rebind a Source 1 model onto Jedi Academy's `_humanoid.gla` skeleton.
+//! Rebind a Source 1 model onto either supplied Ghoul2 humanoid skeleton.
+//! The target GLA defines mesh indices/bind frames, independently of runtime
+//! gameplay animation. JK2 targets preserve five digits, third joints and toes;
+//! JKA targets retain the original reduced compatibility mapping.
 //!
 //! `Direction` is a rest-pose **animation of the SOURCE skeleton** into JKA's
 //! anatomical limb directions, NOT independent per-JKA-joint translations.
@@ -518,6 +521,33 @@ fn humanoid_bone_for(normalized: &str) -> Option<&'static str> {
     })
 }
 
+/// Prefer all five independent digits, three phalanges and toes on JK2.
+/// The original reduced mapping remains the 53-bone compatibility profile.
+fn humanoid_target_for(gla: &GlaAnimation, normalized: &str) -> Option<String> {
+    let digit = source_digit(normalized).or_else(|| {
+        let stem = normalized.strip_suffix('2')?;
+        source_digit(stem).filter(|(_, _, level)| *level == 0)
+            .map(|(side, digit, _)| (side, digit, 2))
+    });
+    if let Some((side, digit, level)) = digit.filter(|_| gla.num_bones() == 72) {
+        let name = format!("{side}_d{}_j{}", digit + 1, level + 1);
+        if gla_bone_index(gla, &name).is_some() { return Some(name); }
+    }
+    let toe = match normalized {
+        "ltoe" | "ltoe0" => Some("ltarsal"),
+        "rtoe" | "rtoe0" => Some("rtarsal"),
+        _ => None,
+    };
+    if let Some(name) = toe.filter(|name| gla_bone_index(gla, name).is_some()) {
+        return Some(name.to_owned());
+    }
+    humanoid_bone_for(normalized).map(str::to_owned)
+}
+
+fn pivot_parent(gla: &GlaAnimation, bone: usize) -> Option<usize> {
+    crate::skeleton::mesh_pose_parent(&gla.skeleton, bone)
+}
+
 /// `_humanoid` spine bones between the pelvis and the neck, root first.
 const HUMANOID_SPINE: [&str; 3] = ["lower_lumbar", "upper_lumbar", "thoracic"];
 
@@ -893,12 +923,18 @@ fn source_fk_rebinds(
             };
             // Several Source models carry only two or three digit chains.
             // The most outboard surviving chain still gives a palm roll axis.
-            let source_outer = source_knuckle(4)
-                .or_else(|| source_knuckle(3))
-                .or_else(|| source_knuckle(2));
+            let outer = [4, 3, 2].into_iter().find_map(|digit| {
+                source_knuckle(digit).map(|joint| (joint, digit))
+            });
+            let source_outer = outer.map(|(joint, _)| joint);
+            let target_outer = if gla.num_bones() == 72 {
+                outer.and_then(|(_, digit)| target_knuckle(digit + 1))
+            } else {
+                target_knuckle(4)
+            };
             if let (Some(si), Some(so), Some(ti), Some(to)) = (
                 source_knuckle(1), source_outer,
-                target_knuckle(2), target_knuckle(4),
+                target_knuckle(2), target_outer,
             ) {
                 if let (Some(from), Some(to)) = (
                     palm_frame(origin(&current), si, so),
@@ -929,6 +965,8 @@ fn source_fk_rebinds(
             "rthigh" => Some(("rcalf", "rtibia")),
             "lcalf" => Some(("lfoot", "ltalus")),
             "rcalf" => Some(("rfoot", "rtalus")),
+            "lfoot" if gla_bone_index(gla, "ltarsal").is_some() => Some(("ltoe0", "ltarsal")),
+            "rfoot" if gla_bone_index(gla, "rtarsal").is_some() => Some(("rtoe0", "rtarsal")),
             _ => None,
         };
         // Aim each Source finger's two real phalanges independently toward
@@ -937,10 +975,13 @@ fn source_fk_rebinds(
         // retains a little additional inward curl in the rest shape.
         let digit_aim = source_digit(&names[index]).and_then(|(side, digit, level)| {
             let next = format!("{side}finger{digit}{}", level + 1);
-            let target_digit = match digit { 0 => 1, 1 | 2 => 2, _ => 4 };
-            let joint1 = gla_bone_index(gla, &format!("{side}_d{target_digit}_j1"))?;
-            let joint2 = gla_bone_index(gla, &format!("{side}_d{target_digit}_j2"))?;
-            Some((next, joint1, joint2, level))
+            let native = gla.num_bones() == 72;
+            let target_digit = if native { digit + 1 } else { match digit { 0 => 1, 1 | 2 => 2, _ => 4 } };
+            let here = if native { level + 1 } else { 1 };
+            let child = if native { level + 2 } else { 2 };
+            let joint1 = gla_bone_index(gla, &format!("{side}_d{target_digit}_j{here}"))?;
+            let joint2 = gla_bone_index(gla, &format!("{side}_d{target_digit}_j{child}"))?;
+            Some((next, joint1, joint2, if native { 0 } else { level }))
         });
         let child_info = if let Some((name, target_name)) = continuation {
             gla_bone_index(gla, target_name).and_then(|child| {
@@ -1028,7 +1069,7 @@ fn source_native_pivots(
         if known.iter().all(|&v| v) { break; }
         for (j, bone) in gla.skeleton.iter().enumerate() {
             if known[j] { continue; }
-            let Ok(parent) = usize::try_from(bone.parent) else { continue; };
+            let Some(parent) = pivot_parent(gla, j) else { continue; };
             if parent >= count || !known[parent] { continue; }
             let parent_gl = origin(&gla.skeleton[parent].base_pose);
             let here_gl = origin(&bone.base_pose);
@@ -1070,11 +1111,11 @@ pub fn rebase_source_ghoul2_pose(
         state[j] = 1;
         let here = origin(&gla.skeleton[j].base_pose);
         let animated_here = transform(&stock[j], here);
-        let parent = gla.skeleton[j].parent;
-        if parent < 0 {
+        let parent = pivot_parent(gla, j);
+        if parent.is_none() {
             joints[j] = transform(&stock[j], pivots[j]);
         } else {
-            let p = usize::try_from(parent).map_err(|_| "Invalid GLA parent".to_owned())?;
+            let p = parent.expect("parent checked above");
             if p >= stock.len() { return Err(format!("Invalid GLA parent {p} for bone {j}")); }
             visit(p, gla, stock, pivots, output, joints, state)?;
             let parent_rest = origin(&gla.skeleton[p].base_pose);
@@ -1172,9 +1213,9 @@ pub fn build_source_rig(
         let direct = gla_bone_index(gla, &bone.name);
         let mapped = match direct {
             Some(found) => Some(found),
-            None => match humanoid_bone_for(&key) {
+            None => match humanoid_target_for(gla, &key) {
                 Some(name) => {
-                    let found = gla_bone_index(gla, name);
+                    let found = gla_bone_index(gla, &name);
                     if found.is_none() {
                         missing_humanoid.push(name);
                     }
@@ -1831,9 +1872,65 @@ pub fn attach_humanoid_bolts(
     Ok(attached)
 }
 
+/// Transfer tags authored for a different rig into the destination bind space.
+/// Packed local weight indices are retained; only global references and bind
+/// coordinates change. Ordinary 53-bone donors still use the original helper.
+pub fn attach_humanoid_bolts_between_rigs(
+    rig: &mut SourceRig,
+    donor: &GlmModel,
+    donor_gla: &GlaAnimation,
+    target_gla: &GlaAnimation,
+) -> Result<usize, String> {
+    let mut remapped = donor.clone();
+    for lod in &mut remapped.lods {
+        for surface in &mut lod.surfaces {
+            if !donor.hierarchy[surface.surface_index].name.starts_with('*') { continue; }
+            let mut corrections = Vec::new();
+            for bone in &mut surface.bone_references {
+                let source = donor_gla.skeleton.get(*bone).ok_or("invalid donor tag bone")?;
+                let target = crate::skeleton::source_for_target(&target_gla.skeleton, &donor_gla.skeleton, *bone)
+                    .ok_or_else(|| format!("no target tag bone {}", source.name))?;
+                corrections.push(mul(&target_gla.skeleton[target].base_pose, &source.base_pose_inv));
+                *bone = target;
+            }
+            for vertex in &mut surface.vertices {
+                let mut position = [0.0; 3];
+                let mut normal = [0.0; 3];
+                for weight in &vertex.weights {
+                    let correction = corrections.get(weight.local_bone_index).ok_or("invalid donor tag weight")?;
+                    let p = transform(correction, vertex.position);
+                    let n = rotate(correction, vertex.normal);
+                    for k in 0..3 { position[k] += weight.weight * p[k]; normal[k] += weight.weight * n[k]; }
+                }
+                vertex.position = position;
+                vertex.normal = normalized(normal).unwrap_or(vertex.normal);
+            }
+        }
+    }
+    attach_humanoid_bolts(rig, &remapped, target_gla)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_jk2_profile_preserves_every_source_digit_and_toe() {
+        use crate::skeleton::{humanoid_reference, HumanoidRig};
+        let native = humanoid_reference(HumanoidRig::Jk2_72);
+        let legacy = humanoid_reference(HumanoidRig::Jka53);
+        for side in ['l', 'r'] {
+            for digit in 0..5 {
+                for (suffix, joint) in [("", 1), ("1", 2), ("2", 3)] {
+                    let name = format!("{side}finger{digit}{suffix}");
+                    assert_eq!(humanoid_target_for(&native, &name), Some(format!("{side}_d{}_j{joint}", digit+1)));
+                    assert_eq!(humanoid_target_for(&legacy, &name).as_deref(), humanoid_bone_for(&name));
+                }
+            }
+            assert_eq!(humanoid_target_for(&native, &format!("{side}toe0")), Some(format!("{side}tarsal")));
+            assert_eq!(humanoid_target_for(&legacy, &format!("{side}toe0")), Some(format!("{side}talus")));
+        }
+    }
 
     #[test]
     fn normalizes_valvebiped_names() {

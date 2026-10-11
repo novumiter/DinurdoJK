@@ -25,6 +25,7 @@ impl DynamicModelRenderer {
         self.skin_wireframe_pipeline = None;
         // MD3 / Ghoul2 alpha-mode pipelines are lazy: recompiled by
         // ensure_model_pipelines for only the modes that have draws.
+        self.model_bundles.clear();
         self.model_pipelines = Default::default();
         self.model_glow_pipelines = Default::default();
         self.model_alpha_mask = 0;
@@ -1654,11 +1655,13 @@ pub(in crate::renderer) fn create_world_pipeline(
         None => Default::default(),
     };
     let legacy_dlight_vertex_stream = shader_variant.is_some_and(|variant| variant.legacy_dlights);
-    let vertex_entry_point = match (key.class, legacy_dlight_vertex_stream) {
-        (DrawClass::Sky, true) => "vs_sky_legacy",
-        (DrawClass::Sky, false) => "vs_sky",
-        (_, true) => "vs_main_legacy",
-        (_, false) => "vs_main",
+    let vertex_entry_point = match (key.class, legacy_dlight_vertex_stream, key.auto_sprite2) {
+        (_, true, true) => "vs_autosprite2_legacy",
+        (_, false, true) => "vs_autosprite2",
+        (DrawClass::Sky, true, false) => "vs_sky_legacy",
+        (DrawClass::Sky, false, false) => "vs_sky",
+        (_, true, false) => "vs_main_legacy",
+        (_, false, false) => "vs_main",
     };
     let base_vertex_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,

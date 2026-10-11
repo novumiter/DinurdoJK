@@ -1,6 +1,6 @@
 //! Effects.
 use crate::cgame::player_presenter::{
-    cosmetic_draws_for_mask, model_bolt_origin_timed, multiply_3x4, scene, AnimationSet, Arc,
+    cosmetic_draws_for_mask, global_cosmetic_draw, model_bolt_origin_timed, multiply_3x4, scene, AnimationSet, Arc,
     ClientGameState, DynamicModelAlphaMode, FxGpuSpriteInstance, Ghoul2Animator, HashMap,
     Matrix3x4, PlayerAngleEntity, PlayerFxRequest, PlayerModelAsset, PlayerPresenter,
     PresentedEntity, TextureData, TraceQuery, Vec3, ANIM_TOGGLEBIT, BLOB_SHADOW_DISTANCE,
@@ -302,17 +302,39 @@ impl PlayerPresenter {
     ) {
         use crate::japro_cg;
         let state = &entity.state;
-        // Only jaPRO servers relay everyone's `c5`. A local game has no server, so
-        // the viewer's own `cp_cosmetics` is drawn directly. Stock servers draw none.
+        // jaPRO: server-authoritative c5 cosmetics. All other servers:
+        // TaystJK global hats/capes from the relayed c1/c2 suffixes.
         let own = i32::from(entity.number) == self.viewer_client;
         let japro_server = self.viewer_style.japro;
-        if !(japro_server || own)
-            || entity.entity_type != ET_PLAYER
+        if entity.entity_type != ET_PLAYER
             || self.japro.style_bit(japro_cg::style::HIDE_COSMETICS)
             || state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0
             || entity_is_mind_tricked(entity, self.viewer_client)
         {
             return;
+        }
+        if !japro_server {
+            use crate::global_cosmetics::Slot;
+            let hat = if own && info.global_hat.is_empty() {
+                self.local_global_hat.clone()
+            } else { info.global_hat.clone() };
+            let cape = if own && info.global_cape.is_empty() {
+                self.local_global_cape.clone()
+            } else { info.global_cape.clone() };
+            for (slot, name) in [(Slot::Hat, hat), (Slot::Cape, cape)] {
+                let Some(path) = crate::global_cosmetics::model_path(slot, &name) else { continue };
+                if !self.assets.contains_qpath(&path) { continue; }
+                let offset = self.global_cosmetic_offsets(slot, &name, &info.model_name, &info.skin_name);
+                if let Some(draw) = global_cosmetic_draw(
+                    &mut self.perf, model, pose, axis, origin, slot, &name, offset,
+                    entity.number, entity_alpha, japro_cg::ghost_shader(ghost),
+                ) {
+                    self.cosmetic_draws.push(draw);
+                }
+            }
+            // Keep the existing jaPRO bitmask-based cosmetic preview for
+            // the offline solo shim. Never use cp_cosmetics for remote players.
+            if !own || self.local_cosmetics == 0 { return; }
         }
         let mut mask = if japro_server {
             info.cosmetics

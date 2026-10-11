@@ -17,6 +17,13 @@ DEPTH_DECLARATION
 @group(1) @binding(2) var wave_sampler: sampler;
 @group(1) @binding(3) var<uniform> ocean: OceanRenderSettings;
 
+// Depth-unprojected receivers can fall just outside their water bounds. Pool
+// walls commonly lie exactly on those bounds (e.g. hothchallenges y=7728), so
+// strict containment made caustics toggle per pixel like a coplanar overlay.
+// Match the outline's existing tolerance, in map units. Only receiver tests
+// use this margin; ray intervals and absorption retain the actual volume.
+const CAUSTIC_RECEIVER_MARGIN: f32 = 0.75;
+
 @vertex fn vs_main(@builtin(vertex_index) id: u32) -> @builtin(position) vec4<f32> {
     let xy = vec2<f32>(f32((id << 1u) & 2u), f32(id & 2u));
     return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
@@ -50,7 +57,9 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
         return true;
     }
     let bounds = ocean.mask_bounds[slot];
-    if (any(p < bounds.xy) || any(p > bounds.zw)) {
+    let outside_bounds = any(p < bounds.xy) || any(p > bounds.zw);
+    if (any(p < bounds.xy - vec2<f32>(CAUSTIC_RECEIVER_MARGIN))
+        || any(p > bounds.zw + vec2<f32>(CAUSTIC_RECEIVER_MARGIN))) {
         return false;
     }
     let tile_xy = vec2<u32>(clamp(
@@ -58,8 +67,10 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
         vec2<f32>(0.0), vec2<f32>(7.0)));
     let tile = tile_xy.y * 8u + tile_xy.x;
     let code = (ocean.mask_tiles[slot][tile >> 4u] >> ((tile & 15u) * 2u)) & 3u;
-    if (code == 1u) { return false; }
-    if (code == 2u) { return true; }
+    // Cached tile classifications cover only the exact bounds. Points in the
+    // margin must still pass the tolerant triangle test, including hole edges.
+    if (!outside_bounds && code == 1u) { return false; }
+    if (!outside_bounds && code == 2u) { return true; }
     let first = u32(range.x);
     let tolerance = 0.75;
     for (var i = 0u; i < count; i = i + 1u) {
@@ -233,25 +244,10 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
     let world = h.xyz / h.w;
     let delta = world - optics.eye.xyz;
     let ray_length = length(delta);
-    // World-position derivatives are also our cheapest reliable screen-space
-    // discontinuity signal. At silhouettes they span unrelated surfaces, which
-    // previously produced bogus normals and black caustic outlines. Keep these
-    // derivatives outside conditional control flow so WGSL derivative-uniformity
-    // requirements remain satisfied.
+    // Derivatives must remain outside pixel-dependent branches for WGSL
+    // derivative uniformity; other caustics work is gated below.
     let world_dx = dpdx(world);
     let world_dy = dpdy(world);
-    let world_pixel_span = max(length(world_dx), length(world_dy));
-    let viewport = vec2<f32>(textureDimensions(scene_color));
-    let expected_pixel_span = max(ray_length * 4.0 / max(min(viewport.x, viewport.y), 1.0), 0.25);
-    let caustic_surface_confidence = 1.0 - smoothstep(
-        expected_pixel_span * 4.0,
-        expected_pixel_span * 12.0,
-        world_pixel_span,
-    );
-    let normal_cross = cross(world_dx, world_dy);
-    let normal_length = length(normal_cross);
-    var scene_normal = vec3<f32>(0.0, 1.0, 0.0);
-    if (normal_length > 0.000001) { scene_normal = normal_cross / normal_length; }
     var color = sample_color;
     g_span_count = 0u;
     g_eye_depth = 0.0;
@@ -268,8 +264,10 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
                 add_span(span, hi.y, delta.y);
             }
         }
-        if (all(world >= lo) && all(world <= hi) && ocean_mask_contains(slot, world.xz)) {
-            bottom_depth = max(bottom_depth, hi.y - world.y);
+        let receiver_margin = vec3<f32>(CAUSTIC_RECEIVER_MARGIN);
+        if (all(world >= lo - receiver_margin) && all(world <= hi + receiver_margin)
+            && ocean_mask_contains(slot, world.xz)) {
+            bottom_depth = max(bottom_depth, max(hi.y - world.y, 0.0));
         }
     }
     let eye_depth = g_eye_depth;
@@ -280,25 +278,40 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
         end = max(end, g_spans[i].y);
     }
     // Optional low-cost wave-curvature caustics. Approximation, not photon tracing.
-    // Scope to the bound simulation; distinct authored oceans never borrow its waves.
-    let own_water = ocean.authored_plane.x < 0.5 || (all(world.xz >= ocean.authored_bounds.xy) && all(world.xz <= ocean.authored_bounds.zw));
-    let sun = normalize(-ocean.sun_direction_intensity.xyz);
-    if (optics.params.z > 0.0 && bottom_depth > 2.0 && depth > 0.0 && own_water && sun.y > 0.05) {
-        let refracted = refract(-sun, vec3<f32>(0.0, 1.0, 0.0), 1.0 / 1.333);
-        let surface = world.xz - refracted.xz * bottom_depth / max(-refracted.y, 0.1);
-        let step = 8.0;
-        let dx = (slopes(surface + vec2<f32>(step,0.0)) - slopes(surface - vec2<f32>(step,0.0))) / (2.0*step);
-        let dz = (slopes(surface + vec2<f32>(0.0,step)) - slopes(surface - vec2<f32>(0.0,step))) / (2.0*step);
-        let focus = clamp(1.0 / max(0.25, 1.0 + bottom_depth * 0.25 * (dx.x + dz.y)) - 1.0, -0.4, 2.0);
-        let fade = exp2(-4.321928 * bottom_depth / max(optics.fog.w, 1.0));
-        let caustic = focus * optics.params.z * fade * abs(dot(scene_normal, sun)) * min(ocean.sun_direction_intensity.w, 1.0);
-        // This is a screen-space curvature approximation, not a full light
-        // transport solve. Never let its defocusing lobe drive scene radiance
-        // through/below zero, and fade it out where neighboring pixels clearly
-        // belong to different surfaces. The latter prevents player/prop/world
-        // silhouettes from becoming artificial dark contour lines underwater.
-        let caustic_multiplier = max(1.0 + caustic, 0.65);
-        color *= mix(1.0, caustic_multiplier, caustic_surface_confidence);
+    // No caustic-specific normal reconstruction or wave samples when disabled.
+    if (optics.params.z > 0.0 && bottom_depth > 2.0 && depth > 0.0) {
+        // Scope to the bound simulation; distinct authored oceans never borrow its waves.
+        let own_margin = vec2<f32>(CAUSTIC_RECEIVER_MARGIN);
+        let own_water = ocean.authored_plane.x < 0.5 || (all(world.xz >= ocean.authored_bounds.xy - own_margin) && all(world.xz <= ocean.authored_bounds.zw + own_margin));
+        let sun = normalize(-ocean.sun_direction_intensity.xyz);
+        if (own_water && sun.y > 0.05) {
+            let normal_cross = cross(world_dx, world_dy);
+            let normal_length = length(normal_cross);
+            // No invented world-up normal when gradients are degenerate.
+            // In that case the receiver's orientation is unknown: skip caustics.
+            if (normal_length > 0.000001) {
+                let scene_normal = normal_cross / normal_length;
+                let world_pixel_span = max(length(world_dx), length(world_dy));
+                let viewport = vec2<f32>(textureDimensions(scene_color));
+                let expected_pixel_span = max(ray_length * 4.0 / max(min(viewport.x, viewport.y), 1.0), 0.25);
+                let caustic_surface_confidence = 1.0 - smoothstep(
+                    expected_pixel_span * 4.0,
+                    expected_pixel_span * 12.0,
+                    world_pixel_span,
+                );
+                let refracted = refract(-sun, vec3<f32>(0.0, 1.0, 0.0), 1.0 / 1.333);
+                let surface = world.xz - refracted.xz * bottom_depth / max(-refracted.y, 0.1);
+                let step = 8.0;
+                let dx = (slopes(surface + vec2<f32>(step,0.0)) - slopes(surface - vec2<f32>(step,0.0))) / (2.0*step);
+                let dz = (slopes(surface + vec2<f32>(0.0,step)) - slopes(surface - vec2<f32>(0.0,step))) / (2.0*step);
+                let focus = clamp(1.0 / max(0.25, 1.0 + bottom_depth * 0.25 * (dx.x + dz.y)) - 1.0, -0.4, 2.0);
+                let fade = exp2(-4.321928 * bottom_depth / max(optics.fog.w, 1.0));
+                let caustic = focus * optics.params.z * fade * abs(dot(scene_normal, sun)) * min(ocean.sun_direction_intensity.w, 1.0);
+                // Preserve the existing discontinuity fade and brightness clamp.
+                let caustic_multiplier = max(1.0 + caustic, 0.65);
+                color *= mix(1.0, caustic_multiplier, caustic_surface_confidence);
+            }
+        }
     }
     if (water_fraction > 0.0) {
         // log2(20) corresponds to FIVE percent transmission, not four.

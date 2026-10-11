@@ -779,7 +779,7 @@ pub(in crate::renderer) fn bake_static_structural_vertex_ao(
         {
             let bvh = Arc::clone(&bvh);
             let sample_pattern = Arc::clone(&sample_pattern);
-            scope.spawn(move || {
+            std::thread::Builder::new().name("jka-static-ao-vertex".into()).spawn_scoped(scope, move || {
                 for (visibility, &(position, normal, seed)) in
                     value_chunk.iter_mut().zip(vertex_chunk.iter())
                 {
@@ -792,7 +792,7 @@ pub(in crate::renderer) fn bake_static_structural_vertex_ao(
                         range_scale,
                     );
                 }
-            });
+            }).expect("spawn named worker");
         }
     });
 

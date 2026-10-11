@@ -217,6 +217,33 @@ fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
     return output;
 }
 
+// TaystJK rd-vanilla Autosprite2Deform, prepared per authored quad at map load.
+// position = midpoint of its short edge, normal = shared long axis,
+// lightmap_uv.x = signed half-width; y = -1337 is the encoding marker.
+// Unmodified geometry (including source .map) keeps its original positions.
+// This entry exists only for the autoSprite2 pipeline key; ordinary BSP vertex
+// shaders have no billboard branch, uniforms or per-vertex overhead.
+fn autosprite2_input(original: VertexIn) -> VertexIn {
+    var input = original;
+    let half_width = original.lightmap_uv.x;
+    if (original.lightmap_uv.y == -1337.0) {
+        // BackEnd view axis[0] is the camera forward direction (not the
+        // position-to-eye vector). A single long-axis rotation, not full XYZ.
+        let minor = cross(original.normal, camera.camera_forward.xyz);
+        let length_sq = dot(minor, minor);
+        if (length_sq > 0.000001) {
+            input.position = original.position + minor * (half_width * inverseSqrt(length_sq));
+            // Deformed surface normal for lighting passes that use it.
+            input.normal = normalize(cross(original.normal, minor));
+        }
+    }
+    return input;
+}
+
+@vertex fn vs_autosprite2(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return fast_world_vertex(autosprite2_input(input), instance_index);
+}
+
 @vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
     return fast_world_vertex(input, instance_index);
 }

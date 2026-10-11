@@ -22,6 +22,10 @@ pub mod interaction;
 pub mod surfaces;
 pub mod bathymetry;
 pub mod coastal;
+mod footprint_index;
+#[cfg(test)]
+#[path = "ocean/footprint_perf_tests.rs"]
+mod footprint_perf_tests;
 pub use authoring::{AtmosphericWind, OceanAuthoring, OceanWind};
 pub const OCEAN_CASCADES: usize = 3;
 pub const OCEAN_DEFAULT_MAP_SIZE: u32 = 1024;
@@ -71,6 +75,8 @@ const PROMOTED_CLIPMAP_FULL_DETAIL_AMPLITUDE: f32 = 64.0;
 /// much of the PVS set the per-surface claim collapsed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OceanDrawStats {
+    /// CPU footprint queries/index regeneration, including work before acquire.
+    pub topology_ms: f64,
     /// Promoted surfaces the loaded world carries, visible or not.
     pub promoted_surfaces: u32,
     /// Authored (`r_oceanAuthoring`) oceans, each of which owns a *separate*
@@ -809,6 +815,7 @@ pub struct OceanMasks {
     /// CPU-side exact sparse footprints. These do not enter the shader
     /// uniform; they guide clipmap centering, LOD distance, and index pruning.
     pub footprints: [Option<std::sync::Arc<WaterFootprint>>; OCEAN_MAX_SURFACES],
+    footprint_indices: [Option<std::sync::Arc<footprint_index::FootprintIndex>>; OCEAN_MAX_SURFACES],
 }
 
 /// CPU twin of the promoted vertex shader's two-stage centre snapping. The
@@ -901,6 +908,7 @@ impl Default for OceanMasks {
             prune_tiles: [[0; OCEAN_PRUNE_TILE_WORDS]; OCEAN_MAX_SURFACES],
             triangles: Vec::new(),
             footprints: std::array::from_fn(|_| None),
+            footprint_indices: std::array::from_fn(|_| None),
         }
     }
 }
@@ -1037,11 +1045,16 @@ pub fn promoted_outline_needs_mask(
 }
 
 impl OceanMasks {
+    pub fn set_footprint(&mut self,slot:usize,footprint:&WaterFootprint) {
+        if slot>=OCEAN_MAX_SURFACES {return;}
+        self.footprint_indices[slot]=Some(std::sync::Arc::new(footprint_index::FootprintIndex::new(footprint)));
+        self.footprints[slot]=Some(std::sync::Arc::new(footprint.clone()));
+    }
     pub fn push_footprint(&mut self, slot: usize, footprint: &WaterFootprint) -> bool {
         if slot >= OCEAN_MAX_SURFACES {
             return false;
         }
-        self.footprints[slot] = Some(std::sync::Arc::new(footprint.clone()));
+        self.set_footprint(slot,footprint);
         self.push_surface(slot, &footprint.triangles)
     }
 
@@ -1116,7 +1129,11 @@ impl OceanMasks {
     /// Fine-grid boundary tiles remain present for the fragment mask to trim;
     /// only cells covered entirely by proven-dry tiles are omitted.
     pub fn rect_may_contain(&self, slot: usize, lo: [f32; 2], hi: [f32; 2]) -> bool {
-        if let Some(footprint) = self.footprints.get(slot).and_then(Option::as_deref) {
+        #[cfg(test)]
+        footprint_perf_tests::record_query(slot,lo,hi);
+        if let Some(index)=self.footprint_indices.get(slot).and_then(Option::as_deref) {
+            if !index.rect_may_contain(lo,hi) {return false;}
+        } else if let Some(footprint) = self.footprints.get(slot).and_then(Option::as_deref) {
             let intersects_sparse_tile = footprint.tiles.iter().any(|tile| {
                 hi[0] >= tile.minimum[0]
                     && hi[1] >= tile.minimum[1]
@@ -1156,6 +1173,9 @@ impl OceanMasks {
     }
 
     pub fn closest_point(&self, slot: usize, p: [f32; 2]) -> Option<[f32; 2]> {
+        if let Some(index)=self.footprint_indices.get(slot).and_then(Option::as_deref) {
+            return index.closest_point(p);
+        }
         let footprint = self.footprints.get(slot)?.as_deref()?;
         let mut best = None::<([f32; 2], f32)>;
         for triangle in &footprint.triangles {
@@ -1438,6 +1458,7 @@ struct PromotedRenderSurface {
 }
 
 pub struct OceanGpu {
+    promoted_centres: [Option<[f32; 2]>; OCEAN_MAX_SURFACES],
     pub coastal: Option<coastal::Gpu>,
     coastal_render: std::sync::Arc<coastal::RenderResources>,
     coastal_key: Option<(usize, u8, bool, u32, u32)>,
@@ -1814,7 +1835,7 @@ impl OceanGpu {
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
             interaction_splash_uniform: interaction.splash_uniform.clone(),
-            coastal: None, coastal_render, coastal_key: None };
+            coastal: None, coastal_render, coastal_key: None, promoted_centres: [None;OCEAN_MAX_SURFACES] };
         ocean.upload_params(queue,0.0);
         let mut encoder=device.create_command_encoder(&wgpu::CommandEncoderDescriptor{label:Some("Ocean FFT init")});
         {
@@ -1862,8 +1883,11 @@ impl OceanGpu {
         uniform.mask_triangles[..self.masks.triangles.len()].copy_from_slice(&self.masks.triangles);
         queue.write_buffer(&self.render_buffer,0,bytemuck::bytes_of(&uniform));
         for surface in &self.promoted_surfaces {
-            let local = make_promoted_render_uniform(&uniform, &surface.settings,
+            let mut local = make_promoted_render_uniform(&uniform, &surface.settings,
                 &surface.descriptor, surface.manual, self.promoted_surfaces.len());
+            if let Some(centre)=self.promoted_centres[surface.descriptor.index] {
+                local.clipmap[0]=centre[0];local.clipmap[1]=centre[1];
+            }
             queue.write_buffer(&surface.buffer,0,bytemuck::bytes_of(&local));
         }
     }
@@ -1875,6 +1899,15 @@ impl OceanGpu {
             .map_or(&self.render_bind_group, |s| &s.bind_group)
     }
 
+    /// The shader must place the mesh at the same centre the CPU used when
+    /// pruning indices. Clamping independently to the AABB caused dry-corner
+    /// cameras to draw topology generated for a different water location.
+    pub fn set_promoted_clipmap_centres(&mut self,queue:&wgpu::Queue,centres:[Option<[f32;2]>;OCEAN_MAX_SURFACES]) {
+        if self.promoted_centres==centres {return;}
+        self.promoted_centres=centres;
+        self.write_render_uniform(queue);
+    }
+
     /// Rebuild only when the map/selection/amplitude changes. Failed selections
     /// are remembered so unsupported pools do not retry every render frame.
     pub fn configure_coastal(
@@ -1884,6 +1917,7 @@ impl OceanGpu {
         promoted: &[appearance::PromotedOcean], overrides: &[(usize, OceanSettings)],
     ) {
         let pointer=atlas.map_or(0,|a|std::sync::Arc::as_ptr(a) as usize);
+        if !enabled && self.coastal.is_none() {return;}
         let mut candidates:Vec<_>=promoted.iter().filter(|p|pool==0 || p.index+1==pool as usize).collect();
         let amplitude=|p:&appearance::PromotedOcean|overrides.iter().find(|(slot,_)|*slot==p.index)
             .map_or(p.heuristic.amplitude,|(_,s)|s.authored.amplitude);

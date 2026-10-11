@@ -433,7 +433,8 @@ impl App {
     }
 
     pub(in crate::app) fn ensure_asset_preview_entity_presenter(&mut self) -> Result<(), String> {
-        if self.asset_preview_entity_presenter.is_some() {
+        if let Some(presenter) = self.asset_preview_entity_presenter.as_mut() {
+            presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
             return Ok(());
         }
         let mut assets =
@@ -444,6 +445,7 @@ impl App {
             EntityPresenter::new(assets, self.video.pbr)
                 .map_err(|error| format!("ASSET VIEWER MD3 ERROR: {error}"))?,
         );
+        self.asset_preview_entity_presenter.as_mut().unwrap().set_md3_geometry_cache(self.video.md3_geometry_cache);
         Ok(())
     }
 

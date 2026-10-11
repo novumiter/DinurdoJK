@@ -448,6 +448,7 @@ fn sky_cloud_stages_become_ordered_sky_batches_with_view_direction_coordinates()
     let cloud = |texture: usize, blend: Option<crate::materials::BlendFunc>, mods: Vec<TcMod>| {
         MaterialStage {
             texture: StageTexture::Image(texture),
+            animation: None,
             enhancements: Default::default(),
             blend,
             alpha_cutoff: 0.0,
@@ -553,6 +554,7 @@ fn authored_world_lighting_diffuse_does_not_render_white() {
     // but the texture/constant alpha must remain untouched.
     let stage = MaterialStage {
         texture: StageTexture::Image(1), enhancements: Default::default(),
+        animation: None,
         blend: Some(crate::materials::BlendFunc {
             src: crate::materials::BlendFactor::SrcAlpha,
             dst: crate::materials::BlendFactor::OneMinusSrcAlpha,
@@ -587,6 +589,7 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
 
     let stage = MaterialStage {
         texture: StageTexture::Image(1),
+        animation: None,
         enhancements: Default::default(),
         blend: None,
         alpha_cutoff: 0.0,

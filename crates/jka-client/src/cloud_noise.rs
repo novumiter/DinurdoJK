@@ -251,7 +251,7 @@ pub fn bake_weather_map() -> Vec<u8> {
     std::thread::scope(|scope| {
         for (band, chunk) in data.chunks_mut(band_bytes).enumerate() {
             let y0 = band as u32 * rows_per_band;
-            scope.spawn(move || {
+            std::thread::Builder::new().name(format!("jka-cloud-weather-{band}")).spawn_scoped(scope, move || {
                 for (row, out) in chunk.chunks_mut(row_bytes).enumerate() {
                     let y = y0 + row as u32;
                     let v = (y as f32 + 0.5) / size as f32;
@@ -266,7 +266,7 @@ pub fn bake_weather_map() -> Vec<u8> {
                         }
                     }
                 }
-            });
+            }).expect("spawn named worker");
         }
     });
 
@@ -285,7 +285,7 @@ pub fn bake_detail_volume() -> Vec<u8> {
     std::thread::scope(|scope| {
         for (band, chunk) in data.chunks_mut(band_bytes).enumerate() {
             let z0 = band as u32 * slices_per_band;
-            scope.spawn(move || {
+            std::thread::Builder::new().name(format!("jka-cloud-detail-{band}")).spawn_scoped(scope, move || {
                 for (slice, out) in chunk.chunks_mut(slice_bytes).enumerate() {
                     let z = z0 + slice as u32;
                     let w = (z as f32 + 0.5) / size as f32;
@@ -300,7 +300,7 @@ pub fn bake_detail_volume() -> Vec<u8> {
                         }
                     }
                 }
-            });
+            }).expect("spawn named worker");
         }
     });
 

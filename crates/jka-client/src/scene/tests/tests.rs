@@ -273,6 +273,7 @@ use super::*;
 fn one_zero_world_base_is_opaque_and_seeds_depth() {
     let stage = MaterialStage {
         texture: StageTexture::Image(7),
+        animation: None,
         enhancements: Default::default(),
         blend: Some(materials::BlendFunc {
             src: BlendFactor::One,
@@ -409,6 +410,7 @@ fn entity_sun_weights_split_sunlit_from_torch_and_sky_probes() {
 fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
     let lightmap = MaterialStage {
         texture: StageTexture::Lightmap,
+        animation: None,
         enhancements: Default::default(),
         blend: None,
         alpha_cutoff: 0.0,
@@ -424,6 +426,7 @@ fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
 };
     let mut diffuse = MaterialStage {
         texture: StageTexture::Image(7),
+        animation: None,
         enhancements: Default::default(),
         blend: Some(materials::BlendFunc {
             src: BlendFactor::DstColor,
@@ -583,6 +586,7 @@ fn material_audit_recognizes_existing_collapse_without_changing_rendering() {
 fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
     let diffuse = MaterialStage {
         texture: StageTexture::Image(7),
+        animation: None,
         enhancements: Default::default(),
         blend: None,
         alpha_cutoff: 0.0,
@@ -598,6 +602,7 @@ fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
 };
     let lightmap = MaterialStage {
         texture: StageTexture::Lightmap,
+        animation: None,
         enhancements: Default::default(),
         blend: Some(materials::BlendFunc {
             src: BlendFactor::DstColor,
@@ -647,6 +652,7 @@ fn vertex_lit_lightmap_stage_keeps_explicit_white_texture_source() {
 fn vertex_lit_pbr_override_consumes_bsp_vertex_lighting() {
     let mut base = MaterialStage {
         texture: StageTexture::Image(7),
+        animation: None,
         enhancements: Default::default(),
         blend: None,
         alpha_cutoff: 0.0,
@@ -665,6 +671,7 @@ fn vertex_lit_pbr_override_consumes_bsp_vertex_lighting() {
 
     let glow = MaterialStage {
         texture: StageTexture::Image(10),
+        animation: None,
         enhancements: Default::default(),
         blend: Some(materials::BlendFunc {
             src: BlendFactor::One,
@@ -696,6 +703,7 @@ fn vertex_lit_pbr_override_consumes_bsp_vertex_lighting() {
 fn classic_explicit_vertex_lit_identity_stage_is_not_forced() {
     let base = MaterialStage {
         texture: StageTexture::Image(7),
+        animation: None,
         enhancements: Default::default(),
         blend: None,
         alpha_cutoff: 0.0,
@@ -724,6 +732,7 @@ fn guaranteed_alpha_discard_render_cull_keeps_surface_light_semantics() {
     let material = SurfaceMaterial {
         stages: vec![MaterialStage {
             texture: StageTexture::White,
+            animation: None,
             enhancements: Default::default(),
             blend: None,
             alpha_cutoff: 0.5,
@@ -756,6 +765,7 @@ fn black_additive_surface_light_render_cull_keeps_surface_light_semantics() {
     let material = SurfaceMaterial {
         stages: vec![MaterialStage {
             texture: StageTexture::White,
+            animation: None,
             enhancements: Default::default(),
             blend: Some(materials::BlendFunc {
                 src: BlendFactor::One,
@@ -791,6 +801,7 @@ fn black_additive_non_light_shader_is_not_mapload_culled() {
     let material = SurfaceMaterial {
         stages: vec![MaterialStage {
             texture: StageTexture::White,
+            animation: None,
             enhancements: Default::default(),
             blend: Some(materials::BlendFunc {
                 src: BlendFactor::One,
@@ -818,6 +829,7 @@ fn black_additive_non_light_shader_is_not_mapload_culled() {
 fn guaranteed_alpha_discard_render_cull_requires_every_stage_to_discard() {
     let invisible = MaterialStage {
         texture: StageTexture::White,
+        animation: None,
         enhancements: Default::default(),
         blend: None,
         alpha_cutoff: 0.5,
@@ -1429,6 +1441,7 @@ fn promoted_water_inherits_stage_tint_alpha_and_material_hints() {
     enhancements.specular_reflectance = Some([0.08, 0.06, 0.04]);
     let stage = MaterialStage {
         texture: StageTexture::White, enhancements, blend: None,
+        animation: None,
         alpha_cutoff: 0.0, opacity: 0.4, color: [0.2, 0.4, 0.8],
         rgb_gen: RgbGen::Const, alpha_gen: AlphaGen::Vertex,
         tc_gen: TcGen::Base, tc_mods: Vec::new(),
@@ -1464,6 +1477,7 @@ fn promoted_water_inherits_stage_tint_alpha_and_material_hints() {
 fn promoted_water_screen_stage_uses_analyzed_color_without_texture_mapping() {
     let stage = MaterialStage {
         texture:StageTexture::White,enhancements:Default::default(),
+        animation: None,
         blend:Some(materials::BlendFunc {src:materials::BlendFactor::OneMinusDstColor,dst:materials::BlendFactor::One}),
         alpha_cutoff:0.0,opacity:1.0,color:[1.0;3],rgb_gen:RgbGen::Vertex,alpha_gen:AlphaGen::Identity,
         tc_gen:TcGen::Base,tc_mods:vec![TcMod::Turb {base:0.5,amplitude:0.03,phase:0.0,frequency:0.3}],

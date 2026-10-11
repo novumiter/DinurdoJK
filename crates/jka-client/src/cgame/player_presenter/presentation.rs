@@ -597,14 +597,16 @@ impl PlayerPresenter {
             .get(&entity.number)
             .is_none_or(|runtime| runtime.model_key != model.key);
         if recreate {
-            // A model swap onto the very same skeleton (all humanoid players
-            // share one GLA through the asset workers) keeps the running
+            // A model swap using the same animation source keeps the running
             // animation/angle state instead of restarting the player.
             if let Some(runtime) = self
                 .entities
                 .get_mut(&entity.number)
-                .filter(|runtime| Arc::ptr_eq(&runtime.model.gla, &model.gla))
+                .filter(|runtime| Arc::ptr_eq(&runtime.model.animation_gla, &model.animation_gla))
             {
+                if !runtime.model.shares_mesh_pose_binding(&model) {
+                    runtime.bone_smooth_history = None;
+                }
                 runtime.model_key.clone_from(&model.key);
                 runtime.model = Arc::clone(&model);
                 recreate = false;
@@ -618,11 +620,14 @@ impl PlayerPresenter {
                 .get_mut(&entity.number)
                 .filter(|runtime| !Arc::ptr_eq(&runtime.model, &model))
             {
+                if !runtime.model.shares_mesh_pose_binding(&model) {
+                    runtime.bone_smooth_history = None;
+                }
                 runtime.model = Arc::clone(&model);
             }
         }
         if recreate {
-            let animation = PlayerAnimationState::new(&model.gla, current_time)?;
+            let animation = PlayerAnimationState::new(&model.animation_gla, current_time)?;
             self.entities.insert(
                 entity.number,
                 EntityPlayerState {
@@ -912,20 +917,20 @@ impl PlayerPresenter {
             // depends on seeing that one-frame lag to detect an animation
             // change. Evaluate them ahead of `runtime.animation.update` below
             // to keep that ordering, rather than after it.
-            let motion_index = Ghoul2Animator::bone_index(&model.gla, "Motion")
+            let motion_index = Ghoul2Animator::bone_index(&model.animation_gla, "Motion")
                 .ok_or_else(|| format!("{} has no Ghoul2 Motion bone", info.model_qpath()))?;
             let pose_started = Instant::now();
             // OpenJK's CBoneCache::Eval is lazy: BG_G2PlayerAngles only needs the
             // pre-angle Motion bolt, so evaluate Motion + its ancestors here rather
             // than materializing all humanoid bones a first time.
             let motion_pose = runtime.animation.animator.evaluate_bone_openjk_root(
-                &model.gla,
+                &model.animation_gla,
                 current_time,
                 motion_index,
             )?;
             record_motion_pose_eval(&mut self.perf, pose_started);
             let motion_bolt =
-                multiply_3x4(&motion_pose, &model.gla.skeleton[motion_index].base_pose);
+                multiply_3x4(&motion_pose, &model.animation_gla.skeleton[motion_index].base_pose);
             let motion_matrix = flatten_matrix3x4(&motion_bolt);
 
             let frametime = current_time.saturating_sub(runtime.last_angle_time);
@@ -1009,7 +1014,7 @@ impl PlayerPresenter {
                     ));
                 }
                 runtime.animation.animator.set_bone_angles_postmult(
-                    &model.gla,
+                    &model.animation_gla,
                     command.bone_name(),
                     command.angles,
                     command.up,
@@ -1039,7 +1044,7 @@ impl PlayerPresenter {
         runtime.animation.update(
             &entity.state,
             animations,
-            &model.gla,
+            &model.animation_gla,
             info,
             &self.saber_scales,
             current_time,
@@ -1142,18 +1147,10 @@ impl PlayerPresenter {
         };
 
         let pose_started = Instant::now();
-        let mut pose = runtime
+        let animation_pose = runtime
             .animation
-            .evaluate_pose_openjk_root(&model.gla, current_time)?;
-        // Source anatomy has custom joint lengths. Rebase this ONE model's
-        // Ghoul2 skin matrices to those pivots before ragdoll, bolt sampling,
-        // smoothing, GPU skinning or attachment effects inspect the pose.
-        // Stock GLM players bypass this path completely.
-        if let Some(ref pivots) = model.source_native_pivots {
-            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(
-                &model.gla, &pose, pivots.as_slice(),
-            )?;
-        }
+            .evaluate_pose_openjk_root(&model.animation_gla, current_time)?;
+        let mut pose = model.bind_animation_pose(animation_pose)?;
         record_pose_eval(&mut self.perf, pose_started);
 
         let (render_axis, render_origin) = ghoul2_render_transform(entity, axis);

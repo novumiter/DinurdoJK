@@ -836,6 +836,17 @@ pub(in crate::scene) fn prepare_internal(
             }
         }
 
+        // The authored BSP triangles are already expanded into a non-indexed
+        // stream. Do NOT rotate the whole material/PVS batch: one tree quad
+        // must pivot independently of the next. Encode each consecutive pair
+        // before batching, retaining original vertices for malformed pairs.
+        // This packing uses the (unused) lightmap UV on no-lightmap billboards.
+        if material.auto_sprite2 && lightmap_slot.is_none() {
+            for quad in geometry.chunks_exact_mut(6) {
+                super::geometry::encode_autosprite2_quad(quad);
+            }
+        }
+
         let has_environment_stage = material
             .stages
             .iter()
@@ -854,6 +865,15 @@ pub(in crate::scene) fn prepare_internal(
                 || (options.planar_environment && has_environment_stage && planar_group.is_none()));
         let key = GroupKey {
             class,
+            // Existing world passes separate opaque/mask from transparent;
+            // within each class preserve explicit shader sorting. Untagged
+            // transparent materials default to TaystJK's SS_BLEND0 (14).
+            // Fixed-point keeps GroupKey totally ordered without f32 NaNs.
+            sort_priority: (material.sort.unwrap_or(if class == DrawClass::Transparent {
+                14.0
+            } else {
+                3.0
+            }) * 1024.0) as i32,
             shader: batch.shader,
             lightmap,
             vertex_lit,
@@ -972,6 +992,7 @@ pub(in crate::scene) fn prepare_internal(
             .par_iter()
             .enumerate()
             .map(|(batch_index, batch)| {
+                crate::thread_activity::label_rayon_worker();
                 let (key, chunk) = batch_geometry(&mesh, batch_index, batch)?;
                 let signature_started = Instant::now();
                 let signature = bsp
@@ -1017,7 +1038,7 @@ pub(in crate::scene) fn prepare_internal(
             .into_iter()
             .collect::<Vec<_>>()
             .into_par_iter()
-            .map(|(key, geometry)| (key, order_pvs_pieces(geometry.by_pvs_signature)))
+            .map(|(key, geometry)| { crate::thread_activity::label_rayon_worker(); (key, order_pvs_pieces(geometry.by_pvs_signature)) })
             .collect::<Vec<_>>()
     };
     let order_time = order_started.elapsed();

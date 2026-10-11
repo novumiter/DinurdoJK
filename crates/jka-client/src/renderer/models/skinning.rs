@@ -656,6 +656,7 @@ impl DynamicModelRenderer {
         let rt = self.rt_skinning.as_mut().expect("created above");
         if !vertex_bytes.is_empty() {
             queue.write_buffer(&rt.vertex_buffer, 0, vertex_bytes);
+            self.perf_prepare.vertex_upload_bytes = vertex_bytes.len() as u64;
         }
         if !index_bytes.is_empty() {
             queue.write_buffer(&rt.index_buffer, 0, index_bytes);

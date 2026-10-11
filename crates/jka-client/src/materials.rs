@@ -97,9 +97,34 @@ impl Default for StageEnhancements {
     }
 }
 
+/// GPU texture indices, resolved once at map load from an authored animMap.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterialAnimation {
+    pub fps: f32,
+    pub frames: Vec<usize>,
+    pub one_shot: bool,
+}
+
+impl MaterialAnimation {
+    /// TaystJK R_BindAnimatedImage uses integer shader-time * fps, clamps
+    /// negative remap offsets to frame zero, then loops or holds the last.
+    pub fn frame_index(&self, shader_time: f32) -> usize {
+        if self.frames.len() <= 1 || !shader_time.is_finite() || !self.fps.is_finite() || self.fps <= 0.0 {
+            return 0;
+        }
+        let frame = (shader_time.max(0.0) as f64 * self.fps as f64).floor();
+        if self.one_shot {
+            frame.min((self.frames.len() - 1) as f64) as usize
+        } else {
+            (frame % self.frames.len() as f64) as usize
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MaterialStage {
     pub texture: StageTexture,
+    pub animation: Option<MaterialAnimation>,
     pub enhancements: StageEnhancements,
     pub blend: Option<BlendFunc>,
     pub alpha_cutoff: f32,
@@ -187,6 +212,8 @@ pub struct SurfaceMaterial {
     pub surface_material: u8,
     pub cull: CullMode,
     pub offset: bool,
+    /// Explicit shader sort rank, matching TaystJK's `shader.sort`.
+    pub sort: Option<f32>,
     /// Authored id Tech 3 `portal` / `sort portal` surface. These surfaces are
     /// eligible for the renderer's exact planar-reflection path.
     pub planar_reflection: bool,
@@ -228,6 +255,8 @@ pub struct SurfaceMaterial {
     /// cull state to leak between passes, so scene preparation uses this bit to
     /// reproduce the visible retail result deterministically for world geometry.
     pub surface_sprite_cull_quirk: bool,
+    /// Camera-facing rectangular BSP quads about their long axis (TaystJK autoSprite2).
+    pub auto_sprite2: bool,
     /// False for the implicit "texture + map lighting" material synthesized when
     /// no shader script exists. This lets scene preparation keep that path in one
     /// draw call while explicit multi-pass scripts remain ordered passes.
@@ -245,6 +274,7 @@ impl Default for SurfaceMaterial {
             surface_material: 0,
             cull: CullMode::Back,
             offset: false,
+            sort: None,
             planar_reflection: false,
             water: false,
             water_amplitude: crate::ocean::appearance::DEFAULT_PROMOTED_AMPLITUDE,
@@ -261,6 +291,7 @@ impl Default for SurfaceMaterial {
             grass: None,
             surface_sprite_effects: Vec::new(),
             surface_sprite_cull_quirk: false,
+            auto_sprite2: false,
             explicit: false,
             authored_detail: false,
         }
@@ -1030,6 +1061,7 @@ impl Textures {
         // bit-identical output.
         let heights = rgba.clone();
         rgba.par_chunks_mut(width * 4).enumerate().for_each(|(y, row)| {
+            crate::thread_activity::label_rayon_worker();
             for x in 0..width {
                 let mut s = [0_f32; 9];
                 let mut n = 0;
@@ -1522,7 +1554,7 @@ fn build_normal_height_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec
             use rayon::prelude::*;
             next.par_chunks_mut(row_bytes)
                 .enumerate()
-                .for_each(|(y, row)| fill_row(y as u32, row));
+                .for_each(|(y, row)| { crate::thread_activity::label_rayon_worker(); fill_row(y as u32, row); });
         } else {
             for (y, row) in next.chunks_mut(row_bytes).enumerate() {
                 fill_row(y as u32, row);
@@ -2122,6 +2154,11 @@ pub fn primary_texture_requests(
                         continue;
                     }
                     push(&stage.image, stage.clamp, true);
+                    if let Some(animation) = &stage.animation {
+                        for frame in &animation.frames {
+                            push(frame, stage.clamp, true);
+                        }
+                    }
                     if let Some(path) = stage.normal_map.as_deref() {
                         push(path, false, false);
                     }
@@ -2140,6 +2177,29 @@ pub fn primary_texture_requests(
         }
     }
     requests
+}
+
+/// Load every authored frame through the same provider and sampler rules
+/// as map; do not silently animate a partially missing texture sequence.
+fn resolve_stage_animation(
+    source: &shader::Stage,
+    assets: &mut AssetSearchPath,
+    textures: &mut Textures,
+    preferred_source: Option<&Path>,
+) -> Option<MaterialAnimation> {
+    let anim = source.animation.as_ref()?;
+    let mut frames = Vec::with_capacity(anim.frames.len());
+    for name in &anim.frames {
+        let image = preferred_source
+            .and_then(|provider| textures.load_from_source(assets, name, source.clamp, provider))
+            .or_else(|| textures.load(assets, name, source.clamp))?;
+        frames.push(image);
+    }
+    (frames.len() > 1).then_some(MaterialAnimation {
+        fps: anim.fps,
+        frames,
+        one_shot: anim.one_shot,
+    })
 }
 
 /// The stages of a sky shader that authored a `skyParms` cloud height. The
@@ -2184,6 +2244,7 @@ fn sky_cloud_stages(
         }
         stages.push(MaterialStage {
             texture,
+            animation: resolve_stage_animation(source, assets, textures, preferred_source),
             enhancements: StageEnhancements::default(),
             blend,
             alpha_cutoff: alpha_cutoff(source),
@@ -2430,6 +2491,7 @@ pub fn describe(
                 );
                 stages.push(MaterialStage {
                     texture,
+                    animation: resolve_stage_animation(source, assets, textures, preferred_source),
                     enhancements,
                     blend,
                     alpha_cutoff: alpha_cutoff(source),
@@ -2467,6 +2529,7 @@ pub fn describe(
                     .unwrap_or(StageTexture::White);
                 stages.push(MaterialStage {
                     texture,
+                    animation: None,
                     enhancements: StageEnhancements::default(),
                     blend: None,
                     alpha_cutoff: 0.0,
@@ -2500,6 +2563,7 @@ pub fn describe(
             );
             stages.push(MaterialStage {
                 texture,
+                animation: None,
                 enhancements,
                 blend: None,
                 alpha_cutoff: 0.0,
@@ -2553,9 +2617,11 @@ pub fn describe(
         grass,
         surface_sprite_effects,
         surface_sprite_cull_quirk,
+        auto_sprite2: definition.auto_sprite2,
         stages,
         cull: cull_mode(&definition.cull),
         offset: definition.polygon_offset,
+        sort: definition.sort,
         planar_reflection: definition.portal,
         water: definition.water,
         water_amplitude: crate::ocean::appearance::amplitude_from_shader(definition),
@@ -2860,6 +2926,24 @@ blendFunc GL_ONE GL_ONE
     }
 
     #[test]
+    fn taystjk_anim_map_frame_clock() {
+        let looping = MaterialAnimation {
+            fps: 10.0,
+            frames: vec![1, 2, 3, 4],
+            one_shot: false,
+        };
+        assert_eq!(looping.frame_index(0.0), 0);
+        assert_eq!(looping.frame_index(0.099), 0);
+        assert_eq!(looping.frame_index(0.100), 1);
+        assert_eq!(looping.frame_index(0.399), 3);
+        assert_eq!(looping.frame_index(0.400), 0);
+        assert_eq!(looping.frame_index(-100.0), 0);
+        let once = MaterialAnimation { one_shot: true, ..looping };
+        assert_eq!(once.frame_index(0.400), 3);
+        assert_eq!(once.frame_index(90.0), 3);
+    }
+
+    #[test]
     fn shader_light_promotion_tracks_glow_and_additive_with_q3map_overlap_metadata() {
         let glow = material(
             "test {\n{\nmap $whiteimage\nglow\nrgbGen const ( 1 0.25 0.1 )\n}\n}",
@@ -2916,6 +3000,7 @@ rgbGen const ( 0 0 0 )
         });
         let stage = MaterialStage {
             texture: StageTexture::White,
+            animation: None,
             enhancements: StageEnhancements {
                 emissive_texture: Some(0),
                 ..Default::default()

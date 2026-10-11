@@ -503,6 +503,17 @@ commands! {
         }
     }
 
+    cmd_emote_net_test ["emote_net_test", ] ("emote_net_test <id>", "Send a one-snapshot Fortnite emote ID using a normal taunt (experimental).", CommandScope::Always) |self, command| {
+        let id = command.split_whitespace().nth(1).and_then(|value| value.parse::<u16>().ok());
+        match id {
+            Some(id) if self.live_connected() && self.live_input.queue_emote_taunt(id) => {
+                self.push_console_line(format!("^5[DJK EMOTE NET] transmitting ID {id} with immediate taunt (experimental)"));
+            }
+            _ => self.push_console_line("^3Usage: emote_net_test <0..2047> while connected to a server".to_owned()),
+        }
+        CommandResult::Handled
+    }
+
     cmd_game_taunt ["taunt", ] ("taunt", "Taunt.", CommandScope::Always, game = GameCommand::Generic(27)) |self, command| {
         if self.execute_game_command(command) {
             CommandResult::Handled

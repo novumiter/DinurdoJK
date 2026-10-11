@@ -206,7 +206,7 @@ impl App {
             lagometer: self.lagometer_ui.clone(),
             video: self.video,
             perf: self.perf,
-            threads: self.threads,
+            threads: self.threads.clone(),
             surface_inspector,
             startup_splash: !self.startup_first_frame_seen,
             loading: self.loading.as_ref().map(MapLoadingState::ui),

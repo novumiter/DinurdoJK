@@ -109,6 +109,189 @@ fn coastal_adapter_stitches_tiles_and_seals_unknowns_and_walls() {
 }
 
 #[test]
+fn coastal_live_budget_excludes_unused_offshore_tiles_and_remaps_seams() {
+    let (mut atlas, ocean) = tiled_bank();
+    let reference = prepare(&atlas, &ocean).unwrap();
+    // More than the old 256-tile live limit; all the extra bathymetry is deep.
+    for y in 0..260 {
+        let mut grid = atlas.grids[0].clone();
+        grid.origin = [1024.0, y as f32 * 256.0];
+        for cell in &mut grid.cells {
+            cell.class = Class::Wet;
+            cell.bed = -128.0;
+            cell.bed_min = -128.0;
+            cell.bed_max = -128.0;
+            cell.depth = 128.0;
+        }
+        atlas.grids.push(grid);
+    }
+    // Put unused tiles between the two active ones to exercise remapping.
+    atlas.grids.swap(1, 200);
+    let packed = prepare(&atlas, &ocean).unwrap();
+    assert_eq!(packed.cells.len(), 512);
+    assert_eq!(packed.active, reference.active);
+    assert_eq!(
+        bytemuck::cast_slice::<_, u8>(&packed.cells),
+        bytemuck::cast_slice::<_, u8>(&reference.cells)
+    );
+    assert_eq!(packed.depth, reference.depth);
+    assert_eq!(packed.lookup, reference.lookup);
+}
+
+#[test]
+fn coastal_screened_pool_rejects_wavelength_beyond_baked_depth() {
+    let (mut atlas, mut ocean) = tiled_bank();
+    atlas
+        .shoreline_bands
+        .push(jka_assets::bsp::bathymetry::ShorelineBand {
+            slot: ocean.index as u32,
+            full_tiles: 5000,
+            retained_tiles: 2,
+            max_depth: 38.4,
+        });
+    assert!(prepare(&atlas, &ocean).is_ok());
+    ocean.heuristic.wavelength = 800.0;
+    assert!(prepare(&atlas, &ocean)
+        .err()
+        .unwrap()
+        .contains("screened shoreline band"));
+}
+
+#[test]
+#[ignore = "requires installed RaceArena / Racepack4 / Racepack6 assets"]
+fn coastal_large_pool_runtime_maps() {
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for name in ["racearena_pro", "racepack4", "racepack6"] {
+        let map = crate::scene::prepare_with_options(
+            &workspace.join("target/release/base"),
+            Some(&workspace.join("target/release/japro")),
+            name,
+            crate::scene::MapPrepareOptions {
+                ocean: true,
+                grass: false,
+                voxel_probe_gi: false,
+                client_physics: false,
+                gen_normal_maps: false,
+                steam_audio: false,
+                planar_reflections: false,
+                planar_environment: false,
+                ..Default::default()
+            },
+        )
+        .expect("prepare real large-pool map");
+        let entries =
+            super::super::surfaces::collect(&map.vertices, &map.batches, &map.pvs_batches);
+        let faces: Vec<_> = entries.iter().map(|e| e.face).collect();
+        let triangles: Vec<_> = entries.iter().map(|e| e.triangles.clone()).collect();
+        let footprints = super::super::build_water_footprints(
+            &faces,
+            &triangles,
+            super::super::WATER_FOOTPRINT_TILE_SIZE,
+        );
+        let job = map
+            .coastal_bathymetry
+            .as_ref()
+            .expect("coastal geometry job");
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let status = job.status.lock().unwrap();
+            match &*status {
+                super::super::bathymetry::Status::Ready {
+                    atlas,
+                    total_ms,
+                    cache_hit,
+                    ..
+                } => {
+                    let decoded = Atlas::decode(&atlas.encode([11, 12]), [11, 12]).unwrap();
+                    assert_eq!(decoded.shoreline_bands.len(), atlas.shoreline_bands.len());
+                    eprintln!(
+                        "{name}: {} grids; {total_ms:.2} ms; cache_hit={cache_hit}",
+                        atlas.grids.len()
+                    );
+                    for (slot, footprint) in footprints
+                        .iter()
+                        .take(super::super::OCEAN_MAX_SURFACES)
+                        .enumerate()
+                    {
+                        if faces[footprint.members[0]].authored_ocean.is_some() {
+                            continue;
+                        }
+                        let representative = footprint
+                            .members
+                            .iter()
+                            .copied()
+                            .max_by(|&a, &b| {
+                                let area = |i: usize| {
+                                    (faces[i].maximum[0] - faces[i].minimum[0])
+                                        * (faces[i].maximum[1] - faces[i].minimum[1])
+                                };
+                                area(a).total_cmp(&area(b))
+                            })
+                            .unwrap();
+                        let primary = entries[representative].source;
+                        let source = map
+                            .batches
+                            .iter()
+                            .chain(&map.pvs_batches)
+                            .find(|s| {
+                                s.vertices == primary.vertices
+                                    && s.water
+                                    && !s.texture_is_lightmap
+                                    && !matches!(s.tc_gen, jka_assets::shader::TcGen::Environment)
+                                    && s.texture.is_some()
+                            })
+                            .unwrap_or(primary);
+                        let appearance = super::super::appearance::from_stage(
+                            source,
+                            &map.vertices,
+                            &map.textures,
+                        );
+                        let ocean = PromotedOcean {
+                            index: slot,
+                            name: name.into(),
+                            surface: super::super::OceanSurface {
+                                plane_height: footprint.plane,
+                                minimum: footprint.minimum,
+                                maximum: footprint.maximum,
+                            },
+                            heuristic: appearance.heuristic,
+                            color: [0.1; 3],
+                            roughness: None,
+                            swell_direction: None,
+                        };
+                        let baked = atlas.grids.iter().filter(|g| g.slot == slot as u32).count();
+                        let result = match prepare(atlas, &ocean) {
+                            Ok(p) => format!(
+                                "LIVE {} cells / {} active / {} bank cells",
+                                p.cells.len(),
+                                p.active,
+                                p.shoreline
+                            ),
+                            Err(e) => format!("FFT: {e}"),
+                        };
+                        eprintln!("{name} Pool {}: level {}u; full {} tiles / {} baked tiles; wavelength {:.2}u; {result}",
+                            slot + 1, footprint.plane, footprint.tiles.len(), baked, ocean.heuristic.wavelength);
+                    }
+                    for warning in &atlas.warnings {
+                        eprintln!("{name}: {warning}");
+                    }
+                    break;
+                }
+                super::super::bathymetry::Status::Failed(e) => panic!("{name}: {e}"),
+                _ => {}
+            }
+            drop(status);
+            assert!(Instant::now() < deadline, "{name} bake timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires installed Racepack6 assets in target/release/base and japro"]
 fn coastal_racepack6_pool3_runtime_adapter() {
     use std::path::Path;
@@ -446,9 +629,11 @@ fn coastal_gpu_matches_cpu_conservation_wall_and_wet_front() {
         for case in 0..5 {
             let (prepared, mut cpu) = rectangular_fixture(case);
             let initial_volume = cpu.volume();
-            let initialization_scope=device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let initialization_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let mut gpu = Gpu::new(&device, prepared, &view, &sampler, 0.0);
-            if let Some(error)=initialization_scope.pop().await {panic!("coastal GPU initialization: {error}");}
+            if let Some(error) = initialization_scope.pop().await {
+                panic!("coastal GPU initialization: {error}");
+            }
             for step in 0..80 {
                 cpu.step(f64::from(gpu.dt));
                 let mut encoder = device.create_command_encoder(&Default::default());

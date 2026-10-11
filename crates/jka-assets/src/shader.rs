@@ -226,9 +226,19 @@ impl SurfaceSprite {
     }
 }
 
+/// Authored id Tech 3 texture animation. A frame is selected from shader time;
+/// this is independent of deformVertexes autoSprite/autosprite2 geometry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageAnimation {
+    pub fps: f32,
+    pub frames: Vec<String>,
+    pub one_shot: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Stage {
     pub image: String,
+    pub animation: Option<ImageAnimation>,
     pub clamp: bool,
     /// `videoMap`: `image` names a looping RoQ cinematic instead of a texture.
     pub video: bool,
@@ -286,6 +296,9 @@ pub struct Shader {
     /// Classic id Tech 3 portal/mirror surface. The renderer can use this as
     /// an authored planar-reflection mask instead of guessing from gloss.
     pub portal: bool,
+    /// Explicit id Tech 3 shader sort rank; None uses renderer-derived ordering.
+    /// TaystJK ParseSort maps `additive` to SS_BLEND1 (15).
+    pub sort: Option<f32>,
     /// TaystJK alphaGen portal range, also used by RB_RenderFlare as sprite radius.
     pub portal_range: Option<f32>,
     pub sky: bool,
@@ -346,6 +359,8 @@ pub struct Shader {
     pub bulge: Option<Bulge>,
     /// `deformVertexes wave`. JKA model shaders author at most one.
     pub vertex_wave: Option<VertexWave>,
+    /// `deformVertexes autoSprite2`: billboard rectangular quads about their long axis.
+    pub auto_sprite2: bool,
     pub stages: Vec<Stage>,
     pub unsupported: Vec<String>,
 }
@@ -709,9 +724,24 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                         stage.video = true;
                     }
                     "animmap" | "oneshotanimmap" | "clampanimmap" => {
-                        stage.image = args.get(1).cloned().unwrap_or_default();
+                        // TaystJK tr_shader.cpp: at most 32 images, sampled in
+                        // authored order; the number preceding them is frames/sec.
                         stage.clamp = key == "clampanimmap";
-                        stage.unsupported.push(format!("{key} (first frame only)"));
+                        if let Some(fps) = args.first().and_then(|s| s.parse::<f32>().ok()) {
+                            let frames = args.iter().skip(1).take(32).cloned().collect::<Vec<_>>();
+                            if fps.is_finite() && fps > 0.0 && !frames.is_empty() {
+                                stage.image = frames[0].clone();
+                                stage.animation = Some(ImageAnimation {
+                                    fps,
+                                    frames,
+                                    one_shot: key == "oneshotanimmap",
+                                });
+                            } else {
+                                stage.unsupported.push(format!("{key} (invalid animation)"));
+                            }
+                        } else {
+                            stage.unsupported.push(format!("{key} (missing frequency)"));
+                        }
                     }
                     "normalmap" => stage.normal_map = args.first().cloned(),
                     "normalheightmap" => stage.normal_height_map = args.first().cloned(),
@@ -1130,8 +1160,27 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                         // in the original renderer. Accept both authoring styles
                         // so mirror shaders from stock/custom JKA content are
                         // recognized consistently.
-                        if first == "portal" || first == "1" {
-                            shader.portal = true;
+                        let rank = match first.as_str() {
+                            "portal" => Some(1.0),
+                            "sky" => Some(2.0),
+                            "opaque" => Some(3.0),
+                            "decal" => Some(4.0),
+                            "seethrough" => Some(5.0),
+                            "banner" => Some(6.0),
+                            "inside" => Some(7.0),
+                            "mid_inside" => Some(8.0),
+                            "middle" => Some(9.0),
+                            "mid_outside" => Some(10.0),
+                            "outside" => Some(11.0),
+                            "underwater" => Some(13.0),
+                            "additive" => Some(15.0), // TaystJK SS_BLEND1
+                            "nearest" => Some(21.0),
+                            // TaystJK also accepts numeric sort values.
+                            _ => first.parse::<f32>().ok().filter(|v| v.is_finite()),
+                        };
+                        if let Some(rank) = rank {
+                            shader.sort = Some(rank);
+                            if rank == 1.0 { shader.portal = true; }
                         } else {
                             shader.unsupported.push(format!("sort {first}"));
                         }
@@ -1153,6 +1202,9 @@ pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
                             }
                             _ => shader.unsupported.push(format!("deformvertexes wave {}", args[1..].join(" "))),
                         }
+                    }
+                    "deformvertexes" if first == "autosprite2" && args.len() == 1 => {
+                        shader.auto_sprite2 = true;
                     }
                     "deformvertexes" => shader.unsupported.push(format!("deformvertexes {}", args.join(" "))),
                     _ => (),
@@ -1323,6 +1375,13 @@ mod tests {
         assert_eq!(wave.div, 100.0);
         assert_eq!(wave.wave, Wave { func: WaveFunc::Sin, base: 0.0, amplitude: 1.0, phase: 0.0, frequency: 1.0 });
         assert!(shaders["powerups/ysalimarishell"].unsupported.is_empty());
+    }
+
+    #[test]
+    fn parses_autosprite2_deform() {
+        let shaders = parse("textures/test/tree {\ndeformVertexes autoSprite2\n}\n").unwrap();
+        assert!(shaders["textures/test/tree"].auto_sprite2);
+        assert!(shaders["textures/test/tree"].unsupported.is_empty());
     }
 
     #[test]
@@ -1544,7 +1603,7 @@ mod tests {
     }
 
     #[test]
-    fn clamp_anim_map_keeps_its_first_frame_and_clamping() {
+    fn clamp_anim_map_keeps_its_frames_and_clamping() {
         let shaders = parse(
             "textures/test/anim {
 {
@@ -1557,6 +1616,20 @@ clampanimmap 2 textures/test/a1 textures/test/a2
         let stage = &shaders["textures/test/anim"].stages[0];
         assert_eq!(stage.image, "textures/test/a1");
         assert!(stage.clamp);
+        let animation = stage.animation.as_ref().unwrap();
+        assert_eq!(animation.fps, 2.0);
+        assert_eq!(animation.frames, ["textures/test/a1", "textures/test/a2"]);
+        assert!(!animation.one_shot);
+    }
+
+    #[test]
+    fn anim_map_and_one_shot_parse_all_frames() {
+        let shaders = parse("textures/test/coin { { animMap 10 a b c d } }\ntextures/test/once { { oneshotAnimMap 3 a b c } }").unwrap();
+        let looping = shaders["textures/test/coin"].stages[0].animation.as_ref().unwrap();
+        assert_eq!(looping.fps, 10.0);
+        assert_eq!(looping.frames, ["a", "b", "c", "d"]);
+        assert!(!looping.one_shot);
+        assert!(shaders["textures/test/once"].stages[0].animation.as_ref().unwrap().one_shot);
     }
 
     #[test]
@@ -1747,6 +1820,15 @@ map models/players/test/torso_04
                 "textures/byss/byss_basic1_piller_light\n{\n    {\n        map $lightmap\n    }\n    {\n        map textures/byss/byss_basic1_piller_light\n        blendFunc GL_DST_COLOR GL_ZERO\n    }\n    {\n        map textures/byss/byss_piller_glow\n        blendFunc GL_ONE GL_ONE\n        glow\n    }\n}"
             )
         );
+    }
+
+    #[test]
+    fn parses_additive_and_numeric_sort_with_taystjk_order() {
+        let shaders = parse("textures/test/water {\nsort additive\n{\nmap textures/test/water\nblendFunc GL_SRC_ALPHA GL_ONE\n}\n}\ntextures/test/other {\nsort 9.5\n{\nmap $whiteimage\n}\n}").unwrap();
+        let water = &shaders["textures/test/water"];
+        assert_eq!(water.sort, Some(15.0));
+        assert!(water.unsupported.is_empty());
+        assert_eq!(shaders["textures/test/other"].sort, Some(9.5));
     }
 
     #[test]

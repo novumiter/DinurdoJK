@@ -43,7 +43,7 @@ use bodies::dismemberment::{
     BodyQueueCopyState, DetachedLimbVisual, DismemberPart, DismemberSourceSnap,
 };
 pub use cosmetics::apply_profile_studio_light;
-use cosmetics::{cosmetic_draws_for_mask, model_bolt_matrix_timed, VehicleSnap};
+use cosmetics::{cosmetic_draws_for_mask, global_cosmetic_draw, model_bolt_matrix_timed, VehicleSnap};
 pub use diagnostics::Ghoul2PerfStats;
 use diagnostics::{record_motion_pose_eval, record_pose_eval};
 #[cfg(test)]
@@ -120,7 +120,7 @@ use glam::Vec3;
 use jka_assets::{
     animation::{animation_index, is_death_animation, load_humanoid_animations, AnimationSet},
     ghoul2::{
-        model_bolt_matrix, multiply_3x4, openjk_default_gla, parse_gla, parse_glm,
+        model_bolt_matrix, multiply_3x4, openjk_default_gla, parse_gla,
         skin_glm_surface, smooth_ghoul2_pose, Ghoul2Animator, Ghoul2SkinnedSurface, GlaAnimation,
         GlmModel, GlmSurface, Matrix3x4, BONE_ANIM_OVERRIDE_FREEZE, BONE_ANIM_OVERRIDE_LOOP,
         OPENJK_DEFAULT_GLA_NAME,
@@ -199,6 +199,11 @@ pub struct PlayerPresenter {
     cosmetic_draws: Vec<CosmeticDraw>,
     /// `cp_cosmetics` of this client in a local (solo) game, which has no `c5`.
     local_cosmetics: u32,
+    /// Local choice used when a solo session has no player configstring relay.
+    local_global_hat: String,
+    local_global_cape: String,
+    /// Cached TaystJK `.cosmetic` offsets, keyed per model + skin.
+    global_cosmetic_offsets: HashMap<(u8, String, String, String), [f32; 3]>,
     /// `cp_cosmetics` this client last sent a jaPRO server, to spot the server
     /// relaying (`c5`) something else, e.g. after stripping locked cosmetics.
     sent_cosmetics: u32,

@@ -85,7 +85,7 @@ impl PlayerPresenter {
         // vehicle-specific animation comes later.
         let pose_started = Instant::now();
         let pose =
-            Ghoul2Animator::new(&model.gla).evaluate_pose_openjk_root(&model.gla, current_time)?;
+            model.bind_animation_pose(Ghoul2Animator::new(&model.animation_gla).evaluate_pose_openjk_root(&model.animation_gla, current_time)?)?;
         record_pose_eval(&mut self.perf, pose_started);
         let axis = angles_to_axis(entity.angles);
         let (axis, origin) = ghoul2_render_transform(entity, axis);

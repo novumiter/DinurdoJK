@@ -1107,7 +1107,7 @@ where
     } else {
         thread::scope(|scope| {
             let handles = (0..workers)
-                .map(|_| scope.spawn(&run_worker))
+                .map(|_| std::thread::Builder::new().name("pipeline-world-scoped".into()).spawn_scoped(scope, &run_worker).expect("spawn named worker"))
                 .collect::<Vec<_>>();
             handles
                 .into_iter()
@@ -1212,6 +1212,7 @@ pub(in crate::renderer) fn legacy_fog_pass_pipeline_key(
     depth_equal: bool,
 ) -> PipelineKey {
     PipelineKey {
+        auto_sprite2: source.auto_sprite2,
         class: source.class,
         blend: BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha),
         cull: source.cull,
@@ -1260,6 +1261,7 @@ pub(in crate::renderer) fn create_legacy_fog_pass_pipelines(
 
 pub(in crate::renderer) fn ocean_pipeline_key() -> PipelineKey {
     PipelineKey {
+        auto_sprite2: false,
         class: DrawClass::Transparent,
         blend: BlendMode::Opaque,
         cull: CullMode::None,

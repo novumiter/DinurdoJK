@@ -108,6 +108,21 @@ pub(in crate::renderer) struct RuntimeOceanClipmap {
     pub(in crate::renderer) current_pvs_cluster: Option<usize>,
 }
 
+/// Prebuilt texture bindings for a TaystJK animMap stage. These are the same
+/// pipeline/layout as an ordinary stage; only binding 0's image differs.
+#[derive(Clone)]
+pub(in crate::renderer) struct WorldAnimationFrame {
+    pub(in crate::renderer) full: wgpu::BindGroup,
+    pub(in crate::renderer) fast: wgpu::BindGroup,
+    pub(in crate::renderer) glow: Option<wgpu::BindGroup>,
+}
+
+#[derive(Clone)]
+pub(in crate::renderer) struct WorldBatchAnimation {
+    pub(in crate::renderer) frames: Vec<WorldAnimationFrame>,
+    pub(in crate::renderer) selected: usize,
+}
+
 #[derive(Clone)]
 pub(in crate::renderer) struct WorldBatch {
     pub(in crate::renderer) source: DrawBatch,
@@ -128,6 +143,7 @@ pub(in crate::renderer) struct WorldBatch {
     /// An uploaded ocean replaces this stage, including its sibling passes.
     pub(in crate::renderer) ocean_replaced: bool,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
+    pub(in crate::renderer) animation: Option<WorldBatchAnimation>,
     /// Same authored stage resources as `bind_group`, but with OpenJK's
     /// Dynamic Glow fog override: glow stages fog toward black during replay.
     /// Only allocated for exact `.shader` stages marked `glow`.

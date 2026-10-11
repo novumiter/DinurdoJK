@@ -149,6 +149,7 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
     }
     a.pipeline == b.pipeline
         && a.texture == b.texture
+        && a.animation == b.animation
         && a.texture_is_lightmap == b.texture_is_lightmap
         && a.texture_is_white == b.texture_is_white
         && a.normal_texture == b.normal_texture

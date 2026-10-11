@@ -273,6 +273,7 @@ pub(crate) fn append_authored_ocean_planes(
         b.color = [1.0; 4];
         b.alpha_cutoff = 0.0;
         b.pipeline = PipelineKey {
+            auto_sprite2: false,
             class: DrawClass::Transparent,
             blend: BlendMode::Opaque,
             cull: CullMode::None,

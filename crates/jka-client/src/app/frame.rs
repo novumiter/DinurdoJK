@@ -415,7 +415,7 @@ impl App {
     pub(in crate::app) fn publish_telemetry_ui(&self) {
         self.render_command(RenderCommand::SetUiTelemetry {
             perf: self.perf,
-            threads: self.threads,
+            threads: self.threads.clone(),
         });
     }
 

@@ -57,6 +57,8 @@ pub struct VideoSettings {
     /// This preserves non-zero-alpha edges and is intentionally limited to
     /// source-alpha sprite blend modes.
     pub fx_zero_alpha_discard: bool,
+    /// Session-only A/B: force the uploaded BSP world vertex alpha to 1.
+    pub debug_world_vertex_alpha_one: bool,
     /// Server-placed MD3 map props (misc_model_* / func_static models). Inline
     /// BSP brush models and geometry compiled into the BSP are unaffected.
     pub draw_map_models: bool,
@@ -68,6 +70,8 @@ pub struct VideoSettings {
     /// target/targetname link lines for every map entity. Session-only.
     pub draw_entities: bool,
     pub draw_fps: u8,
+    /// Zero-based page of the complete live-thread CPU list.
+    pub perf_thread_page: u32,
     /// `cg_drawTimer`: classic elapsed level timer (M:SS only).
     pub draw_timer: bool,
     /// `developer`: 0 quiet, 1 basic diagnostics, 2 verbose, 3 trace.
@@ -97,6 +101,9 @@ pub struct VideoSettings {
     /// Minimum visible members for CPU world compaction (1 baseline, 2 experimental).
     pub world_compact_min_draws: u32,
     pub model_prepare_threads: u32,
+    pub md3_geometry_cache: bool,
+    pub model_render_bundles: bool,
+    pub encoder_finish_threads: u32,
     pub model_index_upload_cache: bool,
     pub ghoul2_batch_key_cache: bool,
     /// `r_ghoul2animsmooth`: jaPRO `CBoneCache::SmoothLow` renderer bone-history
@@ -527,11 +534,13 @@ impl Default for VideoSettings {
             lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             fx_geometry: FxGeometryMode::Cpu,
             fx_zero_alpha_discard: false,
+            debug_world_vertex_alpha_one: false,
             draw_map_models: true,
             draw_triggers: false,
             draw_clip_brushes: false,
             draw_entities: false,
             draw_fps: Default::default(),
+            perf_thread_page: 0,
             draw_timer: Default::default(),
             developer_level: 0,
             developer_tools: false,
@@ -546,9 +555,12 @@ impl Default for VideoSettings {
             ghoul2_lod_bias: 0,
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             model_state_cache: false,
-            dynamic_batch_draws: false,
+            dynamic_batch_draws: true,
             world_compact_min_draws: 1,
             model_prepare_threads: 0,
+            md3_geometry_cache: true,
+            model_render_bundles: false,
+            encoder_finish_threads: 2,
             model_index_upload_cache: false,
             ghoul2_batch_key_cache: false,
             ghoul2_anim_smooth: 0.3,

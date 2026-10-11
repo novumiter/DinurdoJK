@@ -1600,20 +1600,20 @@ settings_cvars! { NetworkSettings;
     }
 
     APP_COLOR1 {
-        runtime: CvarDef::new("color1", "", "0..6", "Primary saber colour: 0 red, 1 orange, 2 yellow, 3 green, 4 blue, 5 purple, 6 RGB (jaPRO / JA+ servers; see cp_sbRGB1).", CvarType::String, CvarFlags::ARCHIVE.union(CvarFlags::USERINFO), LatchScope::None, |app| CvarValue::String(App::cvar_get_color1(app)), |app, value| App::cvar_set_color1(app, APP_COLOR1.entry.name, &value.to_string())).with_text_setter(App::cvar_set_color1, None),
+        runtime: CvarDef::new("color1", "", "0..6[cosmetic]", "Primary saber colour: 0 red, 1 orange, 2 yellow, 3 green, 4 blue, 5 purple, 6 RGB (jaPRO / JA+ servers; see cp_sbRGB1).", CvarType::String, CvarFlags::ARCHIVE.union(CvarFlags::USERINFO), LatchScope::None, |app| CvarValue::String(App::cvar_get_color1(app)), |app, value| App::cvar_set_color1(app, APP_COLOR1.entry.name, &value.to_string())).with_text_setter(App::cvar_set_color1, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.network.set_cvar(name, value);
                 }),
                 archive: Some((313, |state| {
                     let presentation = state.presentation;
-                    format!("{}", presentation.network.color1)
+                    crate::global_cosmetics::encode(presentation.network.color1, &presentation.network.global_hat)
                 })),
                 ..CvarBinding::NONE
             },
         settings: SETTINGS_COLOR1 = APP_COLOR1
                 .bind(
-                    |state: &NetworkSettings| CvarValue::String(state.color1.to_string()),
+                    |state: &NetworkSettings| CvarValue::String(crate::global_cosmetics::encode(state.color1, &state.global_hat)),
                     |state, value| {
                         NetworkSettings::cvar_set_color1(state, APP_COLOR1.entry.name, &value.to_string())
                     },
@@ -1622,11 +1622,11 @@ settings_cvars! { NetworkSettings;
         implementations: [
             impl NetworkSettings {
                 fn cvar_set_color1(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    (network_number(name, value, 0, 255).map(|v| {
-                        self.color1 = v as u8;
-                        true
-                    }))
-                    .map(|_: bool| ())
+                    let (color, hat) = crate::global_cosmetics::parse_cvar(value)
+                        .map_err(|error| format!("{name}: {error}"))?;
+                    self.color1 = color;
+                    self.global_hat = hat;
+                    Ok(())
                 }
             }
             impl App {
@@ -1648,7 +1648,7 @@ settings_cvars! { NetworkSettings;
         runtime: CvarDef::new(
                 "color2",
                 "",
-                "0..6",
+                "0..6[cosmetic]",
                 "Secondary saber colour (same values as color1; RGB uses cp_sbRGB2).",
                 CvarType::String,
                 CvarFlags::ARCHIVE.union(CvarFlags::USERINFO),
@@ -1663,13 +1663,13 @@ settings_cvars! { NetworkSettings;
                 }),
                 archive: Some((314, |state| {
                     let presentation = state.presentation;
-                    format!("{}", presentation.network.color2)
+                    crate::global_cosmetics::encode(presentation.network.color2, &presentation.network.global_cape)
                 })),
                 ..CvarBinding::NONE
             },
         settings: SETTINGS_COLOR2 = APP_COLOR2
                 .bind(
-                    |state: &NetworkSettings| CvarValue::String(state.color2.to_string()),
+                    |state: &NetworkSettings| CvarValue::String(crate::global_cosmetics::encode(state.color2, &state.global_cape)),
                     |state, value| {
                         NetworkSettings::cvar_set_color2(state, APP_COLOR2.entry.name, &value.to_string())
                     },
@@ -1678,11 +1678,11 @@ settings_cvars! { NetworkSettings;
         implementations: [
             impl NetworkSettings {
                 fn cvar_set_color2(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    (network_number(name, value, 0, 255).map(|v| {
-                        self.color2 = v as u8;
-                        true
-                    }))
-                    .map(|_: bool| ())
+                    let (color, cape) = crate::global_cosmetics::parse_cvar(value)
+                        .map_err(|error| format!("{name}: {error}"))?;
+                    self.color2 = color;
+                    self.global_cape = cape;
+                    Ok(())
                 }
             }
             impl App {

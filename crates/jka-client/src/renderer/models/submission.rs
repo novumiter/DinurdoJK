@@ -8,6 +8,8 @@ use std::ops::Range;
 #[derive(Clone, Copy, Default)]
 pub(in crate::renderer) struct ModelPhaseCalls {
     pub cpu_draw_indexed: u32,
+    pub bundle_executes: u32,
+    pub bundle_draw_indexed: u32,
     pub fx_draw: u32,
     pub skin_draw_indexed: u32,
     pub set_pipeline: u32,

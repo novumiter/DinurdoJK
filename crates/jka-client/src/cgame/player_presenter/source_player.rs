@@ -1,6 +1,6 @@
 //! Source 1 / Garry's Mod player models.
 //!
-//! A Source character is rebound onto `_humanoid.gla` at load time by
+//! A Source character is rebound onto the native 72-bone JK2 rig at load time by
 //! [`jka_assets::source1_rig`], so what reaches the rest of the presenter is an
 //! ordinary [`GlmModel`] with GLA bone weights. Animation, torso/legs blending,
 //! bolts, saber and weapon attachment, ragdoll, gore, shadows and ray tracing
@@ -11,7 +11,7 @@ use super::*;
 use jka_assets::source1::{parse_source1_materials, parse_source1_skeleton};
 use jka_assets::source1_geometry::{parse_source_vtx, parse_source_vvd};
 use jka_assets::source1_rig::{
-    attach_humanoid_bolts, build_source_rig, SourceRebindMode, SourceRigDiagnostics,
+    attach_humanoid_bolts_between_rigs, build_source_rig, SourceRebindMode, SourceRigDiagnostics,
     SourceRigOptions,
 };
 
@@ -25,7 +25,7 @@ use crate::renderer::SourceMaterialParams;
 pub(in crate::cgame::player_presenter) const MAX_DESCRIPTOR_BYTES: usize = 64 * 1024;
 const MAX_VMT_BYTES: usize = 1024 * 1024;
 const MAX_VTF_BYTES: usize = 64 * 1024 * 1024;
-/// `_humanoid.gla` drives every Source player, exactly as for a stock GLM.
+/// Gameplay animation source. Mesh binding uses the separate JK2 reference.
 const HUMANOID_GLA: &str = "models/players/_humanoid/_humanoid.gla";
 /// Bolts come from a stock humanoid's `*` tag surfaces. Kyle is OpenJK's own
 /// registration fallback, so it is the model guaranteed to be present.
@@ -303,7 +303,9 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
         parse_source1_skeleton(&mdl).map_err(|error| format!("{}: {error}", descriptor.model))?;
     let materials =
         parse_source1_materials(&mdl).map_err(|error| format!("{}: {error}", descriptor.model))?;
-    let gla = source.load_gla(HUMANOID_GLA)?;
+    let animation_gla = source.load_gla(HUMANOID_GLA)?;
+    let gla = jka_assets::skeleton::humanoid_reference(jka_assets::skeleton::HumanoidRig::Jk2_72);
+    let retargeter = Some(jka_assets::skeleton::cached_retargeter(&animation_gla.skeleton, &gla.skeleton)?);
 
     let mut rig = build_source_rig(
         &descriptor.model,
@@ -325,9 +327,14 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
     // has no bolts at all and the saber, weapon flash and jetpack silently vanish.
     let bolts = match source.read_optional(&descriptor.bolt_donor, MAX_GLM_BYTES)? {
         Some(bytes) => {
-            let donor = jka_assets::ghoul2::parse_glm(&bytes)
+            let donor = jka_assets::ghoul2::parse_glm_native(&bytes)
                 .map_err(|error| format!("{}: {error}", descriptor.bolt_donor))?;
-            attach_humanoid_bolts(&mut rig, &donor, &gla)
+            let donor_gla = match donor.num_bones {
+                53 => jka_assets::skeleton::humanoid_reference(jka_assets::skeleton::HumanoidRig::Jka53),
+                72 => Arc::clone(&gla),
+                _ => return Err("Source bolt donor must use a 53- or 72-bone humanoid rig".into()),
+            };
+            attach_humanoid_bolts_between_rigs(&mut rig, &donor, &donor_gla, &gla)
                 .map_err(|error| format!("{}: {error}", descriptor.bolt_donor))?
         }
         None => {
@@ -399,6 +406,8 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
         key,
         glm,
         gla,
+        animation_gla,
+        retargeter,
         source_native_pivots,
         // A Source player is driven by `players/_humanoid/`, so it takes the
         // ordinary multiplayer animation and BG_G2PlayerAngles path.

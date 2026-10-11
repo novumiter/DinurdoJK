@@ -474,6 +474,10 @@ pub struct App {
     /// The Vote page's forms.
     vote_menu: egui_pages::VoteMenuState,
     live_input: crate::net::LiveInput,
+    emote_net_rx: crate::emote_net::Receiver,
+    /// Candidate remote starts, for the separate Fortnite animation runtime.
+    /// A caller must validate the ID against the installed catalog first.
+    pub(crate) remote_emote_starts: VecDeque<crate::emote_net::RemoteEmoteStart>,
     /// Lowercased `+command` kbuttons currently held (IN_KeyDown state).
     live_buttons: HashSet<String>,
     /// Per-button input sources, mirroring OpenJK/TaystJK kbutton_t::down[].
@@ -881,7 +885,7 @@ pub struct App {
     preserve_game_state_on_next_map_upload: bool,
     renderer_restart_started: Option<Instant>,
     perf: PerfStats,
-    threads: [ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
+    threads: std::sync::Arc<[ThreadPerfStats]>,
     surface_inspector: Option<SurfaceInspectorInfo>,
     /// History for the `/trace` menu (`OverlayMode::Trace`), newest last.
     /// `surface_inspector` always mirrors `trace_menu_entries[trace_menu_selected]`.

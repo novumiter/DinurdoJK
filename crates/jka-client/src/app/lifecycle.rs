@@ -347,13 +347,14 @@ impl ApplicationHandler<UserEvent> for App {
                     input_event_to_present_call_max_ms: stats.input_event_to_present_call_max_ms,
                     input_latency_samples: stats.input_latency_samples,
                 };
-                self.threads = stats.threads.map(|thread| ThreadPerfStats {
-                    name: crate::thread_activity::slot_label(thread.slot),
-                    task: thread.task.label(),
+                self.threads = stats.threads.iter().map(|thread| ThreadPerfStats {
+                    id: thread.id,
+                    name: thread.name.clone(),
+                    task: thread.task,
                     active: thread.active,
                     busy_percent: thread.busy_percent,
-                });
-                // Perf/thread counters refresh at 2 Hz. Send only their Copy data
+                }).collect();
+                // Perf/thread counters refresh at 2 Hz. Share the thread array
                 // instead of cloning the entire retained UI/console snapshot, and
                 // do not send anything when the renderer HUD is not displaying it.
                 if self.video.draw_fps != 0 {

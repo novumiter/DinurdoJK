@@ -9,7 +9,7 @@ use crate::cgame::player_presenter::source_player::{
 };
 use crate::cgame::player_presenter::{
     asset_jobs, build_joined_breast_bakes, build_lod_gpu_meshes, load_skin, materials, openjk_default_gla, parse_gla,
-    parse_glm, player_model_key, static_model_key, AlphaGen, Arc, AssetPriority, AssetSearchPath,
+    player_model_key, static_model_key, AlphaGen, Arc, AssetPriority, AssetSearchPath,
     AssetSource, AssetState, BTreeMap, DynamicModelAlphaMode, GlaAnimation, HashMap, JiggleProfile, JiggleRemeshTuning,
     Mutex, OnceLock, PlayerModelAsset, PlayerPresenter, PlayerSurfaceAsset, Requested,
     ResolvedMaterial, ResolvedStage, RgbGen, SaberDefinition, SaberModelAsset, Shader,
@@ -654,6 +654,25 @@ impl CowAnimationSet<'_> {
     }
 }
 
+pub(in crate::cgame::player_presenter) fn mesh_skeleton_binding(
+    glm: &jka_assets::ghoul2::GlmModel, animation: &Arc<GlaAnimation>,
+) -> Result<(Arc<GlaAnimation>, Option<Arc<jka_assets::skeleton::PoseRetargeter>>), String> {
+    use jka_assets::skeleton::{cached_retargeter, humanoid_reference, HumanoidRig};
+    let humanoid = glm.anim_name.replace('\\', "/").to_ascii_lowercase().contains("players/_humanoid/");
+    let reference = match (humanoid, glm.num_bones, animation.num_bones()) {
+        (true, 72, 53) => Some(HumanoidRig::Jk2_72),
+        (true, 53, 72) => Some(HumanoidRig::Jka53),
+        _ => None,
+    };
+    if let Some(rig) = reference {
+        let mesh = humanoid_reference(rig);
+        let plan = cached_retargeter(&animation.skeleton, &mesh.skeleton)?;
+        Ok((mesh, Some(plan)))
+    } else {
+        Ok((Arc::clone(animation), None))
+    }
+}
+
 fn build_character_model(
     source: &mut dyn ModelSource,
     model_qpath: String,
@@ -665,14 +684,15 @@ fn build_character_model(
     jiggle_remesh: JiggleRemeshTuning,
 ) -> Result<PlayerModelAsset, String> {
     let model_bytes = source.read_model(&model_qpath)?;
-    let glm = Arc::new(parse_glm(&model_bytes)?);
+    let glm = Arc::new(jka_assets::ghoul2::parse_glm_native(&model_bytes)?);
 
     let gla_qpath = if glm.anim_name.to_ascii_lowercase().ends_with(".gla") {
         glm.anim_name.clone()
     } else {
         format!("{}.gla", glm.anim_name)
     };
-    let gla = source.load_gla(&gla_qpath)?;
+    let animation_gla = source.load_gla(&gla_qpath)?;
+    let (gla, retargeter) = mesh_skeleton_binding(&glm, &animation_gla)?;
     if glm.num_bones > gla.skeleton.len() {
         return Err(format!(
             "GLM references {} bones but GLA only provides {}",
@@ -853,6 +873,8 @@ fn build_character_model(
         key,
         glm,
         gla,
+        animation_gla,
+        retargeter,
         source_native_pivots: None,
         humanoid,
         animations,
@@ -937,13 +959,14 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
     preview_fallback: bool,
 ) -> Result<SaberModelAsset, String> {
     let model_bytes = source.read_model(model_qpath)?;
-    let glm = Arc::new(parse_glm(&model_bytes)?);
+    let glm = Arc::new(jka_assets::ghoul2::parse_glm_native(&model_bytes)?);
     let gla_qpath = if glm.anim_name.to_ascii_lowercase().ends_with(".gla") {
         glm.anim_name.clone()
     } else {
         format!("{}.gla", glm.anim_name)
     };
-    let gla = source.load_gla(&gla_qpath)?;
+    let animation_gla = source.load_gla(&gla_qpath)?;
+    let (gla, retargeter) = mesh_skeleton_binding(&glm, &animation_gla)?;
     // Match OpenJK's MDXM registration rule: the mesh may use fewer
     // bones than the referenced GLA, it just may not reference beyond it.
     if glm.num_bones > gla.skeleton.len() {
@@ -1050,7 +1073,7 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
         gla.skeleton.len(),
         gla_qpath,
     );
-    Ok(SaberModelAsset { glm, gla, surfaces })
+    Ok(SaberModelAsset { glm, gla, animation_gla, retargeter, surfaces })
 }
 
 impl PlayerPresenter {

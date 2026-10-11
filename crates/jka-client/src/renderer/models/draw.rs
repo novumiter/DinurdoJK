@@ -123,6 +123,11 @@ impl DynamicModelRenderer {
         self.perf_phase_calls.set(ModelPhaseCalls::default());
         self.capture_prepare = crate::renderer::diagnostics::perf_capture::enabled();
         self.perf_prepare = PreparePerf::default();
+        if ray_traced_shadows {
+            // RT preparation uses different buffers and may repack the scratch
+            // streams. Re-enter raster through a cold, explicitly valid cache.
+            self.md3_stream_cache.clear();
+        }
         if ray_traced_shadows
             && self.prepare_rt_skinned(
                 brightness,
@@ -145,8 +150,10 @@ impl DynamicModelRenderer {
         self.ghoul2_input_instances = 0;
         self.ghoul2_encoded_draws = 0;
         if surfaces.is_empty() {
+            self.md3_stream_cache.clear();
             return;
         }
+        if self.md3_geometry_cache { self.md3_stream_cache.begin_frame(); }
 
         let gather_started = self.capture_prepare.then(Instant::now);
         let total_vertices = surfaces
@@ -352,7 +359,13 @@ impl DynamicModelRenderer {
             let base_vertex = vertices.len() as u32;
             let first_index = indices.len() as u32;
             self.record_cpu_geometry(surface.geometry_source, surface.vertices.len(), surface.indices.len());
-            if self.model_prepare_threads != 0 {
+            let cached_md3 = self.md3_geometry_cache
+                && surface.geometry_source == crate::renderer::ModelGeometrySource::Md3
+                && self.md3_stream_cache.append(surface, classic_light, &mut vertices, &mut indices);
+            if cached_md3 {
+                // Already lit and rebased with these exact source allocations,
+                // sampled lights and stream offsets. Preserve the original draw.
+            } else if self.model_prepare_threads != 0 {
                 vertices.extend_from_slice(surface.vertices.as_slice());
                 indices.extend_from_slice(surface.indices.as_slice());
                 cpu_jobs.push(CpuPackJob {
@@ -408,6 +421,13 @@ impl DynamicModelRenderer {
             self.perf_prepare.parallel_used = parallel;
         }
         self.scratch_cpu_pack_jobs = cpu_jobs;
+        if self.md3_geometry_cache {
+            self.md3_stream_cache.finish_frame(&vertices, &indices);
+            self.perf_prepare.md3_cache_hits = self.md3_stream_cache.hits;
+            self.perf_prepare.md3_cache_misses = self.md3_stream_cache.misses;
+            self.perf_prepare.md3_reused_vertices = self.md3_stream_cache.vertex_hits.iter()
+                .map(|range| range.len() as u64).sum();
+        }
         if let Some(started) = pack_started { self.perf_prepare.cpu_pack_ms = started.elapsed().as_secs_f64() * 1000.0; }
         let group_started = self.capture_prepare.then(Instant::now);
         self.ghoul2_input_instances = u32::try_from(skin_pending.len()).unwrap_or(u32::MAX);
@@ -563,18 +583,42 @@ impl DynamicModelRenderer {
 
         let vertex_bytes = bytemuck::cast_slice(vertices.as_slice());
         let index_bytes = bytemuck::cast_slice(indices.as_slice());
+        let vertices_grew = vertex_bytes.len() as u64 > self.vertex_capacity;
+        let indices_grew = index_bytes.len() as u64 > self.index_capacity;
         self.ensure_vertex_capacity(device, vertex_bytes.len() as u64);
         self.ensure_index_capacity(device, index_bytes.len() as u64);
-        if !vertex_bytes.is_empty() {
+        if self.md3_geometry_cache {
+            self.perf_prepare.vertex_upload_bytes = super::md3_cache::upload_stream(
+                queue, &self.vertex_buffer, &vertices,
+                &self.md3_stream_cache.vertex_hits, vertices_grew);
+            self.perf_prepare.md3_vertex_skipped_bytes = vertex_bytes.len() as u64
+                - self.perf_prepare.vertex_upload_bytes;
+        } else if !vertex_bytes.is_empty() {
             queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
+            self.perf_prepare.vertex_upload_bytes = vertex_bytes.len() as u64;
         }
         if self.model_index_upload_cache {
-            if let Some(span) = self.index_upload_cache.update(&indices) {
+            let changed = self.index_upload_cache.update(&indices);
+            if let Some(span) = changed.as_ref() {
                 let bytes = bytemuck::cast_slice(&indices[span.clone()]);
                 queue.write_buffer(&self.index_buffer, span.start as u64 * 4, bytes);
                 self.perf_prepare.index_upload_bytes = bytes.len() as u64;
             }
             self.perf_prepare.index_skipped_bytes = index_bytes.len() as u64 - self.perf_prepare.index_upload_bytes;
+            if self.md3_geometry_cache {
+                self.perf_prepare.md3_index_skipped_bytes = self.md3_stream_cache.index_hits.iter().map(|hit| {
+                    let overlap = changed.as_ref().map_or(0, |span|
+                        hit.end.min(span.end).saturating_sub(hit.start.max(span.start)));
+                    (hit.len() - overlap) as u64 * 4
+                }).sum();
+            }
+        } else if self.md3_geometry_cache {
+            self.perf_prepare.index_upload_bytes = super::md3_cache::upload_stream(
+                queue, &self.index_buffer, &indices,
+                &self.md3_stream_cache.index_hits, indices_grew);
+            self.perf_prepare.md3_index_skipped_bytes = index_bytes.len() as u64
+                - self.perf_prepare.index_upload_bytes;
+            self.perf_prepare.index_skipped_bytes = self.perf_prepare.md3_index_skipped_bytes;
         } else if !index_bytes.is_empty() {
             queue.write_buffer(&self.index_buffer, 0, index_bytes);
             self.perf_prepare.index_upload_bytes = index_bytes.len() as u64;
@@ -631,12 +675,7 @@ impl DynamicModelRenderer {
         // draw after the ocean surface/spray so water cannot paint over them.
         if !self.draws.is_empty() {
             let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
-            if capture_calls { calls.set_vertex_buffer += 1; }
-            pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            if capture_calls { calls.set_index_buffer += 1; }
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            if capture_calls { calls.set_bind_group += 1; }
-            pass.set_bind_group(0, camera, &[]);
+            let mut cpu_buffers_bound = false;
 
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER
                 .into_iter()
@@ -652,6 +691,41 @@ impl DynamicModelRenderer {
                 let Some(pipeline) = pipeline else {
                     continue;
                 };
+                if self.model_render_bundles
+                    && super::bundles::eligible_pass(self.rt_prepared, excluded_entity, authored_glow_only)
+                {
+                    if let Some((bundle, represented_draws, last_texture)) = self.model_bundles.executable(
+                        alpha_mode, camera, pipeline, vertex_buffer, index_buffer,
+                    ) {
+                        super::bundles::execute_and_restore_model_state(
+                            pass, bundle, camera, pipeline, vertex_buffer, index_buffer, last_texture,
+                        );
+                        if capture_calls {
+                            calls.bundle_executes += 1;
+                            calls.bundle_draw_indexed += represented_draws;
+                        }
+                        // Restore the state left by the equivalent direct draws.
+                        // execute_bundles clears pipeline, bind groups and buffers;
+                        // callers and subsequent modes retain the old contract.
+                        if capture_calls {
+                            calls.set_pipeline += 1;
+                            calls.set_vertex_buffer += 1;
+                            calls.set_index_buffer += 1;
+                            calls.set_bind_group += 2;
+                        }
+                        cpu_buffers_bound = true;
+                        continue;
+                    }
+                }
+                if !cpu_buffers_bound {
+                    if capture_calls { calls.set_vertex_buffer += 1; }
+                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    if capture_calls { calls.set_index_buffer += 1; }
+                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    if capture_calls { calls.set_bind_group += 1; }
+                    pass.set_bind_group(0, camera, &[]);
+                    cpu_buffers_bound = true;
+                }
                 let pipeline =
                     if let Some((models, scene)) = rt_receivers.filter(|_| self.rt_prepared) {
                         let receiver_pipeline = match alpha_mode {

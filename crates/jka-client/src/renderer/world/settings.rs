@@ -15,6 +15,31 @@ use crate::renderer::{
 };
 
 impl Renderer {
+    /// Rewrites only the indexed static-world vertex prefix on a debug toggle.
+    /// The original CPU vertex data (and its alpha values) is never changed,
+    /// so disabling the mode restores the exact authored result. No fragment
+    /// branches, shader variants, or per-frame copies are introduced.
+    pub(in crate::renderer) fn set_debug_world_vertex_alpha_one(&mut self, enabled: bool) {
+        if self.debug_world_vertex_alpha_one == enabled {
+            return;
+        }
+        self.debug_world_vertex_alpha_one = enabled;
+        self.upload_debug_world_vertex_alpha();
+    }
+
+    pub(in crate::renderer) fn upload_debug_world_vertex_alpha(&self) {
+        let Some(world) = &self.world else { return; };
+        if self.debug_world_vertex_alpha_one {
+            let mut vertices = world.static_ao_gpu_vertices.clone();
+            for vertex in &mut vertices {
+                vertex.color[3] = 1.0;
+            }
+            self.queue.write_buffer(&world.vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        } else {
+            self.queue.write_buffer(&world.vertex_buffer, 0, bytemuck::cast_slice(&world.static_ao_gpu_vertices));
+        }
+    }
+
     pub(in crate::renderer) fn set_picmip(&mut self, picmip: u32) {
         self.picmip = picmip.min(16);
     }

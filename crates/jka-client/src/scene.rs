@@ -200,6 +200,8 @@ pub enum BlendMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PipelineKey {
+    /// Dedicated vertex shader for TaystJK autoSprite2, absent from normal BSP pipelines.
+    pub auto_sprite2: bool,
     pub class: DrawClass,
     pub blend: BlendMode,
     pub cull: CullMode,
@@ -226,6 +228,8 @@ pub struct DrawBatch {
     pub surface_material: u8,
     /// Image index when this stage samples a regular texture.
     pub texture: Option<usize>,
+    /// Pre-resolved animMap frame indices (absent for ordinary stages).
+    pub animation: Option<materials::MaterialAnimation>,
     /// True when binding 0 should be the BSP lightmap instead of `texture`.
     pub texture_is_lightmap: bool,
     /// True when binding 0 should be the engine's neutral white texture.

@@ -139,6 +139,9 @@ pub struct ClientInfo {
     pub definition_saber_colors: bool,
     /// jaPRO `c5` (relayed `cp_cosmetics`): bit mask of worn cosmetics.
     pub cosmetics: u32,
+    /// TaystJK global cosmetic suffixes decoded from c1/c2 (non-jaPRO).
+    pub global_hat: String,
+    pub global_cape: String,
 }
 
 impl ClientInfo {
@@ -164,6 +167,8 @@ impl ClientInfo {
             plugin_disable: 1536,
             definition_saber_colors: false,
             cosmetics: 0,
+            global_hat: String::new(),
+            global_cape: String::new(),
         }
     }
 
@@ -1696,13 +1701,17 @@ impl ClientGameState {
             .unwrap_or_default();
         // jaPRO relays `cp_sbRGB1/2` as c3/c4; they only apply to SABER_RGB.
         let rgb_capable = self.rgb_sabers_supported();
+        let (color1_number, global_hat) = crate::global_cosmetics::decode_wire(
+            info_value(configstring, b"c1").unwrap_or(b"4"));
+        let (color2_number, global_cape) = crate::global_cosmetics::decode_wire(
+            info_value(configstring, b"c2").unwrap_or(b"4"));
         let mut saber_color = resolve_saber_color(
-            info_value(configstring, b"c1").and_then(parse_i32_ascii).unwrap_or(4),
+            color1_number,
             info_value(configstring, b"c3").and_then(parse_i32_ascii).unwrap_or(0),
             rgb_capable,
         );
         let mut saber2_color = resolve_saber_color(
-            info_value(configstring, b"c2").and_then(parse_i32_ascii).unwrap_or(4),
+            color2_number,
             info_value(configstring, b"c4").and_then(parse_i32_ascii).unwrap_or(0),
             rgb_capable,
         );
@@ -1746,6 +1755,8 @@ impl ClientGameState {
             cosmetics: info_value(configstring, b"c5")
                 .and_then(parse_i32_ascii)
                 .map_or(0, |bits| bits as u32),
+            global_hat,
+            global_cape,
         })
     }
 
@@ -1841,6 +1852,8 @@ impl ClientGameState {
                 plugin_disable: self.plugin_disable,
                 definition_saber_colors: bolt_colors == 0,
                 cosmetics: 0,
+                global_hat: String::new(),
+                global_cape: String::new(),
             },
         })
     }

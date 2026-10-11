@@ -583,14 +583,14 @@ fn scan_sources(sources: &[Source]) -> Vec<Result<Scanned, String>> {
     let results = (0..count).map(|_| Mutex::new(None)).collect::<Vec<_>>();
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| loop {
+            std::thread::Builder::new().name("jka-pk3-index".into()).spawn_scoped(scope, || loop {
                 let slot = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(&index) = order.get(slot) else {
                     break;
                 };
                 let scanned = scan_source(&sources[index]);
                 *results[index].lock().unwrap_or_else(PoisonError::into_inner) = Some(scanned);
-            });
+            }).expect("spawn named worker");
         }
     });
     results

@@ -17,6 +17,13 @@ impl Atlas {
         out.extend(self.bake_ms.to_le_bytes());
         out.extend((self.grids.len() as u32).to_le_bytes());
         out.extend((self.warnings.len() as u32).to_le_bytes());
+        out.extend((self.shoreline_bands.len() as u32).to_le_bytes());
+        for band in &self.shoreline_bands {
+            for v in [band.slot, band.full_tiles, band.retained_tiles] {
+                out.extend(v.to_le_bytes());
+            }
+            out.extend(band.max_depth.to_le_bytes());
+        }
         for warning in &self.warnings {
             out.extend((warning.len() as u32).to_le_bytes());
             out.extend(warning.as_bytes());
@@ -74,17 +81,36 @@ impl Atlas {
         }
         let count = reader.u32()? as usize;
         let warnings = reader.u32()? as usize;
+        let band_count = reader.u32()? as usize;
         // Sparse 16x16 tiles can legitimately number in the thousands. Total
         // decoded cells/bytes remain bounded below; the old dense-grid cap
         // caused every v3 tiled map to rebake on every load.
-        if count > 8192 || warnings > 64 {
+        if count > 8192 || warnings > 64 || band_count > 64 {
             return Err(fail());
         }
         let mut atlas = Atlas {
             grids: Vec::new(),
             warnings: Vec::new(),
             bake_ms,
+            shoreline_bands: Vec::new(),
         };
+        for _ in 0..band_count {
+            let band = ShorelineBand {
+                slot: reader.u32()?,
+                full_tiles: reader.u32()?,
+                retained_tiles: reader.u32()?,
+                max_depth: reader.f32()?,
+            };
+            if band.retained_tiles == 0
+                || band.retained_tiles > band.full_tiles
+                || !band.max_depth.is_finite()
+                || band.max_depth <= 0.0
+                || atlas.shoreline_bands.iter().any(|b| b.slot == band.slot)
+            {
+                return Err(fail());
+            }
+            atlas.shoreline_bands.push(band);
+        }
         for _ in 0..warnings {
             let n = reader.u32()? as usize;
             if n > 16_384 {
@@ -207,6 +233,11 @@ impl Atlas {
             });
         }
         if reader.pos != data.len() {
+            return Err(fail());
+        }
+        if atlas.shoreline_bands.iter().any(|b| {
+            atlas.grids.iter().filter(|g| g.slot == b.slot).count() != b.retained_tiles as usize
+        }) {
             return Err(fail());
         }
         Ok(atlas)

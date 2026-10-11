@@ -1,6 +1,7 @@
 //! Frame draw.
 use crate::renderer::{
     aabb_behind_plane, aabb_intersects_clip_frustum, aabb_intersects_shadow_frustum,
+    advance_world_animations,
     aabb_screen_rect,
     active_batch_selection, batch_area_visible, bevy_cascade_shadow_matrices, block_on,
     camera_depth_clear, claim_ocean_clipmap, draw_snow_shell, draw_world_batch,
@@ -37,6 +38,7 @@ impl Renderer {
         view_latch: ViewLatchMode,
         latest_view: Option<&LatestViewState>,
     ) -> Result<FrameInfo, RenderError> {
+        let frame_started = Instant::now();
         // Every frame path (fast baseline, asset preview, full) is entered from
         // here, so one check covers them all. On a dead device the first queue
         // write of the frame fails silently and the panic surfaces wherever that
@@ -99,9 +101,11 @@ impl Renderer {
         let render_ocean = self.ocean_enabled && active_world_variant.is_some_and(|key| key.ocean);
         let ocean_clipmap =
             render_ocean.then(|| usize::from(self.ocean_settings.mesh_quality.min(1)));
+        let topology_started=render_ocean.then(Instant::now);
         if render_ocean {
             self.update_promoted_ocean_clipmap_lod(camera.position.to_array());
         }
+        let ocean_topology_ms=topology_started.map_or(0.0,|s|s.elapsed().as_secs_f64()*1000.0);
 
         let menu_backdrop_requested = self.menu_backdrop_requested();
         if menu_backdrop_requested {
@@ -130,6 +134,9 @@ impl Renderer {
         self.surface_deformation
             .prepare_frame(&self.device, &self.queue);
         self.update_world_videos();
+        if let Some(world) = self.world.as_mut() {
+            advance_world_animations(world, self.started.elapsed().as_secs_f32());
+        }
         self.ensure_lazy_scene_pipelines();
 
         // Pipeline/render-plan selection happens only when settings change. The
@@ -163,7 +170,6 @@ impl Renderer {
         // Keep glow pipeline polling entirely outside the maximum-FPS path.
         self.ensure_bloom_pipelines();
 
-        let frame_started = Instant::now();
         let frame_time = self.started.elapsed().as_secs_f32();
         let frame_delta = if self.previous_frame_time > 0.0 {
             (frame_time - self.previous_frame_time).clamp(0.0, 0.25)
@@ -513,6 +519,7 @@ impl Renderer {
             prep_camera_ms,
             ..FrameInfo::default()
         };
+        info.ocean.topology_ms=ocean_topology_ms;
         info.late_latch = late_view_sample;
         info.gpu_ms = self.gpu_profiler.latest_frame_ms();
         if self.cull_debug_mode != CullDebugMode::Off {
@@ -831,6 +838,7 @@ impl Renderer {
             prepared_grass.as_ref(),
             prepared_surface_sprite_effects.as_ref(),
         );
+        self.dynamic_model_renderer.prepare_model_bundles(&self.device, &self.camera_bind_group);
         info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
             self.dynamic_model_renderer.ghoul2_draw_stats();
@@ -934,6 +942,8 @@ impl Renderer {
         let perf_timing = crate::renderer::diagnostics::perf_capture::enabled();
         let encode_started = Instant::now();
         let perf_setup_started = perf_timing.then(Instant::now);
+        let mut prefix_command_buffer = None;
+        let mut prefix_finish_pending = false;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3428,6 +3438,56 @@ impl Renderer {
                     prepared,
                 );
             }
+            if super::finish::eligible(
+                self.encoder_finish_threads, self.msaa_samples, self.ocean_enabled,
+                optical_volumes.is_some(), ray_traced_shadows,
+                self.planar_reflection_mode, self.planar_reflection_debug_mode,
+                self.gpu_driven_enabled,
+            ) {
+                // End all passes before transferring ownership of the prefix.
+                // The next pass loads exactly the same stored color/depth and
+                // records models/post/UI while the world prefix can finalize.
+                drop(pass);
+                let started = perf_timing.then(Instant::now);
+                let prefix = std::mem::replace(&mut encoder,
+                    self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("JKA model/post tail after world split"),
+                    }));
+                info.perf_encoder_split_active = true;
+                if self.encoder_finish_threads == 2 {
+                    if let Err(error) = self.encoder_finisher.as_mut().expect("mode 2 worker initialized")
+                        .dispatch(prefix, perf_timing)
+                    {
+                        eprintln!("Encoder finish dispatch failed: {error}");
+                        return Err(RenderError::DeviceLost);
+                    }
+                    prefix_finish_pending = true;
+                    if let Some(started) = started {
+                        info.perf_encoder_dispatch_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    }
+                } else {
+                    let started = perf_timing.then(Instant::now);
+                    prefix_command_buffer = Some(prefix.finish());
+                    if let Some(started) = started {
+                        info.perf_encoder_prefix_finish_ms = started.elapsed().as_secs_f64() * 1000.0;
+                        info.perf_encoder_finish_ms += info.perf_encoder_prefix_finish_ms;
+                    }
+                }
+                if capture_api_calls { info.perf_encode_calls.render_passes += 1; }
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA models after threaded-finish world split"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view, depth_slice: None, resolve_target,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                });
+            }
             let split_dynamic_for_ocean = optical_volumes.is_some();
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, false);
@@ -4575,7 +4635,10 @@ impl Renderer {
         }
         self.compact_group_scratch = compact_group_drawn;
         if let Some(started) = perf_scene_started {
-            info.perf_encode_scene_ms = started.elapsed().as_secs_f64() * 1000.0;
+            // The serial split's prefix finish is reported in finish, rather
+            // than double-counted in this mutually exclusive scene interval.
+            let prefix_block = if self.encoder_finish_threads == 1 { info.perf_encoder_prefix_finish_ms } else { 0.0 };
+            info.perf_encode_scene_ms = (started.elapsed().as_secs_f64() * 1000.0 - prefix_block).max(0.0);
         }
         let perf_post_ui_started = perf_timing.then(Instant::now);
 
@@ -5311,23 +5374,42 @@ impl Renderer {
         let perf_finish_started = perf_timing.then(Instant::now);
         let command_buffer = encoder.finish();
         if let Some(started) = perf_finish_started {
-            info.perf_encoder_finish_ms = started.elapsed().as_secs_f64() * 1000.0;
+            info.perf_encoder_tail_finish_ms = started.elapsed().as_secs_f64() * 1000.0;
+            info.perf_encoder_finish_ms += info.perf_encoder_tail_finish_ms;
         }
         let perf_readback_started = perf_timing.then(Instant::now);
         let profiler_readback_copy = self.gpu_profiler.encode_readback_copy(&self.device);
         if let Some(started) = perf_readback_started {
             info.perf_profiler_readback_encode_ms = started.elapsed().as_secs_f64() * 1000.0;
-            info.perf_primary_command_buffers = 1 + u32::from(profiler_readback_copy.is_some());
+            info.perf_primary_command_buffers = 1 + u32::from(info.perf_encoder_split_active)
+                + u32::from(profiler_readback_copy.is_some());
+        }
+        if prefix_finish_pending {
+            let started = perf_timing.then(Instant::now);
+            let result = self.encoder_finisher.as_mut().expect("pending encoder worker").wait();
+            if let Some(started) = started {
+                info.perf_encoder_join_wait_ms = started.elapsed().as_secs_f64() * 1000.0;
+                info.perf_encoder_finish_ms += info.perf_encoder_join_wait_ms;
+            }
+            match result {
+                Ok(finished) => {
+                    info.perf_encoder_prefix_finish_ms = finished.milliseconds;
+                    prefix_command_buffer = Some(finished.buffer);
+                }
+                Err(error) => {
+                    eprintln!("Encoder finish worker failed: {error}");
+                    return Err(RenderError::DeviceLost);
+                }
+            }
         }
         info.cpu_encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
         let submit_started = Instant::now();
         info.submit_call_at = Some(submit_started);
         let perf_submit_api_started = perf_timing.then(Instant::now);
-        let frame_submission = if let Some(readback_copy) = profiler_readback_copy {
-            self.queue.submit([command_buffer, readback_copy])
-        } else {
-            self.queue.submit([command_buffer])
-        };
+        // One same-frame submission, prefix first, then tail and profiler copy.
+        // No extra in-flight frame and no presentation before either finish.
+        let frame_submission = self.queue.submit(super::finish::ordered_buffers(
+            prefix_command_buffer, command_buffer, profiler_readback_copy));
         if let Some(started) = perf_submit_api_started {
             info.perf_primary_submit_api_ms = started.elapsed().as_secs_f64() * 1000.0;
         }

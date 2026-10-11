@@ -136,9 +136,9 @@ impl PlayerPresenter {
                 ));
             };
             let hilt = self.load_saber_model_in_game(&definition)?;
-            let mut animator = Ghoul2Animator::new(&hilt.gla);
+            let mut animator = Ghoul2Animator::new(&hilt.animation_gla);
             let pose_started = Instant::now();
-            let hilt_pose = animator.evaluate_pose(&hilt.gla, current_time, hand_bolt)?;
+            let hilt_pose = hilt.bind_animation_pose(animator.evaluate_pose(&hilt.animation_gla, current_time, hand_bolt)?)?;
             record_pose_eval(&mut self.perf, pose_started);
             if i32::from(entity.number) == self.viewer_client {
                 if let Some(debug) = self.viewer_anim_debug.as_mut() {
@@ -423,9 +423,9 @@ impl PlayerPresenter {
             definition.model.clone_from(qpath);
         }
         let hilt = self.load_saber_model_in_game(&definition)?;
-        let mut animator = Ghoul2Animator::new(&hilt.gla);
+        let mut animator = Ghoul2Animator::new(&hilt.animation_gla);
         let pose_started = Instant::now();
-        let hilt_pose = animator.evaluate_pose_openjk_root(&hilt.gla, current_time)?;
+        let hilt_pose = hilt.bind_animation_pose(animator.evaluate_pose_openjk_root(&hilt.animation_gla, current_time)?)?;
         record_pose_eval(&mut self.perf, pose_started);
         let snapshot_num = game
             .current_snapshot()

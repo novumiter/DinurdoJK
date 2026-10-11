@@ -1,7 +1,7 @@
 //! World bindings.
 use crate::renderer::{
     detail_texture_for_source, DrawBatch, GpuImage, HashMap, ReflectionProbeGpuSet, UniformSlot,
-    WorldGpu,
+    WorldGpu, WorldAnimationFrame, WorldBatchAnimation,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -414,6 +414,7 @@ pub(in crate::renderer) fn sync_auto4_bind_groups(world: &mut WorldGpu) {
         if let Some(full) = source.and_then(|source| full_batches.get(source)) {
             batch.bind_group = full.bind_group.clone();
             batch.fast_bind_group = full.fast_bind_group.clone();
+            batch.authored_glow_bind_group = full.authored_glow_bind_group.clone();
         }
     }
 }
@@ -513,6 +514,99 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             deformation_field_views,
             deformation_field_sampler,
         );
+        batch.authored_glow_bind_group = batch._authored_glow_fog_buffer.as_ref().map(|glow_fog| {
+            create_world_bind_group(
+                device, surface_layout, white, missing, flat_normal,
+                repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
+                lightmap_sampler, sky_sampler, selected_detail_texture,
+                textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                &footprint_marks, reflection_probes, &batch.source,
+                &batch._material_buffer, glow_fog, surface_deformation_buffer,
+                deformation_field_views, deformation_field_sampler,
+            )
+        });
+        batch.animation = build_world_animation(
+            &batch.source, &batch.bind_group, &batch.fast_bind_group,
+            &batch.authored_glow_bind_group,
+            |alternate| WorldAnimationFrame {
+                full: create_world_bind_group(
+                    device, surface_layout, white, missing, flat_normal,
+                    repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
+                    lightmap_sampler, sky_sampler, selected_detail_texture,
+                    textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                    &footprint_marks, reflection_probes, alternate,
+                    &batch._material_buffer, &batch._fog_buffer, surface_deformation_buffer,
+                    deformation_field_views, deformation_field_sampler,
+                ),
+                fast: create_fast_world_bind_group(
+                    device, fast_surface_layout, white, missing, repeat_sampler, clamp_sampler,
+                    lightmap_sampler, sky_sampler, textures, lightmaps, texture_clamp,
+                    *primary_skybox, &footprint_marks, alternate, &batch._material_buffer,
+                    surface_deformation_buffer, deformation_field_views, deformation_field_sampler,
+                ),
+                glow: batch._authored_glow_fog_buffer.as_ref().map(|glow_fog| {
+                    create_world_bind_group(
+                        device, surface_layout, white, missing, flat_normal,
+                        repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
+                        lightmap_sampler, sky_sampler, selected_detail_texture,
+                        textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                        &footprint_marks, reflection_probes, alternate,
+                        &batch._material_buffer, glow_fog, surface_deformation_buffer,
+                        deformation_field_views, deformation_field_sampler,
+                    )
+                }),
+            },
+        );
     }
     sync_auto4_bind_groups(world);
+}
+
+/// Cache frame-specific bind groups at upload/rebuild time, never during draw.
+/// Factory is skipped entirely for static stages and the first animation image
+/// reuses the ordinary stage's already allocated resource group.
+pub(in crate::renderer) fn build_world_animation(
+    source: &DrawBatch,
+    first_full: &wgpu::BindGroup,
+    first_fast: &wgpu::BindGroup,
+    first_glow: &Option<wgpu::BindGroup>,
+    mut make: impl FnMut(&DrawBatch) -> WorldAnimationFrame,
+) -> Option<WorldBatchAnimation> {
+    let animation = source.animation.as_ref()?;
+    if animation.frames.len() <= 1 {
+        return None;
+    }
+    let mut frames = Vec::with_capacity(animation.frames.len());
+    frames.push(WorldAnimationFrame {
+        full: first_full.clone(),
+        fast: first_fast.clone(),
+        glow: first_glow.clone(),
+    });
+    for &texture in animation.frames.iter().skip(1) {
+        let mut alternate = source.clone();
+        alternate.texture = Some(texture);
+        alternate.animation = None;
+        frames.push(make(&alternate));
+    }
+    Some(WorldBatchAnimation { frames, selected: 0 })
+}
+
+/// TaystJK uses shaderTime = refdef.floatTime - shader.timeOffset.
+/// Scan only world batches; static batches have no animation and do no work.
+pub(in crate::renderer) fn advance_world_animations(world: &mut WorldGpu, shader_time: f32) {
+    let mut changed = false;
+    for batch in world.coarse_batches.iter_mut().chain(world.full_batches.iter_mut()) {
+        let Some(animation) = batch.animation.as_mut() else { continue };
+        let Some(definition) = batch.source.animation.as_ref() else { continue };
+        let selected = definition.frame_index(shader_time - batch.source.shader_time_offset);
+        if animation.selected == selected { continue; }
+        let frame = &animation.frames[selected];
+        batch.bind_group = frame.full.clone();
+        batch.fast_bind_group = frame.fast.clone();
+        batch.authored_glow_bind_group = frame.glow.clone();
+        animation.selected = selected;
+        changed = true;
+    }
+    if changed {
+        sync_auto4_bind_groups(world);
+    }
 }

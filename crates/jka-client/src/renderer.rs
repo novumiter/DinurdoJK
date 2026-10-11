@@ -229,8 +229,8 @@ use visibility::pvs::{
 };
 use visibility::readback::CullDiagnosticsReadback;
 use world::bindings::{
-    create_fast_world_bind_group, create_world_bind_group, rebuild_world_bind_groups,
-    sync_auto4_bind_groups,
+    advance_world_animations, build_world_animation, create_fast_world_bind_group,
+    create_world_bind_group, rebuild_world_bind_groups, sync_auto4_bind_groups,
 };
 use world::detail_textures::{
     auto_detail_fallback_index, build_auto_detail_by_base_texture, detail_texture_for_source,
@@ -266,6 +266,7 @@ use world::types::{
     PlanarReflectionView, PlanarReflector, PlanarReflectorKind, ReflectionProbeGpuSet,
     RuntimeOceanClipmap,
     StaticLightGridGpu, UniformArena, UniformSlot, VoxelProbeGiGpu, WorldBatch, WorldBatchSet,
+    WorldAnimationFrame, WorldBatchAnimation,
     WorldDrawGroup, WorldGpu, WorldPipelineCompilePlan, WorldPipelineVariant,
     STATIC_AO_ADAPTIVE_MAX_CENTER_ERROR, STATIC_AO_ADAPTIVE_MAX_VISIBILITY_RANGE,
     STATIC_AO_ADAPTIVE_MIN_NORMAL_DOT, STATIC_AO_BVH_LEAF_TRIANGLES, STATIC_AO_HQ_BROAD_RADIUS,
@@ -566,6 +567,8 @@ struct Renderer {
     present_modes: Vec<wgpu::PresentMode>,
     /// Set by [`Renderer::request_scene_rebuild`], consumed once per frame.
     scene_rebuild_pending: bool,
+    /// A/B diagnostic: upload BSP vertex alpha=1 without touching material shaders.
+    debug_world_vertex_alpha_one: bool,
     /// Format/sample count for which the complete scene pipeline set was last
     /// rebuilt. Unlike `targets`, this is NOT advanced by resize/reconfigure:
     /// those can recreate textures without updating render pipelines.
@@ -732,6 +735,8 @@ struct Renderer {
     /// `videoMap` cinematics of the current world, streamed into `world.textures`.
     world_videos: Vec<WorldVideoPlayer>,
     dynamic_model_renderer: DynamicModelRenderer,
+    encoder_finish_threads: u32,
+    encoder_finisher: Option<frame::finish::EncoderFinisher>,
     spectator_highlight: SpectatorHighlightResources,
     white: GpuImage,
     missing: GpuImage,

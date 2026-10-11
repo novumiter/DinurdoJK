@@ -31,7 +31,7 @@ impl App {
         settings.fullscreen = stable.fullscreen;
         settings.renderer_backend = stable.renderer_backend;
         settings.resolution = stable.resolution;
-        // Grass/ocean can be disabled live. Preserve a pending enable as latched
+        // Grass can be disabled live. Preserve a pending enable as latched
         // until the renderer has actually been restarted with the required map
         // resources, but persist live disables immediately.
         settings.grass = if self.video.grass && !self.applied_grass {
@@ -39,11 +39,9 @@ impl App {
         } else {
             self.video.grass
         };
-        settings.ocean = if self.video.ocean && !self.applied_ocean {
-            self.applied_ocean
-        } else {
-            self.video.ocean
-        };
+        // Archive the selected ocean preference even before Apply has prepared
+        // the current world's clipmaps. The next launch prepares with this value;
+        // substituting applied_ocean here silently lost pending enables on quit.
         // OpenJK archives the pending CVAR_LATCH value. Overlay only console
         // latches here; unconfirmed menu display changes above remain last-good.
         self.apply_latched_values_to_settings(&mut settings);

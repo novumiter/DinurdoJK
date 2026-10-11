@@ -476,7 +476,7 @@ pub(in crate::ui) fn hud_stock_rect(
         }
         HudElementId::Fps if ctx.draw_fps >= 2 => {
             let (x, y, width, height) =
-                perf_panel_rect(w, ctx.gpu_enabled, ctx.cull_debug, ctx.thread_count);
+                perf_panel_rect(w, h, ctx.gpu_enabled, ctx.cull_debug, ctx.thread_count);
             HudRect {
                 x,
                 y,

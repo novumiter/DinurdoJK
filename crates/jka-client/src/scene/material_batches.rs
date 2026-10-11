@@ -143,6 +143,7 @@ pub(in crate::scene) fn stage_pipeline(
     first: bool,
 ) -> PipelineKey {
     PipelineKey {
+        auto_sprite2: material.auto_sprite2,
         class: if material.sky {
             DrawClass::Sky
         } else {
@@ -246,6 +247,7 @@ pub(in crate::scene) fn stage_batch(
         material_debug_index: material_debug_index.map_or(u32::MAX, |index| index as u32),
         surface_material: material.surface_material,
         texture,
+        animation: stage.animation.clone(),
         texture_is_lightmap,
         texture_is_white,
         detail_texture_eligible,
@@ -459,7 +461,7 @@ pub(in crate::scene) fn build_material_debug_entry(
             .sum::<usize>();
         let unsupported = definition.unsupported.len() + stage_unsupported;
         lines.push(format!(
-            "parsed shader: stages={} portal={} sky={} nodraw={} translucent={} nofog={} cull={} unsupported={} (shader={} stage={})",
+            "parsed shader: stages={} portal={} sky={} nodraw={} translucent={} nofog={} cull={} sort={:?} unsupported={} (shader={} stage={})",
             definition.stages.len(),
             definition.portal,
             definition.sky,
@@ -471,6 +473,7 @@ pub(in crate::scene) fn build_material_debug_entry(
             } else {
                 &definition.cull
             },
+            definition.sort,
             unsupported,
             definition.unsupported.len(),
             stage_unsupported
@@ -820,6 +823,7 @@ pub(crate) fn append_sky_batches(
 ) {
     let box_stage = MaterialStage {
         texture: StageTexture::White,
+        animation: None,
         enhancements: Default::default(),
         blend: None,
         alpha_cutoff: 0.0,

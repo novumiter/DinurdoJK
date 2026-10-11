@@ -309,7 +309,7 @@ pub(in crate::renderer) fn spawn_snow_shell_job(job: impl FnOnce() + Send + 'sta
     match pool {
         Some(pool) => pool.spawn(job),
         None => {
-            std::thread::spawn(job);
+            std::thread::Builder::new().name("jka-snow-shell-fallback".into()).spawn(job).expect("spawn snow shell worker");
         }
     }
 }

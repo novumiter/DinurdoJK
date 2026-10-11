@@ -1389,6 +1389,7 @@ impl App {
             playback
                 .entity_presenter
                 .set_draw_map_models(self.video.draw_map_models);
+            playback.entity_presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
             playback
                 .player_presenter
                 .set_lod_bias(self.video.ghoul2_lod_bias);
@@ -1500,6 +1501,8 @@ impl App {
                 } else {
                     0
                 });
+            playback.player_presenter.set_local_global_cosmetics(
+                &self.network.global_hat, &self.network.global_cape);
             playback.race_ghost_alpha = self.race_ghost_alpha;
             let (advance, sample) = if playback.local {
                 let Some((server_time, angles)) = local_frame else {

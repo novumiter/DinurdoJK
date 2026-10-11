@@ -345,10 +345,17 @@ impl DynamicModelRenderer {
             skin_instance_entities: Vec::new(),
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
             model_state_cache: false,
-            dynamic_batch_draws: false,
+            dynamic_batch_draws: true,
+            // Startup applies VideoSettings' serial default through the
+            // fallible pool setter.
             model_prepare_threads: 0,
             cpu_pack_pool: None,
             scratch_cpu_pack_jobs: Vec::new(),
+            model_render_bundles: false,
+            model_bundles: Default::default(),
+            perf_bundles: Default::default(),
+            md3_geometry_cache: true,
+            md3_stream_cache: Default::default(),
             model_index_upload_cache: false,
             index_upload_cache: super::prepare::IndexUploadCache::default(),
             ghoul2_batch_key_cache: false,
@@ -388,6 +395,14 @@ impl DynamicModelRenderer {
         self.cpu_pack_pool = pool;
         self.model_prepare_threads = threads;
         Ok(())
+    }
+
+    pub(in crate::renderer) fn set_md3_geometry_cache(&mut self, enabled: bool) {
+        if self.md3_geometry_cache != enabled {
+            self.md3_stream_cache.clear();
+            self.index_upload_cache.clear();
+            self.md3_geometry_cache = enabled;
+        }
     }
 
     pub(in crate::renderer) fn set_model_index_upload_cache(&mut self, enabled: bool) {

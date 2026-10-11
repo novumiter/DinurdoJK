@@ -1,5 +1,172 @@
 use super::*;
 
+fn large_pool_tiles() -> Vec<Region> {
+    let footprint = rectangle([0.0, 0.0], [2048.0, 2048.0]);
+    (0..8)
+        .flat_map(|y| {
+            let footprint = &footprint;
+            (0..8).map(move |x| Region {
+                slot: 2,
+                level: 0.0,
+                triangles: footprint.clone(),
+                bounds: Some([
+                    [x as f32 * 256.0, y as f32 * 256.0],
+                    [(x + 1) as f32 * 256.0, (y + 1) as f32 * 256.0],
+                ]),
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn shoreline_bands_keep_internal_bank_and_match_complete_bake() {
+    let mut geometry = Geometry {
+        solids: vec![box_solid([-256., -256., -256.], [2304., 2304., -128.])],
+        triangles: vec![],
+        liquids: vec![],
+    };
+    let mut bank = box_solid([720., 720., -256.], [820., 820., 64.]);
+    bank.planes[4] = Plane {
+        normal: [-1., 0., 1.],
+        distance: -800.,
+    };
+    geometry.solids.push(bank);
+    let tiles = large_pool_tiles();
+    let options = Options {
+        max_cells_per_region: 4096,
+        ..Default::default()
+    };
+    let complete = geometry.bake(&tiles, options).unwrap();
+    let screened = geometry
+        .bake_shoreline_bands(&tiles, options, 38.4)
+        .unwrap();
+    assert_eq!(
+        screened.grids.len(),
+        16,
+        "interior bank plus diagonal halo, not the outer pool envelope"
+    );
+    assert_eq!(screened.shoreline_bands[0].full_tiles, 64);
+    for reference in &complete.grids {
+        let matching = screened.grids.iter().find(|g| g.origin == reference.origin);
+        if reference
+            .cells
+            .iter()
+            .any(|c| c.class == Class::Wet && c.depth <= 38.4)
+        {
+            assert!(
+                matching.is_some(),
+                "every shallow tile must survive screening"
+            );
+        }
+        if let Some(g) = matching {
+            for (a, b) in g.cells.iter().zip(&reference.cells) {
+                assert_eq!(a.class, b.class);
+                assert_eq!(a.bed.to_bits(), b.bed.to_bits());
+                assert_eq!(a.depth.to_bits(), b.depth.to_bits());
+            }
+            // The bank spans four core tiles. Its stitched faces must exactly
+            // match the complete atlas; only the distant halo cuts may differ.
+            if (0..2).all(|a| g.origin[a] >= 512. && g.origin[a] <= 768.) {
+                for (a, b) in g
+                    .faces_x
+                    .iter()
+                    .chain(&g.faces_y)
+                    .zip(reference.faces_x.iter().chain(&reference.faces_y))
+                {
+                    assert_eq!(a.boundary, b.boundary);
+                    assert_eq!(a.crest.to_bits(), b.crest.to_bits());
+                }
+            }
+        }
+    }
+    let roundtrip = Atlas::decode(&screened.encode([9, 8]), [9, 8]).unwrap();
+    assert_eq!(roundtrip.shoreline_bands[0].retained_tiles, 16);
+    assert_eq!(roundtrip.shoreline_bands[0].max_depth, 38.4);
+
+    let mut broken = tiles.clone();
+    broken
+        .iter_mut()
+        .find(|r| r.bounds.unwrap()[0] == [512., 512.])
+        .unwrap()
+        .triangles
+        .clear();
+    let rejected = geometry
+        .bake_shoreline_bands(&broken, options, 38.4)
+        .unwrap();
+    assert!(
+        rejected.grids.is_empty(),
+        "a failed required tile rejects the whole pool"
+    );
+    assert!(rejected.shoreline_bands.is_empty());
+    assert!(rejected
+        .warnings
+        .iter()
+        .any(|w| w.contains("incomplete shoreline-band bake")));
+    assert!(Atlas::decode(&rejected.encode([9, 8]), [9, 8]).is_ok());
+}
+
+#[test]
+fn shoreline_screening_keeps_subcell_terrain_and_rejects_over_budget_band() {
+    let mut geometry = Geometry {
+        solids: vec![],
+        liquids: vec![],
+        triangles: vec![Triangle {
+            points: [[767.9, 750., -1.], [768.1, 750., -1.], [768., 750.1, -1.]],
+            normal: [0., 0., 1.],
+            bounds: [[767.9, 750.], [768.1, 750.1]],
+        }],
+    };
+    let tiles = large_pool_tiles();
+    let options = Options {
+        max_cells_per_region: 4096,
+        ..Default::default()
+    };
+    let narrow = geometry
+        .bake_shoreline_bands(&tiles, options, 38.4)
+        .unwrap();
+    assert_eq!(
+        narrow.grids.len(),
+        12,
+        "tiny bank across a tile seam cannot vanish between coarse probes"
+    );
+    geometry
+        .solids
+        .push(box_solid([-256., -256., -256.], [2304., 2304., -16.]));
+    let broad = geometry
+        .bake_shoreline_bands(&tiles, options, 38.4)
+        .unwrap();
+    assert!(
+        broad.grids.is_empty(),
+        "do not silently truncate an oversized shallow domain"
+    );
+    assert!(broad.warnings[0].contains("bands plus halo exceed"));
+}
+
+#[test]
+fn large_deep_wall_pool_stays_fft_without_allocating_the_interior() {
+    let geometry = Geometry {
+        solids: vec![
+            box_solid([-256., -256., -256.], [2304., 2304., -128.]),
+            box_solid([1023.99, -256., -256.], [1024.01, 2304., 128.]),
+        ],
+        triangles: vec![],
+        liquids: vec![],
+    };
+    let atlas = geometry
+        .bake_shoreline_bands(
+            &large_pool_tiles(),
+            Options {
+                max_cells_per_region: 4096,
+                ..Default::default()
+            },
+            38.4,
+        )
+        .unwrap();
+    assert!(atlas.grids.is_empty());
+    assert!(atlas.warnings[0].contains("FFT-only"));
+    assert!(atlas.shoreline_bands.is_empty());
+}
+
 fn box_solid(min: [f32; 3], max: [f32; 3]) -> Solid {
     Solid {
         planes: vec![
@@ -383,10 +550,16 @@ fn sparse_l_tiles_skip_the_empty_envelope_corner_and_stitch_open_faces() {
         )
         .unwrap();
     assert_eq!(atlas.grids.len(), 3);
-    assert_eq!(atlas.grids.iter().map(|g| g.cells.len()).sum::<usize>(), 768);
+    assert_eq!(
+        atlas.grids.iter().map(|g| g.cells.len()).sum::<usize>(),
+        768
+    );
     let lower_left = atlas.grids.iter().find(|g| g.origin == [0.0, 0.0]).unwrap();
     let nx = lower_left.size[0] as usize;
     let ny = lower_left.size[1] as usize;
-    assert_eq!(lower_left.faces_x[8 * (nx + 1) + nx].boundary, Boundary::Open);
+    assert_eq!(
+        lower_left.faces_x[8 * (nx + 1) + nx].boundary,
+        Boundary::Open
+    );
     assert_eq!(lower_left.faces_y[ny * nx + 8].boundary, Boundary::Open);
 }

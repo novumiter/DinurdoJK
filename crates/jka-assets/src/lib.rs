@@ -3,6 +3,7 @@ pub mod animation;
 pub mod animevents;
 pub mod bsp;
 pub mod ghoul2;
+pub mod skeleton;
 pub mod map;
 pub mod md3;
 pub mod pak_checksum;

@@ -162,6 +162,7 @@ impl Renderer {
             prepared_grass.as_ref(),
             prepared_surface_sprite_effects.as_ref(),
         );
+        self.dynamic_model_renderer.prepare_model_bundles(&self.device, &self.camera_bind_group);
         info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
             self.dynamic_model_renderer.ghoul2_draw_stats();

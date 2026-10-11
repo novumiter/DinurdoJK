@@ -2,6 +2,25 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_DEBUGWORLDVERTEXALPHAONE {
+        runtime: CvarDef::new("r_debugWorldVertexAlphaOne", "", "0..1", "A/B shader test: force BSP world vertex alpha to 1. Original vertex data is restored by setting 0. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_debugworldvertexalphaone(app)), |app, value| App::cvar_set_r_debugworldvertexalphaone(app, APP_R_DEBUGWORLDVERTEXALPHAONE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_debugworldvertexalphaone, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_get_r_debugworldvertexalphaone(&self) -> String {
+                    bool_value(self.video.debug_world_vertex_alpha_one)
+                }
+                fn cvar_set_r_debugworldvertexalphaone(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    self.video.debug_world_vertex_alpha_one = enabled;
+                    self.render_command(RenderCommand::SetDebugWorldVertexAlphaOne(enabled));
+                    self.console_status = format!("BSP VERTEX ALPHA A/B: {}", if enabled { "FORCED 1.0" } else { "AUTHORED" });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_DEVELOPER {
         runtime: CvarDef::new("developer", "", "0..3", "Global diagnostic level: 0 quiet, 1 basic lifecycle, 2 verbose per-entity/job output, 3 trace. Levels above 0 also enable developer-only inspector/overlay tools.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_developer(app)), |app, value| App::cvar_set_developer(app, APP_DEVELOPER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_developer, None),
         config: CvarBinding {
@@ -1874,7 +1893,7 @@ app_cvars! {
     }
 
     APP_R_GHOUL2BATCHDRAWS {
-        runtime: CvarDef::new("r_ghoul2BatchDraws", "", "0|1|2", "GPU Ghoul2 draw batching: 0 off, 1 adaptive, 2 force. Adaptive only groups repeated opaque/masked mesh/material/LOD surfaces when the crowd is likely to benefit.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_ghoul2batchdraws(app)), |app, value| App::cvar_set_r_ghoul2batchdraws(app, APP_R_GHOUL2BATCHDRAWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ghoul2batchdraws, None),
+        runtime: CvarDef::new("r_ghoul2BatchDraws", "", "0|1|2", "GPU Ghoul2 draw batching: 0 off, 1 adaptive (default), 2 force. Adaptive only groups repeated opaque/masked mesh/material/LOD surfaces when the crowd is likely to benefit.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_ghoul2batchdraws(app)), |app, value| App::cvar_set_r_ghoul2batchdraws(app, APP_R_GHOUL2BATCHDRAWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ghoul2batchdraws, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.ghoul2_batch_draws =
@@ -1933,7 +1952,7 @@ app_cvars! {
     }
 
     APP_R_DYNAMICBATCHDRAWS {
-        runtime: CvarDef::new("r_dynamicBatchDraws", "", "0..1", "A/B merging adjacent compatible CPU model index ranges and GPU FX instance ranges without reordering. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_dynamicBatchDraws", "", "0..1", "Merging adjacent compatible CPU model index ranges and GPU FX instance ranges without reordering. Session-only A/B override; default 1.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.dynamic_batch_draws)),
             |app, value| App::cvar_set_r_dynamicbatchdraws(app, APP_R_DYNAMICBATCHDRAWS.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_dynamicbatchdraws, None),
@@ -1976,6 +1995,75 @@ app_cvars! {
         ]
     }
 
+    APP_R_PERFTHREADPAGE {
+        runtime: CvarDef::new("r_perfThreadPage", "", "0..", "Zero-based page of every live process thread in cg_drawFPS 2. Windows percentages are CPU time per core, excluding waits. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.perf_thread_page.to_string()),
+            |app, value| App::cvar_set_r_perfthreadpage(app, APP_R_PERFTHREADPAGE.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_perfthreadpage, None),
+        config: CvarBinding { default: Some(|state| state.video.perf_thread_page.to_string()), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_perfthreadpage(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.perf_thread_page = value.trim().parse::<u32>()
+                    .map_err(|_| format!("{name}: expected a nonnegative page number"))?;
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_ENCODERFINISHTHREADS {
+        runtime: CvarDef::new("r_encoderFinishThreads", "", "0|1|2", "A/B finalization: 0 original encoder; 1 split world/model-post encoders finished serially; 2 finish world on a persistent worker concurrently with remaining recording/finish (default). Same-frame ordered submit. Unified MSAA1 CPU raster, no ocean/optics/RT/planar views. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.encoder_finish_threads.to_string()),
+            |app, value| App::cvar_set_r_encoderfinishthreads(app, APP_R_ENCODERFINISHTHREADS.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_encoderfinishthreads, None),
+        config: CvarBinding { default: Some(|state| state.video.encoder_finish_threads.to_string()), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_encoderfinishthreads(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u32>().ok().filter(|mode| *mode <= 2)
+                    .ok_or_else(|| format!("{name}: expected 0|1|2"))?;
+                self.video.encoder_finish_threads = mode;
+                self.render_command(RenderCommand::SetEncoderFinishThreads(mode));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_MODELRENDERBUNDLES {
+        runtime: CvarDef::new("r_modelRenderBundles", "", "0..1", "A/B reusable opaque/masked indexed-model command recording; exact draw/resource checks and two-frame stability. RT/glow/excluded views retain direct submission. Session-only prototype; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.model_render_bundles)),
+            |app, value| App::cvar_set_r_modelrenderbundles(app, APP_R_MODELRENDERBUNDLES.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_modelrenderbundles, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.model_render_bundles)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_modelrenderbundles(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.model_render_bundles = Self::parse_cvar_bool(name, value)?;
+                self.render_command(RenderCommand::SetModelRenderBundles(self.video.model_render_bundles));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_MD3GEOMETRYCACHE {
+        runtime: CvarDef::new("r_md3GeometryCache", "", "0..1", "A/B reuse unchanged transformed/lit MD3 geometry and resident GPU stream ranges. Animation/transforms/lights invalidate exact cached inputs. Raster stream cache; RT keeps its original preparation. Session-only A/B override; default 1.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.md3_geometry_cache)),
+            |app, value| App::cvar_set_r_md3geometrycache(app, APP_R_MD3GEOMETRYCACHE.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_md3geometrycache, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.md3_geometry_cache)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_md3geometrycache(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.md3_geometry_cache = Self::parse_cvar_bool(name, value)?;
+                if let Some(presenter) = self.asset_preview_entity_presenter.as_mut() {
+                    presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
+                }
+                self.render_command(RenderCommand::SetMd3GeometryCache(self.video.md3_geometry_cache));
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_MODELINDEXUPLOADCACHE {
         runtime: CvarDef::new("r_modelIndexUploadCache", "", "0..1", "A/B skip unchanged index uploads and upload only a changed span on the raster CPU-model path. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.model_index_upload_cache)),
@@ -2009,7 +2097,7 @@ app_cvars! {
     }
 
     APP_R_MODELPREPARETHREADS {
-        runtime: CvarDef::new("r_modelPrepareThreads", "", "0|1|2|4", "CPU model packing: 0 original serial path, 1 serial prepared jobs, 2/4 bounded worker threads for vertex lighting/index rebasing. Raster path only. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_modelPrepareThreads", "", "0|1|2|4", "CPU model packing: 0 original serial path (default), 1 serial prepared jobs, 2/4 bounded worker threads for vertex lighting/index rebasing. Raster path only. Session-only A/B override.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.model_prepare_threads.to_string()),
             |app, value| App::cvar_set_r_modelpreparethreads(app, APP_R_MODELPREPARETHREADS.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_modelpreparethreads, None),

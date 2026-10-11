@@ -1,6 +1,7 @@
 //! Static ao runtime.
 use crate::renderer::{
-    create_fast_world_bind_group, create_world_bind_group, detail_texture_for_source, mpsc,
+    build_world_animation, create_fast_world_bind_group, create_world_bind_group,
+    detail_texture_for_source, mpsc, WorldAnimationFrame,
     run_static_ao_worker, sync_auto4_bind_groups, thread, upload_texture, GpuImage, Renderer,
     StaticAoBakeData, StaticAoBakeMode, StaticAoBakedLightmap, StaticAoJobKey, StaticAoPendingJob,
     StaticAoWorkerUpdate, TextureData, TryRecvError, WorldGpu,
@@ -171,6 +172,56 @@ impl Renderer {
                 self.surface_deformation.field_views(),
                 self.surface_deformation.field_sampler(),
             );
+            batch.authored_glow_bind_group = batch._authored_glow_fog_buffer.as_ref().map(|glow_fog| {
+                create_world_bind_group(
+                    &self.device, &self.surface_layout, &self.white, &self.missing,
+                    &self.flat_normal, &self.repeat_sampler, &self.clamp_sampler,
+                    &self.pbr_repeat_sampler, &self.pbr_clamp_sampler,
+                    &self.lightmap_sampler, &self.sky_sampler, detail_texture, textures,
+                    lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                    &footprint_marks, reflection_probes, &batch.source,
+                    &batch._material_buffer, glow_fog,
+                    self.surface_deformation.buffer(), self.surface_deformation.field_views(),
+                    self.surface_deformation.field_sampler(),
+                )
+            });
+            batch.animation = build_world_animation(
+                &batch.source, &batch.bind_group, &batch.fast_bind_group,
+                &batch.authored_glow_bind_group,
+                |alternate| WorldAnimationFrame {
+                    full: create_world_bind_group(
+                        &self.device, &self.surface_layout, &self.white, &self.missing,
+                        &self.flat_normal, &self.repeat_sampler, &self.clamp_sampler,
+                        &self.pbr_repeat_sampler, &self.pbr_clamp_sampler,
+                        &self.lightmap_sampler, &self.sky_sampler, detail_texture, textures,
+                        lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                        &footprint_marks, reflection_probes, alternate, &batch._material_buffer,
+                        &batch._fog_buffer, self.surface_deformation.buffer(),
+                        self.surface_deformation.field_views(), self.surface_deformation.field_sampler(),
+                    ),
+                    fast: create_fast_world_bind_group(
+                        &self.device, &self.fast_surface_layout, &self.white, &self.missing,
+                        &self.repeat_sampler, &self.clamp_sampler, &self.lightmap_sampler,
+                        &self.sky_sampler, textures, lightmaps, texture_clamp, *primary_skybox,
+                        &footprint_marks, alternate, &batch._material_buffer,
+                        self.surface_deformation.buffer(), self.surface_deformation.field_views(),
+                        self.surface_deformation.field_sampler(),
+                    ),
+                    glow: batch._authored_glow_fog_buffer.as_ref().map(|glow_fog| {
+                        create_world_bind_group(
+                            &self.device, &self.surface_layout, &self.white, &self.missing,
+                            &self.flat_normal, &self.repeat_sampler, &self.clamp_sampler,
+                            &self.pbr_repeat_sampler, &self.pbr_clamp_sampler,
+                            &self.lightmap_sampler, &self.sky_sampler, detail_texture, textures,
+                            lightmaps, deluxemaps, texture_clamp, *primary_skybox,
+                            &footprint_marks, reflection_probes, alternate,
+                            &batch._material_buffer, glow_fog,
+                            self.surface_deformation.buffer(), self.surface_deformation.field_views(),
+                            self.surface_deformation.field_sampler(),
+                        )
+                    }),
+                },
+            );
         }
         sync_auto4_bind_groups(world);
     }
@@ -219,11 +270,19 @@ impl Renderer {
                 vertex.alpha_cutoff = f32::from(visibility) / 255.0;
             }
         }
-        self.queue.write_buffer(
-            &world.vertex_buffer,
-            0,
-            bytemuck::cast_slice(&world.static_ao_gpu_vertices),
-        );
+        if self.debug_world_vertex_alpha_one {
+            let mut gpu_vertices = world.static_ao_gpu_vertices.clone();
+            for vertex in &mut gpu_vertices {
+                vertex.color[3] = 1.0;
+            }
+            self.queue.write_buffer(&world.vertex_buffer, 0, bytemuck::cast_slice(&gpu_vertices));
+        } else {
+            self.queue.write_buffer(
+                &world.vertex_buffer,
+                0,
+                bytemuck::cast_slice(&world.static_ao_gpu_vertices),
+            );
+        }
         Ok(())
     }
 

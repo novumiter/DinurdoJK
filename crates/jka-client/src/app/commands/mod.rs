@@ -2,5 +2,6 @@
 pub(in crate::app) mod buffer;
 pub(in crate::app) mod cvars;
 pub(in crate::app) mod dispatch;
+pub(in crate::app) mod global_cosmetics;
 
 pub(in crate::app) mod registry;

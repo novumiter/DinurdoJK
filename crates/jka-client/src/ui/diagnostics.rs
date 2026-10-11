@@ -65,19 +65,34 @@ pub(in crate::ui) fn build_fps_simple(out: &mut Vec<UiVertex>, ui: &UiSnapshot, 
     text(out, &label, x, 12.0, scale, [1.0; 4], w, h);
 }
 
-pub(in crate::ui) fn compact_thread_name(name: &'static str) -> &'static str {
+pub(in crate::ui) fn compact_thread_name(name: &str) -> String {
+    let prefixes = [
+        ("jka-model-pack-", "PACK"), ("jka-g2-skin-", "G2SKIN"),
+        ("jka-fx-geom-", "FXGEO"), ("jka-event-", "EV"),
+        ("jka-worker-", "MAP"), ("jka-asset-", "ASSET"),
+        ("jka-snow-shell-", "SNOW"), ("jka-rayon-", "RAYON"),
+        ("jka-static-ao-ray-", "AO RAY"), ("jka-static-ao-vertex-", "AO VTX"),
+    ];
+    for (prefix, label) in prefixes {
+        if let Some(index) = name.strip_prefix(prefix) { return format!("{label}{index}"); }
+    }
     match name {
+        "jka-encoder-finish" => "FINISH",
+        "jka-thread-monitor" => "CPU MONITOR",
+        "jka-fx" => "FX SIM",
+        "jka-cloth-physics" => "CLOTH",
+        "jka-jiggle-physics" => "JIGGLE",
         "MAIN" => "MAIN",
         "RENDER" => "RENDER",
         "MAP LOADER" => "MAP",
-        "WORKER 0" => "W0",
-        "WORKER 1" => "W1",
-        "WORKER 2" => "W2",
-        "WORKER 3" => "W3",
-        "WORKER 4" => "W4",
-        "WORKER 5" => "W5",
-        "WORKER 6" => "W6",
-        "WORKER 7" => "W7",
+        "WORKER 0" => "MAP0",
+        "WORKER 1" => "MAP1",
+        "WORKER 2" => "MAP2",
+        "WORKER 3" => "MAP3",
+        "WORKER 4" => "MAP4",
+        "WORKER 5" => "MAP5",
+        "WORKER 6" => "MAP6",
+        "WORKER 7" => "MAP7",
         "EVENT 0" => "E0",
         "EVENT 1" => "E1",
         "EVENT 2" => "E2",
@@ -89,7 +104,7 @@ pub(in crate::ui) fn compact_thread_name(name: &'static str) -> &'static str {
         "ASSET 0" => "A0",
         "ASSET 1" => "A1",
         _ => name,
-    }
+    }.to_owned()
 }
 
 pub(in crate::ui) fn draw_perf_metric(
@@ -118,6 +133,12 @@ pub(in crate::ui) fn draw_perf_metric(
     );
 }
 
+fn perf_text_line(out: &mut Vec<UiVertex>, available: f32, label: &str, x: f32, y: f32,
+    scale: f32, color: [f32; 4], w: u32, h: u32) {
+    let fitted = scale.min(available / (label.chars().count().max(1) as f32 * 6.0));
+    text(out, label, x, y, fitted, color, w, h);
+}
+
 pub(in crate::ui) const PERF_HEADER_H: f32 = 38.0;
 
 pub(in crate::ui) const PERF_CPU_H: f32 = 78.0;
@@ -126,13 +147,46 @@ pub(in crate::ui) const PERF_CLIENT_H: f32 = 161.0;
 
 pub(in crate::ui) const PERF_INPUT_H: f32 = 108.0;
 
-pub(in crate::ui) const PERF_THREAD_HEADER_H: f32 = 28.0;
+pub(in crate::ui) const PERF_THREAD_HEADER_H: f32 = 38.0;
 
 pub(in crate::ui) const PERF_THREAD_ROW_H: f32 = 32.0;
+
+fn thread_rows(h: u32, gpu_enabled: bool, debug_culling: bool, thread_count: usize) -> usize {
+    let fixed = 12.0 + PERF_HEADER_H + PERF_CPU_H
+        + if gpu_enabled { 112.0 } else { 42.0 }
+        + PERF_CLIENT_H + PERF_INPUT_H + PERF_THREAD_HEADER_H
+        + if debug_culling { 42.0 } else { 0.0 } + 18.0;
+    let available = ((h as f32 - 28.0 - fixed) / PERF_THREAD_ROW_H).floor().max(1.0) as usize;
+    available.min(11).min(thread_count.div_ceil(2).max(1))
+}
+
+fn thread_page(thread_count: usize, rows: usize, requested: u32) -> (usize, usize, std::ops::Range<usize>) {
+    let capacity = rows.max(1) * 2;
+    let pages = thread_count.div_ceil(capacity).max(1);
+    let page = (requested as usize).min(pages - 1);
+    let start = (page * capacity).min(thread_count);
+    (page, pages, start..(start + capacity).min(thread_count))
+}
 
 /// `x, y, width, height` of the `cg_drawFPS 2` profiler panel.
 pub(in crate::ui) fn perf_panel_rect(
     w: u32,
+    h: u32,
+    gpu_enabled: bool,
+    debug_culling: bool,
+    thread_count: usize,
+) -> (f32, f32, f32, f32) {
+    let (_, _, width, height) = unscaled_perf_panel_rect(w, h, gpu_enabled, debug_culling, thread_count);
+    let scale = ((h as f32 - 28.0).max(1.0) / height)
+        .min((w as f32 - 28.0).max(1.0) / width).min(1.0);
+    let width = width * scale;
+    let height = height * scale;
+    ((w as f32 - width - 14.0).max(14.0), 14.0, width, height)
+}
+
+fn unscaled_perf_panel_rect(
+    w: u32,
+    h: u32,
     gpu_enabled: bool,
     debug_culling: bool,
     thread_count: usize,
@@ -141,11 +195,7 @@ pub(in crate::ui) fn perf_panel_rect(
     let panel_w = 900.0_f32.min((w as f32 - margin * 2.0).max(620.0));
     let x = (w as f32 - panel_w - margin).max(margin);
     let gpu_h = if gpu_enabled { 112.0 } else { 42.0 };
-    let thread_two_columns = thread_count > 11;
-    // The original profiler has 11 core/map slots. Keep those together in
-    // the left column and put the event-pool and asset-loader slots in the right column.
-    // This preserves the old panel height instead of adding eight more rows.
-    let thread_rows = if thread_two_columns { 11 } else { thread_count };
+    let thread_rows = thread_rows(h, gpu_enabled, debug_culling, thread_count);
     let footer_h = if debug_culling { 42.0 } else { 0.0 };
     let panel_h = 12.0
         + PERF_HEADER_H
@@ -161,10 +211,32 @@ pub(in crate::ui) fn perf_panel_rect(
 }
 
 pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
+    let start = out.len();
+    build_perf_contents(out, ui, w, h);
+    let gpu = ui.perf.gpu_ms.is_some();
+    let debug = ui.video.cull_debug != CullDebugMode::Off;
+    let (rx, ry, rw, _) = unscaled_perf_panel_rect(w, h, gpu, debug, ui.threads.len());
+    let (x, y, width, _) = perf_panel_rect(w, h, gpu, debug, ui.threads.len());
+    let scale = width / rw;
+    if scale < 1.0 {
+        // Scale the entire panel uniformly at small resolutions. The HUD editor
+        // uses the same rectangle, so its bounds match the actual vertices.
+        for vertex in &mut out[start..] {
+            let px = (vertex.position[0] + 1.0) * 0.5 * w.max(1) as f32;
+            let py = (1.0 - vertex.position[1]) * 0.5 * h.max(1) as f32;
+            vertex.position = [
+                (x + (px - rx) * scale) / w.max(1) as f32 * 2.0 - 1.0,
+                1.0 - (y + (py - ry) * scale) / h.max(1) as f32 * 2.0,
+            ];
+        }
+    }
+}
+
+fn build_perf_contents(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32) {
     let p = ui.perf;
     let debug_culling = ui.video.cull_debug != CullDebugMode::Off;
     let gpu_enabled = p.gpu_ms.is_some();
-    let (x, y, panel_w, panel_h) = perf_panel_rect(w, gpu_enabled, debug_culling, ui.threads.len());
+    let (x, y, panel_w, panel_h) = unscaled_perf_panel_rect(w, h, gpu_enabled, debug_culling, ui.threads.len());
     let header_h = PERF_HEADER_H;
     let cpu_h = PERF_CPU_H;
     let gpu_h = if gpu_enabled { 112.0 } else { 42.0 };
@@ -172,12 +244,8 @@ pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
     let input_h = PERF_INPUT_H;
     let thread_header_h = PERF_THREAD_HEADER_H;
     let thread_row_h = PERF_THREAD_ROW_H;
-    let thread_two_columns = ui.threads.len() > 11;
-    let thread_rows = if thread_two_columns {
-        11
-    } else {
-        ui.threads.len()
-    };
+    let thread_rows = thread_rows(h, gpu_enabled, debug_culling, ui.threads.len());
+    let (page, pages, thread_range) = thread_page(ui.threads.len(), thread_rows, ui.video.perf_thread_page);
     rect(out, x, y, panel_w, panel_h, [0.0, 0.0, 0.0, 0.76], w, h);
 
     let section_color = [0.60, 0.74, 0.88, 1.0];
@@ -441,8 +509,8 @@ pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
             h,
         );
     }
-    text(
-        out,
+    perf_text_line(
+        out, panel_w - 24.0,
         &format!(
             "EVENT PREP {:.3} MS / {} JOBS / {} POOL THREADS / {}   AUDIO DECODE {:.3} MS / {} JOBS / {}",
             p.client_event_prepare_ms,
@@ -461,8 +529,8 @@ pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
         h,
     );
 
-    text(
-        out,
+    perf_text_line(
+        out, panel_w - 24.0,
         &format!(
             "G2 {} POSES (MOTION {} / {:.3} MS) / {} BOLTS ({:.3} MS) / {} SURF / {} VERTS   CULL {}/{} LOD [{}/{}/{}/{}]   FX {:.3} + TESS {:.3} MS   DYN REPACK {:.3} MS / {} SURF / {} VERTS / {} INDICES",
             p.ghoul2_pose_evals,
@@ -493,8 +561,8 @@ pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
         h,
     );
 
-    text(
-        out,
+    perf_text_line(
+        out, panel_w - 24.0,
         &format!(
             "FX DRAWS {} [SPR {} ORIENT {} LINE {} QUAD {} MESH {} CYL {}]   OUT {} SURF / CPU {} SURF {} V {} I / GPU {} BATCH {} INST / GPU FX {} MS",
             p.client_fx_draws,
@@ -667,59 +735,56 @@ pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
 
     text(
         out,
-        "THREAD UTILIZATION  (~500 MS)",
+        &format!("{} (~500 MS)  PAGE {}/{}  {} LIVE THREADS", crate::thread_activity::CPU_SAMPLE_LABEL, page + 1, pages, ui.threads.len()),
         x + 12.0,
         next_y + 1.0,
-        1.18,
+        1.0,
         section_color,
         w,
         h,
     );
+    text(out, &format!("r_perfThreadPage 0..{}  |  {}", pages - 1,
+        if cfg!(windows) { "100% = ONE CORE; WAITS EXCLUDED" } else { "SCOPED WALL TIME; INCLUDES WAITS" }),
+        x + 12.0, next_y + 17.0, 0.9, muted_color, w, h);
     let thread_column_w = (panel_w - 24.0) * 0.5;
-    for (index, thread) in ui.threads.into_iter().enumerate() {
-        let (column, row) = if thread_two_columns && index >= 11 {
-            (1, index - 11)
-        } else {
-            (0, index)
-        };
+    for (index, thread) in ui.threads[thread_range].iter().enumerate() {
+        let (column, row) = (index / thread_rows, index % thread_rows);
         let column_x = x + 12.0 + column as f32 * thread_column_w;
-        let thread_bar_x = if thread_two_columns {
-            column_x + 72.0
-        } else {
-            x + 100.0
-        };
-        let thread_bar_w = if thread_two_columns { 150.0 } else { 320.0 };
+        let thread_bar_x = column_x;
+        let thread_bar_w = (thread_column_w * 0.32).min(140.0);
         let ty = next_y + thread_header_h + row as f32 * thread_row_h;
-        let name = compact_thread_name(thread.name);
+        let name = compact_thread_name(&thread.name);
+        let max_name = ((thread_column_w - 72.0) / 6.0).max(8.0) as usize;
+        let name: String = name.chars().take(max_name).collect();
         let (bar_color, task_color) = if thread.active {
             ([0.34, 0.94, 0.48, 1.0], [0.34, 0.94, 0.48, 1.0])
-        } else if thread.task == "IDLE" {
+        } else if matches!(thread.task, "IDLE" | "WAIT / IDLE") {
             ([0.34, 0.39, 0.44, 1.0], [0.54, 0.60, 0.66, 1.0])
         } else {
             ([0.40, 0.68, 0.92, 1.0], [0.70, 0.84, 0.98, 1.0])
         };
 
-        text(out, name, column_x, ty + 3.0, 1.18, body_color, w, h);
+        text(out, &name, column_x, ty, 1.0, body_color, w, h);
         rect(
             out,
             thread_bar_x,
-            ty + 6.0,
+            ty + 14.0,
             thread_bar_w,
-            17.0,
+            12.0,
             [0.10, 0.12, 0.14, 0.95],
             w,
             h,
         );
         let fill = thread_bar_w * (thread.busy_percent / 100.0).clamp(0.0, 1.0);
         if fill > 0.0 {
-            rect(out, thread_bar_x, ty + 6.0, fill, 17.0, bar_color, w, h);
+            rect(out, thread_bar_x, ty + 14.0, fill, 12.0, bar_color, w, h);
         }
         rect_outline(
             out,
             thread_bar_x,
-            ty + 6.0,
+            ty + 14.0,
             thread_bar_w,
-            17.0,
+            12.0,
             1.0,
             [0.42, 0.48, 0.54, 0.9],
             w,
@@ -728,19 +793,19 @@ pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
         text(
             out,
             &format!("{:>5.1}%", thread.busy_percent),
-            thread_bar_x + thread_bar_w + 8.0,
-            ty + 3.0,
-            1.12,
+            column_x + thread_column_w - 70.0,
+            ty,
+            1.0,
             body_color,
             w,
             h,
         );
         text(
             out,
-            thread.task,
-            thread_bar_x + thread_bar_w + 64.0,
-            ty + 3.0,
-            1.04,
+            &format!("{}  T{}", thread.task, thread.id),
+            thread_bar_x + thread_bar_w + 8.0,
+            ty + 15.0,
+            0.85,
             task_color,
             w,
             h,
@@ -786,5 +851,56 @@ pub(in crate::ui) fn build_perf(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32
             w,
             h,
         );
+    }
+}
+
+#[cfg(test)]
+mod thread_hud_tests {
+    use super::*;
+
+    #[test]
+    fn every_live_thread_is_reachable_once_at_multiple_resolutions() {
+        for height in [480, 720, 800, 1080, 1440] {
+            for gpu in [false, true] {
+                for count in [0, 1, 22, 63, 128, 257] {
+                    let rows = thread_rows(height, gpu, false, count);
+                    let (_, pages, _) = thread_page(count, rows, 0);
+                    let visited: Vec<_> = (0..pages).flat_map(|p| thread_page(count, rows, p as u32).2).collect();
+                    assert_eq!(visited, (0..count).collect::<Vec<_>>());
+                    let (page, _, range) = thread_page(count, rows, u32::MAX);
+                    assert_eq!(page, pages - 1);
+                    assert!(range.end <= count);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn panel_and_worker_rows_fit_viewport_with_gpu_timestamps_and_culling() {
+        let mut ui = UiSnapshot::default();
+        ui.threads = (0..63).map(|id| crate::ui::ThreadPerfStats {
+            id, name: "jka-model-pack-0".into(), task: "MODEL PACK", active: true, busy_percent: 43.0,
+        }).collect();
+        ui.perf.gpu_ms = Some(1.0);
+        for (width, height) in [(640, 480), (1280, 720), (1920, 1080)] {
+          for debug in [false, true] {
+            ui.video.cull_debug = if debug { CullDebugMode::RejectionReasons } else { CullDebugMode::Off };
+            let (x, y, w, h) = perf_panel_rect(width, height, true, debug, 63);
+            assert!(x >= 0.0 && y >= 0.0 && x + w <= width as f32 && y + h <= height as f32);
+            let mut vertices = Vec::new();
+            build_perf(&mut vertices, &ui, width, height);
+            let outside: Vec<_> = vertices.iter().filter(|v| v.position.iter().any(|p| !(-1.001..=1.001).contains(p))).take(8).map(|v| v.position).collect();
+            assert!(outside.is_empty(), "{width}x{height}: {outside:?}");
+          }
+        }
+    }
+
+    #[test]
+    fn distinct_worker_pools_have_distinct_labels() {
+        assert_eq!(compact_thread_name("jka-encoder-finish"), "FINISH");
+        assert_eq!(compact_thread_name("jka-model-pack-1"), "PACK1");
+        assert_eq!(compact_thread_name("jka-g2-skin-1"), "G2SKIN1");
+        assert_eq!(compact_thread_name("jka-fx-geom-1"), "FXGEO1");
+        assert_eq!(compact_thread_name("WORKER 1"), "MAP1");
     }
 }

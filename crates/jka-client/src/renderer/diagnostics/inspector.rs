@@ -14,6 +14,8 @@ pub(in crate::renderer) struct InspectorVertex {
     pub(in crate::renderer) normal: [f32; 3],
     pub(in crate::renderer) uv: [f32; 2],
     pub(in crate::renderer) lightmap_uv: [f32; 2],
+    /// Exactly the RGBA supplied to the BSP vertex shader, after lightstyle selection.
+    pub(in crate::renderer) color: [f32; 4],
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +425,15 @@ impl Renderer {
             .map(|(triangle, weights)| {
                 interpolate_uv(triangle, weights, |vertex| vertex.lightmap_uv)
             });
+        let hit_vertex_color = hit_triangle.zip(hit_barycentric).map(|(triangle, weights)| {
+            let mut rgba = [0.0; 4];
+            for (vertex, weight) in triangle.iter().zip(weights) {
+                for (channel, value) in rgba.iter_mut().enumerate() {
+                    *value += vertex.color[channel] * weight;
+                }
+            }
+            rgba
+        });
 
         let texture = source
             .texture
@@ -517,6 +528,32 @@ impl Renderer {
                         .unwrap_or("<unresolved>")
                 ),
             );
+        }
+        // SOURCE ALPHA describes the sampled image, NOT `alphaGen vertex`.
+        // These GPU vertex attributes decide whether all five additive stages
+        // of shaders such as oceanwater are visible at all.
+        let range_start = source.vertices.start as usize;
+        let range_end = (source.vertices.end as usize).min(world.inspector_vertices.len());
+        if let Some(batch_vertices) = world.inspector_vertices.get(range_start..range_end) {
+            if !batch_vertices.is_empty() {
+                let (minimum, maximum, sum) = batch_vertices.iter().fold(
+                    (1.0_f32, 0.0_f32, 0.0_f64),
+                    |(lo, hi, sum), vertex| {
+                        (lo.min(vertex.color[3]), hi.max(vertex.color[3]), sum + f64::from(vertex.color[3]))
+                    },
+                );
+                lines.push(format!(
+                    "BSP VERTEX ALPHA (SOURCE): min {:.3} max {:.3} avg {:.3} ({} vertices)",
+                    minimum, maximum, sum / batch_vertices.len() as f64, batch_vertices.len()
+                ));
+            }
+        }
+        lines.push(format!("GPU VERTEX ALPHA OVERRIDE: {}", if self.debug_world_vertex_alpha_one { "FORCED 1.000" } else { "AUTHORED" }));
+        if let Some(color) = hit_vertex_color {
+            lines.push(format!(
+                "BSP VERTEX RGBA AT HIT: {:.3}, {:.3}, {:.3}, {:.3} (interpolated)",
+                color[0], color[1], color[2], color[3],
+            ));
         }
         if let Some(uv) = hit_base_uv {
             lines.push(format!("BASE UV HIT: {:.5}, {:.5}", uv.x, uv.y));

@@ -15,7 +15,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 106] = [
+const FIELDS: [&str; 124] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -122,6 +122,24 @@ const FIELDS: [&str; 106] = [
     "client_latest_fx_cpu_indices",
     "client_latest_fx_gpu_sprite_batches",
     "client_latest_fx_gpu_sprite_instances",
+    "md3_geometry_cache_hits",
+    "md3_geometry_cache_misses",
+    "md3_geometry_reused_vertices",
+    "md3_vertex_upload_skipped_bytes",
+    "md3_index_upload_skipped_bytes",
+    "model_bundle_key_ms",
+    "model_bundle_update_ms",
+    "model_bundle_cache_hits",
+    "model_bundle_cache_misses",
+    "model_bundle_builds",
+    "model_bundle_candidate_draws",
+    "model_phase_execute_bundles_calls",
+    "model_phase_bundle_indexed_draws",
+    "encoder_finish_split_active",
+    "encoder_finish_prefix_ms",
+    "encoder_finish_tail_ms",
+    "encoder_finish_dispatch_ms",
+    "encoder_finish_join_wait_ms",
 ];
 
 #[derive(Clone)]
@@ -137,9 +155,8 @@ impl PerfRow {
         let prepare = &models.perf_prepare;
         let gpu_timing = renderer.gpu_profiler.enabled()
             .then(|| renderer.gpu_profiler.latest_timing()).flatten();
-        // These retained slices are exactly the full streams passed to
-        // queue.write_buffer in raster/RT preparation. Empty-input raster
-        // frames return before clearing scratch, so never report stale bytes.
+        // Vertex/index bytes come from actual queue writes. Other retained
+        // streams are full writes; guard empty-input frames against stale scratch.
         let has_input = info.dynamic_model_surfaces != 0;
         fn bytes<T>(values: &[T], has_input: bool) -> f64 {
             if has_input { std::mem::size_of_val(values) as f64 } else { 0.0 }
@@ -202,7 +219,7 @@ impl PerfRow {
                 f64::from(model_calls.set_vertex_buffer),
                 f64::from(model_calls.set_index_buffer),
                 info.dynamic_model_prepare_ms,
-                bytes(models.scratch_vertices.as_slice(), has_input),
+                prepare.vertex_upload_bytes as f64,
                 prepare.index_upload_bytes as f64,
                 bytes(models.scratch_fx_sprite_instances.as_slice(), has_input),
                 bytes(models.scratch_bones.as_slice(), has_input),
@@ -259,7 +276,24 @@ impl PerfRow {
                 client.fx_cpu_indices as f64,
                 client.fx_gpu_sprite_batches as f64,
                 client.fx_gpu_sprite_instances as f64,
-
+                prepare.md3_cache_hits as f64,
+                prepare.md3_cache_misses as f64,
+                prepare.md3_reused_vertices as f64,
+                prepare.md3_vertex_skipped_bytes as f64,
+                prepare.md3_index_skipped_bytes as f64,
+                models.perf_bundles.key_ms,
+                models.perf_bundles.build_ms,
+                models.perf_bundles.hits as f64,
+                models.perf_bundles.misses as f64,
+                models.perf_bundles.builds as f64,
+                models.perf_bundles.eligible_draws as f64,
+                model_calls.bundle_executes as f64,
+                model_calls.bundle_draw_indexed as f64,
+                u8::from(info.perf_encoder_split_active) as f64,
+                info.perf_encoder_prefix_finish_ms,
+                info.perf_encoder_tail_finish_ms,
+                info.perf_encoder_dispatch_ms,
+                info.perf_encoder_join_wait_ms,
             ],
         }
     }
@@ -309,7 +343,7 @@ impl PerfCapture {
             pvs_candidate_batches: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             pvs_candidate_indices: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             fingerprint: format!(
-                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={}",
+                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={}",
                 renderer.config.width,
                 renderer.config.height,
                 renderer.config.present_mode,
@@ -330,6 +364,11 @@ impl PerfCapture {
                 renderer.dynamic_model_renderer.model_prepare_threads,
                 renderer.dynamic_model_renderer.model_index_upload_cache,
                 renderer.dynamic_model_renderer.ghoul2_batch_key_cache,
+                renderer.dynamic_model_renderer.md3_geometry_cache,
+                renderer.ocean_enabled,
+                renderer.ocean_enabled && renderer.world.as_ref().is_some_and(|w| w.active_pipeline_variant.ocean),
+                renderer.dynamic_model_renderer.model_render_bundles,
+                renderer.encoder_finish_threads,
             ),
         }
     }
@@ -379,7 +418,7 @@ impl PerfCapture {
     pub(in crate::renderer) fn finish(mut self) {
         CAPTURE_ENABLED.store(false, Ordering::Relaxed);
         self.hooks_owned = false;
-        std::thread::spawn(move || {
+        std::thread::Builder::new().name("jka-renderperf-write".into()).spawn(move || {
             let csv = self.csv();
             let summary = self.summary();
             let csv_path = self.stem.with_extension("csv");
@@ -399,7 +438,7 @@ impl PerfCapture {
                 ),
                 Err(error) => eprintln!("[RENDER PERF] capture write failed: {error}"),
             }
-        });
+        }).expect("spawn render perf writer");
     }
 
     fn csv(&self) -> String {
@@ -464,7 +503,7 @@ impl PerfCapture {
             });
         }
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "dinurdojk-cpu-renderperf-v3",
+            "schema": "dinurdojk-cpu-renderperf-v6",
             "sample_count": self.frames.len(),
             "warmup_seconds_before_frame_skip": 2,
             "warmup_skipped_frames": self.warmup_frames,
@@ -486,13 +525,18 @@ impl PerfCapture {
                 "model_phase_* are actual API calls in DynamicModelRenderer::draw_phase, including secondary/glow views; exclude wireframe, shadow helper and compute commands",
                 "ghoul2_prepared_* and *_prepared_ranges describe prepared main-view geometry, not actual per-pass calls; cpu_model includes MD3, CPU-skinned models, mesh FX and RT-skinned indexed streams",
                 "world_cpu_compact_* audit only the CPU main-view compaction path, not GPU-driven visibility; singleton counts are eligible visible groups before the minimum-size test",
-                "*_upload_bytes cover the five full dynamic vertex/index, GPU FX instance and Ghoul2 bone/draw streams written during preparation; exclude cache-miss mesh creation, textures and extra RT metadata/raw-color streams; dynamic streams include MD3 and mesh FX, not MD3-only costs",
+                "*_upload_bytes cover actual dynamic vertex/index writes and full GPU FX instance/Ghoul2 bone/draw streams; exclude cache-miss mesh creation, textures and extra RT metadata/raw-color streams; dynamic streams include MD3 and mesh FX, not MD3-only costs",
                 "world_cpu_compact_multistage_excluded_batches counts visible grouped opaque/masked batches rejected due to adjacent sibling stages, not all multistage or transparent geometry",
                 "model_gather includes serial CPU lighting/rebasing in threads=0; modes 1/2/4 move that work to model_cpu_pack; compare their sum rather than either interval alone; RT uses its original preparation path",
                 "model_upload_and_pipeline includes capacity checks, lazy pipeline readiness, queue writes and optional index comparisons; it is not a pure PCIe transfer timer",
                 "cpu_* source counts describe indexed CPU input geometry including clipped blob output, not GPU skin/sprite inputs or actual replay draw counts",
                 "ghoul2_singleton_opaque_draws includes opaque/masked draws not instanced by the current batching threshold; ordered and companion-excluded inputs stay conservative",
-                "dynamic_index_stream_upload_bytes now records actual index writes; index cache may skip or update a span; other stream sizes exclude cache-miss resource creation and RT metadata",
+                "dynamic_vertex_stream_upload_bytes and dynamic_index_stream_upload_bytes record actual queue writes; resident MD3 ranges and the index cache may skip writes; stream sizes exclude cache-miss resource creation and RT metadata",
+                "md3_geometry_cache_hits measure exact source/light/offset reuse in raster preparation; source counts still include cached inputs; changed animation/transform/color/light/visibility may cause misses; buffer growth and >32 fragmented dirty spans force full uploads even with CPU hits",
+                "model_phase_execute_bundles_calls are API executions, while model_phase_bundle_indexed_draws counts indexed draws represented inside them; add represented draws to model_phase_cpu_draw_indexed_calls when comparing logical indexed-model draw totals",
+                "model_bundle_key_ms assembles exact resource/draw keys; model_bundle_update_ms includes equality checks and optional bundle recording, not only cache-miss builds; candidate draws include modes below the 32-draw eligibility threshold; only ordinary opaque/masked raster draws can use bundles",
+                "encoder_finish_ms is renderer blocking finalization: original finish in mode 0, prefix+tail serial finishes in mode 1, tail finish+worker join wait in active mode 2; worker prefix duration overlaps other recording/finish and must not be added to renderer frame/encode totals",
+                "encoder_finish_prefix_ms is serial-prefix time or worker-task elapsed time; dispatch includes tail-encoder creation/handoff and nests in encode_scene; mode 1 excludes prefix finish from scene to avoid double-counting; split_active reports actual use, since unsupported views stay on the original path",
                 "gpu_latest_* use asynchronous resolved pass timings, not matching the CPU CSV frame; model/FX/grass intervals nest inside world and must not be summed with world/frame totals",
                 "client_latest_* are telemetry from the consumed client snapshot, may repeat across renderer frames, include overlapping/nested intervals and exclude waits; never add client total to renderer frame time",
                 "no image parity or hardware benchmarks are implied by this capture"

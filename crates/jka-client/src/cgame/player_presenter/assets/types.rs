@@ -153,6 +153,10 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     pub(in crate::cgame::player_presenter) key: String,
     pub(in crate::cgame::player_presenter) glm: Arc<GlmModel>,
     pub(in crate::cgame::player_presenter) gla: Arc<GlaAnimation>,
+    /// Gameplay evaluator and bone overrides operate on this animation rig.
+    /// `gla` above binds the mesh, bolts, ragdolls and GPU skin matrices.
+    pub(in crate::cgame::player_presenter) animation_gla: Arc<GlaAnimation>,
+    pub(in crate::cgame::player_presenter) retargeter: Option<Arc<jka_assets::skeleton::PoseRetargeter>>,
     /// Per-Source-model anatomical Ghoul2 pivots. None for stock GLM players.
     pub(in crate::cgame::player_presenter) source_native_pivots: Option<Arc<Vec<[f32; 3]>>>,
     /// `players/_humanoid/` skeletons use the normal multiplayer animation/angle
@@ -173,8 +177,45 @@ pub(in crate::cgame::player_presenter) struct PlayerModelAsset {
     pub(in crate::cgame::player_presenter) female: bool,
 }
 
+impl PlayerModelAsset {
+    pub(in crate::cgame::player_presenter) fn shares_mesh_pose_binding(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.gla, &other.gla) && match (&self.source_native_pivots, &other.source_native_pivots) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    /// Convert once before every consumer of the final mesh pose. The stock
+    /// JKA path returns its original matrices without conversion or allocation.
+    pub(in crate::cgame::player_presenter) fn bind_animation_pose(
+        &self, mut pose: Vec<crate::cgame::player_presenter::Matrix3x4>,
+    ) -> Result<Vec<crate::cgame::player_presenter::Matrix3x4>, String> {
+        if let Some(plan) = &self.retargeter {
+            pose = plan.retarget(jka_assets::skeleton::PoseInput::Ghoul2SkinMatrices(&pose))?;
+        }
+        if let Some(pivots) = &self.source_native_pivots {
+            pose = jka_assets::source1_rig::rebase_source_ghoul2_pose(&self.gla, &pose, pivots)?;
+        }
+        Ok(pose)
+    }
+}
+
 pub(in crate::cgame::player_presenter) struct SaberModelAsset {
     pub(in crate::cgame::player_presenter) glm: Arc<GlmModel>,
     pub(in crate::cgame::player_presenter) gla: Arc<GlaAnimation>,
+    pub(in crate::cgame::player_presenter) animation_gla: Arc<GlaAnimation>,
+    pub(in crate::cgame::player_presenter) retargeter: Option<Arc<jka_assets::skeleton::PoseRetargeter>>,
     pub(in crate::cgame::player_presenter) surfaces: Vec<PlayerSurfaceAsset>,
+}
+
+impl SaberModelAsset {
+    pub(in crate::cgame::player_presenter) fn bind_animation_pose(
+        &self, pose: Vec<crate::cgame::player_presenter::Matrix3x4>,
+    ) -> Result<Vec<crate::cgame::player_presenter::Matrix3x4>, String> {
+        match &self.retargeter {
+            Some(plan) => plan.retarget(jka_assets::skeleton::PoseInput::Ghoul2SkinMatrices(&pose)),
+            None => Ok(pose),
+        }
+    }
 }

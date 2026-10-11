@@ -5,6 +5,11 @@ use crate::app::{
 };
 
 impl App {
+    pub(in crate::app) fn reset_remote_emotes(&mut self) {
+        self.emote_net_rx.reset();
+        self.remote_emote_starts.clear();
+    }
+
     pub(in crate::app) fn connect_to_server(&mut self, target: &str) {
         if self.net.is_some() || self.game_session.is_some() {
             self.disconnect_to_main_menu();
@@ -31,6 +36,7 @@ impl App {
                 self.console_status = format!("CONNECTING TO {}...", target.to_ascii_uppercase());
                 self.reconnect_target = Some(target.to_owned());
                 self.live_input = crate::net::LiveInput::default();
+                self.reset_remote_emotes();
                 self.predictor.reset();
                 self.pending_frontend_map_launch = false;
                 self.pending_live_server_commands.clear();
@@ -326,6 +332,7 @@ impl App {
                 }
             }
             SessionEvent::Gamestate => {
+                self.reset_remote_emotes();
                 let elapsed = self
                     .live_join_timing
                     .as_ref()
@@ -339,6 +346,9 @@ impl App {
                 self.start_live_gamestate();
             }
             SessionEvent::ServerCommand(command) => {
+                if command.text.split(|byte| byte.is_ascii_whitespace()).next() == Some(b"map_restart".as_slice()) {
+                    self.reset_remote_emotes();
+                }
                 // Decoder configstrings are current before this event is delivered.
                 if command.text.starts_with(b"cs 0 ") || command.text.starts_with(b"bcs2 0 ") {
                     self.send_userinfo();
@@ -356,6 +366,21 @@ impl App {
                 }
             }
             SessionEvent::Snapshot(snapshot) => {
+                if self.game_session.as_ref().is_some_and(|session| session.live) {
+                    if self.emote_net_rx.needs_reset(&snapshot) {
+                        self.remote_emote_starts.clear();
+                    }
+                    let own_client = self.net.as_ref().map(|net| net.session().client_num()).unwrap_or(-1);
+                    for found in self.emote_net_rx.on_snapshot(&snapshot, own_client) {
+                        devprintln!(1,
+                            "[DJK EMOTE NET] client={} id={} serverTime={} candidate (catalog validation required)",
+                            found.client_num, found.emote_id, found.server_time);
+                        if self.remote_emote_starts.len() >= 64 {
+                            self.remote_emote_starts.pop_front();
+                        }
+                        self.remote_emote_starts.push_back(found);
+                    }
+                }
                 if let Some(session) = self.game_session.as_mut().filter(|session| session.live) {
                     if session.live_snapshots.len() >= 128 {
                         session.live_snapshots.pop_front();
@@ -372,6 +397,7 @@ impl App {
             }
             SessionEvent::Download(block) => self.handle_live_download_block(block),
             SessionEvent::MapChange => {
+                self.reset_remote_emotes();
                 // CG_MapChange: sticks until the next gamestate builds a fresh session.
                 if let Some(session) = self.game_session.as_mut().filter(|session| session.live) {
                     session.map_change = true;

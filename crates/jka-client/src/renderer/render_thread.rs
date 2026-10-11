@@ -515,6 +515,11 @@ pub(in crate::renderer) fn render_thread_main(
     if let Err(error) = renderer.dynamic_model_renderer.set_model_prepare_threads(initial_ui.video.model_prepare_threads) {
         eprintln!("Model packing workers: {error}");
     }
+    renderer.dynamic_model_renderer.set_md3_geometry_cache(initial_ui.video.md3_geometry_cache);
+    renderer.dynamic_model_renderer.set_model_render_bundles(initial_ui.video.model_render_bundles);
+    if let Err(error) = renderer.set_encoder_finish_threads(initial_ui.video.encoder_finish_threads) {
+        eprintln!("Encoder finish worker: {error}");
+    }
     renderer.dynamic_model_renderer.set_model_index_upload_cache(initial_ui.video.model_index_upload_cache);
     renderer.dynamic_model_renderer.ghoul2_batch_key_cache = initial_ui.video.ghoul2_batch_key_cache;
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
@@ -625,6 +630,8 @@ pub(in crate::renderer) fn render_thread_main(
     let mut trace_present_ms = 0.0_f64;
     let mut trace_dynamic_model_ms = 0.0_f64;
     let mut trace_grass_cpu_ms = 0.0_f64;
+    let mut trace_ocean_topology_ms=0.0_f64;
+    let mut trace_ocean_topology_max_ms=0.0_f64;
     // The per-pass GPU numbers printed below come from `gpu_profiler.latest`,
     // which is ONE frame. That is misleading for deliberately amortized work:
     // the ocean FFT encodes one cascade on roughly one frame in N, so a single
@@ -871,6 +878,8 @@ pub(in crate::renderer) fn render_thread_main(
                         trace_submit_ms = 0.0;
                         trace_present_ms = 0.0;
                         trace_grass_cpu_ms = 0.0;
+                        trace_ocean_topology_ms=0.0;
+                        trace_ocean_topology_max_ms=0.0;
                         trace_prep_stage_ms = [0.0; 4];
                         println!(
                             "JKA perf trace {}",
@@ -890,6 +899,9 @@ pub(in crate::renderer) fn render_thread_main(
                             .dynamic_model_renderer
                             .set_fx_zero_alpha_discard(enabled);
                     }
+                    Ok(RenderCommand::SetDebugWorldVertexAlphaOne(enabled)) => {
+                        renderer.set_debug_world_vertex_alpha_one(enabled);
+                    }
                     Ok(RenderCommand::SetGhoul2BatchDraws(mode)) => {
                         renderer.set_ghoul2_batch_draws(mode)
                     }
@@ -906,6 +918,17 @@ pub(in crate::renderer) fn render_thread_main(
                         if let Err(error) = renderer.dynamic_model_renderer.set_model_prepare_threads(threads) {
                             eprintln!("Model packing workers: {error}");
                         }
+                    }
+                    Ok(RenderCommand::SetEncoderFinishThreads(mode)) => {
+                        if let Err(error) = renderer.set_encoder_finish_threads(mode) {
+                            eprintln!("Encoder finish worker: {error}");
+                        }
+                    }
+                    Ok(RenderCommand::SetModelRenderBundles(enabled)) => {
+                        renderer.dynamic_model_renderer.set_model_render_bundles(enabled);
+                    }
+                    Ok(RenderCommand::SetMd3GeometryCache(enabled)) => {
+                        renderer.dynamic_model_renderer.set_md3_geometry_cache(enabled);
                     }
                     Ok(RenderCommand::SetModelIndexUploadCache(enabled)) => {
                         renderer.dynamic_model_renderer.set_model_index_upload_cache(enabled);
@@ -1438,6 +1461,8 @@ pub(in crate::renderer) fn render_thread_main(
                     trace_present_ms += info.cpu_present_ms;
                     trace_dynamic_model_ms += info.dynamic_model_prepare_ms;
                     trace_grass_cpu_ms += info.grass.cpu_ms;
+                    trace_ocean_topology_ms+=info.ocean.topology_ms;
+                    trace_ocean_topology_max_ms=trace_ocean_topology_max_ms.max(info.ocean.topology_ms);
                     if let Some(timing) = renderer.gpu_profiler.latest {
                         for (slot, pass) in TRACE_GPU_PASSES.iter().enumerate() {
                             if let Some(ms) = timing.milliseconds[pass.index()] {
@@ -1588,7 +1613,7 @@ pub(in crate::renderer) fn render_thread_main(
                     crate::thread_activity::ThreadSlot::Render,
                     crate::thread_activity::Task::RenderFrame,
                 );
-                crate::thread_activity::sample()
+                crate::thread_activity::sample(renderer.ui_state.video.draw_fps >= 2)
             };
             let gpu_timing = renderer.gpu_profiler.latest;
             let gpu_pass =
@@ -1963,15 +1988,19 @@ pub(in crate::renderer) fn render_thread_main(
                 });
             if ocean.promoted_surfaces > 0 || ocean.authored_oceans > 0 || renderer.ocean_enabled {
                 println!(
-                    "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] samples={} avg/min/max_ms sim={} surface={} optics={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",
+                    "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] topology_cpu[last/avg/max]={:.4}/{:.4}/{:.4}ms samples={} avg/min/max_ms sim={} coastal={} surface={} optics={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",
                     u8::from(renderer.ocean_enabled),
                     u8::from(ocean_resources),
                     u8::from(ocean_variant),
                     u8::from(renderer.ocean_enabled && ocean_variant),
+                    ocean.topology_ms,
+                    trace_ocean_topology_ms/trace_frames.max(1) as f64,
+                    trace_ocean_topology_max_ms,
                     trace_gpu_n[1],
                     gpu_window[1].as_str(),
                     gpu_window[2].as_str(),
                     gpu_window[3].as_str(),
+                    gpu_window[4].as_str(),
                     gpu_window[0].as_str(),
                     ocean.promoted_surfaces,
                     ocean.authored_oceans,
@@ -2146,6 +2175,8 @@ pub(in crate::renderer) fn render_thread_main(
             trace_present_ms = 0.0;
             trace_dynamic_model_ms = 0.0;
             trace_grass_cpu_ms = 0.0;
+            trace_ocean_topology_ms=0.0;
+            trace_ocean_topology_max_ms=0.0;
             trace_prep_stage_ms = [0.0; 4];
         }
 

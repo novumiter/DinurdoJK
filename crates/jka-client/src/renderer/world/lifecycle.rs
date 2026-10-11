@@ -175,6 +175,11 @@ impl Renderer {
         upload_timings.post_bind_groups_ms = post_bind_started.elapsed().as_secs_f64() * 1000.0;
         let post_misc_started = Instant::now();
         self.world = Some(world);
+        // A map replaced while the A/B diagnostic was enabled must receive
+        // the same forced-alpha upload as a live toggle.
+        if self.debug_world_vertex_alpha_one {
+            self.upload_debug_world_vertex_alpha();
+        }
         if let Some(ref world) = self.world {
             self.world_flares.install_textures(
                 &self.device, &world.textures, &self.white,

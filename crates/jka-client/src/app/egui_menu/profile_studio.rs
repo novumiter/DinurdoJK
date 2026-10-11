@@ -618,13 +618,17 @@ impl App {
                 if let Err(error) = self.profile_set_cvar(rgb_cvar, &packed.to_string()) {
                     self.console_status = error;
                 }
-                if let Err(error) = self.profile_set_cvar(color_cvar, &SABER_RGB.to_string()) {
+                let cosmetic = if hand == 0 { &self.network.global_hat } else { &self.network.global_cape };
+                let value = crate::global_cosmetics::encode(SABER_RGB as u8, cosmetic);
+                if let Err(error) = self.profile_set_cvar(color_cvar, &value) {
                     self.console_status = error;
                 }
                 self.profile_preview_key = None;
             }
             if picker.clicked_by(egui::PointerButton::Middle) {
-                for (cvar, value) in [(color_cvar, "4"), (rgb_cvar, "0")] {
+                let cosmetic = if hand == 0 { &self.network.global_hat } else { &self.network.global_cape };
+                let color = crate::global_cosmetics::encode(4, cosmetic);
+                for (cvar, value) in [(color_cvar, color.as_str()), (rgb_cvar, "0")] {
                     if let Err(error) = self.profile_set_cvar(cvar, value) { self.console_status = error; }
                 }
                 self.profile_preview_key = None;
@@ -763,8 +767,7 @@ impl App {
                 .stroke(egui::Stroke::new(1.0, EDGE)))
                 .on_hover_text("Middle-click to remove");
             if button.clicked_by(egui::PointerButton::Middle) {
-                let new = crate::japro_cg::toggle_cosmetic(self.network.cosmetics, group, None);
-                if let Err(error) = self.profile_set_cvar("cp_cosmetics", &(new as i32).to_string()) {
+                if let Err(error) = self.studio_set_cosmetic_group(group, None) {
                     self.console_status = error;
                 }
                 self.profile_preview_key = None;
@@ -816,8 +819,7 @@ impl App {
                                     .any(|item| self.network.cosmetics & item.bit !=0),
                             };
                             if ui.selectable_label(chosen,title).clicked() {
-                                let new=crate::japro_cg::toggle_cosmetic(self.network.cosmetics,group,bit);
-                                if let Err(error)=self.profile_set_cvar("cp_cosmetics",&(new as i32).to_string()) {
+                                if let Err(error)=self.studio_set_cosmetic_group(group,bit) {
                                     self.console_status=error;
                                 }
                                 self.profile_preview_key=None;
@@ -830,4 +832,36 @@ impl App {
         }
     }
 
+}
+
+impl App {
+    /// The profile's existing jaPRO picker also selects the identical global
+    /// MD3 basename on stock servers. This preserves the one Profile page and
+    /// the `cp_cosmetics` behavior on jaPRO while broadcasting TaystJK c1/c2
+    /// on servers that don't understand c5.
+    fn studio_set_cosmetic_group(&mut self, group: u8, bit: Option<u32>) -> Result<(), String> {
+        let new = crate::japro_cg::toggle_cosmetic(self.network.cosmetics, group, bit);
+        self.profile_set_cvar("cp_cosmetics", &(new as i32).to_string())?;
+        if self.active_server_mod() != crate::net::mod_support::ServerMod::Japro {
+            let slot = if group == 3 { crate::global_cosmetics::Slot::Cape }
+                else { crate::global_cosmetics::Slot::Hat };
+            let selected = bit.filter(|value| new & value != 0)
+                .and_then(|value| crate::japro_cg::COSMETICS.iter().find(|item| item.bit == value))
+                .and_then(|item| std::path::Path::new(item.model).file_stem())
+                .and_then(|stem| stem.to_str()).unwrap_or("");
+            let (cvar, color, current) = match slot {
+                crate::global_cosmetics::Slot::Hat => ("color1", self.network.color1, self.network.global_hat.as_str()),
+                crate::global_cosmetics::Slot::Cape => ("color2", self.network.color2, self.network.global_cape.as_str()),
+            };
+            // Removing another jaPRO group must not accidentally clear a
+            // different active global cosmetic on the shared hat slot.
+            let should_clear = bit.is_none() && crate::japro_cg::cosmetics_in_group(group)
+                .any(|item| std::path::Path::new(item.model).file_stem()
+                    .and_then(|stem| stem.to_str()).is_some_and(|stem| stem.eq_ignore_ascii_case(current)));
+            if !selected.is_empty() || should_clear {
+                self.profile_set_cvar(cvar, &crate::global_cosmetics::encode(color, selected))?;
+            }
+        }
+        Ok(())
+    }
 }

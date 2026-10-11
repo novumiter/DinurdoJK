@@ -477,7 +477,7 @@ impl Renderer {
     pub(in crate::renderer) fn set_ui_telemetry(
         &mut self,
         perf: ui::PerfStats,
-        threads: [ui::ThreadPerfStats; crate::thread_activity::SLOT_COUNT],
+        threads: std::sync::Arc<[ui::ThreadPerfStats]>,
     ) {
         self.ui_state.perf = perf;
         self.ui_state.threads = threads;

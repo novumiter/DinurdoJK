@@ -51,6 +51,7 @@ const SHIELD_MAX_TIME_MS: i32 = 2000;
 #[derive(Clone)]
 struct Md3SurfaceAsset {
     surface_index: usize,
+    cached_indices: Arc<Vec<u32>>,
     texture: Option<Arc<TextureData>>,
     alpha_mode: DynamicModelAlphaMode,
     authored_glow: bool,
@@ -60,6 +61,24 @@ struct Md3Asset {
     key: Arc<str>,
     model: Arc<Md3Model>,
     surfaces: Vec<Md3SurfaceAsset>,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct Md3GeometrySlot {
+    model: usize,
+    surface: usize,
+    entity: u16,
+    depth_hack: u32,
+    stage: usize,
+}
+
+struct CachedMd3Geometry {
+    // Prevent model-pointer recycling after a registration is replaced.
+    _model: Arc<Md3Model>,
+    frame: usize,
+    input: [u32; 18],
+    vertices: Arc<Vec<DynamicModelVertex>>,
+    indices: Arc<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -83,8 +102,11 @@ pub struct EntityPresenter {
     texture_arcs: HashMap<usize, Arc<TextureData>>,
     missing_texture: Arc<TextureData>,
     md3_models: HashMap<String, Arc<Md3Asset>>,
+    md3_geometry_cache_enabled: bool,
+    md3_geometry: HashMap<Md3GeometrySlot, CachedMd3Geometry>,
+    md3_geometry_bytes: usize,
     /// Cosmetic models that failed to load (logged once each).
-    missing_cosmetics: std::collections::HashSet<&'static str>,
+    missing_cosmetics: std::collections::HashSet<String>,
     failed_models: HashSet<String>,
     logged_unsupported: HashSet<String>,
     fx_materials: HashMap<String, Vec<crate::fx::draw::FxMaterial>>,
@@ -149,6 +171,9 @@ impl EntityPresenter {
             texture_arcs: HashMap::new(),
             missing_texture: Arc::new(materials::missing_texture_data()),
             md3_models: HashMap::new(),
+            md3_geometry_cache_enabled: true,
+            md3_geometry: HashMap::new(),
+            md3_geometry_bytes: 0,
             missing_cosmetics: std::collections::HashSet::new(),
             failed_models: HashSet::new(),
             logged_unsupported: HashSet::new(),
@@ -264,12 +289,22 @@ impl EntityPresenter {
         self.draw_map_models = enabled;
     }
 
+    pub fn set_md3_geometry_cache(&mut self, enabled: bool) {
+        if self.md3_geometry_cache_enabled != enabled {
+            self.md3_geometry.clear();
+            self.md3_geometry_bytes = 0;
+            self.md3_geometry_cache_enabled = enabled;
+        }
+    }
+
     pub(crate) fn set_shader_remaps(&mut self, remaps: scene::ShaderRemapState) {
         if self.shader_remaps == remaps {
             return;
         }
         self.shader_remaps = remaps;
         self.md3_models.clear();
+        self.md3_geometry.clear();
+        self.md3_geometry_bytes = 0;
         self.fx_materials.clear();
         self.static_props = None;
     }
@@ -594,35 +629,23 @@ impl EntityPresenter {
             if source_vertices.is_empty() || surface.indices.is_empty() {
                 continue;
             }
-            let mut indices = surface.indices.clone();
-            for triangle in indices.chunks_exact_mut(3) {
-                triangle.swap(1, 2);
-            }
-            let indices = Arc::new(indices);
-            for material in &materials {
+            for (stage, material) in materials.iter().enumerate() {
                 let color = [
                     if material.rgb_vertex { rgba[0] } else { material.rgb_const[0] },
                     if material.rgb_vertex { rgba[1] } else { material.rgb_const[1] },
                     if material.rgb_vertex { rgba[2] } else { material.rgb_const[2] },
                     if material.alpha_vertex { rgba[3] } else { material.alpha_const },
                 ];
-                let vertices = source_vertices
-                    .iter()
-                    .map(|vertex| DynamicModelVertex {
-                        position: transform_model_point(vertex.position, axis, origin, 1.0),
-                        normal: transform_model_normal(vertex.normal, axis),
-                        uv: vertex.uv,
-                        color,
-                        depth_hack: 0.0,
-                    })
-                    .collect::<Vec<_>>();
+                let (vertices, indices) = self.md3_geometry(
+                    &asset, surface_asset, entity_num, stage, 0, axis, origin,
+                    1.0, color, 0.0);
                 draws.push(DynamicModelSurface {
                     geometry_source: crate::renderer::ModelGeometrySource::Md3,
                     entity_num,
                     wireframe_class: DynamicWireframeClass::Entity,
                     raster_visible: true,
-                    vertices: Arc::new(vertices),
-                    indices: Arc::clone(&indices),
+                    vertices,
+                    indices,
                     lighting_origin: Some(origin),
                     // A translucent presentation shell must never become a
                     // physical RT shadow caster.
@@ -825,13 +848,78 @@ impl EntityPresenter {
             match self.present_md3_ref_entity(cosmetic.entity_num, &submission) {
                 Ok(mut surfaces) => draws.append(&mut surfaces),
                 Err(error) => {
-                    if self.missing_cosmetics.insert(cosmetic.model) {
+                    if self.missing_cosmetics.insert(cosmetic.model.clone()) {
                         println!("COSMETIC UNAVAILABLE: {}: {error}", cosmetic.model);
                     }
                 }
             }
         }
         draws
+    }
+
+    /// Retain only the latest pose for each entity/model/surface/stage slot.
+    /// Changed frames/transforms/colours/depth hacks use the original CPU math.
+    #[allow(clippy::too_many_arguments)]
+    fn md3_geometry(
+        &mut self,
+        asset: &Md3Asset,
+        surface_asset: &Md3SurfaceAsset,
+        entity: u16,
+        stage: usize,
+        frame: usize,
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+        scale: f32,
+        color: [f32; 4],
+        depth_hack: f32,
+    ) -> (Arc<Vec<DynamicModelVertex>>, Arc<Vec<u32>>) {
+        let slot = Md3GeometrySlot {
+            model: Arc::as_ptr(&asset.model) as usize,
+            surface: surface_asset.surface_index,
+            entity,
+            depth_hack: depth_hack.to_bits(),
+            stage,
+        };
+        let input = md3_geometry_input(axis, origin, scale, color, depth_hack);
+        if self.md3_geometry_cache_enabled {
+            if let Some(cached) = self.md3_geometry.get(&slot)
+                .filter(|cached| cached.frame == frame && cached.input == input)
+            {
+                return (Arc::clone(&cached.vertices), Arc::clone(&cached.indices));
+            }
+        }
+        let surface = &asset.model.surfaces[surface_asset.surface_index];
+        let vertices = Arc::new(surface.frame_vertices(frame).unwrap_or_default().iter()
+            .map(|vertex| DynamicModelVertex {
+                position: transform_model_point(vertex.position, axis, origin, scale),
+                normal: transform_model_normal(vertex.normal, axis),
+                uv: vertex.uv,
+                color,
+                depth_hack,
+            }).collect::<Vec<_>>());
+        let indices = if self.md3_geometry_cache_enabled {
+            Arc::clone(&surface_asset.cached_indices)
+        } else {
+            Arc::new(flipped_md3_indices(&surface.indices))
+        };
+        if self.md3_geometry_cache_enabled {
+            let required = std::mem::size_of_val(vertices.as_slice());
+            if let Some(old) = self.md3_geometry.remove(&slot) {
+                self.md3_geometry_bytes -= std::mem::size_of_val(old.vertices.as_slice());
+            }
+            if self.md3_geometry_bytes.saturating_add(required) > MAX_MD3_BYTES {
+                self.md3_geometry.clear();
+                self.md3_geometry_bytes = 0;
+            }
+            if required <= MAX_MD3_BYTES {
+                self.md3_geometry_bytes += required;
+                self.md3_geometry.insert(slot, CachedMd3Geometry {
+                    _model: Arc::clone(&asset.model), frame, input,
+                    vertices: Arc::clone(&vertices), indices: Arc::clone(&indices),
+                });
+            }
+        }
+        (vertices, indices)
     }
 
     /// An MD3 refEntity with an explicit transform (frame 0), shaderRGBA and
@@ -857,20 +945,9 @@ impl EntityPresenter {
             if vertices.is_empty() || surface.indices.is_empty() {
                 continue;
             }
-            let vertices = vertices
-                .iter()
-                .map(|vertex| DynamicModelVertex {
-                    position: transform_model_point(vertex.position, submission.axis, submission.origin, 1.0),
-                    normal: transform_model_normal(vertex.normal, submission.axis),
-                    uv: vertex.uv,
-                    color: submission.rgba,
-                    depth_hack: 0.0,
-                })
-                .collect::<Vec<_>>();
-            let mut indices = surface.indices.clone();
-            for triangle in indices.chunks_exact_mut(3) {
-                triangle.swap(1, 2);
-            }
+            let (vertices, indices) = self.md3_geometry(
+                &asset, surface_asset, entity_num, 0, 0, submission.axis,
+                submission.origin, 1.0, submission.rgba, 0.0);
             let (texture, alpha_mode, authored_glow) = custom.clone().unwrap_or_else(|| {
                 (
                     surface_asset.texture.clone(),
@@ -883,8 +960,8 @@ impl EntityPresenter {
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
-                vertices: Arc::new(vertices),
-                indices: Arc::new(indices),
+                vertices,
+                indices,
                 lighting_origin: Some(submission.origin),
                 rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
                     Arc::clone(&asset.key),
@@ -955,29 +1032,16 @@ impl EntityPresenter {
             if vertices.is_empty() || surface.indices.is_empty() {
                 continue;
             }
-            let vertices = vertices
-                .iter()
-                .map(|vertex| DynamicModelVertex {
-                    position: transform_model_point(vertex.position, axis, entity.origin, scale),
-                    normal: transform_model_normal(vertex.normal, axis),
-                    uv: vertex.uv,
-                    color,
-                    depth_hack: 0.0,
-                })
-                .collect::<Vec<_>>();
-            let mut indices = surface.indices.clone();
-            // MD3/GLM data is authored for the legacy OpenGL front-face convention.
-            // The dynamic WGPU pipeline uses CCW, matching the existing player path.
-            for triangle in indices.chunks_exact_mut(3) {
-                triangle.swap(1, 2);
-            }
+            let (vertices, indices) = self.md3_geometry(
+                &asset, surface_asset, entity.number, 0, frame, axis,
+                entity.origin, scale, color, 0.0);
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 entity_num: entity.number,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
-                vertices: Arc::new(vertices),
-                indices: Arc::new(indices),
+                vertices,
+                indices,
                 lighting_origin: Some(entity.origin),
                 rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
                     Arc::clone(&asset.key),
@@ -1148,27 +1212,16 @@ impl EntityPresenter {
             if vertices.is_empty() || surface.indices.is_empty() {
                 continue;
             }
-            let vertices = vertices
-                .iter()
-                .map(|vertex| DynamicModelVertex {
-                    position: transform_model_point(vertex.position, axis, origin, 1.0),
-                    normal: transform_model_normal(vertex.normal, axis),
-                    uv: vertex.uv,
-                    color: [1.0; 4],
-                    depth_hack: 1.0,
-                })
-                .collect::<Vec<_>>();
-            let mut indices = surface.indices.clone();
-            for triangle in indices.chunks_exact_mut(3) {
-                triangle.swap(1, 2);
-            }
+            let (vertices, indices) = self.md3_geometry(
+                &asset, surface_asset, entity_num, 0, 0, axis, origin,
+                1.0, [1.0; 4], 1.0);
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
-                vertices: Arc::new(vertices),
-                indices: Arc::new(indices),
+                vertices,
+                indices,
                 lighting_origin: Some(origin),
                 // View weapons are camera-space presentation and must never be
                 // inserted into the world RT acceleration structure.
@@ -1210,27 +1263,16 @@ impl EntityPresenter {
             if vertices.is_empty() || surface.indices.is_empty() {
                 continue;
             }
-            let vertices = vertices
-                .iter()
-                .map(|vertex| DynamicModelVertex {
-                    position: transform_model_point(vertex.position, axis, origin, 1.0),
-                    normal: transform_model_normal(vertex.normal, axis),
-                    uv: vertex.uv,
-                    color: rgba,
-                    depth_hack: 0.0,
-                })
-                .collect::<Vec<_>>();
-            let mut indices = surface.indices.clone();
-            for triangle in indices.chunks_exact_mut(3) {
-                triangle.swap(1, 2);
-            }
+            let (vertices, indices) = self.md3_geometry(
+                &asset, surface_asset, entity_num, 0, frame, axis, origin,
+                1.0, rgba, 0.0);
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
-                vertices: Arc::new(vertices),
-                indices: Arc::new(indices),
+                vertices,
+                indices,
                 lighting_origin: Some(origin),
                 rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
                     Arc::clone(&asset.key),
@@ -1284,6 +1326,7 @@ impl EntityPresenter {
                     self.resolve_surface_material(&surface.shader);
                 surfaces.push(Md3SurfaceAsset {
                     surface_index,
+                    cached_indices: Arc::new(flipped_md3_indices(&surface.indices)),
                     texture,
                     alpha_mode,
                     authored_glow,
@@ -1731,6 +1774,25 @@ fn invulnerability_sphere_transform(
     Some((origin, angles_to_axis(angles)))
 }
 
+fn flipped_md3_indices(source: &[u32]) -> Vec<u32> {
+    let mut indices = source.to_vec();
+    for triangle in indices.chunks_exact_mut(3) { triangle.swap(1, 2); }
+    indices
+}
+
+fn md3_geometry_input(
+    axis: [[f32; 3]; 3], origin: [f32; 3], scale: f32,
+    color: [f32; 4], depth_hack: f32,
+) -> [u32; 18] {
+    let mut input = [0; 18];
+    for (i, value) in axis.into_iter().flatten().chain(origin).chain([scale])
+        .chain(color).chain([depth_hack]).enumerate()
+    {
+        input[i] = value.to_bits();
+    }
+    input
+}
+
 fn transform_model_point(
     point: [f32; 3],
     axis: [[f32; 3]; 3],
@@ -1764,6 +1826,103 @@ fn transform_model_normal(normal: [f32; 3], axis: [[f32; 3]; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_md3_presenter() -> (crate::cvar_compatibility::Fixture, EntityPresenter) {
+        let fixture = crate::cvar_compatibility::Fixture::new();
+        let mut presenter = EntityPresenter::new(AssetSearchPath::open(&fixture.0).unwrap(), false).unwrap();
+        let vertex = md3::Vertex { position: [1.0, 2.0, 3.0], normal: [0.0, 0.0, 1.0], uv: [0.2, 0.8] };
+        let mut next = vertex;
+        next.position[2] = 9.0;
+        let frame = md3::Frame {
+            mins: [0.0; 3], maxs: [10.0; 3], local_origin: [0.0; 3], radius: 10.0, name: String::new(),
+        };
+        let surface = md3::Surface {
+            name: "test".into(), shader: "test".into(), vertices: vec![vertex; 3],
+            frames: vec![vec![vertex; 3], vec![next; 3]], indices: vec![0, 1, 2],
+        };
+        presenter.md3_models.insert("synthetic.md3".into(), Arc::new(Md3Asset {
+            key: "synthetic.md3".into(),
+            model: Arc::new(Md3Model { frames: vec![frame.clone(), frame], tags: vec![], surfaces: vec![surface] }),
+            surfaces: vec![Md3SurfaceAsset {
+                surface_index: 0, cached_indices: Arc::new(vec![0, 2, 1]), texture: None,
+                alpha_mode: DynamicModelAlphaMode::Opaque, authored_glow: true,
+            }],
+        }));
+        (fixture, presenter)
+    }
+
+    #[test]
+    fn md3_geometry_cache_preserves_animation_transforms_colour_and_depth_hack() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        let (_reference_fixture, mut reference_presenter) = synthetic_md3_presenter();
+        presenter.set_md3_geometry_cache(true);
+        reference_presenter.set_md3_geometry_cache(false);
+        let origin = [10.0, 20.0, 30.0];
+        // Includes non-uniform and negative scale in the authored axis.
+        let axis = [[2.0, 0.0, 0.0], [0.0, -3.0, 0.0], [0.0, 0.0, 4.0]];
+        let asset = Arc::clone(&presenter.md3_models["synthetic.md3"]);
+        let surface = &asset.surfaces[0];
+        let mut previous = None;
+        for variant in 0..7 {
+            let frame = usize::from(variant != 0);
+            let mut origin = origin;
+            let mut axis = axis;
+            let mut colour = [0.8, 0.6, 0.4, 0.3];
+            let mut depth_hack = 0.0;
+            let mut scale = 1.0;
+            match variant {
+                2 => origin[0] += 1.0,
+                3 => axis[0][1] = 0.5,
+                4 => colour[2] = 0.2,
+                5 => depth_hack = 1.0,
+                6 => scale = -0.5,
+                _ => {},
+            }
+            let reference = reference_presenter.md3_geometry(&asset, surface, 7, 0, frame, axis, origin, scale, colour, depth_hack);
+            let cached = presenter.md3_geometry(&asset, surface, 7, 0, frame, axis, origin, scale, colour, depth_hack);
+            let hit = presenter.md3_geometry(&asset, surface, 7, 0, frame, axis, origin, scale, colour, depth_hack);
+            assert!(Arc::ptr_eq(&cached.0, &hit.0));
+            assert!(Arc::ptr_eq(&cached.1, &hit.1));
+            assert_eq!(bytemuck::cast_slice::<_, u8>(&reference.0), bytemuck::cast_slice::<_, u8>(&hit.0));
+            assert_eq!(reference.1, hit.1);
+            if let Some(old) = previous { assert!(!Arc::ptr_eq(&cached.0, &old)); }
+            previous = Some(cached.0);
+        }
+        // A changed frame must never freeze on a cached frame-0 vertex.
+        let old = presenter.md3_geometry(&asset, surface, 7, 0, 0, axis, origin, 1.0, [1.0; 4], 0.0);
+        let next = presenter.md3_geometry(&asset, surface, 7, 0, 1, axis, origin, 1.0, [1.0; 4], 0.0);
+        assert_ne!(old.0[0].position, next.0[0].position);
+        assert_eq!(next.0[0].position, [12.0, 66.0, -14.0]);
+        assert!(Arc::ptr_eq(&old.1, &next.1));
+        assert_eq!(presenter.md3_geometry.len(), 2); // ordinary and depth-hack slots
+        presenter.set_md3_geometry_cache(false);
+        assert!(presenter.md3_geometry.is_empty());
+    }
+
+    #[test]
+    fn md3_geometry_cache_keeps_multistage_and_view_weapon_draw_semantics() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        presenter.set_md3_geometry_cache(true);
+        let axis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let origin = [10.0, 20.0, 30.0];
+        let asset = Arc::clone(&presenter.md3_models["synthetic.md3"]);
+        let surface = &asset.surfaces[0];
+        let a = presenter.md3_geometry(&asset, surface, 7, 0, 0, axis, origin, 1.0, [0.3; 4], 0.0);
+        let b = presenter.md3_geometry(&asset, surface, 7, 1, 0, axis, origin, 1.0, [0.6; 4], 0.0);
+        let a2 = presenter.md3_geometry(&asset, surface, 7, 0, 0, axis, origin, 1.0, [0.3; 4], 0.0);
+        assert!(Arc::ptr_eq(&a.0, &a2.0));
+        assert_ne!(a.0[0].color, b.0[0].color);
+        let view = presenter.present_view_md3(7, "synthetic.md3", origin, axis).unwrap();
+        let world = presenter.present_static_md3(7, "synthetic.md3", origin, axis, [1.0; 4], 0).unwrap();
+        assert_eq!(view[0].vertices[0].depth_hack, 1.0);
+        assert_eq!(world[0].vertices[0].depth_hack, 0.0);
+        assert_eq!(view[0].indices.as_slice(), &[0, 2, 1]);
+        assert!(view[0].rt_rigid.is_none());
+        assert!(world[0].authored_glow);
+        assert!(world[0].raster_visible);
+        presenter.set_draw_map_models(false);
+        assert!(presenter.present_static_models(None).is_empty());
+    }
 
     #[test]
     #[ignore = "requires JKA_TEST_BASE with stock PK3s"]

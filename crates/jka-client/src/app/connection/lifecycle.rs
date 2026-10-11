@@ -24,6 +24,7 @@ impl App {
     }
 
     pub(in crate::app) fn disconnect_to_main_menu(&mut self) {
+        self.reset_remote_emotes();
         if self.demo_video_export.is_some() {
             self.cancel_demo_video_export();
         }
@@ -128,6 +129,7 @@ impl App {
     /// The previous GPU world is harmless behind the opaque loading-information
     /// screen and is replaced atomically by RenderCommand::LoadMap.
     pub(in crate::app) fn disconnect_for_demo_transition(&mut self) {
+        self.reset_remote_emotes();
         if self.chat_log_enabled {
             self.chat_log.end("Switched to demo playback");
         }

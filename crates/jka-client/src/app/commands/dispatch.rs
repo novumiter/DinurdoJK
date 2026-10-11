@@ -8,6 +8,11 @@ impl App {
             return;
         }
         let words: Vec<_> = command.split_whitespace().collect();
+        if words.first().is_some_and(|word| word.eq_ignore_ascii_case("cosmetics")) {
+            self.command_cosmetics(&words);
+            return;
+        }
+
         if let Some(def) = super::registry::command_registry().find(words[0]) {
             match (def.handler)(self, command) {
                 super::registry::CommandResult::Handled => return,

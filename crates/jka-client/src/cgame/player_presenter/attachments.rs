@@ -9,7 +9,7 @@ use crate::cgame::player_presenter::{
 #[derive(Clone, Debug, PartialEq)]
 pub struct CosmeticDraw {
     pub entity_num: u16,
-    pub model: &'static str,
+    pub model: String,
     pub origin: [f32; 3],
     pub axis: [[f32; 3]; 3],
     pub rgba: [f32; 4],
@@ -314,11 +314,11 @@ impl PlayerPresenter {
 
         let jetpack = self.load_static_glm_in_game(JETPACK_MODEL, None, JETPACK_MODEL)?;
         let pose_started = Instant::now();
-        let jetpack_pose = Ghoul2Animator::new(&jetpack.gla).evaluate_pose(
-            &jetpack.gla,
+        let jetpack_pose = jetpack.bind_animation_pose(Ghoul2Animator::new(&jetpack.animation_gla).evaluate_pose(
+            &jetpack.animation_gla,
             current_time,
             chest_bolt,
-        )?;
+        )?)?;
         record_pose_eval(&mut self.perf, pose_started);
 
         let mut jetpack_draws = self.render_glm_surfaces(
@@ -459,11 +459,11 @@ impl PlayerPresenter {
         };
         let weapon_model = self.load_static_glm_in_game(&qpath, None, &qpath)?;
         let pose_started = Instant::now();
-        let pose = Ghoul2Animator::new(&weapon_model.gla).evaluate_pose(
-            &weapon_model.gla,
+        let pose = weapon_model.bind_animation_pose(Ghoul2Animator::new(&weapon_model.animation_gla).evaluate_pose(
+            &weapon_model.animation_gla,
             current_time,
             hand_bolt,
-        )?;
+        )?)?;
         record_pose_eval(&mut self.perf, pose_started);
         let mut weapon_draws = self.render_glm_surfaces(
             entity.number,

@@ -1,6 +1,6 @@
 use crate::{
     scene::{BspMapStats, MapLoadTimings, PreparedMap},
-    thread_activity::{Task, ThreadActivitySample, SLOT_COUNT},
+    thread_activity::{Task, ThreadActivitySample},
     ui::VsyncMode,
 };
 use std::{path::PathBuf, sync::Arc, time::Instant};
@@ -42,7 +42,7 @@ pub struct RenderStats {
     pub input_latency_samples: u32,
     pub msaa_samples: u32,
     pub vsync: VsyncMode,
-    pub threads: [ThreadActivitySample; SLOT_COUNT],
+    pub threads: Arc<[ThreadActivitySample]>,
 }
 
 #[derive(Debug, Clone)]

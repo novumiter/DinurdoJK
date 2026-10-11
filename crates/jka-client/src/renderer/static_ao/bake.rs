@@ -82,7 +82,7 @@ pub(in crate::renderer) fn static_ao_trace_adaptive_indices(
         {
             let bvh = Arc::clone(&bvh);
             let sample_pattern = Arc::clone(&sample_pattern);
-            scope.spawn(move || {
+            std::thread::Builder::new().name("jka-static-ao-ray".into()).spawn_scoped(scope, move || {
                 for (result, &index) in result_chunk.iter_mut().zip(index_chunk.iter()) {
                     if let Some(sample) = texels[index] {
                         *result = static_ao_hq_visibility(
@@ -95,7 +95,7 @@ pub(in crate::renderer) fn static_ao_trace_adaptive_indices(
                         );
                     }
                 }
-            });
+            }).expect("spawn named worker");
         }
     });
     for (&index, &visibility) in indices.iter().zip(results.iter()) {

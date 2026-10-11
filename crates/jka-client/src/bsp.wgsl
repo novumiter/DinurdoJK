@@ -840,6 +840,41 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     return output;
 }
 
+// TaystJK rd-vanilla Autosprite2Deform, prepared per authored quad at map load.
+// position = midpoint of its short edge, normal = shared long axis,
+// lightmap_uv.x = signed half-width; y = -1337 is the encoding marker.
+// Unmodified geometry (including source .map) keeps its original positions.
+// This entry exists only for the autoSprite2 pipeline key; ordinary BSP vertex
+// shaders have no billboard branch, uniforms or per-vertex overhead.
+fn autosprite2_input(original: VertexIn) -> VertexIn {
+    var input = original;
+    let half_width = original.lightmap_uv.x;
+    if (original.lightmap_uv.y == -1337.0) {
+        // BackEnd view axis[0] is the camera forward direction (not the
+        // position-to-eye vector). A single long-axis rotation, not full XYZ.
+        let minor = cross(original.normal, camera.camera_forward.xyz);
+        let length_sq = dot(minor, minor);
+        if (length_sq > 0.000001) {
+            input.position = original.position + minor * (half_width * inverseSqrt(length_sq));
+            // Deformed surface normal for lighting passes that use it.
+            input.normal = normalize(cross(original.normal, minor));
+        }
+    }
+    return input;
+}
+
+@vertex fn vs_autosprite2(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
+    return world_vertex(autosprite2_input(input), instance_index, 0xffffffffu);
+}
+
+@vertex fn vs_autosprite2_legacy(
+    input: VertexIn,
+    @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VertexOut {
+    return world_vertex(autosprite2_input(input), instance_index, legacy_dlight_surface_id);
+}
+
 @vertex fn vs_main(input: VertexIn, @builtin(instance_index) instance_index: u32) -> VertexOut {
     return world_vertex(input, instance_index, 0xffffffffu);
 }
@@ -3002,7 +3037,8 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     var n = normalize(vec3<f32>(-gradient_foam.x*normal_fade-interaction.y*interaction_lod,
         1.0, -gradient_foam.y*normal_fade-interaction.z*interaction_lod));
     let coastal=sample_coastal(vec3<f32>(world_m.x*units_per_meter,interaction_plane,world_m.y*units_per_meter));
-    n=normalize(mix(n,normalize(vec3<f32>(-coastal.slope.x,1.0,-coastal.slope.y)),coastal.field.w));
+    n=normalize(mix(n,normalize(vec3<f32>(-coastal.slope.x-interaction.y*interaction_lod,
+        1.0,-coastal.slope.y-interaction.z*interaction_lod)),coastal.field.w));
     let view_dir = normalize(camera.camera_pos_time.xyz - input.world_position);
     n = select(n, -n, below);
     let dot_nv = max(dot(n, view_dir), 2e-5);

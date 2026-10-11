@@ -103,6 +103,34 @@ fn removed_prediction_controls_are_not_registered() {
 }
 
 #[test]
+fn ocean_enable_is_archived_before_apply() {
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+    let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+        .with_any_thread(true).build().unwrap();
+    let fixture = Fixture::new();
+    let path = fixture.0.join("DinurdoJK.cfg");
+    fs::write(&path, "seta r_ocean \"0\"\n").unwrap();
+    let mut app = App::new(fixture.0.clone(), None,
+        crate::scene::MapSource::Bsp("mp/ffa3".into()), false,
+        event_loop.create_proxy()).unwrap();
+    assert!(!app.applied_ocean);
+    // The menu can stage ON while the current world has no ocean resources.
+    app.environment_selected = crate::ui::ENV_ROW_OCEAN;
+    app.change_environment_setting(1);
+    assert!(app.video.ocean);
+    app.flush_config();
+    assert!(crate::config::load_video_settings(&path).ocean,
+        "a pending ocean enable must survive quitting before Apply");
+    // The console uses the same saved preference, including immediate OFF.
+    app.set_console_cvar("r_ocean", "0").unwrap();
+    app.flush_config();
+    assert!(!crate::config::load_video_settings(&path).ocean);
+    app.set_console_cvar("r_ocean", "1").unwrap();
+    app.flush_config();
+    assert!(crate::config::load_video_settings(&path).ocean);
+}
+
+#[test]
 fn stage_collapse_extra_is_live_and_archived() {
     use crate::console::LatchScope;
     let definition = crate::app::cvar_registry()
@@ -117,9 +145,12 @@ fn assert_command_encoding_ab_controls(app: &mut App) {
     app.config_dirty = false;
     for (name, baseline, experimental) in [
         ("r_modelStateCache", "0", "1"),
-        ("r_dynamicBatchDraws", "0", "1"),
+        ("r_dynamicBatchDraws", "1", "0"),
         ("r_worldCompactMinDraws", "1", "2"),
-        ("r_modelPrepareThreads", "0", "2"),
+        ("r_modelPrepareThreads", "2", "0"),
+        ("r_md3GeometryCache", "1", "0"),
+        ("r_modelRenderBundles", "0", "1"),
+        ("r_encoderFinishThreads", "2", "0"),
         ("r_modelIndexUploadCache", "0", "1"),
         ("r_ghoul2BatchKeyCache", "0", "1"),
     ] {
@@ -138,8 +169,15 @@ fn assert_command_encoding_ab_controls(app: &mut App) {
         assert!(app.set_console_cvar("r_worldCompactMinDraws", value).is_err());
         assert_eq!(app.video.world_compact_min_draws, 1);
     }
+    app.set_console_cvar("r_encoderFinishThreads", "1").unwrap();
+    assert_eq!(app.video.encoder_finish_threads, 1);
+    app.set_console_cvar("r_encoderFinishThreads", "0").unwrap();
+    for value in ["3", "-1", "1.5"] {
+        assert!(app.set_console_cvar("r_encoderFinishThreads", value).is_err());
+        assert_eq!(app.video.encoder_finish_threads, 0);
+    }
     for value in ["3", "8", "-1", "1.5"] {
         assert!(app.set_console_cvar("r_modelPrepareThreads", value).is_err());
-        assert_eq!(app.video.model_prepare_threads, 0);
+        assert_eq!(app.video.model_prepare_threads, 2);
     }
 }

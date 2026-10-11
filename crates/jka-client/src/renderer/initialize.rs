@@ -1458,7 +1458,7 @@ impl Renderer {
             gamma_post_pipeline,
             fast_post_pipeline,
         ) = thread::scope(|scope| {
-            let cloud_march = scope.spawn(|| {
+            let cloud_march = std::thread::Builder::new().name("pipeline-init-cloud-march".into()).spawn_scoped(scope, || {
                 timed_init_step("cloud march pipeline", || {
                     create_cloud_pass_pipeline(
                         &device,
@@ -1468,8 +1468,8 @@ impl Renderer {
                         "JKA volumetric cloud march pipeline",
                     )
                 })
-            });
-            let cloud_resolve = scope.spawn(|| {
+            }).expect("spawn named worker");
+            let cloud_resolve = std::thread::Builder::new().name("pipeline-init-cloud-resolve".into()).spawn_scoped(scope, || {
                 timed_init_step("cloud resolve pipeline", || {
                     create_cloud_pass_pipeline(
                         &device,
@@ -1479,8 +1479,8 @@ impl Renderer {
                         "JKA volumetric cloud resolve pipeline",
                     )
                 })
-            });
-            let ssao_temporal = scope.spawn(|| {
+            }).expect("spawn named worker");
+            let ssao_temporal = std::thread::Builder::new().name("pipeline-init-ssao-temporal".into()).spawn_scoped(scope, || {
                 timed_init_step("SSAO temporal pipeline", || {
                     create_ssao_temporal_pipeline(
                         &device,
@@ -1488,8 +1488,8 @@ impl Renderer {
                         &ssao_temporal_shader,
                     )
                 })
-            });
-            let ssr_temporal = scope.spawn(|| {
+            }).expect("spawn named worker");
+            let ssr_temporal = std::thread::Builder::new().name("pipeline-init-ssr-temporal".into()).spawn_scoped(scope, || {
                 timed_init_step("SSR temporal pipeline", || {
                     create_ssr_temporal_pipeline(
                         &device,
@@ -1497,13 +1497,13 @@ impl Renderer {
                         &ssr_temporal_shader,
                     )
                 })
-            });
-            let ssr_visibility = scope.spawn(|| {
+            }).expect("spawn named worker");
+            let ssr_visibility = std::thread::Builder::new().name("pipeline-init-ssr-visibility".into()).spawn_scoped(scope, || {
                 timed_init_step("SSR visibility resources", || {
                     create_ssr_visibility_resources(&device, &targets, msaa_samples)
                 })
-            });
-            let gamma_post = scope.spawn(|| {
+            }).expect("spawn named worker");
+            let gamma_post = std::thread::Builder::new().name("pipeline-init-gamma-post".into()).spawn_scoped(scope, || {
                 timed_init_step("gamma post pipeline", || {
                     create_gamma_post_pipeline(
                         &device,
@@ -1512,7 +1512,7 @@ impl Renderer {
                         config.format,
                     )
                 })
-            });
+            }).expect("spawn named worker");
             // The last one runs on this thread rather than idling at the join.
             let fast_post = timed_init_step("fast post pipeline", || {
                 create_gamma_post_pipeline(
@@ -2378,6 +2378,8 @@ impl Renderer {
             world: None,
             world_videos: Vec::new(),
             dynamic_model_renderer,
+            encoder_finish_threads: 0,
+            encoder_finisher: None,
             spectator_highlight,
             white,
             missing,
@@ -2523,6 +2525,7 @@ impl Renderer {
             rt_reduced_shadows: false,
             clustered_lighting_enabled: false,
             map_light_simulation_enabled: false,
+            debug_world_vertex_alpha_one: false,
             classic_fullbright: false,
             classic_vertex_light: false,
             classic_lightmap_only: false,

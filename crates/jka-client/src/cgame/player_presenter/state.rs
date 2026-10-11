@@ -204,6 +204,9 @@ impl PlayerPresenter {
             duel_shell_gray: None,
             cosmetic_draws: Vec::new(),
             local_cosmetics: 0,
+            local_global_hat: String::new(),
+            local_global_cape: String::new(),
+            global_cosmetic_offsets: HashMap::new(),
             sent_cosmetics: 0,
             cosmetic_mismatch_logged: None,
             team_power: HashMap::new(),
@@ -302,11 +305,11 @@ impl PlayerPresenter {
         self.view_weapon_frame_time = 0;
 
         let current_frame = self.entities.get_mut(&entity_num).and_then(|state| {
-            let lower_lumbar = Ghoul2Animator::bone_index(&state.model.gla, "lower_lumbar")?;
+            let lower_lumbar = Ghoul2Animator::bone_index(&state.model.animation_gla, "lower_lumbar")?;
             state
                 .animation
                 .animator
-                .bone_frame(&state.model.gla, lower_lumbar, current_time)
+                .bone_frame(&state.model.animation_gla, lower_lumbar, current_time)
                 .ok()
                 .flatten()
         });
@@ -375,6 +378,13 @@ impl PlayerPresenter {
     /// to relay it back as `c5`.
     pub fn set_local_cosmetics(&mut self, mask: u32) {
         self.local_cosmetics = mask;
+    }
+
+    /// Local global cosmetics for solo preview and servers that do not echo
+    /// our own userinfo; network peers still use the received c1/c2 suffix.
+    pub fn set_local_global_cosmetics(&mut self, hat: &str, cape: &str) {
+        self.local_global_hat = hat.to_owned();
+        self.local_global_cape = cape.to_owned();
     }
 
     pub fn set_saber_team_colors(&mut self, enabled: bool) {

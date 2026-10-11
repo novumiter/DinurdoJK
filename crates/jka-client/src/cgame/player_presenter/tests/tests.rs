@@ -1,6 +1,64 @@
 use super::*;
 use super::submission::mesh::append_surface_indices;
 
+#[test]
+fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices() {
+    use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+    let animation = humanoid_reference(HumanoidRig::Jka53);
+    let mut glm = GlmModel {
+        name: "test".into(), anim_name: "models/players/_humanoid/_humanoid".into(),
+        num_bones: 53, hierarchy: Vec::new(), lods: Vec::new(),
+    };
+    let (mesh, plan) = super::assets::loading::mesh_skeleton_binding(&glm, &animation).unwrap();
+    assert!(Arc::ptr_eq(&mesh, &animation));
+    assert!(plan.is_none());
+    let model = PlayerModelAsset {
+        key: "test".into(), glm: Arc::new(glm.clone()), gla: mesh,
+        animation_gla: Arc::clone(&animation), retargeter: plan,
+        source_native_pivots: None, humanoid: true, animations: None,
+        anim_events: None, surfaces: Vec::new(), jiggle: None, female: false,
+    };
+    let mut animator = Ghoul2Animator::new(&animation);
+    animator.set_bone_angles_postmult(&animation, "lower_lumbar", [14., 6., 0.], 3, 4, 5).unwrap();
+    let stock = animator.evaluate_pose_openjk_root(&animation, 0).unwrap();
+    let allocation = stock.as_ptr();
+    let expected = stock.clone();
+    let bound = model.bind_animation_pose(stock).unwrap();
+    assert_eq!(bound, expected);
+    assert_eq!(bound.as_ptr(), allocation, "stock path must reuse its existing pose allocation");
+    assert_eq!(super::submission::mesh::gpu_bones_from_pose(&bound).len(), 53);
+
+    glm.num_bones = 72;
+    let (mesh, plan) = super::assets::loading::mesh_skeleton_binding(&glm, &animation).unwrap();
+    assert_eq!(mesh.num_bones(), 72);
+    let plan = plan.unwrap();
+    let native = plan.retarget(jka_assets::skeleton::PoseInput::Ghoul2SkinMatrices(&bound)).unwrap();
+    let gpu = super::submission::mesh::gpu_bones_from_pose(&native);
+    assert_eq!(gpu.len(), 72);
+    let hand = Ghoul2Animator::bone_index(&mesh, "rhand").unwrap();
+    assert_eq!(gpu[hand].row0, native[hand][0]);
+    assert_eq!(gpu[hand].row1, native[hand][1]);
+    assert_eq!(gpu[hand].row2, native[hand][2]);
+}
+
+#[test]
+fn skeletal_binding_preserves_nonhumanoids_and_accepts_reverse_animation_rig() {
+    use jka_assets::skeleton::{humanoid_reference, HumanoidRig};
+    let default = Arc::new(openjk_default_gla().unwrap());
+    let mut glm = GlmModel { name: "hilt".into(), anim_name: "*default".into(), num_bones: 1, hierarchy: Vec::new(), lods: Vec::new() };
+    let (mesh, plan) = super::assets::loading::mesh_skeleton_binding(&glm, &default).unwrap();
+    assert!(Arc::ptr_eq(&mesh, &default)); assert!(plan.is_none());
+    let native = humanoid_reference(HumanoidRig::Jk2_72);
+    glm.anim_name = "models/players/custom/custom".into(); glm.num_bones = 72;
+    let (mesh, plan) = super::assets::loading::mesh_skeleton_binding(&glm, &native).unwrap();
+    assert!(Arc::ptr_eq(&mesh, &native)); assert!(plan.is_none());
+    glm.anim_name = "models/players/_humanoid/_humanoid".into(); glm.num_bones = 53;
+    let (mesh, plan) = super::assets::loading::mesh_skeleton_binding(&glm, &native).unwrap();
+    assert_eq!(mesh.num_bones(), 53);
+    let pose = Ghoul2Animator::new(&native).evaluate_pose_openjk_root(&native, 0).unwrap();
+    assert_eq!(plan.unwrap().retarget(jka_assets::skeleton::PoseInput::Ghoul2SkinMatrices(&pose)).unwrap().len(), 53);
+}
+
 fn wait_for_player_model(
     presenter: &mut PlayerPresenter,
     info: &crate::cgame::ClientInfo,
