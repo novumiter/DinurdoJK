@@ -10,6 +10,7 @@ use crate::app::{
 pub(in crate::app) struct AppliedVideoMode {
     pub(in crate::app) fullscreen: FullscreenMode,
     pub(in crate::app) renderer_backend: RendererBackend,
+    pub(in crate::app) hdr_output: u32,
     pub(in crate::app) resolution: [u32; 2],
 }
 
@@ -237,6 +238,7 @@ impl App {
         // The shortcut changes only fullscreen presentation. Do not accidentally
         // apply an uncommitted resolution/backend selection from the Video menu.
         self.video.renderer_backend = self.applied_renderer_backend;
+        self.video.hdr_output = self.applied_hdr_output;
         self.video.resolution = self.applied_resolution;
 
         if target == FullscreenMode::Exclusive
@@ -458,6 +460,7 @@ impl App {
         AppliedVideoMode {
             fullscreen: self.applied_fullscreen,
             renderer_backend: self.applied_renderer_backend,
+            hdr_output: self.applied_hdr_output,
             resolution: self.applied_resolution,
         }
     }
@@ -581,6 +584,7 @@ impl App {
     pub(in crate::app) fn display_restart_required(&self) -> bool {
         self.video.fullscreen != self.applied_fullscreen
             || self.video.renderer_backend != self.applied_renderer_backend
+            || self.video.hdr_output != self.applied_hdr_output
             || self.video.resolution != self.applied_resolution
     }
 
@@ -621,6 +625,9 @@ impl App {
         };
         let on_off = |enabled: bool| if enabled { "On" } else { "Off" };
 
+        if self.video.hdr_output != self.applied_hdr_output {
+            add("hdr_output", "Display output", format!("{} -> {}", crate::renderer::hdr_output::OUTPUT_LABELS[self.applied_hdr_output as usize], crate::renderer::hdr_output::OUTPUT_LABELS[self.video.hdr_output as usize]));
+        }
         if self.video.renderer_backend != self.applied_renderer_backend {
             add(
                 "render_backend",
@@ -892,6 +899,7 @@ impl App {
         };
         self.video.fullscreen = previous.fullscreen;
         self.video.renderer_backend = previous.renderer_backend;
+        self.video.hdr_output = previous.hdr_output;
         self.video.resolution = previous.resolution;
         self.normalize_video_selection();
         self.console_status = format!("VIDEO SETTINGS {reason}; REVERTING...");
@@ -989,6 +997,7 @@ impl App {
         self.render.is_some()
             && self.window.is_some()
             && self.video.renderer_backend == backend
+            && self.video.hdr_output == self.applied_hdr_output
             && [self.applied_fullscreen, self.video.fullscreen]
                 .into_iter()
                 .all(|mode| {
@@ -1136,6 +1145,7 @@ impl App {
     pub(in crate::app) fn set_requested_video_mode(&mut self, target: AppliedVideoMode) {
         self.video.fullscreen = target.fullscreen;
         self.video.renderer_backend = target.renderer_backend;
+        self.video.hdr_output = target.hdr_output;
         self.video.resolution = target.resolution;
     }
 
@@ -1188,6 +1198,7 @@ impl App {
                 // the retained VideoSettings state.
                 self.sync_classic_world_lighting();
                 self.applied_renderer_backend = self.video.renderer_backend;
+                self.applied_hdr_output = self.video.hdr_output;
                 self.applied_grass = self.video.grass;
                 self.applied_ocean = self.video.ocean;
                 // Only DX12 has a present ceiling, so switching backends changes
@@ -1465,6 +1476,7 @@ impl App {
         let target = AppliedVideoMode {
             fullscreen: mode,
             renderer_backend: self.video.renderer_backend,
+            hdr_output: self.video.hdr_output,
             resolution: self.video.resolution,
         };
 

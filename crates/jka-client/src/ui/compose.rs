@@ -8,7 +8,7 @@ use crate::ui::{
     build_siege_hud,
     build_prediction_debug, build_race_timer, build_reflection_debug_legend, build_scoreboard,
     build_speedometer, build_splash_background, build_strafe_helper, build_team_overlay,
-    build_vote, draw_placed, HudElementId, OverlayMode, ProportionalFont, UiSnapshot, UiVertex,
+    build_vote, build_extension_hud, draw_placed, HudElementId, OverlayMode, ProportionalFont, UiSnapshot, UiVertex,
 };
 
 pub fn build_vertices(
@@ -111,6 +111,7 @@ pub fn build_dynamic_static_vertices(
         return;
     }
     build_hud(out, ui, width, height);
+    build_extension_hud(out, &ui.extension_hud, width, height);
 }
 
 /// Hot movement-driven HUD geometry. Strafehelper and MovementKeys are the only

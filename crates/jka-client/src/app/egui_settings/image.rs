@@ -6,6 +6,11 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_image_quality(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "IMAGE QUALITY",
+            "Anti-aliasing, texture filtering and texture detail.",
+        );
         let choices = self.anti_aliasing_ladder();
         let current_aa = self.current_anti_aliasing();
         let current = choices
@@ -92,6 +97,11 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_visibility(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "WORLD VISIBILITY",
+            "Portal visibility, distance culling and GPU draw submission.",
+        );
         const PVS: [(PvsMode, &str); 4] = [
             (PvsMode::Off, "Off"),
             (PvsMode::Minimal, "Minimal"),

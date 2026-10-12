@@ -443,6 +443,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
                 },
                 color: [flash.color[0], flash.color[1], flash.color[2], alpha * 0.55],
                 depth_hack: 0.0,
+                water_wetness: 0.0,
             });
         }
         indices.extend_from_slice(&[

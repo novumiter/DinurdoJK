@@ -33,6 +33,7 @@ mod settings;
 mod siege;
 mod text_input;
 mod tick;
+mod water_wetness;
 mod world_effects;
 use commands::buffer::{random_unit, split_console_script};
 use connection::types::{
@@ -76,6 +77,7 @@ use session::types::{
     LivePredictionFrame,
 };
 
+mod background_jobs;
 mod companion;
 mod egui_dev_radial;
 mod egui_entity_graph;
@@ -214,6 +216,7 @@ struct AccountEditor {
 }
 
 pub struct App {
+    extensions: crate::extensions::Manager,
     base: PathBuf,
     /// Command-line/local game directory. Session fs_game is restored to this on disconnect.
     startup_game: Option<PathBuf>,
@@ -235,6 +238,7 @@ pub struct App {
     source_map_levelshot_texture: Option<egui::TextureHandle>,
     source_map_levelshot_texture_map: Option<String>,
     asset_viewer_entries: Vec<AssetEntry>,
+    asset_viewer_cache: Option<Arc<frontend::AssetViewCache>>,
     asset_viewer_catalog_loaded: bool,
     asset_viewer_catalog_error: Option<String>,
     asset_viewer_selected: Option<String>,
@@ -351,6 +355,8 @@ pub struct App {
     profile_dynamic_models: Arc<Vec<DynamicModelSurface>>,
     profile_preview_active: bool,
     demo_entries: Vec<DemoEntry>,
+    demo_catalog_pending: bool,
+    demo_catalog_generation: u64,
     demo_selected: usize,
     demo_game_choices: Vec<String>,
     /// Demo browser source directory. Empty means the base game directory.
@@ -405,6 +411,8 @@ pub struct App {
     server_browser_rx: Receiver<BrowserEvent>,
     server_browser: BrowserUiState,
     game_session: Option<GameSession>,
+    /// Snapshot-rate water brush immersion and per-body-region drying.
+    water_wetness: crate::water_wetness::WetnessTracker,
     /// Server-driven Siege briefing/class/profile/round-message surface.
     siege_dialog: Option<siege::SiegeDialog>,
     /// Text owned by `UIMENU_SIEGEMESSAGE` / `cg_siegeMessage`. Kept separate
@@ -593,6 +601,7 @@ pub struct App {
     strafe_helper: ui::StrafeHelperSettings,
     hud_layout: HudLayout,
     hud_edit_selected: Option<HudElementId>,
+    hud_edit_extension_selected: Option<String>,
     hud_edit_drag_origin: Option<[f32; 2]>,
     hud_edit_drag_delta: [f32; 2],
     /// Chat corner-resize snapshot. Resize uses total drag distance from this
@@ -786,6 +795,9 @@ pub struct App {
     quality_preset_values: Vec<(String, String)>,
     applied_fullscreen: FullscreenMode,
     applied_renderer_backend: RendererBackend,
+    applied_hdr_output: u32,
+    hdr_output_status: String,
+    hdr_output_active: bool,
     applied_resolution: [u32; 2],
     applied_grass: bool,
     applied_ocean: bool,
@@ -832,6 +844,7 @@ pub struct App {
     map_editor: Option<MapEditor>,
     /// Entity blueprint of the loaded map, for the `entities` overlay.
     entity_graph: Option<std::sync::Arc<crate::entity_graph::EntityGraph>>,
+    entity_marker_cache: Option<(usize, Vec<Option<[f32; 3]>>)>,
     entity_graph_ui: EntityGraphUi,
     /// Set by Developer Tools -> Map Viewer when EDIT SOURCE MAP launches a map.
     source_map_edit_on_load: bool,
@@ -899,6 +912,10 @@ pub struct App {
     dof_focus_target: f32,
     config_path: PathBuf,
     config_dirty: bool,
+    background_jobs: background_jobs::BackgroundJobs,
+    background_result_tx: Sender<background_jobs::JobResult>,
+    background_result_rx: Receiver<background_jobs::JobResult>,
+    config_save_generation: u64,
     last_config_write: Instant,
     quit_requested: bool,
     fps_cap_input: String,

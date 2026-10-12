@@ -501,9 +501,6 @@ impl LocalServer {
         self.player.apply_mouse_look_timed(mouse, elapsed);
     }
 
-    pub fn autofocus_distance(&mut self, camera: &Camera, max_distance: f32) -> f32 {
-        self.player.autofocus_distance(camera, max_distance)
-    }
 }
 
 impl Deref for LocalServer {

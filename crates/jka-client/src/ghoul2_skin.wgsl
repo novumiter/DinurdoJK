@@ -57,6 +57,9 @@ struct SkinDraw {
     // xyz: $phongfresnelranges, packed ((mid-min)*2, mid, (max-mid)*2) by the
     // material loader exactly as Valve's helper packs it. w bit 0: $halflambert.
     source_fresnel: vec4<f32>,
+    water_bands0: vec4<f32>,
+    water_bands1: vec4<f32>,
+    water_base: vec4<f32>,
 };
 // q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
 fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
@@ -554,11 +557,26 @@ fn shaded_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
     return lit_color(input.normal, tex) * input.color;
 }
 
+// Profile is addressed by each skin instance, not the global camera rain.
+// World (render) Y is JKA Z; 8 samples every 8 JKA units, blended in height.
+fn immersion_wetness(input: VertexOut) -> f32 {
+    let draw = skin_draws[input.draw_index];
+    if (draw.water_base.w < 0.5) { return 0.0; }
+    let band = clamp((input.world_position.y - draw.water_base.x) * 0.125, 0.0, 7.0);
+    let lo = u32(band);
+    let hi = min(lo + 1u, 7u);
+    let levels = array<f32, 8>(
+        draw.water_bands0.x, draw.water_bands0.y, draw.water_bands0.z, draw.water_bands0.w,
+        draw.water_bands1.x, draw.water_bands1.y, draw.water_bands1.z, draw.water_bands1.w
+    );
+    return mix(levels[lo], levels[hi], fract(band));
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     return fogged(
-        model_wet_color(shaded_color(input, tex), input.normal, input.world_position),
+        model_wet_color_with_water(shaded_color(input, tex), input.normal, input.world_position, immersion_wetness(input)),
         input.world_position,
         false
     );
@@ -571,7 +589,7 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     return fogged(
-        model_wet_color(shaded_color(input, tex), input.normal, input.world_position),
+        model_wet_color_with_water(shaded_color(input, tex), input.normal, input.world_position, immersion_wetness(input)),
         input.world_position,
         false
     );

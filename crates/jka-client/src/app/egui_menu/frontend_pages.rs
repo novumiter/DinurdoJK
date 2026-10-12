@@ -92,7 +92,7 @@ impl App {
                     .fill(theme::CHROME)
                     .inner_margin(egui::Margin::symmetric(GUTTER as i8, 0)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 ui.horizontal_centered(|ui| {
                     if self.frontend_page != FrontendPage::Profile {
                         theme::glow_label(ui, "DINURDOJK", 16.0, theme::TEXT);
@@ -141,7 +141,7 @@ impl App {
                     .fill(theme::CHROME)
                     .inner_margin(egui::Margin::symmetric(0, 0)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 let rect = ui.max_rect();
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 1.0)),
@@ -177,7 +177,7 @@ impl App {
                     .fill(egui::Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::ZERO),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 let max_w = if matches!(
                     self.frontend_page,
                     FrontendPage::ServerBrowser | FrontendPage::SoloGame | FrontendPage::PlayDemo

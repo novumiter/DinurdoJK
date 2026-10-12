@@ -841,7 +841,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         })
         .unwrap();
     rx.recv().unwrap().unwrap();
-    let data = readback.slice(..).get_mapped_range();
+    let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
     let pixels = bytemuck::cast_slice::<u8, [f32; 4]>(&data);
     // The blocker triangle covers the right half of the view at this row;
     // column 0 sees past it, column 4 does not (same geometry as the fixture
@@ -946,7 +946,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         })
         .unwrap();
     rx.recv().unwrap().unwrap();
-    let data = readback.slice(..).get_mapped_range();
+    let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
     let pixels = bytemuck::cast_slice::<u8, [f32; 4]>(&data);
     assert_eq!(
         pixels[2 * 7 + 5][0],

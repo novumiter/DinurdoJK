@@ -99,9 +99,15 @@ pub(in crate::app) struct GameSession {
     /// TaystJK cg.attackerTime validity: latched by CG_DamageFeedback upon
     /// a nonzero damageCount and changed damageEvent, on this CGame lifetime.
     pub(in crate::app) attacker_damage_seen: bool,
+    /// Accepted events are forwarded to Rhai only after cgame dispatch.
+    pub(in crate::app) extension_events: Vec<crate::extensions::GameEvent>,
+    /// Dedupes snapshot/prediction damage transitions.
+    pub(in crate::app) extension_last_damage: Option<(i32, i32, i32)>,
     pub(in crate::app) player_position: Option<glam::Vec3>,
     pub(in crate::app) ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
     pub(in crate::app) ocean_interaction_enabled: bool,
+    pub(in crate::app) water_wake_mode: u8,
+    pub(in crate::app) water_wake: super::water_wake::WaterWakeTracker,
     /// Canonical current player, analogous to cg.predictedPlayerState. Computed
     /// once per presentation frame from prediction's provisional display state
     /// or snapshot interpolation, with input-owned view angles applied.

@@ -1,6 +1,60 @@
 use super::*;
 
 #[test]
+fn legacy_rgb_transfer_is_shared_by_fused_and_additive_bsp_paths() {
+    // Both zero-pass implementations must use the same exact-sRGB transfer.
+    // Keep fast, lean and full variants in sync without another pipeline.
+    for (name, shader) in [
+        ("world", include_str!("../../bsp.wgsl")),
+        ("lean", include_str!("../../bsp_lean.wgsl")),
+        ("fast", include_str!("../../bsp_fast.wgsl")),
+    ] {
+        assert!(shader.contains("fn legacy_rgb_encode("), "{name}: missing shared encoder");
+        assert!(shader.contains("fn legacy_rgb_decode("), "{name}: missing fused decoder");
+        assert!(shader.contains("fn legacy_rgb_output("), "{name}: missing additive output");
+        assert!(shader.contains("MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u"), "{name}: material bit changed");
+        assert!(shader.contains("legacy_rgb_encode(overlay_sample.rgb)"), "{name}: fused path drifted");
+        assert!(shader.contains("legacy_rgb_encode(color.rgb)"), "{name}: additive path drifted");
+        assert!(!shader.contains("LEGACY_ADDITIVE_SOURCE_SRGB_TEST"), "{name}: temporary test leaked");
+    }
+}
+
+#[test]
+fn world_tcmods_match_taystjk_scroll_wrap_and_rotation_sign() {
+    // rd-vanilla/tr_shade_calc.cpp: RB_CalcScrollTexCoords uses
+    // scroll - floor(scroll), and RB_CalcRotateTexCoords negates the angle.
+    // World, lean, fast, RT, shadow and depth paths must agree.
+    for (name, wgsl) in [
+        ("world", include_str!("../../bsp.wgsl")),
+        ("world-fast", include_str!("../../bsp_fast.wgsl")),
+        ("world-lean", include_str!("../../bsp_lean.wgsl")),
+        ("rt-core", include_str!("../../rt_core.wgsl")),
+        ("shadow", include_str!("../../shadow.wgsl")),
+        ("depth", include_str!("../../depth_prepass.wgsl")),
+    ] {
+        assert!(wgsl.contains("uv = uv + scroll - floor(scroll);"), "{name}: missing TaystJK scroll wrap");
+        assert!(wgsl.contains("let radians = -a.y * time * 0.017453292519943295;"),
+            "{name}: tcMod rotate must use TaystJK's negative angle");
+        assert!(wgsl.contains("let p = uv - vec2<f32>(0.5);"),
+            "{name}: rotate must pivot around the post-scroll UV (0.5, 0.5)");
+    }
+
+    // seph_oceanglow2: scale 0.4, scroll -0.05 0.0008, rotate 4.5.
+    // After 20s, scroll X is -1.0 and wraps to 0 before rotation.
+    // Starting from (1.25,1.25), the scaled UV is (0.5,0.5).
+    let seconds = 20.0_f32;
+    let scroll_x = (-0.05 * seconds).rem_euclid(1.0);
+    let scroll_y = (0.0008 * seconds).rem_euclid(1.0);
+    let (sin, cos) = (-4.5 * seconds).to_radians().sin_cos();
+    let x = 0.5 + scroll_x - 0.5;
+    let y = 0.5 + scroll_y - 0.5;
+    let uv = [0.5 + x*cos - y*sin, 0.5 + x*sin + y*cos];
+    assert!((uv[0] - 0.516).abs() < 0.0001);
+    assert!((uv[1] - 0.5).abs() < 0.0001);
+}
+
+
+#[test]
 fn rt_isolation_variants_validate_and_match_receiver_layouts() {
     use crate::renderer::lighting::{ray_tracing::{ray_traced_world_shader_source_with_features,
         rt_receiver_layout_entries}, rt_diagnostics::ReceiverFeatures};
@@ -75,10 +129,10 @@ fn rt_isolation_world_gpu_pipelines() {
                             vertex: wgpu::VertexState {
                                 module: &shader, entry_point: Some("vs_main"),
                                 compilation_options: Default::default(),
-                                buffers: &[wgpu::VertexBufferLayout {
+                                buffers: &[Some(wgpu::VertexBufferLayout {
                                     array_stride: std::mem::size_of::<GpuVertex>() as u64,
                                     step_mode: wgpu::VertexStepMode::Vertex, attributes: &VERTEX_ATTRIBUTES,
-                                }],
+                                })],
                             },
                             primitive: Default::default(),
                             depth_stencil: Some(wgpu::DepthStencilState {
@@ -168,6 +222,7 @@ fn post_uniform_matches_the_shared_wgsl_struct() {
         ("rain_occlusion", offset_of!(PostUniform, weather_occlusion)),
         ("weather_look", offset_of!(PostUniform, weather_look)),
         ("legacy_weather", offset_of!(PostUniform, legacy_weather)),
+        ("snow_haze", offset_of!(PostUniform, snow_haze)),
         ("underwater", offset_of!(PostUniform, underwater)),
         (
             "cloud_foreground",
@@ -1208,6 +1263,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             uv: [0.0, 0.0],
             color: [1.0; 4],
             depth_hack: 0.0,
+            water_wetness: 0.0,
         };
         let surface = DynamicModelSurface {
             geometry_source: crate::renderer::ModelGeometrySource::Fx,
@@ -1346,7 +1402,7 @@ fn entity_shadow_pass_writes_caster_depth() {
                 })
                 .unwrap();
             rx.recv().unwrap().unwrap();
-            let data = readback.slice(..).get_mapped_range();
+            let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
             let texels = bytemuck::cast_slice::<u8, f32>(&data);
             let at = |x: u32, y: u32| texels[(y * SIZE + x) as usize];
             let centre = at(SIZE / 2, SIZE / 2);
@@ -1472,6 +1528,9 @@ fn ghoul2_draw_uniform_matches_the_skin_draw_wgsl_struct() {
             "source_fresnel",
             offset_of!(Ghoul2GpuDrawUniform, source_fresnel),
         ),
+        ("water_bands0", offset_of!(Ghoul2GpuDrawUniform, water_bands0)),
+        ("water_bands1", offset_of!(Ghoul2GpuDrawUniform, water_bands1)),
+        ("water_base", offset_of!(Ghoul2GpuDrawUniform, water_base)),
     ] {
         assert_eq!(
             offset_of_member(&members, name) as usize,
@@ -1726,7 +1785,7 @@ fn painted_water(p:vec4<f32>)->vec4<f32> {
             device.poll(wgpu::PollType::Wait {submission_index:Some(submission),
                 timeout:Some(std::time::Duration::from_secs(30))}).unwrap();
             rx.recv().unwrap().unwrap();
-            let pixels = readback.slice(..).get_mapped_range();
+            let pixels = readback.slice(..).get_mapped_range().expect("GPU readback range");
             for x in 0..8 {for channel in 0..3 {
                 let expected = pixels[x*4+channel]; let actual = pixels[256+x*4+channel];
                 assert!(expected.abs_diff(actual)<=2,"{src:?}/{dst:?}: pixel {x}, channel {channel}: {actual} vs hardware {expected}");

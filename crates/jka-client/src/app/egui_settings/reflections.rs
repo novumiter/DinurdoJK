@@ -3,6 +3,11 @@ use crate::app::egui_settings::{index_of, quality_table_row, theme, ui, App, Ref
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_reflections(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "REFLECTIONS",
+            "Environment probes, screen-space reflections and planar views.",
+        );
         const REFLECTION_QUALITY: [(ReflectionQuality, &str); 6] = [
             (ReflectionQuality::Off, "Off"),
             (ReflectionQuality::Legacy, "Legacy"),

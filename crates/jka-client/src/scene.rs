@@ -199,8 +199,22 @@ pub enum BlendMode {
     Custom(BlendFactor, BlendFactor),
 }
 
+/// A single policy for the two zero-extra-pass legacy RGB implementations.
+/// The exact fused recipe can blend known texture inputs in encoded sRGB;
+/// independently blended additive stages can only encode the source before
+/// the existing linear scene target's fixed-function blend. The latter is an
+/// intentional, measured approximation of the original framebuffer operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyRgbCompositing {
+    Linear,
+    ExactFusedOverlay,
+    EncodedAdditiveSource,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PipelineKey {
+    /// Shader-specific entry point; ordinary materials compile without legacy conversion.
+    pub legacy_srgb_three_stage: bool,
     /// Dedicated vertex shader for TaystJK autoSprite2, absent from normal BSP pipelines.
     pub auto_sprite2: bool,
     pub class: DrawClass,
@@ -209,6 +223,25 @@ pub struct PipelineKey {
     pub offset: bool,
     pub depth_write: bool,
     pub depth_equal: bool,
+}
+
+impl DrawBatch {
+    /// Evaluated when uploading this draw's material uniform, not per frame
+    /// pixel. Modern promoted ocean and opaque/PBR stages remain linear.
+    pub(crate) fn legacy_rgb_compositing(&self) -> LegacyRgbCompositing {
+        if self.pipeline.legacy_srgb_three_stage {
+            debug_assert!(self.legacy_srgb_overlay.is_some());
+            return LegacyRgbCompositing::ExactFusedOverlay;
+        }
+        if self.authored_ocean.is_none()
+            && matches!(self.pipeline.blend,
+                BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::One)
+                | BlendMode::Custom(BlendFactor::One, BlendFactor::One))
+        {
+            return LegacyRgbCompositing::EncodedAdditiveSource;
+        }
+        LegacyRgbCompositing::Linear
+    }
 }
 
 pub const REFLECTION_CACHE_PROBE: u8 = 1 << 0;
@@ -227,8 +260,16 @@ pub struct DrawBatch {
     /// Two packed u32s keep this developer metadata to 8 bytes per draw batch.
     pub material_debug_index: u32,
     pub surface_material: u8,
+    /// Map-load classification: all stages of an opaque, depth-seeding
+    /// material must finish before fullscreen cloud attenuation. A blended
+    /// sibling stage does not make the *whole* material transparent.
+    pub opaque_composite_before_clouds: bool,
     /// Image index when this stage samples a regular texture.
     pub texture: Option<usize>,
+    /// For a safely fused authored lightmap/diffuse/vertex-alpha overlay, the
+    /// secondary image is sampled through the otherwise unused sky-right slot.
+    /// None leaves every original stage and binding unchanged.
+    pub legacy_srgb_overlay: Option<usize>,
     /// Pre-resolved animMap frame indices (absent for ordinary stages).
     pub animation: Option<materials::MaterialAnimation>,
     /// True when binding 0 should be the BSP lightmap instead of `texture`.
@@ -1325,13 +1366,10 @@ pub struct PreparedSteamAudioScene {
 #[derive(Debug, Clone)]
 pub struct WorldFlare {
     pub shader_clamp_time: Option<f32>,
-    pub surface_id: u32,
     pub origin: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
-    pub shader: String,
     pub shader_index: usize,
-    pub fog_num: i32,
     pub fog: [f32; 4],
     pub fog_is_global: bool,
     pub radius: f32,
@@ -1541,6 +1579,8 @@ pub struct MaterialDebugEntry {
     pub stage_sequence: Vec<String>,
     /// Resolved stage/base/PBR image providers used by this material.
     pub image_sources: Vec<String>,
+    /// Indexed source / decoded asset / fallback diagnosis captured on map load.
+    pub resolution_lines: Vec<String>,
     pub lines: Vec<String>,
 }
 

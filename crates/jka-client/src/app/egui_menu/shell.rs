@@ -4,7 +4,7 @@ use crate::app::egui_menu::{
     EguiRenderData, ElementState, FrontendPage, Instant, KeyCode, KeyEvent, MapEditor, MouseButton,
     OverlayMode, PhysicalKey, RenderCommand, VideoSection, Window, WindowEvent, CONTENT_MAX_W,
     GUTTER, SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
-    SETUP_TAB_MOD, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
+    SETUP_TAB_MOD, SETUP_TAB_EXTENSIONS, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
     TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
 };
 
@@ -502,7 +502,7 @@ impl App {
                     .fill(theme::CHROME)
                     .inner_margin(egui::Margin::ZERO),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 let width = ui.available_width();
                 let item_w = width / TOP_ITEMS.len() as f32;
                 let mut clicked = None;
@@ -650,7 +650,7 @@ impl App {
             }
             _ => {
                 self.console_status =
-                    "USAGE: uipage join|servers|profile|controls|movement|vote|setup [game|movement|camera|video|audio|network|interface|mod]".into();
+                    "USAGE: uipage join|servers|profile|controls|movement|vote|setup [game|movement|camera|video|audio|network|interface|extensions|mod]".into();
             }
         }
     }
@@ -703,7 +703,7 @@ impl App {
                     .fill(theme::SURFACE_ALT)
                     .inner_margin(egui::Margin::symmetric(0, 0)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 let mut clicked = None;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
@@ -764,7 +764,7 @@ impl App {
                     .fill(theme::CHROME)
                     .inner_margin(egui::Margin::symmetric(0, 0)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 let rect = ui.max_rect();
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), 1.0)),
@@ -845,7 +845,7 @@ impl App {
                     .fill(egui::Color32::TRANSPARENT)
                     .inner_margin(egui::Margin::ZERO),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 // Keep the Servers page at the same 1120-point canvas used by
                 // the front-end browser so the two versions have identical
                 // column geometry and interaction positions. Profile remains a
@@ -915,6 +915,7 @@ impl App {
                 SETUP_TAB_AUDIO => self.egui_audio_page(ui),
                 SETUP_TAB_NETWORK => self.egui_network_page(ui),
                 SETUP_TAB_INTERFACE => self.egui_interface_page(ui),
+                SETUP_TAB_EXTENSIONS => self.egui_extensions_page(ui),
                 SETUP_TAB_MOD => self.egui_mod_setup_settings(ui),
                 _ => unreachable!("setup tab index is bounded by the visible setup tabs"),
             }
@@ -948,7 +949,7 @@ impl App {
                     .fill(theme::RAIL_FILL)
                     .inner_margin(egui::Margin::symmetric(0, 12)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 let rect = ui.max_rect();
                 ui.painter().rect_filled(
                     egui::Rect::from_min_size(

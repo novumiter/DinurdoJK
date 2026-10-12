@@ -324,6 +324,9 @@ impl DynamicModelRenderer {
                     jiggle3: skin.jiggle_offsets[3],
                     source_phong: source_phong(source_material),
                     source_fresnel: source_fresnel(source_material),
+                    water_bands0: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.bands[0],p.bands[1],p.bands[2],p.bands[3]]),
+                    water_bands1: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.bands[4],p.bands[5],p.bands[6],p.bands[7]]),
+                    water_base: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.first_z, 0.0, 0.0, 1.0]),
                 };
                 let mut pending = Ghoul2PendingDraw {
                     entity_num: surface.entity_num,
@@ -362,6 +365,9 @@ impl DynamicModelRenderer {
             self.record_cpu_geometry(surface.geometry_source, surface.vertices.len(), surface.indices.len());
             let cached_md3 = self.md3_geometry_cache
                 && surface.geometry_source == crate::renderer::ModelGeometrySource::Md3
+                // A reused dry MD3 vertex stream must not mask live player wetness.
+                && !(surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player
+                    && self.entity_water.contains_key(&surface.entity_num))
                 && self.md3_stream_cache.append(surface, classic_light, &mut vertices, &mut indices);
             if cached_md3 {
                 // Already lit and rebased with these exact source allocations,
@@ -373,6 +379,8 @@ impl DynamicModelRenderer {
                     vertices: base_vertex as usize..vertices.len(),
                     indices: first_index as usize..indices.len(),
                     light: classic_light,
+                    water: self.entity_water.get(&surface.entity_num).copied()
+                        .filter(|_| surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player),
                 });
             } else {
                 if let Some(light) = classic_light {
@@ -394,6 +402,15 @@ impl DynamicModelRenderer {
                         .iter()
                         .map(|index| base_vertex.saturating_add(*index)),
                 );
+            }
+            if self.model_prepare_threads == 0
+                && surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player
+            {
+                if let Some(water) = self.entity_water.get(&surface.entity_num) {
+                    for vertex in &mut vertices[base_vertex as usize..] {
+                        vertex.water_wetness = water.wetness_at_z(vertex.position[1]);
+                    }
+                }
             }
             self.draws.push(DynamicPreparedDraw {
                 entity_num: surface.entity_num,

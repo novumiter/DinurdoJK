@@ -259,6 +259,7 @@ impl JaproCgame {
         self.style_player & bit != 0
     }
 
+    #[cfg(test)]
     pub fn cvar_value(&self, name: &str) -> Option<String> {
         crate::app::japro_cvars::settings_registry().get(self, name).map(|value| value.to_string())
     }
@@ -268,6 +269,7 @@ impl JaproCgame {
         Some(registry.set(self, name, value))
     }
 
+    #[cfg(test)]
     pub fn write_cfg(&self, out: &mut String) {
         use std::fmt::Write;
         let mut definitions: Vec<_> = crate::app::japro_cvars::DEFINITIONS.iter().filter(|def| def.config.archive.is_some()).collect();
@@ -657,13 +659,6 @@ impl Cosmetic {
         if self.exclusive_group == 4 { 3 } else { self.exclusive_group }
     }
 }
-
-/// The three radio groups of the jaPRO `cosmetics` command: (group, title, tip).
-pub const COSMETIC_GROUPS: [(u8, &str, &str); 3] = [
-    (1, "HATS", "One hat at a time."),
-    (2, "MASKS", "One mask, beard or pair of glasses. Combines with a hat and a cape."),
-    (3, "CAPES & CARRIED", "One cape, goose or carried item. Combines with a hat and a mask."),
-];
 
 /// Every cosmetic in `group`, in menu order.
 pub fn cosmetics_in_group(group: u8) -> impl Iterator<Item = &'static Cosmetic> {

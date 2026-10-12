@@ -288,6 +288,7 @@ impl App {
 
             if !chat_resize_active && (response.clicked() || response.drag_started()) {
                 self.hud_edit_selected = Some(id);
+                self.hud_edit_extension_selected = None;
                 self.hud_edit_drag_origin = Some(layout.offset);
                 self.hud_edit_drag_delta = [0.0, 0.0];
                 self.hud_edit_chat_resize_origin = None;
@@ -423,6 +424,10 @@ impl App {
                 }
             }
         }
+
+        // Dynamic extension elements share the editor but not HudElementId.
+        // IDs are stable across reloads and survive scripts being temporarily removed.
+        self.egui_extension_hud_handles(root, full, pixels_per_point);
 
         let mut close_editor = false;
         let mut reset_selected = false;
@@ -850,6 +855,89 @@ impl App {
             }
             self.set_overlay(OverlayMode::None);
             self.publish_snapshot();
+        }
+    }
+}
+
+impl App {
+    fn egui_extension_hud_handles(&mut self, root: &mut egui::Ui, full: egui::Rect, ppp: f32) {
+        let widgets = self.extensions.hud_widgets.clone();
+        if widgets.is_empty() { self.hud_edit_extension_selected = None; return; }
+        let painter = root.painter().clone();
+        let mut save_layout = false;
+        let mut visual_changed = false;
+        for widget in &widgets {
+            let p = self.extensions.widget_placement(&widget.key);
+            let to_pt = |n: f32| n / ppp;
+            let rect = egui::Rect::from_min_size(
+                full.min + egui::vec2(to_pt(p.x), to_pt(p.y)),
+                egui::vec2(to_pt(widget.width*p.scale), to_pt(widget.height*p.scale)),
+            );
+            let response = root.interact(rect, egui::Id::new(("ext_hud", &widget.key)), egui::Sense::click_and_drag());
+            if response.clicked() || response.drag_started() {
+                self.hud_edit_extension_selected = Some(widget.key.clone());
+                self.hud_edit_selected = None;
+                self.hud_edit_drag_origin = Some([p.x,p.y]);
+            }
+            if response.dragged() {
+                let origin = self.hud_edit_drag_origin.unwrap_or([p.x,p.y]);
+                let delta = response.total_drag_delta().unwrap_or(egui::Vec2::ZERO)*ppp;
+                let (mut x,mut y)=(origin[0]+delta.x,origin[1]+delta.y);
+                if self.hud_layout.snap_to_grid && !root.input(|i| i.modifiers.alt) {
+                    let grid=self.hud_layout.grid_size.clamp(1.0,64.0);
+                    x=(x/grid).round()*grid; y=(y/grid).round()*grid;
+                }
+                self.extensions.set_widget_placement(&widget.key,
+                    crate::extensions::HudPlacement { x,y,..p });
+                visual_changed=true;
+            }
+            if response.drag_stopped() {
+                self.hud_edit_drag_origin=None;
+                save_layout=true;
+            }
+            let selected = self.hud_edit_extension_selected.as_deref() == Some(widget.key.as_str());
+            let outline = if selected { theme::ACCENT }
+                else if response.hovered() { theme::TEXT }
+                else { egui::Color32::from_rgba_premultiplied(170,205,230,150) };
+            painter.rect_stroke(rect.expand(3.0),egui::CornerRadius::ZERO,
+                egui::Stroke::new(if selected {2.0}else{1.0},outline),egui::StrokeKind::Outside);
+            painter.text(rect.left_top()+egui::vec2(0.0,-8.0),egui::Align2::LEFT_BOTTOM,
+                format!("EXT: {}{}", widget.name, if p.visible {""} else {" (hidden)"}),
+                egui::FontId::proportional(11.0),outline);
+        }
+        if let Some(id) = self.hud_edit_extension_selected.clone() {
+            if widgets.iter().any(|w|w.key==id) {
+                let mut p=self.extensions.widget_placement(&id);
+                let old=p;
+                egui::Area::new(egui::Id::new("extension_hud_toolbar"))
+                    .anchor(egui::Align2::CENTER_BOTTOM,egui::vec2(0.0,-15.0))
+                    .order(egui::Order::Foreground)
+                    .show(root.ctx(),|ui| {
+                        egui::Frame::new().fill(egui::Color32::from_black_alpha(225))
+                            .inner_margin(egui::Margin::same(9)).show(ui,|ui|{
+                            ui.horizontal(|ui| {
+                                ui.label(format!("EXT: {id}"));
+                                ui.checkbox(&mut p.visible,"Visible");
+                                ui.label("Scale");
+                                ui.add(egui::Slider::new(&mut p.scale,0.5..=2.0));
+                                if ui.button("RESET").clicked() { p=Default::default(); }
+                            });
+                        });
+                    });
+                let scroll=root.input(|i|i.smooth_scroll_delta.y);
+                if scroll.abs()>f32::EPSILON {
+                    p.scale=(p.scale+scroll*0.0025).clamp(0.5,2.0);
+                }
+                if p!=old {
+                    self.extensions.set_widget_placement(&id,p);
+                    save_layout=true; visual_changed=true;
+                }
+            }
+        }
+        if save_layout { self.extensions.save_widget_layouts(); }
+        if visual_changed {
+            self.render_command(crate::app::RenderCommand::SetExtensionHud(self.extensions.placed_widgets()));
+            self.egui_repaint_requested=true;
         }
     }
 }

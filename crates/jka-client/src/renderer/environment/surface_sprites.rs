@@ -158,12 +158,12 @@ impl SurfaceSpriteEffectRenderer {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<SurfaceSpriteEffectVertex>()
                             as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &SURFACE_SPRITE_EFFECT_ATTRIBUTES,
-                    }],
+                    })],
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -266,12 +266,12 @@ impl SurfaceSpriteEffectRenderer {
                     module: &shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: std::mem::size_of::<SurfaceSpriteEffectVertex>()
                             as wgpu::BufferAddress,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &SURFACE_SPRITE_EFFECT_ATTRIBUTES,
-                    }],
+                    })],
                 },
                 primitive: wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -626,12 +626,13 @@ pub(in crate::renderer) fn append_jka_effect_surface_sprites(
     }
 }
 
-pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     0 => Float32x3,
     1 => Float32x3,
     2 => Float32x2,
     3 => Float32x4,
-    4 => Float32
+    4 => Float32,
+    5 => Float32
 ];
 
 /// The RT receiver variant of the dynamic-model pipeline binds a second vertex

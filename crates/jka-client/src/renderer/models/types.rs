@@ -39,6 +39,11 @@ pub(in crate::renderer) struct Ghoul2GpuDrawUniform {
     /// xyz: `$phongfresnelranges`, packed `((mid-min)*2, mid, (max-mid)*2)`.
     /// w: bit 0 = `$halflambert`.
     pub(in crate::renderer) source_fresnel: [f32; 4],
+    /// Per-player water immersion (8 body-relative bands; independent of rain).
+    pub(in crate::renderer) water_bands0: [f32; 4],
+    pub(in crate::renderer) water_bands1: [f32; 4],
+    /// x: first sampled height in renderer Y-up; w: profile present.
+    pub(in crate::renderer) water_base: [f32; 4],
 }
 
 /// `SkinDraw::source_phong` for one surface: `$phongboost`, `$phongexponent`,
@@ -407,6 +412,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) model_brightness: f32,
     pub(in crate::renderer) entity_legacy_fog: EntityLegacyFog,
     pub(in crate::renderer) entity_weather: EntityWeather,
+    pub(in crate::renderer) entity_water: Arc<std::collections::HashMap<u16, crate::water_wetness::WaterProfile>>,
     /// Last value written to the uniform's `cloud_shadow_sun`; w = 0 when off.
     pub(in crate::renderer) cloud_shadow_sun: [f32; 4],
     /// Whether the colour pipelines were built with ENABLE_LEGACY_FOG.

@@ -676,11 +676,86 @@ fn surface_sprite_value(args: &[String], name: &str) -> Result<f32, String> {
 
 /// Quake shader statements are line-oriented; braces delimit shaders and stages.
 pub fn parse(text: &str) -> Result<BTreeMap<String, Shader>, String> {
+    parse_tokens_strict(&tokenize(text)?)
+}
+
+/// Legacy community shader packs use lines of hashes as section dividers.
+/// These are not shader names, and are deliberately ignored only between
+/// shader definitions (never inside a stage or an authored quoted token).
+fn is_shader_section_divider(token: &str) -> bool {
+    token.len() >= 3 && token.bytes().all(|byte| byte == b'#')
+}
+
+/// Parse independent shader blocks, retaining valid definitions when a different
+/// block contains invalid syntax. A single broken community shader must not
+/// suppress every subsequent shader in the same PK3.
+///
+/// Warnings identify dropped definitions; neither images nor rendering stages
+/// are guessed or synthesized by this recovery path.
+pub fn parse_recovering(
+    text: &str,
+) -> Result<(BTreeMap<String, Shader>, Vec<String>), String> {
     let tokens = tokenize(text)?;
+    let mut shaders = BTreeMap::new();
+    let mut warnings = Vec::new();
+    let mut cursor = 0;
+    while cursor < tokens.len() {
+        if tokens[cursor] == "\n" || is_shader_section_divider(&tokens[cursor]) {
+            cursor += 1;
+            continue;
+        }
+
+        let start = cursor;
+        let name = tokens[cursor].to_ascii_lowercase();
+        cursor += 1;
+        while tokens.get(cursor).is_some_and(|t| t == "\n") {
+            cursor += 1;
+        }
+        if tokens.get(cursor).is_none_or(|t| t != "{") {
+            warnings.push(format!("expected shader block after {name}"));
+            continue;
+        }
+
+        // Locate the complete definition by balanced braces before parsing its
+        // contents. Thus one bad stage cannot discard unrelated shaders.
+        let mut depth = 0usize;
+        while cursor < tokens.len() {
+            match tokens[cursor].as_str() {
+                "{" => depth += 1,
+                "}" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        cursor += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if depth != 0 {
+            warnings.push(format!("unterminated shader {name}"));
+            break;
+        }
+
+        match parse_tokens_strict(&tokens[start..cursor]) {
+            Ok(parsed) => {
+                // The first definition in a file wins, as with strict parsing.
+                for (name, shader) in parsed {
+                    shaders.entry(name).or_insert(shader);
+                }
+            }
+            Err(error) => warnings.push(format!("shader {name}: {error}")),
+        }
+    }
+    Ok((shaders, warnings))
+}
+
+fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, String> {
     let mut cursor = 0;
     let mut result = BTreeMap::new();
     while cursor < tokens.len() {
-        if tokens[cursor] == "\n" {
+        if tokens[cursor] == "\n" || is_shader_section_divider(&tokens[cursor]) {
             cursor += 1;
             continue;
         }
@@ -1873,6 +1948,71 @@ map models/players/test/torso_04
         let fallback = parse("textures/test/flare {\n { alphaGen portal\n }\n }\n");
         // The basic marker remains a valid parsed directive with fallback range.
         assert!(fallback.is_ok());
+    }
+
+    #[test]
+    fn community_section_banners_do_not_hide_authored_grates() {
+        let src = r#"
+###################
+////// Skies //////
+###################
+textures/skies/chocoboranchv3
+{
+    surfaceparm sky
+}
+##########################
+////// Transparency //////
+##########################
+textures/chocobo_v3/chocobov3_grate2
+{
+    cull twosided
+    {
+        map textures/imperial/grate02
+        alphaFunc GE128
+        blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+        depthWrite
+    }
+    {
+        map $lightmap
+        rgbGen identity
+        blendFunc GL_DST_COLOR GL_ZERO
+        depthFunc equal
+    }
+}
+"#;
+        let strict = parse(src).unwrap();
+        let grate = &strict["textures/chocobo_v3/chocobov3_grate2"];
+        assert_eq!(grate.stages.len(), 2);
+        assert_eq!(grate.stages[0].image, "textures/imperial/grate02");
+        assert_eq!(grate.stages[0].alpha_test, "ge128");
+        assert_eq!(grate.stages[1].image, "$lightmap");
+        let (recovered, warnings) = parse_recovering(src).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(recovered.len(), strict.len());
+    }
+
+    #[test]
+    fn malformed_definition_does_not_erase_its_neighbors() {
+        let src = r#"
+textures/test/before { { map textures/test/a } }
+textures/test/bad { { tcMod scale sin 2 } }
+textures/test/after { { map textures/test/b } }
+"#;
+        assert!(parse(src).is_err());
+        let (shaders, warnings) = parse_recovering(src).unwrap();
+        assert!(shaders.contains_key("textures/test/before"));
+        assert!(!shaders.contains_key("textures/test/bad"));
+        assert!(shaders.contains_key("textures/test/after"));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("textures/test/bad"));
+    }
+
+    #[test]
+    fn malformed_top_level_name_does_not_hide_next_definition() {
+        let src = "not_a_shader\ntextures/test/recovered { { map textures/test/a } }\n";
+        let (shaders, warnings) = parse_recovering(src).unwrap();
+        assert!(shaders.contains_key("textures/test/recovered"));
+        assert_eq!(warnings.len(), 1);
     }
 
 }

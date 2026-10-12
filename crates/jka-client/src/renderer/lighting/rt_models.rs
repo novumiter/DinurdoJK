@@ -189,7 +189,7 @@ pub(super) fn declaration<'a>(source: &'a str, anchor: &str) -> Result<&'a str, 
 // past all of them, and on the same location the pipeline's second vertex buffer
 // binds; a new vertex field otherwise silently collides with it.
 const _: () = assert!(
-    RT_RECEIVER_RAW_COLOR_LOCATION == 5,
+    RT_RECEIVER_RAW_COLOR_LOCATION == 6,
     "update the injected VertexIn raw_color location in model_shader_source"
 );
 
@@ -276,12 +276,12 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
     for (from, to, count) in [
         (
             "@location(3) color: vec4<f32>,",
-            "@location(3) color: vec4<f32>,\n    @location(5) raw_color: vec4<f32>,",
+            "@location(3) color: vec4<f32>,\n    @location(6) raw_color: vec4<f32>,",
             1,
         ),
         (
             "@location(3) world_position: vec3<f32>,",
-            "@location(3) world_position: vec3<f32>,\n    @location(4) raw_color: vec4<f32>,",
+            "@location(3) world_position: vec3<f32>,\n    @location(5) raw_color: vec4<f32>,",
             1,
         ),
         (
@@ -290,8 +290,8 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
             1,
         ),
         (
-            "lit_color(input.normal, tex) * input.color, input.normal, input.world_position)",
-            "rt_model_color(input, tex), input.normal, input.world_position)",
+            "lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness)",
+            "rt_model_color(input, tex), input.normal, input.world_position, input.water_wetness)",
             2,
         ),
     ] {
@@ -584,7 +584,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             })
             .unwrap();
         rx.recv().unwrap().unwrap();
-        let data = readback.slice(..).get_mapped_range();
+        let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
         for (i, result) in bytemuck::cast_slice::<u8, [f32; 4]>(&data)
             .iter()
             .enumerate()

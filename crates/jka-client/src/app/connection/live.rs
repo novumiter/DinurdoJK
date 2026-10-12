@@ -114,7 +114,7 @@ impl App {
 
     /// Per-frame network work: CL_PacketEvent for every queued datagram,
     /// CL_SetCGameTime, CL_CreateNewCommands and CL_SendCmd.
-    pub(in crate::app) fn tick_network(&mut self, frame: Duration) {
+    pub(in crate::app) fn tick_network(&mut self, _frame: Duration) {
         self.poll_rcon();
         self.poll_live_download();
         let events = {

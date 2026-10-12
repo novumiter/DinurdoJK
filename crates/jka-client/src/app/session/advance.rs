@@ -163,6 +163,12 @@ impl GameSession {
                 // Server damageEvent/count already exist in our protocol PlayerState.
                 if attacker_damage_transition(&current.player_state, &next.player_state) {
                     self.attacker_damage_seen = true;
+                    if !self.seeking_demo {
+                        crate::extensions::enqueue_damage(
+                            &mut self.extension_events, &mut self.extension_last_damage,
+                            &next.player_state, next.server_time,
+                        );
+                    }
                 }
                 // TaystJK CG_TransitionSnapshot: when client-side movement
                 // prediction does not own the presented playerState, committed
@@ -233,6 +239,12 @@ impl GameSession {
             let before = &prediction.previous_committed;
             if attacker_damage_transition(before, now) {
                 self.attacker_damage_seen = true;
+                if !self.seeking_demo {
+                    crate::extensions::enqueue_damage(
+                        &mut self.extension_events, &mut self.extension_last_damage,
+                        now, target_server_time,
+                    );
+                }
             }
             self.client_game.transition_predicted_player_state(
                 now,
@@ -493,7 +505,7 @@ impl GameSession {
         // surface. Explicit identity also covers first/third-person prediction.
         let actors = Arc::make_mut(&mut self.ocean_actors);
         actors.clear();
-        if self.ocean_interaction_enabled {
+        if self.ocean_interaction_enabled || self.water_wake_mode != 0 {
         if sample.policy.pm_type < 2 && self.presented_player_state.as_ref()
             .is_none_or(|ps| ps.field_i32("m_iVehicleNum").unwrap_or(0) == 0) {
             actors.push(crate::ocean::interaction::ActorSample {

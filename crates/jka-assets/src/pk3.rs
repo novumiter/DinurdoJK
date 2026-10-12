@@ -274,6 +274,29 @@ impl AssetSearchPath {
             && self.shared.find(&normalize_asset_name(name)).is_some()
     }
 
+    /// Read-only trace probe: physical provider indexed for this exact qpath.
+    /// `stock_only` models the first pass of texture loading when asset
+    /// overrides are disabled. The normal pass honors the usual VFS policy.
+    /// Existence in the index does NOT mean reading or decoding will succeed.
+    pub fn indexed_provider_path(&self, name: &str, stock_only: bool) -> Option<&Path> {
+        validate_asset_name(name).ok()?;
+        let entry = self.shared.find(&normalize_asset_name(name))?;
+        let provider = if stock_only {
+            entry.providers().find(|provider| self.provider_is_stock(provider))?
+        } else if !self.allow_asset_overrides {
+            entry
+                .providers()
+                .find(|provider| self.provider_is_stock(provider))
+                .unwrap_or(&entry.first)
+        } else {
+            &entry.first
+        };
+        match provider {
+            Provider::Archive { archive, .. } => Some(self.shared.archive_paths[*archive].as_path()),
+            Provider::Loose { path } => Some(path.as_path()),
+        }
+    }
+
     /// Control whether ordinary VFS reads may shadow qpaths present in the
     /// retail JKA `assets0.pk3` through `assets3.pk3` archives. This does not
     /// affect [`Self::read_from_source`], because an active material explicitly
@@ -948,6 +971,27 @@ mod tests {
         let asset = assets.read("maps/mp/test.bsp", 16).unwrap().unwrap();
         assert_eq!(asset.bytes, b"mod");
         assert!(asset.source.ends_with("custom.pk3"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trace_index_provider_respects_stock_first_and_never_reads() {
+        let root = test_root("trace-provider-priority");
+        let base = root.join("base");
+        let mod_dir = root.join("testmod");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&mod_dir).unwrap();
+        write_package(&base.join("assets0.pk3"), "textures/test/base.tga", b"stock");
+        write_package(&mod_dir.join("override.pk3"), "textures/test/base.tga", b"mod");
+        let mut assets = AssetSearchPath::open_game(&base, Some(&mod_dir)).unwrap();
+        assert!(assets.indexed_provider_path("textures/test/base.tga", false)
+            .unwrap().ends_with("override.pk3"));
+        assert!(assets.indexed_provider_path("textures/test/base.tga", true)
+            .unwrap().ends_with("assets0.pk3"));
+        assets.set_allow_asset_overrides(false);
+        assert!(assets.indexed_provider_path("textures/test/base.tga", false)
+            .unwrap().ends_with("assets0.pk3"));
+        assert!(assets.indexed_provider_path("textures/test/missing.tga", false).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

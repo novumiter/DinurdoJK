@@ -7,7 +7,7 @@ use crate::{
 use jka_movement::{
     angle_to_short, CollisionWorld, JoinMode, MovementPower, PlayerState, PlayerView,
     PmoveContext, SaberMovementInfo, TraceQuery, TraceResult, TraceWorld, UserCmd,
-    BUTTON_WALKING, ENTITY_NONE,
+    BUTTON_WALKING,
 };
 use std::{collections::HashSet, time::Duration};
 use winit::keyboard::KeyCode;
@@ -620,26 +620,6 @@ impl LocalPlayer {
 
     pub fn take_deformation_stamps(&mut self) -> Vec<SurfaceDeformationStamp> {
         self.deformation_shim.take_pending()
-    }
-    pub fn autofocus_distance(&mut self, camera: &Camera, max_distance: f32) -> f32 {
-        // Trace the same static BSP collision used by player movement straight
-        // through the crosshair. This gives DOF a gameplay-friendly autofocus
-        // target without a GPU readback or per-pixel center-depth sample.
-        const CONTENTS_SOLID: i32 = 0x0000_0001;
-        const CONTENTS_TERRAIN: i32 = 0x0000_1000;
-        let max_distance = max_distance.max(64.0);
-        let start = camera.position;
-        let end = start + camera.forward() * max_distance;
-        let result = self.world.trace(TraceQuery {
-            start: jka_position(start.to_array()),
-            mins: [0.0; 3],
-            maxs: [0.0; 3],
-            end: jka_position(end.to_array()),
-            pass_entity: ENTITY_NONE,
-            mask: CONTENTS_SOLID | CONTENTS_TERRAIN,
-        });
-        let hit = glam::Vec3::from_array(render_position(result.end));
-        (hit - start).length().clamp(32.0, max_distance)
     }
 
     fn presentation_alpha(&self) -> f32 {

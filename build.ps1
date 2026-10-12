@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [ValidateSet('Debug', 'Release')][string]$Configuration = 'Release',
     [switch]$Check,
@@ -60,133 +60,85 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
     $env:Path = "$toolchainBin;$env:Path"
 }
 
-# Build-speed modes ---------------------------------------------------------
-# -Fast is intentionally conservative: it enables incremental compilation while
-# explicitly preserving Release's normal 16 codegen units. rustc otherwise changes
-# the default to 256 codegen units whenever incremental compilation is enabled.
-# LTO and every other Release setting are left untouched. The first -Fast build may
-# be slower while the incremental cache is populated; subsequent rebuilds benefit.
-#
-# -Faster is the more aggressive iteration mode. In addition to incremental
-# compilation, it disables LTO and raises codegen-units to favor compile/link speed
-# over final runtime performance. Do not use -Faster for FPS benchmarking.
+# Build modes ---------------------------------------------------------------
+# (no flag)  Cargo 'release' profile: fat LTO, codegen-units=1. Use it for final FPS
+#            numbers and shipping. A one-line change costs ~6.5 min (the LTO step).
+# -Fast      Cargo 'fast' profile: ThinLTO + incremental. ~1 min per change and
+#            about 2% below release FPS; fine for day-to-day FPS checks.
+# -Faster    Cargo 'faster' profile: LTO off + incremental. ~20 s per change but
+#            about 23% below release FPS on CPU-bound spots; never bench with it.
+# Each profile keeps its own target\<profile> cache (see Cargo.toml), so switching
+# modes never recompiles every dependency. -Fast/-Faster copy the exe, .pdb and
+# runtime DLLs into target\release, where the base folder lives, so the game is
+# always run from target\release\DinurdoJK.exe. DinurdoJK.exe.mode records which
+# mode produced the exe currently there.
 if ($Fast -and $Faster) {
     throw 'Use either -Fast or -Faster, not both.'
 }
-
-$existingIncremental = $env:CARGO_PROFILE_RELEASE_INCREMENTAL
-$existingLto = $env:CARGO_PROFILE_RELEASE_LTO
-$existingCodegenUnits = $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS
-
+if (($Fast -or $Faster) -and $Configuration -eq 'Debug') {
+    throw '-Fast and -Faster are optimized profiles; omit -Configuration Debug.'
+}
 if ($Fast) {
-    $env:CARGO_PROFILE_RELEASE_INCREMENTAL = 'true'
-    # Important: incremental compilation changes rustc's default codegen-units
-    # from 16 to 256 unless we pin it. Keep normal Release partitioning here.
-    $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '16'
+    $buildMode = 'fast'
+    $profileArguments = @('--profile', 'fast')
 } elseif ($Faster) {
-    $env:CARGO_PROFILE_RELEASE_INCREMENTAL = 'true'
-    $env:CARGO_PROFILE_RELEASE_LTO = 'off'
-    $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = '256'
+    $buildMode = 'faster'
+    $profileArguments = @('--profile', 'faster')
+} elseif ($Configuration -eq 'Release') {
+    $buildMode = 'release'
+    $profileArguments = @('--release')
+} else {
+    $buildMode = 'debug'
+    $profileArguments = @()
+}
+$buildDirectory = Join-Path $PSScriptRoot "target\$buildMode"
+$runtimeDirectory = Join-Path $PSScriptRoot "target\$($Configuration.ToLowerInvariant())"
+$executable = Join-Path $runtimeDirectory 'DinurdoJK.exe'
+$previousExecutable = "$executable.prev"
+
+# Restore upstream SMAA 0.21 with WGPU default backends disabled.
+. (Join-Path $PSScriptRoot 'scripts\ensure-smaa-vendor.ps1')
+
+# Move the live executable aside (Windows allows renaming an exe that is running)
+# so a game that is already open keeps using the old image while the new
+# DinurdoJK.exe is written beside it.
+function Preserve-RunningExecutable {
+    if (Test-Path -LiteralPath $executable) {
+        Move-Item -LiteralPath $executable -Destination $previousExecutable -Force
+        Write-Host "Preserved current executable: $previousExecutable"
+    }
 }
 
-# WGPU backend hygiene -------------------------------------------------------
-# DinurdoJK only supports Vulkan and DX12. The upstream smaa 0.20.0 crate
-# requests wgpu with its default features, which otherwise pulls the GLES/OpenGL
-# backend (glow/WGL/opengl32.dll) into the executable even though we never select it.
-# Keep a tiny repo-local vendor of exactly smaa 0.20.0 and patch only that
-# dependency edge to `default-features = false`. Its required `glsl` shader-input
-# feature stays enabled; GLSL input is translated by Naga and is not an OpenGL
-# rendering backend.
-function Set-SmaaWgpuDefaultsOff([string]$ManifestPath) {
-    if (-not (Test-Path -LiteralPath $ManifestPath)) { return }
-
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    $text = [System.IO.File]::ReadAllText($ManifestPath)
-
-    # crates.io's normalized Cargo.toml uses a [dependencies.wgpu] table.
-    $sectionPattern = '(?ms)^\[dependencies\.wgpu\]\r?\n.*?(?=^\[|\z)'
-    $match = [regex]::Match($text, $sectionPattern)
-    if ($match.Success) {
-        $section = $match.Value
-        if ($section -notmatch '(?m)^default-features\s*=') {
-            $newline = if ($section.Contains("`r`n")) { "`r`n" } else { "`n" }
-            $section = $section.TrimEnd("`r", "`n") + $newline + 'default-features = false' + $newline
-            $text = $text.Substring(0, $match.Index) + $section + $text.Substring($match.Index + $match.Length)
-            [System.IO.File]::WriteAllText($ManifestPath, $text, $utf8NoBom)
-        }
+# Copy a build output into the runtime folder unless an identical file is already
+# there. A file the running game holds open (phonon.dll, or the .pdb under a
+# debugger) is reported and skipped instead of failing the build.
+function Sync-RuntimeFile([string]$Source) {
+    if (-not (Test-Path -LiteralPath $Source)) { return }
+    $destination = Join-Path $runtimeDirectory (Split-Path -Leaf $Source)
+    if ((Test-Path -LiteralPath $destination) -and
+        (Get-FileHash -LiteralPath $Source).Hash -eq (Get-FileHash -LiteralPath $destination).Hash) {
         return
     }
-
-    # Cargo.toml.orig uses the compact inline dependency form in upstream smaa.
-    $inlinePattern = '(?m)^(\s*wgpu\s*=\s*\{)([^}\r\n]*)(\}\s*)$'
-    $match = [regex]::Match($text, $inlinePattern)
-    if ($match.Success) {
-        if ($match.Groups[2].Value -notmatch 'default-features\s*=') {
-            $replacement = $match.Groups[1].Value + ' default-features = false,' + $match.Groups[2].Value + $match.Groups[3].Value
-            $text = $text.Substring(0, $match.Index) + $replacement + $text.Substring($match.Index + $match.Length)
-            [System.IO.File]::WriteAllText($ManifestPath, $text, $utf8NoBom)
-        }
-        return
-    }
-
-    throw "Could not find smaa's wgpu dependency in $ManifestPath"
-}
-
-function Ensure-PatchedSmaaVendor {
-    $vendorRoot = Join-Path $PSScriptRoot 'vendor'
-    $vendorSmaa = Join-Path $vendorRoot 'smaa-0.20.0'
-    $vendorManifest = Join-Path $vendorSmaa 'Cargo.toml'
-
-    if (-not (Test-Path -LiteralPath $vendorManifest)) {
-        New-Item -ItemType Directory -Force -Path $vendorRoot | Out-Null
-
-        # Prefer the already-downloaded Cargo registry copy so normal builds stay
-        # completely offline. This will exist on machines that have built the
-        # current project at least once.
-        $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-        $registrySrc = Join-Path $cargoHome 'registry\src'
-        $cachedSmaa = $null
-        if (Test-Path -LiteralPath $registrySrc) {
-            $cachedSmaa = Get-ChildItem -Path $registrySrc -Directory -ErrorAction SilentlyContinue |
-                ForEach-Object { Join-Path $_.FullName 'smaa-0.20.0' } |
-                Where-Object { Test-Path -LiteralPath (Join-Path $_ 'Cargo.toml') } |
-                Select-Object -First 1
-        }
-
-        if ($cachedSmaa) {
-            Copy-Item -LiteralPath $cachedSmaa -Destination $vendorSmaa -Recurse -Force
-        } else {
-            # Fresh machine: bootstrap the exact locked crate without asking Cargo
-            # to parse the workspace first (the workspace now points at this path).
-            $crateUrl = 'https://static.crates.io/crates/smaa/smaa-0.20.0.crate'
-            $crateFile = Join-Path $env:TEMP 'smaa-0.20.0.crate'
-            Write-Host 'Bootstrapping patched smaa 0.20.0 vendor...'
-            Invoke-WebRequest -UseBasicParsing -Uri $crateUrl -OutFile $crateFile
-            & tar.exe -xzf $crateFile -C $vendorRoot
-            if ($LASTEXITCODE -ne 0) { throw 'Failed to extract smaa-0.20.0.crate.' }
-            Remove-Item -LiteralPath $crateFile -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    Set-SmaaWgpuDefaultsOff (Join-Path $vendorSmaa 'Cargo.toml')
-    Set-SmaaWgpuDefaultsOff (Join-Path $vendorSmaa 'Cargo.toml.orig')
-
-    $patched = [System.IO.File]::ReadAllText((Join-Path $vendorSmaa 'Cargo.toml'))
-    if ($patched -notmatch '(?ms)^\[dependencies\.wgpu\].*?^default-features\s*=\s*false') {
-        throw 'smaa vendor patch did not disable wgpu default features.'
+    try {
+        Copy-Item -LiteralPath $Source -Destination $destination -Force -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not update $destination (in use?): $($_.Exception.Message)"
     }
 }
-
-Ensure-PatchedSmaaVendor
 
 Push-Location $PSScriptRoot
 try {
-    if ($Fetch) {
+    Ensure-PatchedSmaaVendor -WorkspaceRoot $PSScriptRoot
+    # Refresh the dependency graph once when upgrading an older checkout.
+    $lockfile = Join-Path $PSScriptRoot 'Cargo.lock'
+    $lockText = if (Test-Path -LiteralPath $lockfile) { [System.IO.File]::ReadAllText($lockfile) } else { '' }
+    $staleGraphicsLock = (-not $lockText) -or
+        ($lockText -match '(?m)^name = "wgpu"\r?\nversion = "29\.') -or
+        ($lockText -match '(?m)^name = "smaa"\r?\nversion = "0\.20\.0"')
+    if ($Fetch -or $staleGraphicsLock) {
         & $cargoPath fetch
         if ($LASTEXITCODE -ne 0) { throw 'Dependency download failed.' }
     }
-    $profileArguments = @()
-    if ($Configuration -eq 'Release') { $profileArguments += '--release' }
     if ($Check) {
         & $cargoPath fmt --all -- --check
         if ($LASTEXITCODE -ne 0) { throw 'Formatting check failed.' }
@@ -195,30 +147,50 @@ try {
         & $cargoPath clippy --workspace --all-targets --offline --locked @profileArguments -- -D warnings
         if ($LASTEXITCODE -ne 0) { throw 'Clippy failed.' }
     }
+    # Release/Debug link straight into the runtime folder, so make room first.
+    # -Fast/-Faster build elsewhere and replace the exe only after a successful build.
+    $buildsInPlace = $buildDirectory -eq $runtimeDirectory
+    if ($buildsInPlace) { Preserve-RunningExecutable }
     $cargoArguments = @('build', '--workspace', '--offline', '--locked') + $profileArguments
     & $cargoPath @cargoArguments
-    if ($LASTEXITCODE -ne 0) { throw 'Build failed. Check the Rust and MSVC toolchain messages above.' }
-    $executable = Join-Path $PSScriptRoot "target\$($Configuration.ToLowerInvariant())\DinurdoJK.exe"
+    if ($LASTEXITCODE -ne 0) {
+        if ($buildsInPlace -and -not (Test-Path -LiteralPath $executable) -and (Test-Path -LiteralPath $previousExecutable)) {
+            Move-Item -LiteralPath $previousExecutable -Destination $executable
+            Write-Host 'Build failed; restored the previous executable.'
+        }
+        throw 'Build failed. Check the Rust and MSVC toolchain messages above.'
+    }
+    if (-not $buildsInPlace) {
+        New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
+        $builtExecutable = Join-Path $buildDirectory 'DinurdoJK.exe'
+        # An unchanged rebuild must not overwrite .prev with a copy of the same exe.
+        $unchanged = (Test-Path -LiteralPath $executable) -and
+            (Get-FileHash -LiteralPath $builtExecutable).Hash -eq (Get-FileHash -LiteralPath $executable).Hash
+        if (-not $unchanged) {
+            Preserve-RunningExecutable
+            Copy-Item -LiteralPath $builtExecutable -Destination $executable -Force
+        }
+        Sync-RuntimeFile (Join-Path $buildDirectory 'DinurdoJK.pdb')
+        Get-ChildItem -LiteralPath $buildDirectory -Filter '*.dll' | ForEach-Object { Sync-RuntimeFile $_.FullName }
+    }
+    Set-Content -LiteralPath "$executable.mode" -Value "$buildMode $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Encoding ascii
     $rainGlassPackagePath = Join-Path $PSScriptRoot 'assets\dinurdo-assets.pk3'
     if (-not (Test-Path -LiteralPath $rainGlassPackagePath)) {
         throw "RainyGlass package is missing: $rainGlassPackagePath"
     }
-    $runtimeBase = Join-Path (Split-Path -Parent $executable) 'base'
+    $runtimeBase = Join-Path $runtimeDirectory 'base'
     New-Item -ItemType Directory -Force -Path $runtimeBase | Out-Null
     Copy-Item -LiteralPath $rainGlassPackagePath -Destination (Join-Path $runtimeBase 'dinurdo-assets.pk3') -Force
-    Write-Host "`nBuilt: $executable"
-    if ($Fast) { Write-Host '(-Fast build: incremental enabled; Release codegen-units kept at 16; LTO unchanged)' }
-    if ($Faster) { Write-Host '(-Faster build: incremental enabled, LTO off, codegen-units=256; quicker builds but not for FPS benchmarking)' }
+    Write-Host "`nBuilt ($buildMode): $executable"
+    if ($Fast) { Write-Host '(-Fast: ThinLTO + incremental; about 2% below a full release build in FPS)' }
+    if ($Faster) { Write-Host '(-Faster: LTO off; quickest rebuilds but about 23% below release FPS - do not benchmark with it)' }
     Write-Host 'Place a GameData-style base folder beside the executable. Assets may be loose files or live in any .pk3.'
     Write-Host 'Launch the client for mp/ffa3. Choose Join Game or Join Spectate; Escape opens the menu.'
     Write-Host 'WASD moves; Space jumps; hold Space for Force jump; Ctrl crouches/rolls; Shift walks.'
     Write-Host 'Offline OpenJK movement with compiled BSP collision. Multiplayer connections are not implemented yet.'
-    Write-Host 'jka-probe.exe remains available for protocol and map diagnostics.'
+    Write-Host "jka-probe.exe remains available in $buildDirectory for protocol and map diagnostics."
 } finally {
     Pop-Location
     $env:CARGO_ENCODED_RUSTFLAGS = $existingEncoded
     $env:Path = $existingPath
-    $env:CARGO_PROFILE_RELEASE_INCREMENTAL = $existingIncremental
-    $env:CARGO_PROFILE_RELEASE_LTO = $existingLto
-    $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = $existingCodegenUnits
 }

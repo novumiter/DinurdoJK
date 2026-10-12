@@ -43,6 +43,7 @@ fn direction_at(wind: CloudWind, time: f64) -> [f64; 3] {
     [angle.cos(), 0.0, angle.sin()]
 }
 
+#[cfg(test)]
 fn speed_at(wind: CloudWind, time: f64) -> f64 {
     let gust_wave = (time * 0.83).sin() * 0.65 + (time * 1.71 + 1.9).sin() * 0.35;
     f64::from(wind.speed).max(0.0) * (1.0 + f64::from(wind.gust) * gust_wave).max(0.0)

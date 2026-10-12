@@ -602,7 +602,7 @@ fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer) -
         })
         .unwrap();
     receive.recv().unwrap().unwrap();
-    let values = bytemuck::cast_slice::<u8, f32>(&read.slice(..).get_mapped_range()).to_vec();
+    let values = bytemuck::cast_slice::<u8, f32>(&read.slice(..).get_mapped_range().expect("GPU readback range")).to_vec();
     read.unmap();
     values
 }

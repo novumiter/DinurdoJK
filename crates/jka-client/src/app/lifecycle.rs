@@ -161,10 +161,19 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.publish_ui();
             }
+            UserEvent::HdrOutputChanged { status, active } => {
+                self.hdr_output_status = status;
+                self.hdr_output_active = active;
+                self.publish_ui();
+            }
             UserEvent::RendererReady {
                 supported_msaa,
                 wireframe_supported,
+                hdr_output_status,
+                hdr_output_active,
             } => {
+                self.hdr_output_status = hdr_output_status;
+                self.hdr_output_active = hdr_output_active;
                 self.supported_msaa = supported_msaa;
                 self.wireframe_supported = wireframe_supported;
                 if !self.supported_msaa.contains(&self.video.msaa_samples) {
@@ -752,6 +761,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.applied_ocean = self.latest_prepare_options.ocean;
                 self.forget_trace();
                 self.entity_graph = map.entity_graph.clone();
+                self.entity_marker_cache = None;
                 if map.map_file_stats.is_some() {
                     let loose_map = map.source.extension().is_some_and(|extension| {
                         extension.to_string_lossy().eq_ignore_ascii_case("map")
@@ -1082,6 +1092,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // choice before the upload so the new world is built with it.
                 self.sync_world_flares();
                 self.render_command(RenderCommand::SetGrassEnabled(self.video.grass));
+                // Apply cg_waterwake gate on every map load / renderer restart,
+                // including archived settings loaded before session creation.
+                self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
                 self.render_command(RenderCommand::SetOceanEnabled(self.video.ocean));
                 self.render_command(RenderCommand::LoadMap {
                     request_id,
@@ -2472,6 +2485,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.tick_companion_ui();
         if self.quit_requested {
             self.flush_config();
+            if !self.background_jobs.flush_io(Duration::from_millis(500)) {
+                eprintln!("Config/background I/O did not finish before quit");
+            }
             event_loop.exit();
             return;
         }
@@ -2490,6 +2506,9 @@ impl App {
     pub(in crate::app) fn exit_process(&mut self) -> ! {
         self.restore_gamma_before_exit();
         self.flush_config();
+        if !self.background_jobs.flush_io(Duration::from_millis(500)) {
+            eprintln!("Background I/O did not finish before fast exit");
+        }
         // Chat logging is the only buffered durable gameplay output. Give its
         // dedicated writer a short bounded window to append the footer/flush
         // before the Windows fast-exit path terminates all worker threads.

@@ -251,6 +251,7 @@ impl App {
         }
 
         self.egui_film(ui);
+        self.egui_post_color_looks(ui);
     }
 
     pub(in crate::app::egui_settings) fn egui_film(&mut self, ui: &mut egui::Ui) {

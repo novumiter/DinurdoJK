@@ -188,6 +188,11 @@ impl App {
                 .and_then(|playback| playback.current_snapshot.as_ref())
                 .map(|snapshot| snapshot.area_mask),
             dynamic_models,
+            player_water: if isolated_preview {
+                Arc::new(Default::default())
+            } else {
+                Arc::new(self.water_wetness.profiles(Instant::now()))
+            },
             spectator_highlights,
             transient_lights: if self.profile_preview_active {
                 Arc::new(Vec::new())

@@ -933,7 +933,7 @@ impl App {
             },
         });
         let path = destination.clone();
-        let spawned = std::thread::Builder::new().name("jka-hitch-write".into()).spawn(move || {
+        let queued = self.background_jobs.io(move || {
             let result = std::fs::write(&path, snapshot.to_csv()).and_then(|()| {
                 let json = serde_json::to_vec_pretty(&metadata).map_err(std::io::Error::other)?;
                 std::fs::write(path.with_extension("json"), json)
@@ -948,9 +948,9 @@ impl App {
                 path,
             );
         });
-        match spawned {
-            Ok(_) => self.push_console_line(format!("^2hitchmark: writing {frames} frame(s) to {}", destination.display())),
-            Err(error) => self.push_console_line(format!("^1hitchmark: couldn't start writer: {error}")),
+        match queued {
+            Ok(()) => self.push_console_line(format!("^2hitchmark: writing {frames} frame(s) to {}", destination.display())),
+            Err(error) => self.push_console_line(format!("^1hitchmark: couldn't queue writer: {error}")),
         }
     }
 }

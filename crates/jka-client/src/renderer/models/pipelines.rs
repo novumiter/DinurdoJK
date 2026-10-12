@@ -633,11 +633,11 @@ pub(in crate::renderer) fn create_dynamic_wireframe_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -688,11 +688,11 @@ pub(in crate::renderer) fn create_ghoul2_wireframe_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Ghoul2GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &GHOUL2_GPU_VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -867,6 +867,7 @@ pub(in crate::renderer) fn project_blob_shadow_mark(
                 ],
                 color: [shade, shade, shade, 1.0],
                 depth_hack: 0.0,
+                water_wetness: 0.0,
             });
         }
         // The mark index keeps the world mesh's OpenJK (clockwise) winding for BSP
@@ -921,11 +922,11 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<FxGpuSpriteInstance>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &FX_GPU_SPRITE_INSTANCE_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1001,11 +1002,11 @@ pub(in crate::renderer) fn create_fx_sprite_wireframe_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<FxGpuSpriteInstance>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Instance,
                 attributes: &FX_GPU_SPRITE_INSTANCE_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1098,16 +1099,16 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
     force_fog_black: bool,
 ) -> wgpu::RenderPipeline {
     let vertex_layouts = [
-        wgpu::VertexBufferLayout {
+        Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
-        },
-        wgpu::VertexBufferLayout {
+        }),
+        Some(wgpu::VertexBufferLayout {
             array_stride: 16,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &RT_RECEIVER_RAW_COLOR_ATTRIBUTES,
-        },
+        }),
     ];
     let blend = match alpha_mode {
         DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
@@ -1398,11 +1399,11 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
                 )],
                 ..Default::default()
             },
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Ghoul2GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &GHOUL2_GPU_VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1482,11 +1483,11 @@ pub(in crate::renderer) fn create_world_wireframe_pipeline(
                 constants: &shader_constants,
                 ..Default::default()
             },
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1540,11 +1541,11 @@ pub(in crate::renderer) fn create_fast_world_wireframe_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1680,9 +1681,9 @@ pub(in crate::renderer) fn create_world_pipeline(
         attributes: &LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES,
     };
     let vertex_buffers = if legacy_dlight_vertex_stream {
-        vec![base_vertex_layout, legacy_surface_id_layout]
+        vec![Some(base_vertex_layout), Some(legacy_surface_id_layout)]
     } else {
-        vec![base_vertex_layout]
+        vec![Some(base_vertex_layout)]
     };
     let fragment_entry_point = if legacy_dlight_pass {
         "fs_legacy_dlight_pass"
@@ -1690,6 +1691,9 @@ pub(in crate::renderer) fn create_world_pipeline(
         "fs_legacy_fog_pass"
     } else if key.class == DrawClass::Sky {
         "fs_sky"
+    } else if key.legacy_srgb_three_stage {
+        // Separate WGSL entry: conversion math cannot leak into any unrelated PSO.
+        "fs_legacy_srgb_three_stage"
     } else if legacy_fog {
         "fs_main_legacy_fog"
     } else {

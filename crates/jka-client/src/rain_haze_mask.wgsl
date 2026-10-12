@@ -47,7 +47,7 @@ fn godot_grass_wind_strength(world: vec3<f32>) -> f32 {
     return strength * strength;
 }
 
-fn rain_haze_point_exposure(world: vec3<f32>) -> f32 {
+fn precipitation_point_exposure(world: vec3<f32>) -> f32 {
     // The rain blocker is deliberately a top-down field: vertical walls should
     // not stop vertically falling rain. For haze, sample AIR with this field
     // rather than trying to classify the visible surface itself.
@@ -76,7 +76,7 @@ fn rain_haze_point_exposure(world: vec3<f32>) -> f32 {
     return 1.0 - shelter;
 }
 
-fn rain_haze_exposure_along_ray(ray: vec3<f32>, depth: f32) -> f32 {
+fn precipitation_exposure_along_ray(ray: vec3<f32>, depth: f32) -> f32 {
     // Haze is a property of the air between the eye and the surface, not of the
     // brush hit by the depth buffer. Four longitudinal samples cost less than
     // the old endpoint + four-neighbour test and avoid vertical-wall ambiguity.
@@ -94,7 +94,7 @@ fn rain_haze_exposure_along_ray(ray: vec3<f32>, depth: f32) -> f32 {
 
     var exposure = 0.0;
     for (var i = 0u; i < 4u; i = i + 1u) {
-        exposure = exposure + rain_haze_point_exposure(camera + ray * sample_depths[i]);
+        exposure = exposure + precipitation_point_exposure(camera + ray * sample_depths[i]);
     }
     return exposure * 0.25;
 }
@@ -111,7 +111,10 @@ fn cs_main(
     // invocations reach the barrier before tail lanes return.
     if (local_index == 0u) {
         shared_gust = 0.5;
-        if (settings.rain.x > 0.5 && mask_dims.x > 0u && mask_dims.y > 0u) {
+        // Gusts are shared by rain and snow. A snow-only frame must not
+        // default to full exposure just because the rain toggle is off.
+        let windy_haze = settings.rain.x > 0.5 || settings.snow_haze.x > 0.001;
+        if (windy_haze && mask_dims.x > 0u && mask_dims.y > 0u) {
             let centre_gid = min(
                 workgroup_id.xy * vec2<u32>(8u, 8u) + vec2<u32>(4u, 4u),
                 mask_dims - vec2<u32>(1u, 1u)
@@ -141,7 +144,10 @@ fn cs_main(
         return;
     }
     var exposure = 1.0;
-    if (settings.rain.x > 0.5) {
+    // Acid rain also consumes this mask. Unlike the gust field, outdoor
+    // exposure is needed for every kind of shelter-sensitive precipitation.
+    if (settings.rain.x > 0.5 || settings.snow_haze.x > 0.001
+        || settings.legacy_weather.z > 0.001) {
         let uv = (vec2<f32>(f32(gid.x), f32(gid.y)) + vec2<f32>(0.5))
             / vec2<f32>(f32(mask_dims.x), f32(mask_dims.y));
         let depth_dims = textureDimensions(linear_depth_texture, 0);
@@ -155,7 +161,7 @@ fn cs_main(
         );
         let depth = textureLoad(linear_depth_texture, pixel, 0).x;
         if (valid_depth(depth)) {
-            exposure = rain_haze_exposure_along_ray(world_ray(uv), depth);
+            exposure = precipitation_exposure_along_ray(world_ray(uv), depth);
         }
     }
     // R = shelter/exposure, G = coarse shared GodotGrass gust strength. Packing

@@ -3,23 +3,14 @@ use crate::app::egui_menu::{
     asset_size_label, filesystem_refresh_icon, theme, App, AssetFilter, AssetKind, BTreeMap,
 };
 
-impl App {
-    pub(in crate::app::egui_menu) fn egui_asset_viewer_page(&mut self, ui: &mut egui::Ui) {
-        self.ensure_asset_viewer_catalog();
-        if self.ui_catalog.pending.asset_viewer {
-            theme::label(
-                ui,
-                theme::plain("Scanning assets...", 12.0, theme::TEXT_FAINT),
-            );
-            return;
-        }
-        if let Some(error) = &self.asset_viewer_catalog_error {
-            theme::banner(ui, &format!("Asset scan failed: {error}"), theme::WARNING);
-            return;
-        }
-
-        let mut shader_files = self
-            .asset_viewer_entries
+fn build_asset_view_cache(
+    entries: &[crate::app::frontend::AssetEntry],
+    filter: AssetFilter,
+    search_text: &str,
+    folder_text: &str,
+    shader_file_text: &str,
+) -> crate::app::frontend::AssetViewCache {
+        let mut shader_files = entries
             .iter()
             .filter(|entry| entry.kind == AssetKind::Shader)
             .map(|entry| entry.qpath.clone())
@@ -27,14 +18,13 @@ impl App {
         shader_files.sort();
         shader_files.dedup();
 
-        let search = self.asset_viewer_search.trim().to_ascii_lowercase();
-        let folder = self
-            .asset_viewer_folder
+        let search = search_text.trim().to_ascii_lowercase();
+        let folder = folder_text
             .trim()
             .replace('\\', "/")
             .trim_matches('/')
             .to_ascii_lowercase();
-        let shader_file = self.asset_viewer_shader_file.as_str();
+        let shader_file = shader_file_text;
 
         // Build the folder picker from the catalog we already scanned. Every
         // ancestor is included, so typing `ships` can offer both `effects/ships`
@@ -42,9 +32,9 @@ impl App {
         // Counts are for the current asset type / shader-file scope and include
         // descendants, which makes the suggestions useful rather than decorative.
         let mut folder_counts = BTreeMap::<String, usize>::new();
-        for entry in self.asset_viewer_entries.iter().filter(|entry| {
-            self.asset_viewer_filter.matches(entry.kind)
-                && (self.asset_viewer_filter != AssetFilter::Shader
+        for entry in entries.iter().filter(|entry| {
+            filter.matches(entry.kind)
+                && (filter != AssetFilter::Shader
                     || shader_file.is_empty()
                     || entry.qpath == shader_file)
         }) {
@@ -67,11 +57,10 @@ impl App {
                 .keys()
                 .any(|candidate| candidate.eq_ignore_ascii_case(&folder));
 
-        let filtered = self
-            .asset_viewer_entries
+        let filtered = entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| self.asset_viewer_filter.matches(entry.kind))
+            .filter(|(_, entry)| filter.matches(entry.kind))
             .filter(|(_, entry)| {
                 search.is_empty()
                     || entry.qpath.to_ascii_lowercase().contains(&search)
@@ -100,13 +89,60 @@ impl App {
                 }
             })
             .filter(|(_, entry)| {
-                self.asset_viewer_filter != AssetFilter::Shader
+                filter != AssetFilter::Shader
                     || shader_file.is_empty()
                     || entry.qpath == shader_file
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
 
+    crate::app::frontend::AssetViewCache {
+        filter,
+        search: search_text.to_owned(),
+        folder: folder_text.to_owned(),
+        shader_file: shader_file_text.to_owned(),
+        shader_files,
+        folder_counts,
+        filtered,
+    }
+}
+
+impl App {
+    pub(in crate::app::egui_menu) fn egui_asset_viewer_page(&mut self, ui: &mut egui::Ui) {
+        self.ensure_asset_viewer_catalog();
+        if self.ui_catalog.pending.asset_viewer {
+            theme::label(
+                ui,
+                theme::plain("Scanning assets...", 12.0, theme::TEXT_FAINT),
+            );
+            return;
+        }
+        if let Some(error) = &self.asset_viewer_catalog_error {
+            theme::banner(ui, &format!("Asset scan failed: {error}"), theme::WARNING);
+            return;
+        }
+
+        let cache_key_changed = self.asset_viewer_cache.as_ref().is_none_or(|cache| {
+            cache.filter != self.asset_viewer_filter
+                || cache.search != self.asset_viewer_search
+                || cache.folder != self.asset_viewer_folder
+                || cache.shader_file != self.asset_viewer_shader_file
+        });
+        if cache_key_changed {
+            self.asset_viewer_cache = Some(std::sync::Arc::new(build_asset_view_cache(
+                &self.asset_viewer_entries,
+                self.asset_viewer_filter,
+                &self.asset_viewer_search,
+                &self.asset_viewer_folder,
+                &self.asset_viewer_shader_file,
+            )));
+        }
+        // Arc clone avoids borrowing self's cache across mutable egui widgets.
+        // It does not clone the potentially large index and folder maps.
+        let cache = self.asset_viewer_cache.as_ref().unwrap().clone();
+        let shader_files = &cache.shader_files;
+        let folder_counts = &cache.folder_counts;
+        let filtered = &cache.filtered;
         if self.asset_viewer_selected.as_ref().is_some_and(|selected| {
             !filtered
                 .iter()
@@ -392,7 +428,7 @@ impl App {
                                             String::new(),
                                             "All shader files",
                                         );
-                                        for qpath in &shader_files {
+                                        for qpath in shader_files {
                                             let label = qpath.rsplit('/').next().unwrap_or(qpath);
                                             ui.selectable_value(
                                                 &mut self.asset_viewer_shader_file,
@@ -485,7 +521,7 @@ impl App {
                                 .max_height(list_height)
                                 .show(ui, |ui| {
                                     ui.set_min_width(ui.available_width());
-                                    for &index in &filtered {
+                                    for &index in filtered {
                                         let entry = self.asset_viewer_entries[index].clone();
                                         let selected = self.asset_viewer_selected.as_deref()
                                             == Some(entry.id.as_str());

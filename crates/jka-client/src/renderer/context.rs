@@ -6,7 +6,7 @@ use crate::renderer::{
 
 impl Renderer {
     #[inline]
-    fn note_surface_configured(&mut self, reason: &'static str) {
+    pub(in crate::renderer) fn note_surface_configured(&mut self, reason: &'static str) {
         self.surface_config_generation = self.surface_config_generation.saturating_add(1);
         self.surface_config_reason = reason;
         self.surface_configured_at = std::time::Instant::now();
@@ -20,8 +20,9 @@ impl Renderer {
         }
         self.config.width = size.width;
         self.config.height = size.height;
-        self.surface.configure(&self.device, &self.config);
+        self.configure_surface();
         self.note_surface_configured("resize");
+        self.resize_hdr_output();
         self.targets = create_targets(
             &self.device,
             size.width,
@@ -75,8 +76,9 @@ impl Renderer {
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }
-        self.surface.configure(&self.device, &self.config);
+        self.configure_surface();
         self.note_surface_configured(reason);
+        self.resize_hdr_output();
         self.targets = create_targets(
             &self.device,
             self.config.width,
@@ -135,7 +137,7 @@ impl Renderer {
         if self.size.width == 0 || self.size.height == 0 {
             return;
         }
-        self.surface.configure(&self.device, &self.config);
+        self.configure_surface();
         self.note_surface_configured(reason);
     }
 

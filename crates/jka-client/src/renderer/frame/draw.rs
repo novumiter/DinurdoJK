@@ -500,10 +500,7 @@ impl Renderer {
         } else {
             None
         };
-        if self.weather.fog.volumetric_effective()
-            || (self.weather.rain.enabled && !self.rain_uses_2d_haze())
-            || self.weather.snow.enabled
-        {
+        if self.weather_froxels_needed() {
             self.write_froxel_uniform(inv_view_proj, camera_pos_time, shadow_matrices.as_ref());
         }
 
@@ -915,9 +912,8 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
         };
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
 
         // One-shot validation capture for the first diagnostic frame. The first
@@ -1252,6 +1248,12 @@ impl Renderer {
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
+                        // A depthFunc equal stage is only an overlay on pixels admitted
+                        // by an earlier stage. Rendering it as an independent caster
+                        // would fill the holes of an alpha-tested first stage.
+                        if batch.source.pipeline.depth_equal {
+                            continue;
+                        }
                         if self.tinted_glass_enabled && crate::renderer::lighting::glass_transmission::classify_glass(
                             &batch.source,
                             batch.source.texture.and_then(|index| world.glass_texture_names.get(index)).map(String::as_str),
@@ -1453,6 +1455,14 @@ impl Renderer {
                     if ocean_suppresses_batch(render_ocean, batch) {
                         continue;
                     }
+                    // The linear-depth target must record only stages that
+                    // actually establish scene depth. An opaque lightmap stage
+                    // using depthFunc equal is NOT an independent depth writer:
+                    // replaying it here would turn the transparent holes from
+                    // an earlier GE128 stage into a solid fog receiver.
+                    if !batch.source.pipeline.depth_write || batch.source.pipeline.depth_equal {
+                        continue;
+                    }
                     if batch.source.pipeline.class != DrawClass::Sky
                         && !aabb_intersects_clip_frustum(
                             batch.bounds_min,
@@ -1581,6 +1591,12 @@ impl Renderer {
                             continue;
                         }
                         if ocean_suppresses_batch(render_ocean, batch) {
+                            continue;
+                        }
+                        // Same depth-seeding rule as the linear-depth pass:
+                        // sibling blend/depth-equal stages must not independently
+                        // occlude geometry through an earlier alpha mask.
+                        if !batch.source.pipeline.depth_write || batch.source.pipeline.depth_equal {
                             continue;
                         }
                         if !aabb_intersects_clip_frustum(
@@ -1731,10 +1747,7 @@ impl Renderer {
 
         self.encode_rt_sun_shadow(&mut encoder);
 
-        if self.weather.fog.volumetric_effective()
-            || (self.weather.rain.enabled && !self.rain_uses_2d_haze())
-            || self.weather.snow.enabled
-        {
+        if self.weather_froxels_needed() {
             if let Some(world) = &self.world {
                 if let Some(bind_group) = &world.froxel_bind_group {
                     self.gpu_profiler
@@ -2300,6 +2313,11 @@ impl Renderer {
         } else {
             self.config.format
         };
+        // Evaluate before SMAA mutably borrows self.smaa_target for the rest of
+        // the frame. Calling an &self helper after start_frame() triggers E0502.
+        let precipitation_haze_mask_active = plan.use_post
+            && !plan.gamma_only_post
+            && self.precipitation_haze_mask_needed();
         let mut smaa_frame = if self.smaa_enabled {
             self.smaa_target
                 .as_mut()
@@ -2351,6 +2369,11 @@ impl Renderer {
             let active = active_batch_selection(world, self.pvs_mode);
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
+            if capture_api_calls {
+                info.perf_world_material_stages =
+                    vec![crate::renderer::api::WorldStagePerf::default(); world.material_debug.entries.len()];
+                info.perf_world_cpu_visibility = !self.gpu_driven_enabled;
+            }
 
             // OpenJK batches visible drawsurfs by shader/fog state after BSP/PVS
             // visibility has been resolved. Mirror that submission property on
@@ -2736,6 +2759,14 @@ impl Renderer {
                 std::mem::take(&mut self.post_ocean_transparent_scratch);
             deferred_transparent.clear();
             let mut transparency_order = super::plan::WorldTransparencyOrder::default();
+            // Blended stages of opaque materials only need to finish before the
+            // cloud multiplier when it is drawn. Otherwise keep them deferred
+            // together: drawn inline they interleave opaque and blend pipelines
+            // (about 8 extra set_pipeline per frame on mp/ffa3).
+            let cloud_multiplier_active = self.clouds_enabled && self.cloud_shadows_enabled;
+            // Track consecutive surviving sibling stages without counting their
+            // shared geometry as a new logical BSP surface for each stage.
+            let mut perf_last_selected_world_stage: Option<usize> = None;
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
                 if !batch_area_visible(batch, effective_area_mask) {
@@ -2782,13 +2813,27 @@ impl Renderer {
                         continue;
                     }
                 }
-                let defer_batch = transparency_order.defer_stage(&batch.source.vertices,
-                    batch.source.bsp_shader_index, batch.source.pipeline.class);
+                let defer_batch = transparency_order.defer_stage(
+                    &batch.source.vertices,
+                    batch.source.bsp_shader_index,
+                    batch.source.pipeline.class,
+                    batch.source.opaque_composite_before_clouds && cloud_multiplier_active,
+                );
                 if inline_grouping
                     && batch.is_inline_entity
                     && batch.inline_group != u32::MAX
                     && !defer_batch
                 {
+                    if capture_api_calls {
+                        let distinct = perf_last_selected_world_stage
+                            .is_none_or(|previous| !same_world_surface(batch, &active.batches[previous]));
+                        info.perf_count_world_stage(
+                            batch.source.material_debug_index,
+                            batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+                            distinct, true, batch.source.pipeline.class,
+                        );
+                        perf_last_selected_world_stage = Some(batch_index);
+                    }
                     inline_visible.push(batch_index);
                     continue;
                 }
@@ -2835,6 +2880,18 @@ impl Renderer {
                     if !planar_stage {
                         continue;
                     }
+                }
+                if capture_api_calls {
+                    let distinct = perf_last_selected_world_stage
+                        .is_none_or(|previous| !same_world_surface(batch, &active.batches[previous]));
+                    info.perf_count_world_stage(
+                        batch.source.material_debug_index,
+                        batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+                        distinct,
+                        batch.is_inline_entity,
+                        batch.source.pipeline.class,
+                    );
+                    perf_last_selected_world_stage = Some(batch_index);
                 }
                 if defer_batch {
                     deferred_transparent.push(active_pos);
@@ -3453,10 +3510,6 @@ impl Renderer {
                 }
 
             };
-            if optical_volumes.is_some() {
-                draw_legacy_dlights(&mut pass, &mut self.gpu_profiler, &mut info);
-            }
-
             if let Some(prepared) = prepared_surface_sprite_effects.as_ref() {
                 self.surface_sprite_effect_renderer.draw(
                     &mut pass,
@@ -3557,6 +3610,30 @@ impl Renderer {
             }
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, true);
+
+            // Apply cloud visibility to the already drawn opaque receiver BEFORE
+            // transparent JKA shader stages, spray, fog and ocean optics composite.
+            // Fixed-function multiplicative blending keeps the scene attachment
+            // write-only to the fragment shader; the cloud calculation samples
+            // only the independently rendered prepass depth/normal/policy.
+            // Transparent water is drawn afterwards and retains exact OpenJK
+            // multi-stage additive/alpha semantics without a water veto mask.
+            if self.clouds_enabled && self.cloud_shadows_enabled {
+                if let Some(pipeline) = self.cloud_shadow_opaque_pipeline.as_ref() {
+                    if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                    pass.set_pipeline(pipeline);
+                    if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                    pass.set_bind_group(0, &self.cloud_shadow_opaque_bind_group, &[]);
+                    if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
+                    pass.draw(0..3, 0..1);
+                }
+            }
+
+            // Legacy projected point/dynamic lights are not sunlight: draw
+            // them after the cloud multiplier, including in the ocean path.
+            if optical_volumes.is_some() {
+                draw_legacy_dlights(&mut pass, &mut self.gpu_profiler, &mut info);
+            }
 
             if optical_volumes.is_some() {
                 drop(pass);
@@ -4425,6 +4502,11 @@ impl Renderer {
                         }
                         if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed = info.perf_encode_calls.world_helper_draw_indexed.saturating_add(1); }
                         draw_world_batch(&mut glow_pass, batch, 0..1, None);
+                        if capture_api_calls {
+                            info.perf_world_glow_replay_stages += 1;
+                            info.perf_world_glow_replay_indices += u64::from(
+                                batch.indexed_range.end.saturating_sub(batch.indexed_range.start));
+                        }
                     }
 
                     // Inline BSP movers are submitted as ordinary authored stages too.
@@ -4926,11 +5008,9 @@ impl Renderer {
             }
         }
 
-        if self.weather.rain.enabled
-            && !self.weather.rain.fast_post
-            && plan.use_post
-            && !plan.gamma_only_post
-        {
+        // Rain, snow and acid share the same low-resolution outdoor exposure
+        // mask; a snow-only frame must not depend on rain being enabled.
+        if precipitation_haze_mask_active {
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::RainHaze, false);
             self.weather.rain.dispatch_haze(
@@ -5370,7 +5450,7 @@ impl Renderer {
         // copy into the frame command buffer instead of paying another submit.
         // SMAA and the menu backdrop both submit work after this encoder, so
         // those paths intentionally do a tiny late copy submit instead.
-        if !self.smaa_enabled && !menu_backdrop_active && !self.egui_active && !crt_active {
+        if self.hdr_output.is_none() && !self.smaa_enabled && !menu_backdrop_active && !self.egui_active && !crt_active {
             if let Some(readback) = screenshot_readback.as_mut() {
                 let staging_buffer = &self
                     .screenshot_readback_buffer
@@ -5493,11 +5573,14 @@ impl Renderer {
         if crt_everything {
             self.submit_crt(&frame_view);
         }
+        if let Some(output) = &self.hdr_output {
+            output.submit(&self.device, &self.queue, &surface_view, screenshot_readback.is_some());
+        }
         if let Some(readback) = screenshot_readback
             .as_mut()
             .filter(|readback| !readback.inline_copy)
         {
-            self.submit_screenshot_copy(&frame.texture, readback);
+            self.submit_screenshot_copy(self.hdr_output.as_ref().map_or(&frame.texture, |output| &output.capture), readback);
         }
         if let Some(started) = perf_followup_started {
             info.perf_followup_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -5505,7 +5588,7 @@ impl Renderer {
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();
         self.window.pre_present_notify();
-        frame.present();
+        self.queue.present(frame);
         let present_completed_at = Instant::now();
         self.model_frame_log.presented(
             present_completed_at,

@@ -37,6 +37,15 @@ impl Renderer {
         self.rebuild_ui();
     }
 
+    pub(in crate::renderer) fn set_extension_hud(
+        &mut self, widgets: Vec<crate::extensions::PlacedHudWidget>,
+    ) {
+        if self.ui_state.extension_hud == widgets { return; }
+        self.ui_state.extension_hud = widgets;
+        // Uses the existing dynamic HUD buffer/pass. No new egui pass or pipeline.
+        self.rebuild_dynamic_ui();
+    }
+
     /// Poll background shader jobs at UI cadence, not at render frame rate.
     /// Upload only the small retained HUD batch when the integer count changes.
     pub(in crate::renderer) fn refresh_shader_compile_progress(&mut self) {
@@ -489,7 +498,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn set_egui(&mut self, frame: Option<EguiRenderData>) {
-        let Some(frame) = frame else {
+        let Some(mut frame) = frame else {
             self.egui_active = false;
             self.egui_paint_jobs.clear();
             for texture_id in self.egui_pending_free.drain(..) {
@@ -498,12 +507,15 @@ impl Renderer {
             return;
         };
 
-        for (texture_id, image_delta) in &frame.textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, *texture_id, image_delta);
+        for (texture_id, image_deltas) in &frame.textures_delta.set {
+            for image_delta in image_deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *texture_id, image_delta);
+            }
         }
-        self.egui_pending_free.extend(frame.textures_delta.free);
-        self.egui_paint_jobs = frame.paint_jobs;
+        self.egui_pending_free.extend(frame.textures_delta.free.iter().copied());
+        frame.textures_delta.clear();
+        self.egui_paint_jobs = std::mem::take(&mut frame.paint_jobs);
         self.egui_pixels_per_point = frame.pixels_per_point.max(0.25);
         self.egui_active = true;
     }
@@ -533,11 +545,11 @@ impl Renderer {
             let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA egui overlay"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame_view,
+                    view: self.hdr_output.as_ref().map_or(frame_view, |output| &output.ui_view),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: if self.hdr_output.is_some() { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) } else { wgpu::LoadOp::Load },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -549,6 +561,9 @@ impl Renderer {
             let mut pass = pass.forget_lifetime();
             self.egui_renderer
                 .render(&mut pass, &self.egui_paint_jobs, &screen);
+        }
+        if let Some(output) = &self.hdr_output {
+            output.composite_ui(&mut encoder, frame_view);
         }
         let egui_command_buffer = encoder.finish();
         self.queue.submit(

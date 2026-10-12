@@ -17,29 +17,20 @@ impl App {
         theme::set_pending_resets(ui.ctx(), pending_resets);
 
         let (title, detail) = match self.video_section {
-            VideoSection::Display => ("DISPLAY & FRAME PACING", "Window mode, timing and output."),
-            VideoSection::ImageQuality => (
-                "IMAGE QUALITY",
-                "Edge sampling, texture reconstruction and framebuffer precision.",
+            VideoSection::Display => (
+                "DISPLAY & GRAPHICS",
+                "Window mode, frame pacing, anti-aliasing and texture quality.",
             ),
-            VideoSection::Visibility => (
-                "VISIBILITY & GEOMETRY",
-                "World visibility and GPU culling paths.",
-            ),
-            VideoSection::Models => (
-                "MODELS",
-                "Ghoul2 skinning, authored GLM detail and model submission.",
+            VideoSection::Geometry => (
+                "GEOMETRY",
+                "World visibility and model rendering.",
             ),
             VideoSection::Lighting => ("LIGHTING", "Ambient, dynamic and indirect lighting."),
             VideoSection::Effects => (
                 "EFFECTS",
-                "Particle effects, saber presentation, flares and impact marks.",
+                "Particles, saber effects, flares and reflections.",
             ),
             VideoSection::Shadows => ("SHADOWS", "Dynamic and local shadowing."),
-            VideoSection::Reflections => (
-                "REFLECTIONS",
-                "Environment probes, screen-space reflections and dynamically budgeted planar views.",
-            ),
             VideoSection::Color => (
                 "COLOR & HDR",
                 "HDR precision, grading, split toning and output brightness.",
@@ -77,14 +68,20 @@ impl App {
             .id_salt(("jka_video_section", title))
             .auto_shrink([false, false])
             .show(ui, |ui| match self.video_section {
-                VideoSection::Display => self.egui_display_settings(ui),
-                VideoSection::ImageQuality => self.egui_image_quality(ui),
-                VideoSection::Visibility => self.egui_visibility(ui),
-                VideoSection::Models => self.egui_models(ui),
+                VideoSection::Display => {
+                    self.egui_display_settings(ui);
+                    self.egui_image_quality(ui);
+                }
+                VideoSection::Geometry => {
+                    self.egui_visibility(ui);
+                    self.egui_models(ui);
+                }
                 VideoSection::Lighting => self.egui_lighting(ui),
-                VideoSection::Effects => self.egui_effects(ui),
+                VideoSection::Effects => {
+                    self.egui_effects(ui);
+                    self.egui_reflections(ui);
+                }
                 VideoSection::Shadows => self.egui_shadows(ui),
-                VideoSection::Reflections => self.egui_reflections(ui),
                 VideoSection::PostProcessing => self.egui_post_processing(ui),
                 VideoSection::Color => self.egui_color_settings(ui),
                 VideoSection::DebugTools => self.egui_debug_tools(ui),
@@ -108,18 +105,24 @@ impl App {
     // ------------------------------------------------------------ rendering --
 
     pub(in crate::app::egui_settings) fn egui_display_settings(&mut self, ui: &mut egui::Ui) {
-        const PRESETS: [(QualityPreset, &str); 5] = [
+        theme::section(
+            ui,
+            "DISPLAY & FRAME PACING",
+            "Window mode, timing, output and presentation.",
+        );
+        const PRESETS: [(QualityPreset, &str); 6] = [
             (QualityPreset::Minimal, "Minimal (Legacy)"),
             (QualityPreset::MinimalUnified, "Minimal (Unified)"),
             (QualityPreset::Low, "Low"),
             (QualityPreset::Medium, "Medium"),
             (QualityPreset::High, "High"),
+            (QualityPreset::Ultra, "Ultra"),
         ];
         if let Some(index) = optional_quality_table_row(
             ui,
             "Quality preset",
-            "Sets every rendering cost lever at once. Resolution, display mode, \
-             render backend, vsync, frame queue, FPS cap and the debug toggles are left \
+            "Sets every rendering cost lever at once and uses the Balanced frame queue. \
+             Resolution, display mode, render backend, vsync, FPS cap and debug toggles are left \
              alone. The bar becomes Custom once you change a preset-controlled setting. \
              Minimal (Legacy) and Minimal (Unified) have identical settings; Legacy uses \
              the known-fast world renderer and Unified the general one, for comparison.",

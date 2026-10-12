@@ -591,6 +591,11 @@ impl Renderer {
                 source.modulate_lightmap, source.texture_is_lightmap, source.texture_is_white
             ),
         ];
+        if let Some(overlay_index) = source.legacy_srgb_overlay {
+            lines.push(format!(
+                "AUTHORED STAGES: 3 -> 1 GPU draw; exact-sRGB legacy composition; overlay image index={overlay_index} (alphaGen vertex; not a shader tint override)"
+            ));
+        }
         if has_bsp_shader {
             let shader_index = source.bsp_shader_index;
             lines.insert(
@@ -1007,6 +1012,13 @@ impl Renderer {
                     ""
                 }
             ));
+            for resolution in &entry.resolution_lines {
+                lines.push(resolution.clone());
+            }
+            lines.push(format!(
+                "ACTUAL BSP DRAW: texture_is_white={} texture_is_lightmap={} modulate_lightmap={}",
+                source.texture_is_white, source.texture_is_lightmap, source.modulate_lightmap
+            ));
             for image in &entry.image_sources {
                 lines.push(image.clone());
             }
@@ -1078,6 +1090,17 @@ impl Renderer {
                 ],
             },
         ];
+        if let Some(entry) = debug_entry {
+            let mut resolution = entry.resolution_lines.clone();
+            resolution.push(format!(
+                "Draw texture: {} | lightmap modulate: {}",
+                texture_summary, source.modulate_lightmap
+            ));
+            sections.insert(0, SurfaceInspectorSection {
+                title: "MATERIAL RESOLUTION".into(),
+                lines: resolution,
+            });
+        }
         if let Some(report) = ocean_report {
             sections.push(SurfaceInspectorSection {
                 title: "WATER PROMOTION".into(),

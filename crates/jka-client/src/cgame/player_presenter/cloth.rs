@@ -152,6 +152,7 @@ impl PlayerPresenter {
                         uv: vertex.uv,
                         color,
                         depth_hack: 0.0,
+                        water_wetness: 0.0,
                     })
                     .collect();
             }
@@ -166,6 +167,7 @@ impl PlayerPresenter {
                 uv: vertex.uv,
                 color,
                 depth_hack: 0.0,
+                water_wetness: 0.0,
             })
             .collect()
     }

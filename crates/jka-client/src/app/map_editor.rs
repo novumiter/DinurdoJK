@@ -9,7 +9,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{mpsc::{self, Receiver, TryRecvError}, Arc},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -80,7 +80,7 @@ pub(super) struct EditorFaceGeometry {
     pub vertices: Vec<[f64; 3]>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct MapEditor {
     pub source_path: PathBuf,
     pub source_text: String,
@@ -102,6 +102,7 @@ pub(super) struct MapEditor {
     pending_disk_stamp: Option<DiskStamp>,
     pending_disk_since: Option<Instant>,
     reported_disk_stamp: Option<DiskStamp>,
+    external_reload_rx: Option<Receiver<Result<(DiskStamp, String, MapDocument), String>>>,
 }
 
 impl MapEditor {
@@ -129,6 +130,7 @@ impl MapEditor {
             pending_disk_stamp: None,
             pending_disk_since: None,
             reported_disk_stamp: None,
+            external_reload_rx: None,
         })
     }
 
@@ -159,7 +161,68 @@ impl MapEditor {
     /// the cost is negligible at 10 Hz, and atomic-save/rename behavior is the
     /// same on Windows, Linux and macOS. A changed stamp must remain stable for
     /// a short debounce window before we read it, avoiding half-written saves.
+    #[cfg(test)]
     pub(super) fn poll_external_change(&mut self, now: Instant) -> ExternalMapChange {
+        self.poll_external_change_with_jobs(now, None)
+    }
+
+    pub(super) fn poll_external_change_with_jobs(
+        &mut self,
+        now: Instant,
+        jobs: Option<&super::background_jobs::BackgroundJobs>,
+    ) -> ExternalMapChange {
+        // A completed parse is accepted only if the disk identity still
+        // matches; otherwise the normal debounce runs again. Local edits must
+        // never be overwritten by a background job.
+        if let Some(rx) = &self.external_reload_rx {
+            let result = match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Empty) => return ExternalMapChange::None,
+                Err(TryRecvError::Disconnected) => Some(Err("External map reload worker disconnected".into())),
+            };
+            self.external_reload_rx = None;
+            if let Some(result) = result {
+                match result {
+                    Ok((stamp, source_text, document)) => {
+                        match Self::disk_stamp(&self.source_path) {
+                            Ok(current) if current != stamp => {
+                                self.pending_disk_stamp = None;
+                                self.pending_disk_since = None;
+                                return ExternalMapChange::None;
+                            }
+                            Err(error) => return ExternalMapChange::Error(error),
+                            _ => {}
+                        }
+                        if source_text == self.source_text {
+                            self.note_accepted_disk_state(stamp);
+                            return ExternalMapChange::None;
+                        }
+                        if self.has_pending_changes() {
+                            self.reported_disk_stamp = Some(stamp);
+                            let message = format!("{} changed externally while there are unsaved brush edits. Save or revert your edits before accepting the disk version.", self.source_path.display());
+                            self.status = message.clone();
+                            return ExternalMapChange::Conflict(message);
+                        }
+                        self.source_text = source_text;
+                        self.document = document.clone();
+                        self.baseline_document = document;
+                        self.pending_changes = 0;
+                        self.changed_brushes.clear();
+                        self.selected = None;
+                        self.drag = None;
+                        self.preview_visible = false;
+                        self.note_accepted_disk_state(stamp);
+                        self.status = "External source-map change detected; rebuilding textured world...".into();
+                        return ExternalMapChange::Reloaded;
+                    }
+                    Err(message) => {
+                        self.reported_disk_stamp = self.pending_disk_stamp;
+                        self.status = message.clone();
+                        return ExternalMapChange::Error(message);
+                    }
+                }
+            }
+        }
         if now.saturating_duration_since(self.last_disk_poll) < EXTERNAL_MAP_POLL_INTERVAL {
             return ExternalMapChange::None;
         }
@@ -202,6 +265,32 @@ impl MapEditor {
                     "Source map {} is temporarily missing; keeping the current world until it reappears.",
                     self.source_path.display()
                 ));
+            }
+            return ExternalMapChange::None;
+        }
+
+        if let Some(jobs) = jobs {
+            if self.reported_disk_stamp == Some(observed) {
+                return ExternalMapChange::None;
+            }
+            let path = self.source_path.clone();
+            let (tx, rx) = mpsc::channel();
+            match jobs.cpu(move || {
+                let result = (|| {
+                    let source_text = fs::read_to_string(&path)
+                        .map_err(|e| format!("Could not read changed source map {}: {e}", path.display()))?;
+                    let after = Self::disk_stamp(&path)?;
+                    if after != observed {
+                        return Err(format!("Source map {} changed again during read", path.display()));
+                    }
+                    let document = jka_assets::map::parse(&source_text)
+                        .map_err(|e| format!("External source-map edit did not parse: {e}"))?;
+                    Ok((after, source_text, document))
+                })();
+                let _ = tx.send(result);
+            }) {
+                Ok(()) => self.external_reload_rx = Some(rx),
+                Err(error) => return ExternalMapChange::Error(format!("Map reload queue: {error}")),
             }
             return ExternalMapChange::None;
         }
@@ -569,6 +658,7 @@ impl MapEditor {
                     uv: [0.0, 0.0],
                     color,
                     depth_hack: 0.0,
+                    water_wetness: 0.0,
                 });
             }
             for triangle in 1..polygon.vertices.len() - 1 {

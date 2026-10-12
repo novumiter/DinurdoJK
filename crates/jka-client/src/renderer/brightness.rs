@@ -299,7 +299,10 @@ fn read_original(
     rx.recv_timeout(std::time::Duration::from_secs(30))
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
-    let mapped = buffer.slice(..).get_mapped_range();
+    let mapped = buffer.slice(..).get_mapped_range().map_err(|error| {
+        buffer.unmap();
+        error.to_string()
+    })?;
     let mut pixels = Vec::with_capacity(packed_len(texture));
     let mut offset = 0;
     for (_, width, height) in mip_shapes(texture) {

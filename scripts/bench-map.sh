@@ -20,13 +20,14 @@
 #
 # Environment:
 #   JKA_BENCH_DIR  scratch folder (default: $TMPDIR or /tmp + /dinurdojk-bench)
+#   JKA_BENCH_EXE  exe to run instead of target/release/DinurdoJK.exe (base/cfg still from there)
 #   JKA_BENCH_CFG  a cfg file to use for this run only (e.g. r_backend "dx12";
 #                  r_reflectionQuality / r_backend are restart-latched, so they
 #                  must be changed in the cfg, not with +set)
 
 set -u
 if [ $# -lt 2 ]; then
-    sed -n '2,25p' "$0"
+    sed -n '2,26p' "$0"
     exit 2
 fi
 T=$1
@@ -42,13 +43,15 @@ SHOTS="$WORK/shots"
 CFG="$BASE/DinurdoJK.cfg"
 BACKUP="$WORK/DinurdoJK.cfg.backup"
 
-if [ ! -f "$REL/DinurdoJK.exe" ]; then
-    echo "No $REL/DinurdoJK.exe - build first (powershell -File build.ps1 -Fast)"
+EXE="${JKA_BENCH_EXE:-$REL/DinurdoJK.exe}"
+if [ ! -f "$EXE" ]; then
+    echo "No $EXE - build first (powershell -File build.ps1 -Fast)"
     exit 1
 fi
 mkdir -p "$RUN" "$SHOTS" "$BASE/screenshots"
 
-cp -f "$REL/DinurdoJK.exe" "$REL"/*.dll "$RUN/"
+cp -f "$EXE" "$RUN/DinurdoJK.exe"
+cp -f "$REL"/*.dll "$RUN/"
 cp -f "$CFG" "$BACKUP"
 trap 'cp -f "$BACKUP" "$CFG"' EXIT
 echo "cfg backup: $BACKUP"

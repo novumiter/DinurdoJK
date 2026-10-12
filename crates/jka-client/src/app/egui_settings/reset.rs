@@ -40,6 +40,9 @@ impl App {
                 let defaults = crate::color_grading::SplitToningSettings::default();
                 let grade = crate::color_grading::ColorGradeSettings::default();
                 let value = match name {
+                    "r_hdrOutput" => "0".to_owned(),
+                    "r_hdrPaperWhite" => "200".to_owned(),
+                    "r_hdrPeak" => "0".to_owned(),
                     "r_gammaMethod" => "shader".to_owned(),
                     "r_colorExposure" => grade.exposure_ev.to_string(),
                     "r_colorContrast" => grade.contrast.to_string(),

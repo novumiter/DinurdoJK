@@ -37,12 +37,11 @@ impl App {
         self.publish_ui();
     }
 
-    /// `r_drawEntities`. Unlike `draw_triggers`/`draw_clip_brushes` this isn't
-    /// pushed to the renderer here â€” the per-tick marker rebuild
-    /// (`rebuild_entity_markers`) does that every frame while it's on â€” except
-    /// when turning it off, where the overlay must be cleared immediately
-    /// since nothing will send another update once the rebuild stops running.
+    /// `r_drawEntities`: re-upload only when enabled/map/mover positions change.
     pub(in crate::app) fn set_draw_entities(&mut self, enabled: bool) {
+        if self.video.draw_entities != enabled {
+            self.entity_marker_cache = None;
+        }
         self.video.draw_entities = enabled;
         if !enabled {
             self.render_command(RenderCommand::SetEntityMarkers(None));
@@ -513,7 +512,7 @@ impl App {
         // only authored/UI source. Keep every ocean instance on the same wind.
         self.video.ocean_settings.wind = wind;
         self.sync_post_effects();
-        self.render_command(RenderCommand::SetOceanSettings(self.video.ocean_settings));
+        self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
         self.publish_authored_oceans();
         self.mark_config_dirty();
         self.publish_ui();
@@ -560,6 +559,8 @@ impl App {
             .unwrap_or(self.video.weather_wind);
         self.render_command(RenderCommand::SetPostEffects(PostEffects {
             hdr: self.video.hdr,
+            hdr_paper_white: self.video.hdr_paper_white,
+            hdr_peak: self.video.hdr_peak,
             auto_exposure: self.video.auto_exposure,
             tone_mapping: self.video.tone_mapping,
             glow: self.video.glow,
@@ -1592,13 +1593,22 @@ impl App {
         self.publish_ui();
     }
 
+    /// Gate the existing GPU Godot wake/deformation system without erasing
+    /// the user's r_oceanInteraction preference. No new pipelines are compiled.
+    pub(in crate::app) fn effective_ocean_settings(&self) -> crate::ocean::OceanSettings {
+        let mut settings = self.video.ocean_settings;
+        settings.interaction &= self.video.water_wake == 2;
+        settings
+    }
+
     pub(in crate::app) fn commit_ocean_settings(&mut self) {
         if let Some(session) = self.game_session.as_mut() {
-            session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+            session.ocean_interaction_enabled = self.video.ocean
+                && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         }
         self.video.ocean_settings.wind = self.video.weather_wind;
         self.video.ocean_settings = self.video.ocean_settings.sanitize();
-        self.render_command(RenderCommand::SetOceanSettings(self.video.ocean_settings));
+        self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
         self.publish_authored_oceans();
         self.mark_config_dirty();
         self.publish_ui();
@@ -1853,7 +1863,8 @@ impl App {
             ui::ENV_ROW_OCEAN => {
                 self.video.ocean = !self.video.ocean;
                 if let Some(session) = self.game_session.as_mut() {
-                    session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+                    session.ocean_interaction_enabled = self.video.ocean
+                && self.video.ocean_settings.interaction && self.video.water_wake == 2;
                 }
                 // OFF releases the FFT resources immediately. If the current
                 // world already carries its promoted ocean clipmap, ON can also

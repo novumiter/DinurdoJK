@@ -56,6 +56,7 @@ fn exercise(backend: wgpu::Backends) {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .expect("headless GPU adapter");
     println!("Baked brightness GPU test: {:?}", adapter.get_info());

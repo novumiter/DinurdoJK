@@ -3,7 +3,11 @@ use crate::app::egui_settings::{percent, theme, ui, App, ColorLutPreset};
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_color_settings(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "BRIGHTNESS", "Output brightness and per-lighting-class scaling.");
+        theme::section(
+            ui,
+            "BRIGHTNESS",
+            "Output brightness and per-lighting-class scaling.",
+        );
         theme::row(
             ui,
             "Brightness method",
@@ -15,7 +19,7 @@ impl App {
                     .width(230.0)
                     .show_ui(ui, |ui| {
                         for method in crate::gamma::GammaMethod::ALL {
-                            if ui.selectable_label(self.video.gamma_method == method, method.label()).clicked() {
+                            if ui.add_enabled(self.video.hdr_output == 0 || method != crate::gamma::GammaMethod::Hardware, egui::Button::selectable(self.video.gamma_method == method, method.label())).clicked() {
                                 self.set_gamma_method(method);
                             }
                         }
@@ -91,18 +95,51 @@ impl App {
             "HDR",
             "Scene precision, HDR baked lighting and highlight rolloff.",
         );
+        theme::row(ui, "Display output", "HDR Auto selects scRGB or HDR10 when the display and Windows HDR support it. Apply Video Settings to change output mode. Unsupported modes fall back to SDR.", theme::Reset::Color("r_hdrOutput"), |ui| {
+            egui::ComboBox::from_id_salt("hdr_output").selected_text(crate::renderer::hdr_output::OUTPUT_LABELS[self.video.hdr_output as usize])
+                .show_ui(ui, |ui| {
+                    for (mode, label) in crate::renderer::hdr_output::OUTPUT_LABELS.iter().enumerate() {
+                        if ui.selectable_label(self.video.hdr_output == mode as u32, *label).clicked() {
+                            let _ = self.cvar_set_hdr_output("r_hdrOutput", &mode.to_string());
+                        }
+                    }
+                });
+        });
+        ui.label(
+            egui::RichText::new(&self.hdr_output_status)
+                .small()
+                .color(ui.visuals().weak_text_color()),
+        );
+        ui.add_enabled_ui(self.video.hdr_output != 0, |ui| {
+            theme::row(ui, "HDR paper white", "Brightness of ordinary whites and UI, in nits. Highlights have room above this level.", theme::Reset::Color("r_hdrPaperWhite"), |ui| {
+                let mut white = self.video.hdr_paper_white;
+                let readout = format!("{white:.0} nits");
+                if theme::slider(ui, &mut white, 80.0..=500.0, &readout) {
+                    let _ = self.cvar_set_hdr_paper_white("r_hdrPaperWhite", &white.to_string());
+                }
+            });
+            theme::row(ui, "HDR peak brightness", "Display highlight ceiling, in nits. Zero uses reported display metadata, or 1000 nits when unavailable. Set your display's measured peak to calibrate manually.", theme::Reset::Color("r_hdrPeak"), |ui| {
+                let mut peak = self.video.hdr_peak;
+                let text = if peak == 0.0 { "Auto".to_owned() } else { format!("{peak:.0} nits") };
+                if theme::slider(ui, &mut peak, 0.0..=10000.0, &text) {
+                    let _ = self.cvar_set_hdr_peak("r_hdrPeak", &peak.to_string());
+                }
+            });
+        });
         // HDR is a framebuffer format decision: it determines the precision
         // used by lighting and every downstream color/post-processing pass.
-        self.egui_toggle_row(
-            ui,
-            "HDR rendering",
-            "Renders into a floating-point buffer so highlights can exceed white \
+        ui.add_enabled_ui(self.video.hdr_output == 0, |ui| {
+            self.egui_toggle_row(
+                ui,
+                "HDR rendering",
+                "Renders into a floating-point buffer so highlights can exceed white \
              instead of clipping. Costs bandwidth, and is what gives bloom and \
              tone mapping something to work with.",
-            ui::VIDEO_ROW_HDR,
-            self.video.hdr,
-        );
-        ui.add_enabled_ui(self.video.hdr, |ui| {
+                ui::VIDEO_ROW_HDR,
+                self.video.hdr || self.video.hdr_output != 0,
+            );
+        });
+        ui.add_enabled_ui(self.video.hdr || self.video.hdr_output != 0, |ui| {
             self.egui_toggle_row(
                 ui,
                 "Float lightmaps",
@@ -121,16 +158,19 @@ impl App {
                 self.video.tone_mapping,
             );
         });
-        ui.add_enabled_ui(self.video.hdr && self.video.tone_mapping, |ui| {
-            self.egui_toggle_row(
-                ui,
-                "Auto exposure",
-                "Meters HDR scene luminance and smoothly adapts exposure before tone \
+        ui.add_enabled_ui(
+            (self.video.hdr || self.video.hdr_output != 0) && self.video.tone_mapping,
+            |ui| {
+                self.egui_toggle_row(
+                    ui,
+                    "Auto exposure",
+                    "Meters HDR scene luminance and smoothly adapts exposure before tone \
                  mapping, similar to eye/camera adaptation.",
-                ui::VIDEO_ROW_AUTO_EXPOSURE,
-                self.video.auto_exposure,
-            );
-        });
+                    ui::VIDEO_ROW_AUTO_EXPOSURE,
+                    self.video.auto_exposure,
+                );
+            },
+        );
 
         theme::section(
             ui,
@@ -218,8 +258,10 @@ impl App {
             |v| format!("{v:+.0}"),
             true,
         );
+    }
 
-        theme::section(ui, "LOOK", "Choose a film look or an external color grade.");
+    pub(in crate::app::egui_settings) fn egui_post_color_looks(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "COLOR LOOK", "Choose a film look or an external color grade.");
         theme::row(
             ui,
             "Color LUT",
@@ -292,7 +334,10 @@ impl App {
                 ui.ctx().data_mut(|data| data.insert_temp(state_id, value));
             }
             let (primary_down, primary_released) = ui.input(|input| {
-                (input.pointer.primary_down(), input.pointer.primary_released())
+                (
+                    input.pointer.primary_down(),
+                    input.pointer.primary_released(),
+                )
             });
             let staged = ui.ctx().data(|data| data.get_temp::<f32>(state_id));
             let commit = if changed && !primary_down {
@@ -424,9 +469,7 @@ impl App {
                     input.pointer.primary_released(),
                 )
             });
-            let staged = ui
-                .ctx()
-                .data(|data| data.get_temp::<[u8; 3]>(state_id));
+            let staged = ui.ctx().data(|data| data.get_temp::<[u8; 3]>(state_id));
             let commit = if response.changed() && !primary_down {
                 Some(selected)
             } else if primary_released {
@@ -439,14 +482,8 @@ impl App {
                 ui.ctx().data_mut(|data| {
                     data.remove::<[u8; 3]>(state_id);
                 });
-                let (next_hue, next_saturation) =
-                    split_toning_hue_saturation(selected, hue);
-                self.set_split_toning_color(
-                    hue_cvar,
-                    saturation_cvar,
-                    next_hue,
-                    next_saturation,
-                );
+                let (next_hue, next_saturation) = split_toning_hue_saturation(selected, hue);
+                self.set_split_toning_color(hue_cvar, saturation_cvar, next_hue, next_saturation);
             }
 
             ui.add_space(10.0);

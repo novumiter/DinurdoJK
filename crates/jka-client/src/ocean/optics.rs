@@ -383,7 +383,7 @@ mod tests {
                     queue.submit([encoder.finish()]);
                     readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
                     device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-                    let bytes = readback.slice(..).get_mapped_range();
+                    let bytes = readback.slice(..).get_mapped_range().expect("GPU readback range");
                     let distance = (0.125_f32.powi(2)*2.0 + 0.5_f32.powi(2)).sqrt() * fraction;
                     for (channel, ratio) in [38.0/7.5, 38.0/22.0, 1.0].iter().enumerate() {
                         let expected = (-4.321928 * ratio * distance / 20.0).exp2();

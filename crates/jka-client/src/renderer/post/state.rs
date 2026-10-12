@@ -3,6 +3,7 @@ use crate::renderer::{
     cloud_wind, create_auto_exposure_bind_group, create_bloom_bind_groups, create_bloom_pipeline,
     create_cloud_resolve_bind_group, create_dof_bind_group, create_fast_post_bind_group,
     create_gamma_post_bind_group, create_post_bind_group, create_post_pipeline,
+    create_cloud_shadow_opaque_pipeline,
     create_rain_post_pipeline,
     create_ssao_temporal_bind_groups, create_ssr_temporal_bind_groups, pipeline_hash,
     CloudLayerSettings, CloudRenderSettings, CloudSunSettings, GlowMode, Mat4, PipelineJobKey,
@@ -90,6 +91,33 @@ impl Renderer {
         );
         self.pipeline_jobs.request(key, "full post", move || {
             create_post_pipeline(&device, &layout, &shader, format)
+        });
+    }
+
+    /// Specialized opaque-only cloud shadow pass, queued on the normal shader
+    /// worker. No compile, PSO, or draw overhead with cloud shadows disabled.
+    pub(in crate::renderer) fn ensure_cloud_shadow_opaque_pipeline(&mut self) {
+        if !self.clouds_enabled || !self.cloud_shadows_enabled
+            || self.cloud_shadow_opaque_pipeline.is_some()
+        {
+            return;
+        }
+        let format = self.scene_format();
+        let samples = self.msaa_samples;
+        let key = PipelineJobKey::new(
+            "cloud-shadow-opaque", 0, pipeline_hash(&(format, samples)),
+        );
+        if let Some(ready) = self.pipeline_jobs.take_ready(key) {
+            self.cloud_shadow_opaque_pipeline = Some(ready);
+            return;
+        }
+        let (device, layout, shader) = (
+            self.device.clone(),
+            self.post_pipeline_layout.clone(),
+            self.post_shader.clone(),
+        );
+        self.pipeline_jobs.request(key, "cloud shadow (before water)", move || {
+            create_cloud_shadow_opaque_pipeline(&device, &layout, &shader, format, samples)
         });
     }
 
@@ -184,9 +212,10 @@ impl Renderer {
             color: PostColorSettings {
                 gamma: self.output_gamma(),
                 // The floating-point scene format and display tone mapping are
-                // independent. This lane controls ACES only; HDR rendering is
+                // independent. 0 disables ACES, 1 enables SDR ACES, and 3
+                // preserves highlights for the native display-output stage. HDR rendering is
                 // selected separately by scene_format().
-                tone_mapping: if self.tone_mapping_enabled { 1.0 } else { 0.0 },
+                tone_mapping: if self.hdr_output.is_some() { 3.0 } else if self.tone_mapping_enabled { 1.0 } else { 0.0 },
                 bloom: if self.glow_mode.enabled() { 1.0 } else { 0.0 },
                 ssao: if self.ssao_enabled { 1.0 } else { 0.0 },
             },
@@ -219,14 +248,7 @@ impl Renderer {
                 } else {
                     0.0
                 },
-                volumetric_fog: if self.weather.fog.volumetric_effective()
-                    || (self.weather.rain.enabled && !self.rain_uses_2d_haze())
-                    || self.weather.snow.enabled
-                {
-                    1.0
-                } else {
-                    0.0
-                },
+                volumetric_fog: if self.weather_froxels_needed() { 1.0 } else { 0.0 },
                 // r_ssrDebug rides along as a magnitude, exactly as
                 // r_contactShadowDebug does above: every existing consumer only
                 // tests `> 0.5` for "SSR is on".
@@ -423,7 +445,19 @@ impl Renderer {
                 self.weather.atmosphere.sand_strength(),
                 self.weather.atmosphere.space_strength(),
                 self.weather.rain.acid_strength,
-                if self.rain_uses_2d_haze() { 1.0 } else { 0.0 },
+                if self.precipitation_2d_haze_active() { 1.0 } else { 0.0 },
+            ],
+            // A single 2D precipitation shader handles rain and snow. Rain's
+            // fast_post A/B option must not turn off snow's independent haze.
+            snow_haze: [
+                if self.weather_uses_2d_haze() && self.weather.snow.enabled {
+                    self.weather.snow.density_scale.clamp(0.0, 5.0)
+                } else {
+                    0.0
+                },
+                0.0,
+                0.0,
+                0.0,
             ],
             // The optics only exist with the GPU ocean; a plain BSP water
             // shader gets no underwater treatment, so clouds are left alone.
@@ -676,6 +710,39 @@ impl Renderer {
                 })
             })
         });
+        // Unrelated history texture stands in for every UNUSED post scene
+        // sampler. Binding self.targets.scene_view in a pass writing to that
+        // texture would violate wgpu attachment usage even if code ignores it.
+        let history = &self.targets.history_views[0];
+        let noise = self.cloud_noise_resources.as_ref().unwrap_or(&self.cloud_noise_fallback);
+        self.cloud_shadow_opaque_bind_group = create_post_bind_group(
+            &self.device,
+            &self.post_layout,
+            history,
+            &self.targets.linear_depth_view,
+            history,
+            history,
+            history,
+            &self.targets.linear_depth_view,
+            &self.post_sampler,
+            &self.post_buffer,
+            &self.weather.fog.resources.buffer,
+            self.targets.bloom.as_ref(),
+            self.targets.dof.as_ref(),
+            &self.color_lut_view,
+            &self.color_lut_sampler,
+            &noise.detail_view,
+            &noise.sampler,
+            &self.targets.cloud_transfer_views[0],
+            self.weather.rain.collision_view(),
+            &self.targets.rain_haze_mask_view,
+            &noise.weather_view,
+            &self.targets.motion_vector_view,
+            &self.targets.ao_depth_view,
+            &self.targets.reflection_mask_view,
+            &self.auto_exposure_state_buffer,
+            self.targets.ssr_visibility_view.as_ref().unwrap_or(&self.white.view),
+        );
         self.gamma_post_bind_group = create_gamma_post_bind_group(
             &self.device,
             &self.gamma_post_layout,

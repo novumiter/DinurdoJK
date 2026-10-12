@@ -107,17 +107,17 @@ impl App {
         }
     }
 
-    /// `r_drawEntities`: rebuilds the box + link-line overlay from the static
-    /// `EntityGraph` every tick and ships it to the renderer. Entity counts
-    /// are small (tens to a few hundred per map), so a full CPU rebuild +
-    /// GPU reupload each tick is simpler than dirty-tracking and cheap enough
-    /// for a debug toggle.
+    /// Rebuild only when the map or the positions of live brush movers change.
+    /// Static point entities require exactly one upload per map/toggle.
     pub(in crate::app) fn rebuild_entity_markers(&mut self) {
         let Some(graph) = self.entity_graph.as_deref() else {
-            self.render_command(RenderCommand::SetEntityMarkers(None));
+            if self.entity_marker_cache.as_ref().is_none_or(|(id, _)| *id != 0) {
+                self.render_command(RenderCommand::SetEntityMarkers(None));
+                self.entity_marker_cache = Some((0, Vec::new()));
+            }
             return;
         };
-        let mut mesh = jka_assets::bsp::DebugVolumeMesh::default();
+        let graph_id = graph as *const _ as usize;
         let mut origins = Vec::with_capacity(graph.entities.len());
         for entity in &graph.entities {
             if !entity.positioned {
@@ -126,8 +126,18 @@ impl App {
             }
             let origin = self.live_entity_origin(entity);
             origins.push(Some(origin));
-            let (mins, maxs) = entity_marker_box(entity, origin);
-            mesh.push_box(mins, maxs, entity.category.color());
+        }
+        if self.entity_marker_cache.as_ref().is_some_and(|(id, old)| {
+            *id == graph_id && *old == origins
+        }) {
+            return;
+        }
+        let mut mesh = jka_assets::bsp::DebugVolumeMesh::default();
+        for (entity, origin) in graph.entities.iter().zip(origins.iter()) {
+            if let Some(origin) = origin {
+                let (mins, maxs) = entity_marker_box(entity, *origin);
+                mesh.push_box(mins, maxs, entity.category.color());
+            }
         }
         for link in &graph.links {
             if let (Some(from), Some(to)) = (origins[link.from], origins[link.to]) {
@@ -135,6 +145,7 @@ impl App {
             }
         }
         self.render_command(RenderCommand::SetEntityMarkers(Some(mesh)));
+        self.entity_marker_cache = Some((graph_id, origins));
     }
 
     /// Nearest `r_drawEntities` marker box under the center crosshair, as an

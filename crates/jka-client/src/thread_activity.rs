@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
-pub const SLOT_COUNT: usize = 22;
+pub const SLOT_COUNT: usize = 24;
 
 #[cfg(windows)]
 mod windows;
@@ -34,6 +34,8 @@ pub enum ThreadSlot {
     Asset0 = 19,
     Asset1 = 20,
     UiCatalog = 21,
+    BackgroundIo = 22,
+    BackgroundCpu = 23,
 }
 
 impl ThreadSlot {
@@ -103,6 +105,8 @@ pub enum Task {
     MapMaterials = 23,
     MapGeometry = 24,
     MapFxLightProfiles = 25,
+    BackgroundIo = 26,
+    BackgroundCpu = 27,
 }
 
 impl Task {
@@ -134,6 +138,8 @@ impl Task {
             Self::MapMaterials => "MATERIALS",
             Self::MapGeometry => "WORLD GEOMETRY",
             Self::MapFxLightProfiles => "FX LIGHT PROFILES",
+            Self::BackgroundIo => "BACKGROUND I/O",
+            Self::BackgroundCpu => "BACKGROUND CPU",
         }
     }
 
@@ -164,6 +170,8 @@ impl Task {
             23 => Self::MapMaterials,
             24 => Self::MapGeometry,
             25 => Self::MapFxLightProfiles,
+            26 => Self::BackgroundIo,
+            27 => Self::BackgroundCpu,
             _ => Self::Idle,
         }
     }
@@ -197,6 +205,8 @@ impl SlotState {
 
 static START: OnceLock<Instant> = OnceLock::new();
 static SLOTS: [SlotState; SLOT_COUNT] = [
+    SlotState::new(),
+    SlotState::new(),
     SlotState::new(),
     SlotState::new(),
     SlotState::new(),
@@ -296,8 +306,10 @@ pub fn activity(slot: ThreadSlot, task: Task) -> ActivityGuard {
 #[derive(Debug, Clone, Copy)]
 pub struct RawThreadActivity {
     pub slot: ThreadSlot,
+    #[cfg_attr(windows, allow(dead_code))] // read by the non-Windows sampler
     pub active: bool,
     pub task: Task,
+    #[cfg_attr(windows, allow(dead_code))] // read by the non-Windows sampler
     pub busy_total_ns: u64,
 }
 
@@ -326,6 +338,8 @@ pub fn snapshot() -> [RawThreadActivity; SLOT_COUNT] {
         ThreadSlot::Asset0,
         ThreadSlot::Asset1,
         ThreadSlot::UiCatalog,
+        ThreadSlot::BackgroundIo,
+        ThreadSlot::BackgroundCpu,
     ]
     .map(|slot| {
         let state = state(slot);
@@ -378,6 +392,8 @@ pub const fn slot_label(slot: ThreadSlot) -> &'static str {
         ThreadSlot::Asset0 => "ASSET 0",
         ThreadSlot::Asset1 => "ASSET 1",
         ThreadSlot::UiCatalog => "UI CATALOG",
+        ThreadSlot::BackgroundIo => "BACKGROUND I/O",
+        ThreadSlot::BackgroundCpu => "BACKGROUND CPU",
     }
 }
 
@@ -385,6 +401,8 @@ pub const fn slot_label(slot: ThreadSlot) -> &'static str {
 static SAMPLE_LAST_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(windows))]
 static SAMPLE_BUSY_NS: [AtomicU64; SLOT_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

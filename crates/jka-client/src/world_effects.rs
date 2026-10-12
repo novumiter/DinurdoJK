@@ -483,11 +483,15 @@ impl LegacyWorldEffects {
         })
     }
 
+    #[cfg(test)]
     pub fn frozen(&self) -> bool { self.frozen }
+    #[cfg(test)]
     pub fn particle_clouds(&self) -> &[ParticleCloud] { &self.particle_clouds }
+    #[cfg(test)]
     pub fn wind_zones(&self) -> &[WindZone] { &self.wind_zones }
+    #[cfg(test)]
     pub fn weather_zones(&self) -> &[WeatherZone] { &self.weather_zones }
-    pub fn outside_shake(&self) -> bool { self.outside_shake }
+    #[cfg(test)]
     pub fn outside_pain(&self) -> f32 { self.outside_pain }
 }
 

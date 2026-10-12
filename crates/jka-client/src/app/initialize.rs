@@ -21,6 +21,7 @@ impl App {
         let loader_tx = spawn_map_loader(base.clone(), proxy.clone())?;
         let log_rx = crate::logging::subscribe();
         let settings_dir = jka_assets::pk3::active_game_directory(&base, game.as_deref());
+        let extensions = crate::extensions::Manager::spawn(base.join("extensions"))?;
         // External LUTs must be listed before the saved r_colorLut is parsed.
         crate::color_lut::scan_external(&base, game.as_deref());
         let config_path = settings_dir.join("DinurdoJK.cfg");
@@ -80,6 +81,8 @@ impl App {
         let (race_ghost_tx, race_ghost_rx) = mpsc::channel();
         let (race_ghost_web_tx, race_ghost_web_rx) = mpsc::channel();
         let ui_catalog = ui_catalog::UiCatalog::spawn()?;
+        let background_jobs = super::background_jobs::BackgroundJobs::spawn()?;
+        let (background_result_tx, background_result_rx) = mpsc::channel();
         let mut strafe_trails =
             crate::strafe_trail::Manager::spawn(presentation.strafe_trail.clone())?;
         if presentation.strafe_trail.log_name.trim() != "0"
@@ -105,12 +108,14 @@ impl App {
             Err(error) => (Vec::new(), Some(error)),
         };
         let mut app = Self {
+            extensions,
             base,
             startup_game: game.clone(),
             game,
             map_name: initial_label.clone(),
             map_editor: None,
             entity_graph: None,
+            entity_marker_cache: None,
             entity_graph_ui: EntityGraphUi::default(),
             source_map_edit_on_load: false,
             map_edit_preview_request_id: None,
@@ -133,6 +138,7 @@ impl App {
             source_map_levelshot_texture: None,
             source_map_levelshot_texture_map: None,
             asset_viewer_entries: Vec::new(),
+            asset_viewer_cache: None,
             asset_viewer_catalog_loaded: false,
             asset_viewer_catalog_error: None,
             asset_viewer_selected: None,
@@ -220,6 +226,8 @@ impl App {
             profile_dynamic_models: Arc::new(Vec::new()),
             profile_preview_active: false,
             demo_entries: Vec::new(),
+            demo_catalog_pending: false,
+            demo_catalog_generation: 0,
             demo_selected: 0,
             demo_game_choices: Vec::new(),
             demo_game_filter: String::new(),
@@ -270,6 +278,7 @@ impl App {
             server_browser_rx,
             server_browser,
             game_session: None,
+            water_wetness: crate::water_wetness::WetnessTracker::default(),
             siege_dialog: None,
             siege_round_message: None,
             siege_dialog_return_overlay: OverlayMode::None,
@@ -380,6 +389,7 @@ impl App {
             strafe_helper: presentation.strafe_helper,
             hud_layout: presentation.hud_layout,
             hud_edit_selected: None,
+            hud_edit_extension_selected: None,
             hud_edit_drag_origin: None,
             hud_edit_drag_delta: [0.0, 0.0],
             hud_edit_chat_resize_origin: None,
@@ -532,6 +542,9 @@ impl App {
             quality_preset_values: Vec::new(),
             applied_fullscreen: video.fullscreen,
             applied_renderer_backend: video.renderer_backend,
+            applied_hdr_output: video.hdr_output,
+            hdr_output_status: "Initializing display output...".to_owned(),
+            hdr_output_active: false,
             applied_resolution: video.resolution,
             applied_grass: video.grass,
             applied_ocean: video.ocean,
@@ -567,7 +580,7 @@ impl App {
                 ocean: video.ocean,
                 client_physics: video.client_physics,
                 gen_normal_maps: video.gen_normal_maps,
-                float_lightmap: video.float_lightmap && video.hdr,
+                float_lightmap: video.float_lightmap && (video.hdr || video.hdr_output != 0),
                 planar_reflections: video.reflection_quality.planar_slot_budget() > 0,
                 planar_environment: video.reflection_quality.promotes_environment_planars(),
                 omit_environment_stages: video.reflection_quality.omits_environment_stages(),
@@ -602,6 +615,10 @@ impl App {
             dof_focus_target: 4096.0,
             config_path,
             config_dirty,
+            background_jobs,
+            background_result_tx,
+            background_result_rx,
+            config_save_generation: 0,
             last_config_write: Instant::now(),
             quit_requested: false,
             fps_cap_input,

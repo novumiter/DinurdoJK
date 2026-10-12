@@ -25,6 +25,13 @@ impl App {
     }
 
     pub(in crate::app) fn tick(&mut self) {
+        if self.extensions.poll() {
+            self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets()));
+            if self.overlay == OverlayMode::HudEdit {
+                self.egui_repaint_requested = true;
+            }
+        }
+        self.poll_background_results();
         let input_diag_notices = self
             .render
             .as_ref()
@@ -232,6 +239,7 @@ impl App {
             self.publish_transient_ui();
         }
 
+        self.tick_water_wetness(now);
         self.refresh_authored_oceans();
         if !session_is_playing {
             self.tick_frontend_cinematic(now);
@@ -270,6 +278,29 @@ impl App {
         for stamp in deformation_stamps {
             crate::surface_deformation::trace_stamp(stamp);
             self.render_command(RenderCommand::AddSurfaceDeformation(stamp));
+        }
+        // Read-only bridge: accepted events are drained in delivery order; only
+        // clone playerstate ~60 Hz, never per render frame. All Rhai work is
+        // performed by the extension worker, not App::tick.
+        let extension_events = self.game_session.as_mut()
+            .map(|session| std::mem::take(&mut session.extension_events))
+            .unwrap_or_default();
+        self.extensions.queue_events(extension_events);
+        if self.extensions.wants_frame(now) {
+            let state = self.game_session.as_ref()
+                .filter(|session| session.phase == SessionPhase::Playing)
+                .map(|session| crate::extensions::GameStateSnapshot {
+                    presented: session.presented_player_state()
+                        .filter(|ps| ps.field_i32("clientNum") == session.client_game.presentation_client_num())
+                        .cloned(),
+                    authoritative: session.client_game.presentation_player_state().cloned(),
+                    map_name: session.map_name.clone().unwrap_or_default(),
+                    server_time: session.cgame_time,
+                    viewer_client: session.client_game.presentation_client_num(),
+                    is_live: session.live || session.local,
+                    is_demo: !session.live && !session.local,
+                });
+            self.extensions.submit_frame(now, state);
         }
         self.update_player_name_visibility(now);
         self.ensure_inline_instance_capacity();
@@ -373,7 +404,7 @@ impl App {
         self.tick_egui_menu();
 
         if self.config_dirty && self.last_config_write.elapsed() >= Duration::from_millis(250) {
-            self.flush_config();
+            self.queue_config_save();
         }
     }
 

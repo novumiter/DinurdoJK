@@ -405,7 +405,7 @@ fn rt_glass_gpu_transmission_acceptance() {
                 })
                 .unwrap();
             rx.recv().unwrap().unwrap();
-            let data = readback.slice(..).get_mapped_range();
+            let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
             let expected = if enabled { &expected_on } else { &expected_off };
             for (i, actual) in bytemuck::cast_slice::<u8, [f32; 4]>(&data)
                 .iter()
@@ -670,7 +670,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 })
                 .unwrap();
             rx.recv().unwrap().unwrap();
-            let data = readback.slice(..).get_mapped_range();
+            let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
             let expected = if enabled { &expected_on } else { &expected_off };
             for (i, actual) in bytemuck::cast_slice::<u8, [f32; 4]>(&data)
                 .iter()

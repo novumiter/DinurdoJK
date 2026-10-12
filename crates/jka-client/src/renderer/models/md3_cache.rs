@@ -186,6 +186,7 @@ mod tests {
             vertices: Arc::new((0..count).map(|i| DynamicModelVertex {
                 position: [i as f32, 2.0, 3.0], normal: [0.0, 2.0, 0.0],
                 uv: [0.2, 0.8], color: [0.8, 0.6, 0.4, 0.3], depth_hack: 1.0,
+                water_wetness: 0.0,
             }).collect()),
             indices: Arc::new(vec![0, 2, 1]),
             lighting_origin: Some([0.0; 3]),
@@ -216,7 +217,7 @@ mod tests {
             if !cache.append(surface, light, &mut vertices, &mut indices) {
                 vertices.extend_from_slice(&surface.vertices);
                 indices.extend_from_slice(&surface.indices);
-                jobs.push(CpuPackJob { vertices: v..vertices.len(), indices: i..indices.len(), light });
+                jobs.push(CpuPackJob { vertices: v..vertices.len(), indices: i..indices.len(), light, water: None });
             }
         }
         // Also verifies worker packing leaves cached gaps untouched.

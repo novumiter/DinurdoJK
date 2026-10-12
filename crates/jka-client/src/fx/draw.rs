@@ -281,6 +281,7 @@ impl Batch {
             uv,
             color,
             depth_hack: 0.0,
+            water_wetness: 0.0,
         });
         index
     }
@@ -618,6 +619,7 @@ fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
                 f32::from(color[3]) / 255.0,
             ],
             depth_hack: 0.0,
+            water_wetness: 0.0,
         })
         .collect();
     let count = vertices.len() as u32;

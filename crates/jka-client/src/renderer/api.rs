@@ -110,13 +110,15 @@ pub struct DynamicModelVertex {
     /// OpenJK RF_DEPTHHACK: apply the legacy weapon depth-range semantics.
     /// `md3.wgsl` performs the reverse-Z equivalent clip-space remap.
     pub depth_hack: f32,
+    /// CPU/RT skinned per-vertex immersion, interpolated per fragment.
+    pub water_wetness: f32,
 }
 
 /// `ghoul2_skin_compute.wgsl` materializes this vertex through a raw `array<u32>`
 /// and so hard-codes the stride. Keep the two in step: a desync silently writes
 /// every skinned vertex at the wrong offset and leaves the tail of each range
 /// zeroed, i.e. collapsed onto the world origin.
-pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_WORDS: usize = 13;
+pub(in crate::renderer) const DYNAMIC_MODEL_VERTEX_WORDS: usize = 14;
 const _: () = assert!(
     std::mem::size_of::<DynamicModelVertex>() == DYNAMIC_MODEL_VERTEX_WORDS * 4,
     "DynamicModelVertex changed size; update write_vertex in ghoul2_skin_compute.wgsl"
@@ -628,6 +630,8 @@ pub struct RenderSnapshot {
     /// by areaportals/doors. `None` for solo/offline scenes with no snapshot.
     pub area_mask: Option<[u8; 32]>,
     pub dynamic_models: Arc<Vec<DynamicModelSurface>>,
+    /// Per-player immersion history sampled on CGame snapshot transitions.
+    pub player_water: Arc<std::collections::HashMap<u16, crate::water_wetness::WaterProfile>>,
     /// Players outlined through walls while spectating or watching demos.
     pub spectator_highlights: Arc<Vec<SpectatorHighlight>>,
     /// Short-lived RE_AddLightToScene-style sources submitted by CGame/FX.
@@ -667,6 +671,8 @@ pub struct RenderSnapshot {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PostEffects {
     pub hdr: bool,
+    pub hdr_paper_white: f32,
+    pub hdr_peak: f32,
     pub auto_exposure: bool,
     pub tone_mapping: bool,
     pub glow: GlowMode,
@@ -793,6 +799,16 @@ pub struct EguiRenderData {
     pub textures_delta: egui::TexturesDelta,
     pub pixels_per_point: f32,
 }
+
+impl Drop for EguiRenderData {
+    fn drop(&mut self) {
+        // A rejected/retired frame (shutdown or a failed send) deliberately
+        // discards its updates. Superseded companion frames transfer deltas
+        // out first so the presenter still replays them in order.
+        self.textures_delta.clear();
+    }
+}
+
 
 /// Stable identity for an auxiliary native presentation surface. Phase 1 only
 /// exposes one companion window, but the renderer protocol is intentionally
@@ -1015,6 +1031,8 @@ pub enum RenderCommand {
     CopyFrameToClipboard,
     CaptureVideoFrame { frame_index: u64, depth: bool },
     SetUi(UiSnapshot),
+    /// Small independent overlay update; avoids rebuilding the full UiSnapshot.
+    SetExtensionHud(Vec<crate::extensions::PlacedHudWidget>),
     SetTransientUi {
         chat_lines: Vec<ui::UiChatLine>,
         console_notify_lines: Vec<ui::UiConsoleNotifyLine>,
@@ -1105,6 +1123,18 @@ pub(in crate::renderer) struct PerfEncodeCallCounts {
     pub multi_draw_indexed_indirect_count: u32,
 }
 
+/// Opt-in main-camera BSP geometry counters, indexed by loaded material debug ID.
+/// The indexed counts include each authored shader stage (they are not unique
+/// map triangles). Kept out of the ordinary frame's hot path when not capturing.
+#[derive(Clone, Copy, Default)]
+pub(in crate::renderer) struct WorldStagePerf {
+    pub(in crate::renderer) stages: u64,
+    pub(in crate::renderer) stage_indices: u64,
+    pub(in crate::renderer) distinct_surfaces: u64,
+    pub(in crate::renderer) distinct_indices: u64,
+    pub(in crate::renderer) inline_stages: u64,
+}
+
 #[derive(Default)]
 pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) frame_ms: f64,
@@ -1173,8 +1203,63 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) world_encoded_batches: u32,
     pub(in crate::renderer) world_multidraw_groups: u32,
     pub(in crate::renderer) world_multidraw_batches: u32,
+    /// Main-camera authored world stages surviving CPU area/frustum/optical
+    /// rejection. These are geometry-submission *candidates* on the GPU-driven
+    /// path; after CPU culling, they represent the submitted stage workload.
+    pub(in crate::renderer) perf_world_stage_batches: u64,
+    pub(in crate::renderer) perf_world_stage_indices: u64,
+    pub(in crate::renderer) perf_world_distinct_surfaces: u64,
+    pub(in crate::renderer) perf_world_distinct_indices: u64,
+    pub(in crate::renderer) perf_world_inline_stages: u64,
+    pub(in crate::renderer) perf_world_sky_stages: u64,
+    pub(in crate::renderer) perf_world_largest_stage_indices: u64,
+    pub(in crate::renderer) perf_world_opaque_indices: u64,
+    pub(in crate::renderer) perf_world_mask_indices: u64,
+    pub(in crate::renderer) perf_world_transparent_indices: u64,
+    pub(in crate::renderer) perf_world_sky_indices: u64,
+    /// Non-inline authored glow-stage replays in the main camera only.
+    pub(in crate::renderer) perf_world_glow_replay_stages: u64,
+    pub(in crate::renderer) perf_world_glow_replay_indices: u64,
+    pub(in crate::renderer) perf_world_cpu_visibility: bool,
+    pub(in crate::renderer) perf_world_material_stages: Vec<WorldStagePerf>,
     pub(in crate::renderer) grass: GrassDrawStats,
     pub(in crate::renderer) ocean: crate::ocean::OceanDrawStats,
+}
+
+impl FrameInfo {
+    #[inline]
+    pub(in crate::renderer) fn perf_count_world_stage(
+        &mut self, material_index: u32, indices: u32, distinct: bool,
+        inline: bool, class: crate::scene::DrawClass,
+    ) {
+        // An empty vector is the capture-disabled fast path.
+        if self.perf_world_material_stages.is_empty() { return; }
+        let indices = u64::from(indices);
+        self.perf_world_stage_batches += 1;
+        self.perf_world_stage_indices += indices;
+        self.perf_world_largest_stage_indices = self.perf_world_largest_stage_indices.max(indices);
+        self.perf_world_inline_stages += u64::from(inline);
+        self.perf_world_sky_stages += u64::from(class == crate::scene::DrawClass::Sky);
+        match class {
+            crate::scene::DrawClass::Opaque => self.perf_world_opaque_indices += indices,
+            crate::scene::DrawClass::Mask => self.perf_world_mask_indices += indices,
+            crate::scene::DrawClass::Transparent => self.perf_world_transparent_indices += indices,
+            crate::scene::DrawClass::Sky => self.perf_world_sky_indices += indices,
+        }
+        if distinct {
+            self.perf_world_distinct_surfaces += 1;
+            self.perf_world_distinct_indices += indices;
+        }
+        if let Some(mat) = self.perf_world_material_stages.get_mut(material_index as usize) {
+            mat.stages += 1;
+            mat.stage_indices += indices;
+            mat.inline_stages += u64::from(inline);
+            if distinct {
+                mat.distinct_surfaces += 1;
+                mat.distinct_indices += indices;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -817,9 +817,9 @@ impl Gpu {
         if let Some(Ok(status)) = self.pending.as_ref().map(|receive| receive.try_recv()) {
             self.pending = None;
             if status.is_ok() {
-                let view = self.readback.slice(..).get_mapped_range();
-                self.failed = u32::from_le_bytes(view[0..4].try_into().unwrap()) != 0;
-                drop(view);
+                if let Ok(view) = self.readback.slice(..).get_mapped_range() {
+                    self.failed = u32::from_le_bytes(view[0..4].try_into().unwrap()) != 0;
+                }
                 self.readback.unmap();
                 if self.failed {
                     queue.write_buffer(&self.render.params, 16, bytemuck::cast_slice(&[0u32]));

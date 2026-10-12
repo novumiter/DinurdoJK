@@ -202,9 +202,8 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
         };
         info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
 
         // Last coherent point on the baseline path: everything above is either
@@ -437,8 +436,12 @@ impl Renderer {
                     }
                     grass_drawn = true;
                 }
-                if transparency_order.defer_stage(&batch.source.vertices,
-                    batch.source.bsp_shader_index, batch.source.pipeline.class) {
+                if transparency_order.defer_stage(
+                    &batch.source.vertices,
+                    batch.source.bsp_shader_index,
+                    batch.source.pipeline.class,
+                    batch.source.opaque_composite_before_clouds,
+                ) {
                     deferred_transparent.push(active_pos);
                     continue;
                 }
@@ -899,7 +902,7 @@ impl Renderer {
             );
         }
 
-        if !menu_backdrop_active && !self.egui_active && !crt_active {
+        if self.hdr_output.is_none() && !menu_backdrop_active && !self.egui_active && !crt_active {
             if let Some(readback) = screenshot_readback.as_mut() {
                 let staging_buffer = &self
                     .screenshot_readback_buffer
@@ -979,11 +982,14 @@ impl Renderer {
         if crt_everything {
             self.submit_crt(&frame_view);
         }
+        if let Some(output) = &self.hdr_output {
+            output.submit(&self.device, &self.queue, &surface_view, screenshot_readback.is_some());
+        }
         if let Some(readback) = screenshot_readback
             .as_mut()
             .filter(|readback| !readback.inline_copy)
         {
-            self.submit_screenshot_copy(&frame.texture, readback);
+            self.submit_screenshot_copy(self.hdr_output.as_ref().map_or(&frame.texture, |output| &output.capture), readback);
         }
         if let Some(started) = perf_followup_started {
             info.perf_followup_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -991,7 +997,7 @@ impl Renderer {
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();
         self.window.pre_present_notify();
-        frame.present();
+        self.queue.present(frame);
         let present_completed_at = Instant::now();
         self.model_frame_log.presented(
             present_completed_at,

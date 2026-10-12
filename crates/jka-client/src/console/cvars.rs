@@ -254,6 +254,7 @@ impl<State> CvarRegistry<State> {
     pub fn iter(&self) -> impl Iterator<Item = &'static CvarDef<State>> + '_ {
         self.definitions.iter().copied()
     }
+    #[cfg(test)]
     pub fn archived(&self) -> impl Iterator<Item = &'static CvarDef<State>> + '_ {
         self.iter()
             .filter(|def| def.flags.contains(CvarFlags::ARCHIVE))
@@ -280,6 +281,7 @@ impl<State> CvarRegistry<State> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn write_archive(&self, state: &State) -> String {
         use std::fmt::Write;
         let mut text = String::new();

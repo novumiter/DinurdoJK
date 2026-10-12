@@ -896,6 +896,7 @@ impl EntityPresenter {
                 uv: vertex.uv,
                 color,
                 depth_hack,
+                water_wetness: 0.0,
             }).collect::<Vec<_>>());
         let indices = if self.md3_geometry_cache_enabled {
             Arc::clone(&surface_asset.cached_indices)

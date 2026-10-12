@@ -318,6 +318,8 @@ impl GameSession {
         self.demo_spectator_camera_mode = None;
         self.client_deaths = [0; 32];
         self.attacker_damage_seen = false;
+        self.extension_events.clear();
+        self.extension_last_damage = None;
         self.client_game = ClientGameState::new();
         self.siege_extended.fill(super::super::session::types::SiegeExtendedClient::default());
         self.siege_respawn_time = 0;
@@ -332,6 +334,7 @@ impl GameSession {
         self.weapon_fx.reset_for_seek(0);
         self.player_presenter.reset_for_seek();
         self.fx_draws.clear();
+        self.water_wake.clear();
         self.fx_lights = Arc::new(Vec::new());
         self.fx_blades = Arc::new(Vec::new());
         self.fx_surfaces = Arc::new(Vec::new());
@@ -1813,6 +1816,24 @@ impl App {
                 }
             }
 
+            // Vanilla/TaystJK water wake: collision sampling is rate-limited
+            // per player, while the rendered quad follows interpolation at full FPS.
+            // Godot-promoted surfaces are excluded so mode 2 never double-draws.
+            if self.video.water_wake != 0 {
+                playback.water_wake.append_draws(
+                    self.video.water_wake,
+                    sample.presentation_time_ms as i32,
+                    &playback.ocean_actors,
+                    self.map_collision.as_mut(),
+                    if self.video.ocean && self.applied_ocean {
+                        &self.promoted_oceans
+                    } else { &[] },
+                    if self.video.ocean && self.applied_ocean {
+                        &self.authored_oceans
+                    } else { &[] },
+                    &mut playback.fx_draws,
+                );
+            }
             playback.client_perf.fx_draws =
                 u32::try_from(playback.fx_draws.len()).unwrap_or(u32::MAX);
             playback.client_perf.fx_sprites = 0;

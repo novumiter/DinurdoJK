@@ -127,9 +127,12 @@ pub enum UserEvent {
     GammaPrepared(u64),
     HardwareGamma(crate::display_gamma::Status),
     ScreenshotFinished(Result<ScreenshotOutput, String>),
+    HdrOutputChanged { status: String, active: bool },
     RendererReady {
         supported_msaa: Vec<u32>,
         wireframe_supported: bool,
+        hdr_output_status: String,
+        hdr_output_active: bool,
     },
     CompanionReady { id: u32 },
     CompanionError { id: u32, error: String },

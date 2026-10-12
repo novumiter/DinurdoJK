@@ -558,7 +558,7 @@ fn create_mask_pipeline(
                 )],
                 ..Default::default()
             },
-            buffers: std::slice::from_ref(&vertex_layout),
+            buffers: &[Some(vertex_layout)],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,

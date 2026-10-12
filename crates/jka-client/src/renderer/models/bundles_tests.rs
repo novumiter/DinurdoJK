@@ -144,7 +144,7 @@ fn pixels(
         })
         .unwrap();
     rx.recv().unwrap().unwrap();
-    let data = readback.slice(..).get_mapped_range();
+    let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
     data.chunks_exact(256)
         .flat_map(|row| row[..128].iter().copied())
         .collect()
@@ -230,7 +230,7 @@ fn model_bundles_preserve_pixels_live_updates_and_resource_invalidation() {
                     module: &shader,
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: 12,
                         step_mode: wgpu::VertexStepMode::Vertex,
                         attributes: &[wgpu::VertexAttribute {
@@ -238,7 +238,7 @@ fn model_bundles_preserve_pixels_live_updates_and_resource_invalidation() {
                             offset: 0,
                             shader_location: 0,
                         }],
-                    }],
+                    })],
                 },
                 primitive: Default::default(),
                 depth_stencil: Some(wgpu::DepthStencilState {

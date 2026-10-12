@@ -2,7 +2,19 @@
 use crate::app::{config, App};
 
 impl App {
+    /// Explicit saves (writeconfig, video confirmation, quit) retain their
+    /// synchronous durability semantics. Older queued saves complete first,
+    /// so they cannot overwrite the explicitly flushed current settings.
     pub(in crate::app) fn flush_config(&mut self) {
+        self.queue_config_save();
+        if !self.background_jobs.flush_io(std::time::Duration::from_secs(1)) {
+            eprintln!("Timed out waiting for queued config/background I/O");
+        }
+        self.poll_background_results();
+    }
+
+    /// Debounced periodic save: never perform filesystem I/O on the tick path.
+    pub(in crate::app) fn queue_config_save(&mut self) {
         if !self.config_dirty {
             return;
         }
@@ -95,15 +107,56 @@ impl App {
             japro: self.japro_cg,
             master_servers: self.server_browser.master_servers.clone(),
         };
-        match config::save_video_settings(
-            &self.config_path,
-            settings,
-            &self.bindings,
-            &presentation,
-            &self.audio,
-        ) {
-            Ok(()) => self.config_dirty = false,
-            Err(error) => eprintln!("Config save failed: {error}"),
+        let path = self.config_path.clone();
+        let bindings = self.bindings.clone();
+        let audio = self.audio.clone();
+        let generation = self.config_save_generation.wrapping_add(1);
+        let tx = self.background_result_tx.clone();
+        match self.background_jobs.io(move || {
+            // Report serialization panics as a failed save instead of letting
+            // the shared queue swallow the panic and silently lose settings.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                config::save_video_settings(&path, settings, &bindings, &presentation, &audio)
+            }))
+            .unwrap_or_else(|_| Err("config serialization panicked".to_owned()));
+            let _ = tx.send(super::background_jobs::JobResult::ConfigSaved { generation, result });
+        }) {
+            Ok(()) => {
+                self.config_save_generation = generation;
+                self.config_dirty = false;
+                self.last_config_write = std::time::Instant::now();
+            }
+            Err(error) => {
+                eprintln!("Could not queue config save: {error}");
+                self.last_config_write = std::time::Instant::now();
+            },
+        }
+    }
+}
+
+impl App {
+    pub(in crate::app) fn poll_background_results(&mut self) {
+        while let Ok(done) = self.background_result_rx.try_recv() {
+            match done {
+                super::background_jobs::JobResult::ConfigSaved { generation, result } => {
+                    if let Err(error) = result {
+                        eprintln!("Config save failed: {error}");
+                        // A newer scheduled save takes precedence over a failed
+                        // earlier write; don't resurrect stale config state.
+                        if generation == self.config_save_generation {
+                            self.config_dirty = true;
+                            self.last_config_write = std::time::Instant::now();
+                        }
+                    }
+                }
+                super::background_jobs::JobResult::ServerDump { path, result } => match result {
+                    Ok(()) => self.push_console_path_line(
+                        format!("^2serverdump: wrote {} and appended to servers.log", path.display()),
+                        path,
+                    ),
+                    Err(error) => self.push_console_line(format!("^1serverdump: couldn't write files: {error}")),
+                },
+            }
         }
     }
 }

@@ -36,6 +36,10 @@ impl App {
         if self.render.is_none() || self.quit_requested {
             return;
         }
+        if (self.video.hdr_output != 0 || self.hdr_output_active) && self.video.gamma_method == GammaMethod::Hardware {
+            self.video.gamma_method = GammaMethod::Shader;
+            self.mark_config_dirty();
+        }
         self.gamma_runtime.generation = self.gamma_runtime.generation.wrapping_add(1);
         let generation = self.gamma_runtime.generation;
         if self.video.gamma_method != GammaMethod::Hardware
@@ -76,7 +80,11 @@ impl App {
             && self.window_focused
             && matches!(self.gamma_runtime.phase, Phase::Idle | Phase::Applying)
         {
-            self.gamma_runtime.generation = self.gamma_runtime.generation.wrapping_add(1);
+            if (self.video.hdr_output != 0 || self.hdr_output_active) && self.video.gamma_method == GammaMethod::Hardware {
+            self.video.gamma_method = GammaMethod::Shader;
+            self.mark_config_dirty();
+        }
+        self.gamma_runtime.generation = self.gamma_runtime.generation.wrapping_add(1);
             self.apply_hardware_gamma();
         } else {
             self.sync_gamma_method();
@@ -119,6 +127,9 @@ impl App {
         self.publish_ui();
     }
     fn hardware_target(&self) -> Result<Target, String> {
+        if self.hdr_output_active || self.video.hdr_output != 0 {
+            return Err("native HDR output uses shader brightness; hardware gamma is SDR-only".to_owned());
+        }
         let window = self.window.as_ref().ok_or("game window is not ready")?;
         #[cfg(windows)]
         {
@@ -232,6 +243,10 @@ impl App {
     pub(super) fn restore_gamma_before_restart(&mut self) {
         if !self.gamma_runtime.controller.was_started() {
             return;
+        }
+        if (self.video.hdr_output != 0 || self.hdr_output_active) && self.video.gamma_method == GammaMethod::Hardware {
+            self.video.gamma_method = GammaMethod::Shader;
+            self.mark_config_dirty();
         }
         self.gamma_runtime.generation = self.gamma_runtime.generation.wrapping_add(1);
         self.gamma_runtime.phase = Phase::Idle;

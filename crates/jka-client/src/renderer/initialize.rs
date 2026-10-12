@@ -54,6 +54,7 @@ impl Renderer {
         base: &Path,
         game: Option<&Path>,
         desired_maximum_frame_latency: u32,
+        hdr_output_mode: u32,
         _detail_texture_path: &str,
     ) -> Result<Self, String> {
         let size = window.inner_size();
@@ -73,6 +74,7 @@ impl Renderer {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|e| format!("No compatible GPU adapter: {e}"))?;
@@ -270,20 +272,28 @@ impl Renderer {
         }
 
         let caps = surface.get_capabilities(&adapter);
-        let surface_format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .unwrap_or(caps.formats[0]);
+        let display_info = surface.display_hdr_info(&adapter);
+        let output_selection = super::hdr_output::select(&caps, hdr_output_mode, Some(&display_info))
+            .ok_or("Display has no compatible HDR or SDR output format")?;
+        let surface_format = output_selection.format;
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .ok_or("Surface has no compatible default configuration")?;
+            .unwrap_or(wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: surface_format,
+                color_space: output_selection.color_space,
+                width: size.width.max(1), height: size.height.max(1),
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Opaque),
+                view_formats: Vec::new(),
+            });
         config.format = surface_format;
+        config.color_space = output_selection.color_space;
         config.present_mode = no_vsync_mode(&caps.present_modes);
         config.desired_maximum_frame_latency = desired_maximum_frame_latency.clamp(1, 3);
-        let screenshot_supported = caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
-        if screenshot_supported {
+        let screenshot_supported = hdr_output_mode != 0 || caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
         }
         // Surface::configure reports validation through wgpu's device error
@@ -298,6 +308,14 @@ impl Renderer {
             return Err(format!("Surface configuration failed: {error}"));
         }
         let surface_configured_at = Instant::now();
+        let hdr_output = if hdr_output_mode != 0 {
+            // Keep the entire compositor in FP16 even on SDR fallback, so an OS
+            // HDR toggle only changes the final output pipeline/surface.
+            config.format = wgpu::TextureFormat::Rgba16Float;
+            let mut output = super::hdr_output::HdrOutput::new(&device, output_selection, hdr_output_mode, config.width, config.height);
+            output.detected_peak = display_info.luminance.and_then(|l| l.max_nits);
+            Some(output)
+        } else { None };
         rverbose!(
             1,
             "Present mode: {:?}; surface: {:?}",
@@ -314,7 +332,7 @@ impl Renderer {
             }
         );
 
-        let surface_supported_msaa = supported_msaa(&adapter, surface_format);
+        let surface_supported_msaa = supported_msaa(&adapter, config.format);
         let hdr_supported_msaa = supported_msaa(&adapter, wgpu::TextureFormat::Rgba16Float);
         rverbose!(1, "MSAA supported: {surface_supported_msaa:?}");
         rverbose!(1, "HDR Rgba16Float MSAA supported: {hdr_supported_msaa:?}");
@@ -1200,7 +1218,7 @@ impl Renderer {
         init_mark!("UI buffers");
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
-            config.format,
+            if hdr_output.is_some() { wgpu::TextureFormat::Rgba8Unorm } else { config.format },
             egui_wgpu::RendererOptions::default(),
         );
 
@@ -1719,6 +1737,7 @@ impl Renderer {
                 weather_occlusion: [0.0; 4],
                 weather_look: [0.0; 4],
                 legacy_weather: [0.0; 4],
+                snow_haze: [0.0; 4],
                 underwater: [NO_WATER_SURFACE, 1.0, 0.0, 0.0],
                 cloud_foreground: [0.0; 4],
                 cloud_blades: [[0.0; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2],
@@ -1916,6 +1935,37 @@ impl Renderer {
             targets.dof.as_ref(),
         );
 
+        // The in-scene cloud multiplier cannot sample the active scene attachment.
+        // Bind unrelated, already-allocated history as the unused post scene input.
+        // Use the same cloud noise, depth, policy and uniform resources as post.
+        let cloud_shadow_opaque_bind_group = create_post_bind_group(
+            &device,
+            &post_layout,
+            &targets.history_views[0],
+            &targets.linear_depth_view,
+            &targets.history_views[0],
+            &targets.history_views[0],
+            &targets.history_views[0],
+            &targets.linear_depth_view,
+            &post_sampler,
+            &post_buffer,
+            &weather.fog.resources.buffer,
+            targets.bloom.as_ref(),
+            targets.dof.as_ref(),
+            &color_lut_view,
+            &color_lut_sampler,
+            &cloud_noise_fallback.detail_view,
+            &cloud_noise_fallback.sampler,
+            &targets.cloud_transfer_views[0],
+            &shadow_resources.weather_height_view,
+            &targets.rain_haze_mask_view,
+            &cloud_noise_fallback.weather_view,
+            &targets.motion_vector_view,
+            &targets.ao_depth_view,
+            &targets.reflection_mask_view,
+            &auto_exposure_state_buffer,
+            targets.ssr_visibility_view.as_ref().unwrap_or(&white.view),
+        );
         let gamma_post_bind_group = create_gamma_post_bind_group(
             &device,
             &gamma_post_layout,
@@ -2239,6 +2289,7 @@ impl Renderer {
             queue,
             pipeline_jobs,
             scene_pipeline_compat: (config.format, msaa_samples),
+            hdr_output,
             config,
             surface_config_generation: 1,
             surface_config_reason: "initial",
@@ -2606,6 +2657,8 @@ impl Renderer {
             post_shader,
             post_pipeline_layout,
             post_pipeline: None,
+            cloud_shadow_opaque_pipeline: None,
+            cloud_shadow_opaque_bind_group,
             rain_post_pipeline: None,
             taa_post_pipeline,
             rt_taa_resources: None,

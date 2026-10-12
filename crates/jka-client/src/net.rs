@@ -189,6 +189,7 @@ impl Default for NetworkSettings {
 }
 
 impl NetworkSettings {
+    #[cfg(test)]
     pub fn cvar_value(&self, name: &str) -> Option<String> {
         crate::app::network_cvars::settings_registry().get(self, name).map(|value| value.to_string())
     }
@@ -239,6 +240,7 @@ impl NetworkSettings {
         )
     }
 
+    #[cfg(test)]
     pub fn userinfo_for_mod(&self, model: &str, server_mod: mod_support::ServerMod) -> Vec<u8> {
         self.userinfo_for_capabilities(model, server_mod, server_mod.supports_rgb_sabers())
     }
@@ -281,6 +283,7 @@ impl NetworkSettings {
         info
     }
 
+    #[cfg(test)]
     pub fn write_cfg(&self, out: &mut String) {
         use std::fmt::Write;
         let mut definitions: Vec<_> = crate::app::network_cvars::DEFINITIONS.iter().filter(|def| def.config.archive.is_some()).collect();
@@ -330,6 +333,7 @@ pub fn nearest_base_saber_color(packed_rgb: u32) -> u8 {
 // ------------------------------------------------------------- commands --
 
 /// cl_input.cpp inputCmds generic commands -> genCmds_t value.
+#[cfg(test)]
 pub fn generic_command(name: &str) -> Option<u8> {
     match crate::app::command_registry().find(name)?.game_command {
         Some(crate::app::GameCommand::Generic(value)) => Some(value),

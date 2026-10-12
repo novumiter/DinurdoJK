@@ -503,6 +503,9 @@ impl DynamicModelRenderer {
                     // a Source material pipeline.
                     source_phong: [0.0; 4],
                     source_fresnel: [0.0; 4],
+                    water_bands0: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.bands[0],p.bands[1],p.bands[2],p.bands[3]]),
+                    water_bands1: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.bands[4],p.bands[5],p.bands[6],p.bands[7]]),
+                    water_base: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.first_z, 0.0, 0.0, 1.0]),
                 });
                 mesh_draw_indices
                     .entry(Arc::clone(&mesh_key))
@@ -566,6 +569,13 @@ impl DynamicModelRenderer {
                 }
             } else {
                 vertices.extend_from_slice(surface.vertices.as_slice());
+            }
+            if surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player {
+                if let Some(water) = self.entity_water.get(&surface.entity_num) {
+                    for vertex in &mut vertices[base_vertex as usize..] {
+                        vertex.water_wetness = water.wetness_at_z(vertex.position[1]);
+                    }
+                }
             }
             // RT-on keeps each surface's original local index values and uses
             // base_vertex at raster time. The same ranges can therefore feed a

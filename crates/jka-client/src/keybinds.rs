@@ -129,6 +129,7 @@ pub fn control_action(selection: usize) -> Option<&'static ControlAction> {
     )
 }
 
+#[cfg(test)]
 pub fn is_japro_selection(selection: usize) -> bool {
     selection >= CONTROL_ACTIONS.len()
         && selection < CONTROL_ACTIONS.len() + JAPRO_CONTROL_ACTIONS.len()

@@ -4,10 +4,10 @@
 //! [`App::set_console_cvar`] path the console and config loader use, so a preset
 //! click and a typed command produce identical renderer state.
 //!
-//! Presets deliberately cover cost levers only. Resolution, display mode, render
-//! backend, vsync, frame queue, FPS cap, gamma, input timing and the debug/instrumentation
-//! toggles are left alone: those are machine and preference settings, not
-//! quality, and silently rewriting them would be hostile.
+//! Presets cover cost levers and use the balanced frame queue. Resolution,
+//! display mode, render backend, vsync, FPS cap, gamma, input timing and the
+//! debug/instrumentation toggles are left alone: those are machine and
+//! preference settings, not quality, and silently rewriting them would be hostile.
 //! GPU-driven drawing and Hi-Z occlusion are optimization A/B controls, not quality levers.
 //! Likewise, `cg_fxFPS` is a user preference and not part of quality presets.
 
@@ -24,15 +24,17 @@ pub(super) enum QualityPreset {
     Low,
     Medium,
     High,
+    Ultra,
 }
 
 impl QualityPreset {
-    pub(super) const ALL: [Self; 5] = [
+    pub(super) const ALL: [Self; 6] = [
         Self::Minimal,
         Self::MinimalUnified,
         Self::Low,
         Self::Medium,
         Self::High,
+        Self::Ultra,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -42,6 +44,7 @@ impl QualityPreset {
             Self::Low => "Low",
             Self::Medium => "Medium",
             Self::High => "High",
+            Self::Ultra => "Ultra",
         }
     }
 
@@ -50,12 +53,37 @@ impl QualityPreset {
     /// aliases that mutate the same state out of this table: for example,
     /// `r_dynamicShadows` already owns the derived cascaded-shadow boolean.
     pub(super) fn settings(self) -> Vec<(&'static str, &'static str)> {
+        // Medium is Low with the requested visual upgrades. Derive it so the
+        // rest of the Low profile stays aligned if it changes later.
+        if self == Self::Medium {
+            let mut settings = Self::Low.settings();
+            for (name, value) in &mut settings {
+                match *name {
+                    "r_footprints" => *value = "3d",
+                    "r_grass" => *value = "1",
+                    "r_reflectionQuality" => *value = "low",
+                    "r_glow" => *value = "authored",
+                    "fx_physics" => *value = "3",
+                    "r_promoteFxLights" => *value = "1",
+                    "r_detailTextures" => *value = "1",
+                    "r_pbr" => *value = "1",
+                    "r_genNormalMaps" => *value = "1",
+                    "r_deluxeMapping" => *value = "1",
+                    _ => {}
+                }
+            }
+            return settings;
+        }
+
         let table: &'static [(&'static str, &'static str)] = match self {
             Self::Minimal | Self::MinimalUnified => &[
                 // The cvar's canonical "off" value is 0; the setter maps both
                 // 0 and 1 to the renderer's single-sample state. Using 0 here
                 // lets active_quality_preset() compare against the getter.
                 ("r_ext_multisample", "0"),
+                ("r_maxFrameLatency", "2"),
+                ("fx_physics", "0"),
+                ("r_promoteFxLights", "0"),
                 ("r_texturemode", "GL_LINEAR_MIPMAP_NEAREST"),
                 ("r_detailTextures", "off"),
                 ("r_hdr", "0"),
@@ -105,6 +133,9 @@ impl QualityPreset {
             ],
             Self::Low => &[
                 ("r_ext_multisample", "2"),
+                ("r_maxFrameLatency", "2"),
+                ("fx_physics", "2"),
+                ("r_promoteFxLights", "0"),
                 ("r_ext_texture_filter_anisotropic", "16"),
                 ("r_detailTextures", "off"),
                 ("r_hdr", "0"),
@@ -127,13 +158,13 @@ impl QualityPreset {
                 ("r_clouds", "0"),
                 ("r_cloudQuality", "0.40"),
                 ("r_cloudShadows", "1"),
-                ("r_grass", "1"),
+                ("r_grass", "0"),
                 ("r_ocean", "0"),
                 ("r_oceanMapSize", "256"),
                 ("r_oceanMeshQuality", "0"),
                 ("r_oceanUpdates", "30"),
-                ("r_footprints", "3d"),
-                ("r_reflectionQuality", "low"),
+                ("r_footprints", "2d"),
+                ("r_reflectionQuality", "legacy"),
                 ("r_chromaticAberration", "0"),
                 ("r_vignette", "0"),
                 ("r_filmGrain", "0"),
@@ -154,7 +185,10 @@ impl QualityPreset {
                 ("r_voxelProbeGI", "0"),
                 ("r_localLightShadows", "0"),
             ],
-            Self::Medium => &[
+            Self::High => &[
+                ("r_maxFrameLatency", "2"),
+                ("fx_physics", "3"),
+                ("r_promoteFxLights", "1"),
                 // SMAA is the preset AA mode. Post-process AA and MSAA are
                 // mutually exclusive in set_console_cvar(), so describe the
                 // normalized single-sample state instead of asking for both.
@@ -202,16 +236,19 @@ impl QualityPreset {
                 ("r_lodbias", "0"),
                 ("r_entityAmbientLighting", "bevy_irradiance_volume"),
                 ("r_dynamicLights", "forward_plus"),
-                ("r_pbr", "0"),
-                ("r_genNormalMaps", "0"),
-                ("r_deluxeMapping", "0"),
+                ("r_pbr", "1"),
+                ("r_genNormalMaps", "1"),
+                ("r_deluxeMapping", "1"),
                 ("r_deluxeSpecular", "0"),
                 ("r_dynamicShadows", "csm"),
                 ("r_emissiveAreaLights", "0"),
                 ("r_voxelProbeGI", "0"),
                 ("r_localLightShadows", "0"),
             ],
-            Self::High => &[
+            Self::Ultra => &[
+                ("r_maxFrameLatency", "2"),
+                ("fx_physics", "3"),
+                ("r_promoteFxLights", "1"),
                 // TAA is the preset AA mode; enabling it intentionally disables
                 // MSAA, so the preset must match that final state.
                 ("r_ext_multisample", "0"),
@@ -269,6 +306,7 @@ impl QualityPreset {
                 ("r_voxelProbeGI", "1"),
                 ("r_localLightShadows", "1"),
             ],
+            Self::Medium => unreachable!("Medium derives from Low above"),
         };
         let mut settings = table.to_vec();
         // The two Minimal presets differ only in which world renderer draws.
@@ -407,7 +445,10 @@ mod tests {
             assert!(settings.iter().all(|(name, _)| !name.eq_ignore_ascii_case("cg_fxFPS")));
             let expected_bias = match preset {
                 QualityPreset::Minimal | QualityPreset::MinimalUnified => "3",
-                QualityPreset::Low | QualityPreset::Medium | QualityPreset::High => "0",
+                QualityPreset::Low
+                | QualityPreset::Medium
+                | QualityPreset::High
+                | QualityPreset::Ultra => "0",
             };
             assert_eq!(
                 settings.iter().find(|(name, _)| *name == "r_lodbias").map(|(_, value)| *value),

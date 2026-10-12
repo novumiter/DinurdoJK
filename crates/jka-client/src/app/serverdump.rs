@@ -271,18 +271,19 @@ impl App {
         for line in &lines {
             let _ = writeln!(report, "{line}");
         }
-        let result = std::fs::create_dir_all(&directory)
-            .and_then(|()| std::fs::write(&path, report))
-            .and_then(|()| {
-                let mut log = std::fs::OpenOptions::new().create(true).append(true).open(directory.join("servers.log"))?;
-                writeln!(log, "{summary}")
-            });
-        match result {
-            Ok(()) => self.push_console_path_line(
-                format!("^2serverdump: wrote {} and appended to servers.log", path.display()),
-                path,
-            ),
-            Err(error) => self.push_console_line(format!("^1serverdump: couldn't write files: {error}")),
+        let tx = self.background_result_tx.clone();
+        match self.background_jobs.io(move || {
+            let result = std::fs::create_dir_all(&directory)
+                .and_then(|()| std::fs::write(&path, report))
+                .and_then(|()| {
+                    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(directory.join("servers.log"))?;
+                    writeln!(log, "{summary}")
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(background_jobs::JobResult::ServerDump { path, result });
+        }) {
+            Ok(()) => self.push_console_line("^2serverdump: write queued"),
+            Err(error) => self.push_console_line(format!("^1serverdump: could not queue write: {error}")),
         }
     }
 }

@@ -152,13 +152,18 @@ fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
         let b = material.mods[i * 2u + 1u];
         let kind = u32(a.x + 0.5);
         if (kind == 1u) {
-            uv = uv + a.yz * time;
+            // TaystJK RB_CalcScrollTexCoords wraps the offset before later tcMods.
+            // This matters when rotate follows scroll: a whole-texture offset
+            // cannot be discarded after the rotation.
+            let scroll = a.yz * time;
+            uv = uv + scroll - floor(scroll);
         }
         if (kind == 2u) {
             uv = uv * a.yz;
         }
         if (kind == 3u) {
-            let radians = a.y * time * 0.017453292519943295;
+            // TaystJK RB_CalcRotateTexCoords negates degrees-per-second.
+            let radians = -a.y * time * 0.017453292519943295;
             let c = cos(radians);
             let sn = sin(radians);
             let p = uv - vec2<f32>(0.5);
@@ -287,6 +292,52 @@ fn autosprite2_input(original: VertexIn) -> VertexIn {
     return output;
 }
 
+
+// Unified legacy RGB policy: the opaque lightmap/overlay fusion below can
+// compose its known inputs exactly in encoded sRGB. Additive BSP passes have
+// an unknown framebuffer destination, so their encoded source is a no-pass
+// approximation while blending remains linear in the scene target. Both use
+// the SAME transfer function. Keep alpha and authored blend factors unchanged.
+const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
+fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
+    if ((material.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
+        return vec4<f32>(legacy_rgb_encode(color.rgb), color.a);
+    }
+    return color;
+}
+
+fn legacy_rgb_encode(value: vec3<f32>) -> vec3<f32> {
+    let v = max(value, vec3<f32>(0.0));
+    return select(1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+                  12.92 * v, v <= vec3<f32>(0.0031308));
+}
+fn legacy_rgb_decode(value: vec3<f32>) -> vec3<f32> {
+    let v = max(value, vec3<f32>(0.0));
+    return select(pow((v + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),
+                  v / 12.92, v <= vec3<f32>(0.04045));
+}
+fn classic_three_stage_rgb(input: VertexOut) -> vec4<f32> {
+    // 0: base diffuse; 2: baked lightmap; 5: stage-three overlay (non-sky).
+    let diffuse = textureSample(base_texture, base_sampler, input.uv).rgb;
+    let lightmap = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
+    let overlay_sample = textureSample(sky_rt, sky_sampler, input.uv);
+    // alphaGen vertex multiplies the authored image alpha, not replaces it.
+    let vertex_alpha = clamp(input.color.a * overlay_sample.a, 0.0, 1.0);
+    let encoded = mix(
+        legacy_rgb_encode(diffuse) * legacy_rgb_encode(lightmap),
+        legacy_rgb_encode(overlay_sample.rgb), vertex_alpha);
+    return vec4<f32>(legacy_rgb_decode(encoded), 1.0);
+}
+
+@fragment fn fs_legacy_srgb_three_stage(input: VertexOut) -> @location(0) vec4<f32> {
+    let shell_kind = input.shell_kind & 1u;
+    if (surface_deformation_should_discard(input.world_position, material.header.w,
+        input.world_normal, shell_kind, input.shell_coverage, input.clip_position.xy, true)) {
+        discard;
+    }
+    return classic_three_stage_rgb(input);
+}
+
 @fragment fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let shell_kind = input.shell_kind & 1u;
     let classic_flags = input.shell_kind >> 1u;
@@ -371,7 +422,7 @@ fn autosprite2_input(original: VertexIn) -> VertexIn {
         let static_ao = clamp(input.sky_dir_ao.w, 0.0, 1.0);
         base = vec4<f32>(base.rgb * static_ao, base.a);
     }
-    return shade_surface_deformation(
+    let result = shade_surface_deformation(
         input.world_position,
         input.world_normal,
         material.header.w,
@@ -380,6 +431,7 @@ fn autosprite2_input(original: VertexIn) -> VertexIn {
         input.shell_coverage,
         base
     );
+    return legacy_rgb_output(result);
 }
 
 fn sky_uv(s: f32, t: f32) -> vec2<f32> {

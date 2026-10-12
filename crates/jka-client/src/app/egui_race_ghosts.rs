@@ -62,7 +62,7 @@ impl App {
             })
             .unwrap_or_default();
 
-        egui::CentralPanel::default().show_inside(root, |ui| {
+        egui::CentralPanel::default().show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("RACE GHOSTS");
                 ui.add_space(8.0);

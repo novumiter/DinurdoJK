@@ -403,7 +403,11 @@ impl OceanVisibility {
                     };
                     match pending.try_recv() {
                         Ok(Ok(())) => {
-                            let bytes = slot.readback_buffer.slice(..).get_mapped_range();
+                            let Ok(bytes) = slot.readback_buffer.slice(..).get_mapped_range() else {
+                                slot.readback_buffer.unmap();
+                                slot.pending = None;
+                                continue;
+                            };
                             let values: &[u64] = bytemuck::cast_slice(&bytes);
                             let samples = values.first().copied().unwrap_or(0);
                             drop(bytes);

@@ -51,7 +51,18 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
             .unwrap_or(clamp_sampler);
         (base, sampler)
     };
+    // This authored overlay is not a sky texture. Bind its own sampler
+    // so GL_CLAMP_TO_EDGE/GL_REPEAT remains correct even if the rock differs.
+    let overlay_sampler = source.legacy_srgb_overlay
+        .and_then(|index| texture_clamp.get(index).copied())
+        .map(|clamp| if clamp { clamp_sampler } else { repeat_sampler })
+        .unwrap_or(sky_sampler);
     let sky_faces: [&GpuImage; 6] = std::array::from_fn(|face| {
+        if face == 0 {
+            if let Some(overlay) = source.legacy_srgb_overlay.and_then(|index| textures.get(index)) {
+                return overlay;
+            }
+        }
         source
             .skybox
             .or(fallback_skybox)
@@ -108,7 +119,7 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 11,
-                resource: wgpu::BindingResource::Sampler(sky_sampler),
+                resource: wgpu::BindingResource::Sampler(overlay_sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 21,
@@ -250,7 +261,18 @@ pub(in crate::renderer) fn create_world_bind_group(
         .reflection_probe
         .and_then(|index| reflection_probes.probes.get(index))
         .unwrap_or(&reflection_probes.probes[0]);
+    // This authored overlay is not a sky texture. Bind its own sampler
+    // so GL_CLAMP_TO_EDGE/GL_REPEAT remains correct even if the rock differs.
+    let overlay_sampler = source.legacy_srgb_overlay
+        .and_then(|index| texture_clamp.get(index).copied())
+        .map(|clamp| if clamp { clamp_sampler } else { repeat_sampler })
+        .unwrap_or(sky_sampler);
     let sky_faces: [&GpuImage; 6] = std::array::from_fn(|face| {
+        if face == 0 {
+            if let Some(overlay) = source.legacy_srgb_overlay.and_then(|index| textures.get(index)) {
+                return overlay;
+            }
+        }
         source
             .skybox
             .or(fallback_skybox)
@@ -307,7 +329,7 @@ pub(in crate::renderer) fn create_world_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 11,
-                resource: wgpu::BindingResource::Sampler(sky_sampler),
+                resource: wgpu::BindingResource::Sampler(overlay_sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 12,

@@ -67,7 +67,8 @@ impl App {
             crate::cgame::weapon_fx::WeaponFx::new(fx_assets),
             self.forced_player_models.clone(),
         );
-        session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+        session.water_wake_mode = self.video.water_wake;
+        session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         session.set_fx_light_promotion_catalog(Arc::clone(&self.fx_light_promotion_catalog));
         session
             .weapon_fx

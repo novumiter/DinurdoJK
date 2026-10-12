@@ -50,6 +50,7 @@ mod crash;
 mod credential_store;
 mod download;
 mod entity_graph;
+mod extensions;
 mod fx;
 mod grass;
 mod japro_cg;
@@ -84,6 +85,7 @@ mod ui;
 mod vgs;
 mod vote;
 mod weather;
+mod water_wetness;
 mod windows_timer;
 mod world_effects;
 

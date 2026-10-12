@@ -1,6 +1,6 @@
 struct GammaSettings {
     values: vec4<f32>, // gamma, LUT strength, vignette, manual exposure EV
-    flags: vec4<f32>, // x: HDR scene (skip legacy output dither)
+    flags: vec4<f32>, // x: HDR scene (skip legacy output dither), y: preserve HDR LUT headroom
 };
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -58,10 +58,11 @@ fn apply_color_lut(color: vec3<f32>) -> vec3<f32> {
     if (strength <= 0.001) {
         return color;
     }
-    let input = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+    let scale = select(1.0, max(1.0, max(color.r, max(color.g, color.b))), settings.flags.y > 0.5);
+    let input = clamp(color / scale, vec3<f32>(0.0), vec3<f32>(1.0));
     let coord = (input * (COLOR_LUT_SIZE - 1.0) + vec3<f32>(0.5)) / COLOR_LUT_SIZE;
     let graded = textureSample(color_lut_texture, color_lut_sampler, coord).rgb;
-    return mix(color, graded, strength);
+    return mix(color, graded * scale, strength);
 }
 
 @fragment

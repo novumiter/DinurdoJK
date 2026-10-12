@@ -2091,13 +2091,13 @@ settings_cvars! { NetworkSettings;
                 fn cvar_set_fs_game(&mut self, name: &str, value: &str) -> Result<(), String> {
                     ({
                         // A sibling directory name, as `resolve_fs_game_directory` accepts.
-                        let name = value.trim();
-                        let valid = name.len() <= 63
-                            && name != "."
-                            && name != ".."
-                            && !name.bytes().any(|b| b < 0x20 || b == 0x7f || matches!(b, b'/' | b'\\' | b':' | b';' | b'"'));
+                        let dir = value.trim();
+                        let valid = dir.len() <= 63
+                            && dir != "."
+                            && dir != ".."
+                            && !dir.bytes().any(|b| b < 0x20 || b == 0x7f || matches!(b, b'/' | b'\\' | b':' | b';' | b'"'));
                         if valid {
-                            self.fs_game = name.to_owned();
+                            self.fs_game = dir.to_owned();
                             Ok(false)
                         } else {
                             Err(format!("{name}: expected a game directory name like japro (empty or base for none)"))

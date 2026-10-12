@@ -5,6 +5,11 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_models(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "MODELS",
+            "Map props, Ghoul2 skinning and model detail.",
+        );
         self.egui_toggle_row(
             ui,
             "Map models",

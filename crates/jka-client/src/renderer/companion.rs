@@ -44,6 +44,13 @@ pub(in crate::renderer) struct CompanionPending {
     pub(in crate::renderer) shutdown: bool,
 }
 
+impl Drop for CompanionPending {
+    fn drop(&mut self) {
+        // A closed presenter deliberately retires any unreplayed texture updates.
+        for delta in &mut self.skipped_texture_deltas { delta.clear(); }
+    }
+}
+
 /// Auxiliary presenter. It shares the primary WGPU device/queue but owns its
 /// Surface and egui renderer on a separate sleeping OS thread. 3D companion
 /// views are rendered by the primary renderer into a non-blocking texture ring;
@@ -132,7 +139,7 @@ impl CompanionRenderThread {
 
     pub(in crate::renderer) fn publish(&self, frame: EguiRenderData) {
         let publish = |pending: &mut CompanionPending, frame: EguiRenderData| {
-            if let Some(previous) = pending.frame.replace(frame) {
+            if let Some(mut previous) = pending.frame.replace(frame) {
                 // Dropping the old paint jobs is safe; dropping its texture
                 // delta is not. egui may emit a partial ImageDelta in the new
                 // frame that depends on an allocation from this old frame.
@@ -141,7 +148,7 @@ impl CompanionRenderThread {
                 {
                     pending
                         .skipped_texture_deltas
-                        .push_back(previous.textures_delta);
+                        .push_back(std::mem::take(&mut previous.textures_delta));
                 }
             }
         };
@@ -378,7 +385,7 @@ pub(in crate::renderer) fn companion_render_thread_main(
     let _ = proxy.send_event(UserEvent::CompanionReady { id: id.0 });
 
     while wake_rx.recv().is_ok() {
-        let (resize, scene_sources, scene_frame, skipped_texture_deltas, frame, shutdown) = {
+        let (resize, scene_sources, scene_frame, mut skipped_texture_deltas, frame, shutdown) = {
             let mut state = match pending.lock() {
                 Ok(state) => state,
                 Err(poisoned) => poisoned.into_inner(),
@@ -393,6 +400,7 @@ pub(in crate::renderer) fn companion_render_thread_main(
             )
         };
         if shutdown {
+            for delta in &mut skipped_texture_deltas { delta.clear(); }
             return;
         }
         // The companion shares the main device, so a loss there kills this
@@ -401,6 +409,7 @@ pub(in crate::renderer) fn companion_render_thread_main(
         // rather than unconfiguring a swapchain whose submissions a dead device
         // will never retire.
         if crate::renderer::device_lost() {
+            for delta in &mut skipped_texture_deltas { delta.clear(); }
             std::mem::forget(surface);
             return;
         }
@@ -448,17 +457,22 @@ pub(in crate::renderer) fn companion_render_thread_main(
 
         // Every superseded UI frame still contributes texture state. Replay
         // those deltas in frame order while intentionally skipping stale paint.
-        for textures_delta in skipped_texture_deltas {
-            for (texture_id, image_delta) in &textures_delta.set {
-                egui_renderer.update_texture(&device, &queue, *texture_id, image_delta);
+        for mut textures_delta in skipped_texture_deltas {
+            for (texture_id, image_deltas) in &textures_delta.set {
+                for image_delta in image_deltas {
+                    egui_renderer.update_texture(&device, &queue, *texture_id, image_delta);
+                }
             }
-            for texture_id in textures_delta.free {
-                egui_renderer.free_texture(&texture_id);
+            for texture_id in &textures_delta.free {
+                egui_renderer.free_texture(texture_id);
             }
+            textures_delta.clear();
         }
         if let Some(frame) = frame.as_ref() {
-            for (texture_id, image_delta) in &frame.textures_delta.set {
-                egui_renderer.update_texture(&device, &queue, *texture_id, image_delta);
+            for (texture_id, image_deltas) in &frame.textures_delta.set {
+                for image_delta in image_deltas {
+                    egui_renderer.update_texture(&device, &queue, *texture_id, image_delta);
+                }
             }
         }
 
@@ -470,8 +484,8 @@ pub(in crate::renderer) fn companion_render_thread_main(
                 scene_consumed.fetch_max(sequence, Ordering::Release);
             }
             if let Some(frame) = frame {
-                for texture_id in frame.textures_delta.free {
-                    egui_renderer.free_texture(&texture_id);
+                for texture_id in &frame.textures_delta.free {
+                    egui_renderer.free_texture(texture_id);
                 }
             }
             continue;
@@ -495,8 +509,8 @@ pub(in crate::renderer) fn companion_render_thread_main(
                 // progress even though this surface frame cannot be presented.
                 queue.submit([]);
                 if let Some(frame) = frame {
-                    for texture_id in frame.textures_delta.free {
-                        egui_renderer.free_texture(&texture_id);
+                    for texture_id in &frame.textures_delta.free {
+                        egui_renderer.free_texture(texture_id);
                     }
                 }
                 if let Some(sequence) = scene_to_ack {
@@ -510,8 +524,8 @@ pub(in crate::renderer) fn companion_render_thread_main(
                 // window is minimized/occluded and no normal frame is submitted.
                 queue.submit([]);
                 if let Some(frame) = frame {
-                    for texture_id in frame.textures_delta.free {
-                        egui_renderer.free_texture(&texture_id);
+                    for texture_id in &frame.textures_delta.free {
+                        egui_renderer.free_texture(texture_id);
                     }
                 }
                 if let Some(sequence) = scene_to_ack {
@@ -521,8 +535,8 @@ pub(in crate::renderer) fn companion_render_thread_main(
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 if let Some(frame) = frame {
-                    for texture_id in frame.textures_delta.free {
-                        egui_renderer.free_texture(&texture_id);
+                    for texture_id in &frame.textures_delta.free {
+                        egui_renderer.free_texture(texture_id);
                     }
                 }
                 if let Some(sequence) = scene_to_ack {
@@ -620,10 +634,10 @@ pub(in crate::renderer) fn companion_render_thread_main(
             // submission may safely recycle this (and every older) slot.
             scene_consumed.fetch_max(sequence, Ordering::Release);
         }
-        output.present();
+        queue.present(output);
         if let Some(frame) = frame {
-            for texture_id in frame.textures_delta.free {
-                egui_renderer.free_texture(&texture_id);
+            for texture_id in &frame.textures_delta.free {
+                egui_renderer.free_texture(texture_id);
             }
         }
     }

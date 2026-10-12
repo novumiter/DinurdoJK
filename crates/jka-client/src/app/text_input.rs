@@ -96,7 +96,7 @@ impl App {
                 continue;
             }
 
-            changed |= self.insert_console_text(&value[segment_start..index]);
+            self.insert_console_text(&value[segment_start..index]);
             self.execute_console();
             changed = true;
 
@@ -115,7 +115,7 @@ impl App {
         // A copied block usually has no newline after its last command. Since a
         // multiline paste is command-oriented, submit that final line as well.
         if segment_start < value.len() {
-            changed |= self.insert_console_text(&value[segment_start..]);
+            self.insert_console_text(&value[segment_start..]);
             self.execute_console();
             changed = true;
         }

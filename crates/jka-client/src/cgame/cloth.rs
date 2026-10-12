@@ -353,11 +353,6 @@ impl ClothSystem {
             .retain(|_, instance| now_ms.saturating_sub(instance.last_seen_ms) <= INSTANCE_TTL_MS);
     }
 
-    #[inline]
-    pub fn enabled(&self) -> bool {
-        self.config.enabled
-    }
-
     /// Deliberately conservative V1 auto-promotion. Do not infer cloth from a
     /// shader/texture name: GLM hierarchy surface names describe the geometry.
     pub fn is_cloth_surface_name(name: &str) -> bool {

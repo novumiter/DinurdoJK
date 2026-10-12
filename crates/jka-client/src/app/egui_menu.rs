@@ -35,8 +35,8 @@ use super::ui_catalog::CatalogPayload;
 use super::*;
 
 const TOP_ITEMS: [&str; 6] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE"];
-const SETUP_TABS: [&str; 7] = [
-    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE",
+const SETUP_TABS: [&str; 8] = [
+    "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS",
 ];
 
 const TOP_RESUME: usize = 0;
@@ -52,7 +52,8 @@ const SETUP_TAB_VIDEO: usize = 3;
 const SETUP_TAB_AUDIO: usize = 4;
 const SETUP_TAB_NETWORK: usize = 5;
 const SETUP_TAB_INTERFACE: usize = 6;
-const SETUP_TAB_MOD: usize = 7;
+const SETUP_TAB_EXTENSIONS: usize = 7;
+const SETUP_TAB_MOD: usize = 8;
 
 /// Widest the settings/page column is allowed to get. Sized to just fit a
 /// label, a full-width meter and its readout: on the Video page the world
@@ -310,13 +311,10 @@ impl ProfileForceConfig {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum VideoSection {
     Display,
-    ImageQuality,
-    Visibility,
-    Models,
+    Geometry,
     Lighting,
     Effects,
     Shadows,
-    Reflections,
     PostProcessing,
     Color,
     DebugTools,
@@ -329,16 +327,13 @@ pub(super) enum VideoSection {
 }
 
 impl VideoSection {
-    const RENDERING: [(Self, &'static str); 11] = [
-        (Self::Display, "Display"),
+    const RENDERING: [(Self, &'static str); 8] = [
+        (Self::Display, "Display & graphics"),
         (Self::Color, "Color & HDR"),
-        (Self::ImageQuality, "Image quality"),
-        (Self::Visibility, "Visibility"),
-        (Self::Models, "Models"),
+        (Self::Geometry, "Geometry"),
         (Self::Lighting, "Lighting"),
         (Self::Shadows, "Shadows"),
         (Self::Effects, "Effects"),
-        (Self::Reflections, "Reflections"),
         (Self::PostProcessing, "Post processing"),
         (Self::Physics, "Physics"),
     ];
@@ -507,59 +502,6 @@ pub(super) fn jka_colored_text(
                 if next.is_ascii_digit() {
                     flush(&mut job, &mut run, color);
                     chars.next();
-                    color = jka_ui_color(next, fallback);
-                    continue;
-                }
-            }
-        }
-        run.push(ch);
-    }
-    flush(&mut job, &mut run, color);
-    job
-}
-
-/// Build an editor galley with the same character count as the stored name.
-/// Color escapes become zero-width placeholders, preserving cursor movement
-/// and backspace semantics while the surrounding runs keep their JKA colors.
-fn profile_name_layout(raw: &str, size: f32, fallback: egui::Color32) -> egui::text::LayoutJob {
-    const HIDDEN_CHAR: char = '\u{2060}';
-
-    let mut job = egui::text::LayoutJob::default();
-    let mut color = fallback;
-    let mut run = String::new();
-    let flush = |job: &mut egui::text::LayoutJob, run: &mut String, color: egui::Color32| {
-        if run.is_empty() {
-            return;
-        }
-        job.append(
-            run,
-            0.0,
-            egui::TextFormat {
-                font_id: egui::FontId::proportional(size),
-                color,
-                ..Default::default()
-            },
-        );
-        run.clear();
-    };
-
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '^' {
-            if let Some(next) = chars.peek().copied() {
-                if next.is_ascii_digit() {
-                    flush(&mut job, &mut run, color);
-                    chars.next();
-                    let hidden = format!("{HIDDEN_CHAR}{HIDDEN_CHAR}");
-                    job.append(
-                        &hidden,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::proportional(size),
-                            color: egui::Color32::TRANSPARENT,
-                            ..Default::default()
-                        },
-                    );
                     color = jka_ui_color(next, fallback);
                     continue;
                 }

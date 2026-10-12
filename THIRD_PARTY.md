@@ -1,5 +1,13 @@
 # Reference provenance
 
+The vendored SMAA implementation is the published [smaa 0.21.0](https://crates.io/crates/smaa/0.21.0)
+release from [Jonathan Behrens's smaa-rs](https://codeberg.org/fintelia/smaa-rs)
+(MIT, Copyright (c) 2018 Jonathan Behrens). Its source, shaders and lookup tables
+are unchanged; only the WGPU dependency's default features are disabled in the
+two Cargo manifests. Upstream SMAA shader attribution and licenses remain in
+`vendor/smaa-0.21.0/third_party/smaa/`. Archive provenance and its verified
+SHA-256 are recorded in `vendor/README.md`.
+
 The conservative coastal shallow-water solver in `jka-water::coastal` adapts the
 staggered pressure update, terrain-dependent face crest/depth, donor-cell
 flux, shared outgoing-volume limiter, divergence update, and wet-neighbour

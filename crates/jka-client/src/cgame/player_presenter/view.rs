@@ -186,14 +186,6 @@ impl Ghoul2PresentationView {
         self.distance_cull
     }
 
-    pub(crate) fn aspect(self) -> f32 {
-        self.aspect
-    }
-
-    pub(crate) fn fov_x_degrees(self) -> f32 {
-        (2.0 * (self.tan_half_fov_y * self.aspect).atan()).to_degrees()
-    }
-
     /// Camera origin converted back to JKA's native Z-up coordinates. Auxiliary
     /// CGame refEntities such as the invulnerability half-shield orient
     /// themselves from `cg.refdef.vieworg`, not from the player's viewangles.

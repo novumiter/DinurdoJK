@@ -55,10 +55,55 @@ impl App {
         let ctx = self.egui_ctx.clone();
         for result in results {
             match result.payload {
+                CatalogPayload::DemoGames { token, games } => {
+                    if token != self.demo_catalog_generation || !self.demo_catalog_pending {
+                        continue;
+                    }
+                    match games {
+                        Ok(games) => {
+                            self.demo_game_choices = games;
+                            let selected = if self.demo_game_filter.is_empty() { "base" }
+                                else { self.demo_game_filter.as_str() };
+                            if !self.demo_game_choices.iter().any(|g| g.eq_ignore_ascii_case(selected)) {
+                                self.demo_game_filter = self.demo_game_choices.first()
+                                    .map(|g| if g.eq_ignore_ascii_case("base") { String::new() } else { g.clone() })
+                                    .unwrap_or_default();
+                            }
+                            if self.demo_game_choices.is_empty() {
+                                self.demo_catalog_pending = false;
+                            } else {
+                                let game = self.demo_browser_game_path();
+                                self.ui_catalog.request(&self.base, game.as_deref(),
+                                    ui_catalog::CatalogRequest::Demos { token });
+                            }
+                        }
+                        Err(error) => {
+                            self.demo_catalog_pending = false;
+                            self.demo_catalog_error = Some(error);
+                        }
+                    }
+                }
+                CatalogPayload::Demos { token, game, demos } => {
+                    if token != self.demo_catalog_generation || !self.demo_catalog_pending
+                        || game != self.demo_browser_game_path() {
+                        continue;
+                    }
+                    self.demo_catalog_pending = false;
+                    match demos {
+                        Ok(entries) => {
+                            self.demo_entries = entries;
+                            self.demo_selected = self.demo_selected.min(self.demo_entries.len().saturating_sub(1));
+                        }
+                        Err(error) => self.demo_catalog_error = Some(error),
+                    }
+                }
                 CatalogPayload::AssetViewer(result) => {
                     self.ui_catalog.pending.asset_viewer = false;
                     match result {
-                        Ok(entries) => self.asset_viewer_entries = entries,
+                        Ok(entries) => {
+                            self.asset_viewer_entries = entries;
+                            self.asset_viewer_cache = None;
+                        },
                         Err(error) => {
                             eprintln!("Could not build Asset Viewer catalog: {error}");
                             self.asset_viewer_catalog_error = Some(error);

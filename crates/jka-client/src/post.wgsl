@@ -110,7 +110,7 @@ fn scene(uv: vec2<f32>) -> vec3<f32> {
 }
 fn display_scene(uv: vec2<f32>) -> vec3<f32> {
     var color = scene(uv) * exp2(settings.grain.w + auto_exposure_state.exposure_ev);
-    if (settings.color.y > 0.5) {
+    if (settings.color.y > 0.5 && settings.color.y < 2.0) {
         color = aces_fitted(color);
     }
     return pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / max(settings.color.x, 0.05)));
@@ -192,12 +192,13 @@ fn apply_color_lut(color: vec3<f32>) -> vec3<f32> {
     if (strength <= 0.001) {
         return color;
     }
-    let input = clamp(color, vec3<f32>(0.0), vec3<f32>(1.0));
+    let scale = select(1.0, max(1.0, max(color.r, max(color.g, color.b))), settings.color.y > 2.0);
+    let input = clamp(color / scale, vec3<f32>(0.0), vec3<f32>(1.0));
     // Sample texel centres so 0 and 1 map exactly to the endpoints of the
     // baked 33^3 cube while hardware trilinear filtering handles interpolation.
     let coord = (input * (COLOR_LUT_SIZE - 1.0) + vec3<f32>(0.5)) / COLOR_LUT_SIZE;
     let graded = textureSample(color_lut_texture, color_lut_sampler, coord).rgb;
-    return mix(color, graded, strength);
+    return mix(color, graded * scale, strength);
 }
 
 fn pcg_hash(input: u32) -> u32 {
@@ -306,7 +307,7 @@ fn world_position(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 }
 
 fn srgb_to_linear_channel(c: f32) -> f32 {
-    let value = clamp(c, 0.0, 1.0);
+    let value = select(clamp(c, 0.0, 1.0), max(c, 0.0), settings.color.y > 2.0);
     return select(
         pow((value + 0.055) / 1.055, 2.4),
         value / 12.92,
@@ -2006,13 +2007,10 @@ fn cloud_volumetric_shadow(
     return transmittance;
 }
 
-// Ground cloud shadows are resolved here, after the complete JKA material has
-// been composited. Doing this in an individual BSP shader stage made projected
-// shadows depend on how a material happened to be split into legacy passes: an
-// opaque base/lightmap pair could behave differently from its neighbours even
-// though both occupy the same world space. Depth reconstruction gives every
-// visible receiver the same world-space cloud mask, independent of material
-// stage ordering and receiver normals.
+// Evaluate the projected cloud mask from opaque prepass depth. The full-screen
+// multiplier now runs after opaque world/entity lighting and BEFORE authored
+// transparency. This keeps clouds independent of opaque BSP stage splitting
+// while preserving water/glass/foreground fog and additive effects added later.
 fn projected_cloud_shadow_interval(ro: vec3<f32>, rd: vec3<f32>) -> vec2<f32> {
     let inner_radius = CLOUD_HORIZON_RADIUS;
     let thickness = max(settings.cloud_layer.y, 1.0);
@@ -2073,19 +2071,14 @@ fn projected_cloud_shadow_density(world: vec3<f32>) -> f32 {
     return cloud_shape_without_terrain(world, cloud_normalized_height(world), 0.0);
 }
 
-// Entities publish their smooth sun-facing value in the prepass policy G channel
-// as code 26..126 of 255 (md3.wgsl cloud_shadow_facing_code); the BSP prepass
-// writes exactly 0 or 1 there. Returns -1 when the pixel did not provide one.
-fn entity_cloud_shadow_facing(pixel: vec2<i32>) -> f32 {
+// BSP prepass uses G=0/255. Skinned models use 26..126 for the smooth
+// sun-facing value, preventing faceted shadows on their surfaces.
+fn cloud_receiver_code(pixel: vec2<i32>) -> f32 {
     let dims = textureDimensions(reflection_policy_texture);
     let maximum = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
-    let code = round(
+    return round(
         textureLoad(reflection_policy_texture, clamp(pixel, vec2<i32>(0), maximum), 0).g * 255.0
     );
-    if (code < 26.0 || code > 126.0) {
-        return -1.0;
-    }
-    return (code - 26.0) / 100.0;
 }
 
 fn projected_cloud_shadow_factor(
@@ -2093,15 +2086,40 @@ fn projected_cloud_shadow_factor(
     normal: vec3<f32>,
     pixel: vec2<i32>
 ) -> f32 {
-    if (settings.cloud_shadow.x <= 0.5) {
+    // Sunlight intensity and its *availability* must gate projected shadows.
+    // No direct sunlight means nothing for clouds to subtract. This also
+    // bypasses all four expensive density probes for a zero-intensity sun.
+    let sun_intensity = max(settings.cloud_sun_direction.w, 0.0) / 250.0;
+    if (settings.cloud_shadow.x <= 0.5 || sun_intensity <= 0.0001) {
         return 1.0;
     }
+
+    let receiver_code = cloud_receiver_code(pixel);
 
     // cloud_sun_direction stores the direction the light travels (sun -> world).
     let toward_sun = -normalize(settings.cloud_sun_direction.xyz);
     if (toward_sun.y <= 0.02) {
         return 1.0;
     }
+
+    // Determine whether this receiver can have sunlight before ray-marching.
+    // Models supply smooth-facing in their prepass; BSP depth normals are flat.
+    var sun_facing = smoothstep(0.0, 0.3, dot(normal, toward_sun));
+    if (receiver_code >= 26.0 && receiver_code <= 126.0) {
+        sun_facing = (receiver_code - 26.0) / 100.0;
+    }
+
+    // The opaque multiplier cannot perfectly separate baked JKA sun from ambient.
+    // Limit the multiplier to an estimated direct-sun share, rather than
+    // subtracting 75% of ambient/legacy-material color even under a dim sun.
+    // This is a conservative approximation; actual direct terms must instead
+    // receive visibility in their material/lighting shaders.
+    let sun_share = sun_intensity / (sun_intensity + 0.5);
+    let strength = clamp(settings.cloud_shadow.y, 0.0, 1.0) * sun_facing * sun_share;
+    if (strength <= 0.0001) {
+        return 1.0;
+    }
+
     let interval = projected_cloud_shadow_interval(world_position, toward_sun);
     if (interval.y <= interval.x) {
         return 1.0;
@@ -2118,24 +2136,6 @@ fn projected_cloud_shadow_factor(
     let mean_density = density_sum * 0.25;
     let optical_distance = min(segment, max(settings.cloud_layer.y, 1.0) * 4.0);
     let visibility = exp(-mean_density * optical_distance * 0.00115);
-
-    // 1.0 means the projected mask is allowed to reach its full Beer-Lambert
-    // attenuation. The previous BSP path had a hidden second limiter (the CPU
-    // supplied at most 0.55 here) on top of the visible 0.60 multiplier, which
-    // is why even the nominal 60% setting looked much weaker than expected.
-    // This mask multiplies the finished pixel, so it must only bite where the
-    // sun was actually contributing. A surface turned away from the sun gets no
-    // direct light for a cloud to take away, and dimming its ambient/emissive
-    // colour (a wall, an overhang's underside) was the visible error; ramp the
-    // strength in with how squarely the surface faces the sun.
-    // Models use the facing their shader computed from smooth vertex normals;
-    // a normal rebuilt from depth is flat per triangle and shows as blocks.
-    var sun_facing = smoothstep(0.0, 0.3, dot(normal, toward_sun));
-    let entity_facing = entity_cloud_shadow_facing(pixel);
-    if (entity_facing >= 0.0) {
-        sun_facing = entity_facing;
-    }
-    let strength = clamp(settings.cloud_shadow.y, 0.0, 1.0) * sun_facing;
     return 1.0 - strength * (1.0 - visibility);
 }
 
@@ -2852,7 +2852,7 @@ fn apply_volumetric_fog(
     return color * transmittance + max(volume.rgb, vec3<f32>(0.0));
 }
 
-fn rain_haze_field(uv: vec2<f32>) -> vec2<f32> {
+fn precipitation_haze_field(uv: vec2<f32>) -> vec2<f32> {
     let mask_dims = textureDimensions(rain_haze_mask, 0);
     if (mask_dims.x == 0u || mask_dims.y == 0u) {
         return vec2<f32>(1.0, 0.5);
@@ -2866,48 +2866,75 @@ fn rain_haze_field(uv: vec2<f32>) -> vec2<f32> {
     return clamp(field, vec2<f32>(0.0), vec2<f32>(1.0));
 }
 
-fn apply_rain_haze(color: vec3<f32>, uv: vec2<f32>, world: vec3<f32>, depth: f32) -> vec3<f32> {
-    if (settings.rain.x <= 0.5 || !valid_depth(depth)) {
+// Shared depth-aware 2D precipitation: the rain formulas are left intact,
+// and snow adds only its own extinction/air tint. Both use the same shelter
+// field and post draw. No snow fullscreen pass is introduced.
+fn apply_precipitation_haze(color: vec3<f32>, uv: vec2<f32>, world: vec3<f32>, depth: f32) -> vec3<f32> {
+    let rain_enabled = settings.rain.x > 0.5;
+    let snow_clouds = clamp(settings.snow_haze.x, 0.0, 5.0);
+    if (!valid_depth(depth) || (!rain_enabled && snow_clouds <= 0.001)) {
         return color;
     }
 
-    // Individual streaks only need to sell the near/mid field. At distance, cheap
-    // atmospheric extinction conveys the enormous number of unresolved droplets.
-    // Tint from the authored sun color so sunset/storm lighting is preserved instead
-    // of turning the world into generic gray fog.
-    let intensity = clamp(settings.rain.y, 0.0, 1.0);
-    // Haze is a property of the authored rain strength, not a separate user
-    // control. Rust supplies the preset-derived value in settings.rain.z.
-    let haze_strength = clamp(settings.rain.z, 0.0, 1.0);
-    let haze_field = rain_haze_field(uv);
+    let haze_field = precipitation_haze_field(uv);
     let exposure = haze_field.x;
-    let gust = haze_field.y;
     if (exposure <= 0.001) {
         return color;
     }
-    // Still intentionally cheap depth haze, not the froxel volumetric system.
-    // Heavy rain starts a little nearer and ramps density non-linearly so it
-    // reads as a real downpour without adding another volumetric pass.
-    let heavy = smoothstep(0.72, 1.0, intensity);
-    let haze_start = mix(768.0, 620.0, heavy);
-    let distance = max(depth - haze_start, 0.0);
-    let density = mix(0.000110, 0.000335, intensity) * mix(1.0, 1.34, heavy) * haze_strength;
-    // Replace the old independent sine curtain with the same low-frequency
-    // GodotGrass gust field that bends grass and angles the rain. The field was
-    // already evaluated in the 64-wide haze pass and packed into haze_field.y.
-    let curtain = mix(0.78, 1.0, gust);
-    let extinction = 1.0 - exp(-distance * density * curtain);
-    let maximum = mix(0.31, 0.74, intensity) * mix(1.0, 1.10, heavy) * haze_strength;
-    let amount = clamp(extinction, 0.0, maximum) * exposure;
+    var result = color;
+    if (rain_enabled) {
+        // Individual streaks only need to sell the near/mid field. At distance, cheap
+        // atmospheric extinction conveys the enormous number of unresolved droplets.
+        // Tint from the authored sun color so sunset/storm lighting is preserved instead
+        // of turning the world into generic gray fog.
+        let intensity = clamp(settings.rain.y, 0.0, 1.0);
+        // Haze is a property of the authored rain strength, not a separate user
+        // control. Rust supplies the preset-derived value in settings.rain.z.
+        let haze_strength = clamp(settings.rain.z, 0.0, 1.0);
+        let gust = haze_field.y;
+        // Still intentionally cheap depth haze, not the froxel volumetric system.
+        // Heavy rain starts a little nearer and ramps density non-linearly so it
+        // reads as a real downpour without adding another volumetric pass.
+        let heavy = smoothstep(0.72, 1.0, intensity);
+        let haze_start = mix(768.0, 620.0, heavy);
+        let distance = max(depth - haze_start, 0.0);
+        let density = mix(0.000110, 0.000335, intensity) * mix(1.0, 1.34, heavy) * haze_strength;
+        // Replace the old independent sine curtain with the same low-frequency
+        // GodotGrass gust field that bends grass and angles the rain. The field was
+        // already evaluated in the 64-wide haze pass and packed into haze_field.y.
+        let curtain = mix(0.78, 1.0, gust);
+        let extinction = 1.0 - exp(-distance * density * curtain);
+        let maximum = mix(0.31, 0.74, intensity) * mix(1.0, 1.10, heavy) * haze_strength;
+        let amount = clamp(extinction, 0.0, maximum) * exposure;
 
-    // Rain air is a cool blue-grey. It only borrows the sun's brightness, never its
-    // colour: a warm sun must not turn distant walls pink.
-    let sun_tint = max(settings.cloud_sun_color.rgb, vec3<f32>(0.04));
-    let sun_brightness = clamp(luminance(sun_tint), 0.0, 1.0);
-    let rain_air = vec3<f32>(0.39, 0.47, 0.57) * mix(0.94, 1.0, sun_brightness);
-    let scene_luma = luminance(color);
-    let haze_color = rain_air * mix(0.62, 1.08, clamp(scene_luma, 0.0, 1.0));
-    return mix(color, haze_color, amount);
+        // Rain air is a cool blue-grey. It only borrows the sun's brightness, never its
+        // colour: a warm sun must not turn distant walls pink.
+        let sun_tint = max(settings.cloud_sun_color.rgb, vec3<f32>(0.04));
+        let sun_brightness = clamp(luminance(sun_tint), 0.0, 1.0);
+        let rain_air = vec3<f32>(0.39, 0.47, 0.57) * mix(0.94, 1.0, sun_brightness);
+        let scene_luma = luminance(color);
+        let haze_color = rain_air * mix(0.62, 1.08, clamp(scene_luma, 0.0, 1.0));
+        result = mix(result, haze_color, amount);
+    }
+
+    if (snow_clouds > 0.001) {
+        // Match the froxel snow scale: sqrt stacked cloud count, nearer
+        // atmospheric onset than rain, and bounded optical depth.
+        // Flakes handle nearby turbulence; the haze stays low-frequency.
+        let travel = max(depth - 490.0, 0.0);
+        let density = 0.000145 * sqrt(snow_clouds);
+        let curtain = mix(0.90, 1.0, haze_field.y);
+        let extinction = 1.0 - exp(-travel * density * curtain);
+        let maximum = clamp(0.40 + 0.105 * (snow_clouds - 1.0), 0.0, 0.78);
+        let amount = min(extinction, maximum) * exposure;
+        // Cold, high-albedo flakes scatter a pale blue-white ambience without
+        // turning every background solid white under a strong warm sun.
+        let sun_brightness = clamp(luminance(max(settings.cloud_sun_color.rgb,
+            vec3<f32>(0.04))), 0.0, 1.0);
+        let snow_air = vec3<f32>(0.78, 0.84, 0.91) * mix(0.77, 0.93, sun_brightness);
+        result = mix(result, snow_air, amount);
+    }
+    return result;
 }
 
 // Cheap distance-domain atmosphere for the modernized legacy r_we clouds.
@@ -2946,7 +2973,7 @@ fn apply_legacy_weather_air(color_in: vec3<f32>, uv: vec2<f32>, depth: f32) -> v
     if (acid > 0.001) {
         // Acid rain shares rain's low-resolution outdoor/shelter classification;
         // unlike sand it must disappear promptly when the camera moves under cover.
-        let field = rain_haze_field(uv);
+        let field = precipitation_haze_field(uv);
         let exposure = field.x;
         if (exposure > 0.001) {
             let travel = select(1050.0, max(depth - 310.0, 0.0), has_surface);
@@ -2965,7 +2992,7 @@ fn apply_legacy_weather_air(color_in: vec3<f32>, uv: vec2<f32>, depth: f32) -> v
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.5;
+    let tonemap_enabled = settings.color.y > 0.5 && settings.color.y < 2.0;
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
     let halation_enabled = settings.film.x > 0.5;
@@ -3000,9 +3027,6 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (valid_depth(centre_depth)) {
         let world = world_position(input.uv, centre_depth);
         let normal = surface_normal(pixel);
-        let cloud_shadow = projected_cloud_shadow_factor(world, normal, pixel);
-        let saber_foreground = saber_glow_over_receiver(input.uv, centre_depth);
-        color = color * cloud_shadow + saber_foreground * (1.0 - cloud_shadow);
         let puddle = post_puddle_amount(world, normal.y);
         color = finalize_puddle_film(color, world, puddle);
         color = temporal_ssr_color(pixel, centre_depth, color, puddle);
@@ -3016,7 +3040,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         }
         color = apply_volumetric_fog(color, input.uv, centre_depth);
         if (settings.legacy_weather.w > 0.5) {
-            color = apply_rain_haze(color, input.uv, world, centre_depth);
+            color = apply_precipitation_haze(color, input.uv, world, centre_depth);
         }
     }
 
@@ -3066,7 +3090,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.5;
+    let tonemap_enabled = settings.color.y > 0.5 && settings.color.y < 2.0;
     let dims = textureDimensions(linear_depth_texture);
     let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
     let max_pixel = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
@@ -3081,14 +3105,11 @@ fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
     if (valid_depth(centre_depth)) {
         let world = world_position(input.uv, centre_depth);
         let normal = surface_normal(pixel);
-        let cloud_shadow = projected_cloud_shadow_factor(world, normal, pixel);
-        let saber_foreground = saber_glow_over_receiver(input.uv, centre_depth);
-        color = color * cloud_shadow + saber_foreground * (1.0 - cloud_shadow);
         let puddle = post_puddle_amount(world, normal.y);
         color = finalize_puddle_film(color, world, puddle);
         color = apply_volumetric_fog(color, input.uv, centre_depth);
         if (settings.legacy_weather.w > 0.5) {
-            color = apply_rain_haze(color, input.uv, world, centre_depth);
+            color = apply_precipitation_haze(color, input.uv, world, centre_depth);
         }
     }
     color = apply_legacy_weather_air(color, input.uv, centre_depth);
@@ -3118,7 +3139,7 @@ struct TaaFragmentOut {
 @fragment
 fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.5;
+    let tonemap_enabled = settings.color.y > 0.5 && settings.color.y < 2.0;
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
     let halation_enabled = settings.film.x > 0.5;
@@ -3158,9 +3179,6 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     if (valid_depth(centre_depth)) {
         let world = world_position(input.uv, centre_depth);
         let normal = surface_normal(pixel);
-        let cloud_shadow = projected_cloud_shadow_factor(world, normal, pixel);
-        let saber_foreground = saber_glow_over_receiver(input.uv, centre_depth);
-        color = color * cloud_shadow + saber_foreground * (1.0 - cloud_shadow);
         let puddle = post_puddle_amount(world, normal.y);
         color = finalize_puddle_film(color, world, puddle);
         color = temporal_ssr_color(pixel, centre_depth, color, puddle);
@@ -3175,7 +3193,7 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
         }
         color = apply_volumetric_fog(color, input.uv, centre_depth);
         if (settings.legacy_weather.w > 0.5) {
-            color = apply_rain_haze(color, input.uv, world, centre_depth);
+            color = apply_precipitation_haze(color, input.uv, world, centre_depth);
         }
     }
 
@@ -3223,4 +3241,28 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     out.display = vec4<f32>(display_color, 1.0);
     out.history = vec4<f32>(temporal_history, taa.history_confidence);
     return out;
+}
+
+// Drawn during the world scene render pass, after depth-writing models and
+// before the transparent BSP queue/ocean and foreground model FX. Never read
+// the scene color target: fixed-function blending multiplies opaque RGB by
+// this mask, preserving all later authored blending and fog/reflections.
+@fragment
+fn fs_cloud_shadow_opaque(input: VertexOut) -> @location(0) vec4<f32> {
+    let dims = textureDimensions(linear_depth_texture);
+    let pixel = clamp(
+        vec2<i32>(input.position.xy),
+        vec2<i32>(0),
+        vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1)
+    );
+    let depth = depth_at_pixel(pixel);
+    if (!valid_depth(depth)) {
+        return vec4<f32>(1.0);
+    }
+    let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) /
+        vec2<f32>(f32(dims.x), f32(dims.y));
+    let world = world_position(uv, depth);
+    let normal = surface_normal(pixel);
+    let factor = projected_cloud_shadow_factor(world, normal, pixel);
+    return vec4<f32>(vec3<f32>(factor), 1.0);
 }

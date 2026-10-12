@@ -323,7 +323,7 @@ impl App {
             ocean: self.video.ocean,
             client_physics: self.video.client_physics,
             gen_normal_maps: self.video.gen_normal_maps,
-            float_lightmap: self.video.float_lightmap && self.video.hdr,
+            float_lightmap: self.video.float_lightmap && (self.video.hdr || self.video.hdr_output != 0),
             planar_reflections: self.video.reflection_quality.planar_slot_budget() > 0,
             planar_environment: self.video.reflection_quality.promotes_environment_planars(),
             omit_environment_stages: self.video.reflection_quality.omits_environment_stages(),
@@ -511,7 +511,7 @@ impl App {
             .map_editor
             .as_mut()
             .map_or(ExternalMapChange::None, |editor| {
-                editor.poll_external_change(now)
+                editor.poll_external_change_with_jobs(now, Some(&self.background_jobs))
             });
         match change {
             ExternalMapChange::None => {}

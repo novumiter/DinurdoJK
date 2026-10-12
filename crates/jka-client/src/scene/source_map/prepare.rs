@@ -446,6 +446,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         }),
         &library,
         &textures,
+        &*assets,
     );
 
     let Some((minimum, maximum)) = bounds else {

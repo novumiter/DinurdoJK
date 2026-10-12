@@ -156,6 +156,7 @@ use post::pipelines::{
     create_bloom_pipeline, create_cloud_pass_pipeline, create_cloud_resolve_bind_group,
     create_cull_debug_pipeline, create_dof_pipeline, create_gamma_post_pipeline,
     create_planar_debug_pipeline, create_post_pipeline, create_rain_post_pipeline,
+    create_cloud_shadow_opaque_pipeline,
     create_ssao_temporal_pipeline,
     create_ssr_temporal_pipeline, create_ssr_visibility_resources, create_taa_post_pipeline,
     create_wireframe_pipeline,
@@ -544,6 +545,8 @@ fn device_lost_reason() -> String {
     }
 }
 
+pub(crate) mod hdr_output;
+
 struct Renderer {
     model_frame_log: crate::model_frame_log::ModelFrameLog,
     base: PathBuf,
@@ -554,7 +557,9 @@ struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline_jobs: PipelineJobManager,
+    /// Composition format; native HDR surfaces use the separate output selection.
     config: wgpu::SurfaceConfiguration,
+    hdr_output: Option<hdr_output::HdrOutput>,
     /// Monotonic counter for every primary-surface configure after creation.
     /// Input diagnostics use this to prove whether focus/resize/present changes
     /// altered surface state between a bad and good capture.
@@ -982,6 +987,10 @@ struct Renderer {
     /// `None` until the background compile finishes and a frame needs it; see
     /// `ensure_post_pipeline`.
     post_pipeline: Option<wgpu::RenderPipeline>,
+    /// Deferred cloud-shadow multiplier for opaque light only. No work when disabled.
+    cloud_shadow_opaque_pipeline: Option<wgpu::RenderPipeline>,
+    /// Like the post bindings, but never samples the scene attachment being written.
+    cloud_shadow_opaque_bind_group: wgpu::BindGroup,
     /// Specialized rain-only full-screen post, compiled lazily for A/B testing.
     rain_post_pipeline: Option<wgpu::RenderPipeline>,
     taa_post_pipeline: Option<wgpu::RenderPipeline>,
@@ -1051,6 +1060,10 @@ mod inline_run_tests;
 #[cfg(test)]
 #[path = "renderer/tests/shader_tests.rs"]
 mod shader_tests;
+
+#[cfg(test)]
+#[path = "renderer/tests/smaa_tests.rs"]
+mod smaa_tests;
 
 #[cfg(test)]
 #[path = "renderer/tests/entity_shadow_tests.rs"]

@@ -28,7 +28,7 @@ impl App {
         let mut start_recording: Option<String> = None;
         let mut settings_changed = false;
 
-        egui::CentralPanel::default().show_inside(root, |ui| {
+        egui::CentralPanel::default().show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("STRAFE TRAILS");
                 ui.add_space(8.0);

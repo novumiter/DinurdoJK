@@ -180,7 +180,7 @@ fn caustic_receivers_survive_water_boundary_roundoff() {
                                 timeout: None,
                             })
                             .unwrap();
-                        let bytes = readback.slice(..).get_mapped_range();
+                        let bytes = readback.slice(..).get_mapped_range().expect("GPU readback range");
                         for y in 0..8 {
                             for x in 0..8 {
                                 assert_eq!(bytes[y * 256 + x * 4], expected,

@@ -7,3 +7,5 @@ pub(in crate::ui) mod notices;
 pub(in crate::ui) mod scores;
 pub(in crate::ui) mod team;
 pub(in crate::ui) mod siege;
+
+pub(in crate::ui) mod extensions;

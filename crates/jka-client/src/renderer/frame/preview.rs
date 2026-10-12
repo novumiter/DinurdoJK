@@ -96,9 +96,8 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
         };
         info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let frame_view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
 
         let encode_started = Instant::now();
         let mut encoder = self
@@ -158,8 +157,11 @@ impl Renderer {
         }
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
         let present_started = Instant::now();
+        if let Some(output) = &self.hdr_output {
+            output.submit(&self.device, &self.queue, &surface_view, false);
+        }
         self.window.pre_present_notify();
-        frame.present();
+        self.queue.present(frame);
         let present_completed_at = Instant::now();
         self.model_frame_log.presented_without_scene(
             present_completed_at,

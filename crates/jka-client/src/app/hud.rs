@@ -196,6 +196,7 @@ impl App {
             hud,
             team_overlay: self.team_overlay_ui(),
             hud_layout: self.hud_layout,
+            extension_hud: self.extensions.placed_widgets(),
             crosshair: self.crosshair,
             crosshair_target,
             force_select,

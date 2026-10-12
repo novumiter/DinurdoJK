@@ -208,6 +208,10 @@ pub struct VideoSettings {
     pub dynamic_light_brightness: f32,
     pub dynamic_light_brightness_locked: bool,
     pub hdr: bool,
+    pub hdr_output: u32,
+    pub hdr_paper_white: f32,
+    /// Zero uses the display's reported peak, falling back to 1000 nits.
+    pub hdr_peak: f32,
     pub float_lightmap: bool,
     pub tone_mapping: bool,
     pub auto_exposure: bool,
@@ -307,6 +311,8 @@ pub struct VideoSettings {
     /// `r_ssrDebug`: isolates the screen-space reflection pass. Runtime only.
     pub ssr_debug: u8,
     pub ocean: bool,
+    /// cg_waterwake: 0 off, 1 TaystJK/JKA quad, 2 enhanced quad plus Godot interaction.
+    pub water_wake: u8,
     pub ocean_settings: crate::ocean::OceanSettings,
     pub cloud_render_resolution: CloudRenderResolution,
     pub cloud_temporal: bool,
@@ -636,6 +642,9 @@ impl Default for VideoSettings {
             dynamic_light_brightness: 1.0,
             dynamic_light_brightness_locked: true,
             hdr: false,
+            hdr_output: 0,
+            hdr_paper_white: 200.0,
+            hdr_peak: 0.0,
             float_lightmap: false,
             tone_mapping: false,
             auto_exposure: false,
@@ -703,6 +712,7 @@ impl Default for VideoSettings {
             contact_shadow_debug: 0,
             ssr_debug: 0,
             ocean: false,
+            water_wake: 1,
             ocean_settings: crate::ocean::OceanSettings::default(),
             cloud_render_resolution: CloudRenderResolution::Full,
             cloud_temporal: true,

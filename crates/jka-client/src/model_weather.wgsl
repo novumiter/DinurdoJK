@@ -47,8 +47,10 @@ fn model_wet_albedo(dry: vec3<f32>, wet: f32) -> vec3<f32> {
 // the soaked upper surfaces and a grazing sheen everywhere else. Nothing on a
 // model samples an environment, so the sheen borrows the light the surface is
 // already standing in rather than inventing a colour of its own.
-fn model_wet_color(dry: vec4<f32>, world_normal: vec3<f32>, world_position: vec3<f32>) -> vec4<f32> {
-    let wet = model_wetness(world_normal);
+fn model_wet_color_with_water(dry: vec4<f32>, world_normal: vec3<f32>, world_position: vec3<f32>, water_wet: f32) -> vec4<f32> {
+    // Submersion wets undersides too, unlike directional falling rain.
+    // MAX avoids double darkening where the two sources overlap.
+    let wet = max(model_wetness(world_normal), clamp(water_wet, 0.0, 1.0));
     if (wet <= 0.001) {
         return dry;
     }
@@ -73,4 +75,9 @@ fn model_wet_color(dry: vec4<f32>, world_normal: vec3<f32>, world_position: vec3
     // Alpha is the material's own: wetness must never make a masked or blended
     // surface more or less present than the artist drew it.
     return vec4<f32>(lit + sheen, dry.a);
+}
+
+// Props and the MD3 reference path have no per-player water payload.
+fn model_wet_color(dry: vec4<f32>, world_normal: vec3<f32>, world_position: vec3<f32>) -> vec4<f32> {
+    return model_wet_color_with_water(dry, world_normal, world_position, 0.0);
 }

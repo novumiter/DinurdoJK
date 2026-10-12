@@ -21,15 +21,6 @@ impl GlowMode {
         Self::JkaAndBloom,
     ];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Off => "OFF",
-            Self::JkaAuthored => "JKA AUTHORED",
-            Self::ModernBloom => "MODERN BLOOM",
-            Self::JkaAndBloom => "JKA + BLOOM",
-        }
-    }
-
     pub fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -57,9 +48,6 @@ impl GlowMode {
         matches!(self, Self::JkaAuthored | Self::JkaAndBloom)
     }
 
-    pub const fn modern(self) -> bool {
-        matches!(self, Self::ModernBloom | Self::JkaAndBloom)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -624,13 +612,6 @@ pub enum CrtStyle {
 impl CrtStyle {
     pub const ALL: [Self; 2] = [Self::LottesFast, Self::Lottes];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::LottesFast => "LOTTES FAST",
-            Self::Lottes => "LOTTES",
-        }
-    }
-
     pub fn config_value(self) -> &'static str {
         match self {
             Self::LottesFast => "fast",
@@ -657,13 +638,6 @@ pub enum CrtQuality {
 impl CrtQuality {
     pub const ALL: [Self; 2] = [Self::Fast, Self::Quality];
 
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Fast => "FAST (2 TAP)",
-            Self::Quality => "QUALITY (8 TAP)",
-        }
-    }
-
     pub fn config_value(self) -> u8 {
         match self { Self::Fast => 0, Self::Quality => 1 }
     }
@@ -688,15 +662,6 @@ pub enum CrtMask {
 
 impl CrtMask {
     pub const ALL: [Self; 4] = [Self::None, Self::GrilleLite, Self::Grille, Self::Shadow];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::None => "OFF",
-            Self::GrilleLite => "GRILLE LITE",
-            Self::Grille => "GRILLE",
-            Self::Shadow => "SHADOW",
-        }
-    }
 
     /// Matches crt-lottes-fast's runtime MASK values exactly.
     pub fn shader_value(self) -> u32 {
@@ -727,15 +692,6 @@ pub enum CrtReferenceResolution {
 
 impl CrtReferenceResolution {
     pub const ALL: [Self; 4] = [Self::P480, Self::P600, Self::P720, Self::Native];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::P480 => "480P",
-            Self::P600 => "600P",
-            Self::P720 => "720P",
-            Self::Native => "NATIVE",
-        }
-    }
 
     pub fn config_value(self) -> u32 {
         match self { Self::P480 => 480, Self::P600 => 600, Self::P720 => 720, Self::Native => 0 }

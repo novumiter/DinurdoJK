@@ -18,6 +18,25 @@ use std::{collections::BTreeMap, path::{Path, PathBuf}, sync::Arc, time::Instant
 const MAX_TEXTURE_FILE_BYTES: usize = 8192 * 8192 * 4 + 1024;
 const MAX_VIDEO_FILE_BYTES: usize = 256 * 1024 * 1024;
 
+/// Exact qpath fallback sequence used by both synchronous texture decode and
+/// map-worker preloading. Keep trace diagnostics on this same sequence.
+pub fn texture_lookup_candidates(path: &str) -> Vec<String> {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let stem = path
+        .rsplit_once('.')
+        .filter(|(_, ext)| ["tga", "jpg", "jpeg", "png"].contains(ext))
+        .map(|(stem, _)| stem)
+        .unwrap_or(path.as_str());
+    let mut candidates = vec![path.clone()];
+    for ext in ["tga", "jpg", "png"] {
+        let candidate = format!("{stem}.{ext}");
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BlendFactor {
     Zero,
@@ -226,6 +245,10 @@ pub struct SurfaceMaterial {
     /// Authored id Tech 3 `portal` / `sort portal` surface. These surfaces are
     /// eligible for the renderer's exact planar-reflection path.
     pub planar_reflection: bool,
+    /// Authored surfaceparm trans/nonopaque/water/lava/slime/lightfilter.
+    /// Unlike an individual blended shader stage, this marks the *entire*
+    /// material as translucent for pre-cloud ordering.
+    pub authored_translucent: bool,
     /// True only for authored `surfaceparm water`.
     pub water: bool,
     /// Geometric shader deformation amplitude used by promoted water, in map units.
@@ -286,6 +309,7 @@ impl Default for SurfaceMaterial {
             offset: false,
             sort: None,
             planar_reflection: false,
+            authored_translucent: false,
             water: false,
             water_amplitude: crate::ocean::appearance::DEFAULT_PROMOTED_AMPLITUDE,
             water_deformed: false,
@@ -539,7 +563,7 @@ fn shader_library_internal(
         source: PathBuf,
         override_existing: bool,
         mtr_override: bool,
-        parsed: Result<BTreeMap<String, Shader>, String>,
+        parsed: Result<(BTreeMap<String, Shader>, Vec<String>), String>,
         parse_ms: f64,
     }
 
@@ -564,7 +588,7 @@ fn shader_library_internal(
                 let bytes = asset.bytes;
                 handles.push(jobs.submit(Task::MapShaderParse, move || {
                     let started = Instant::now();
-                    let parsed = shader::parse(&String::from_utf8_lossy(&bytes));
+                    let parsed = shader::parse_recovering(&String::from_utf8_lossy(&bytes));
                     ParsedFile {
                         name,
                         source,
@@ -595,7 +619,7 @@ fn shader_library_internal(
                     .ok_or("indexed material definition vanished")?;
                 diagnostics.read_ms += read_started.elapsed().as_secs_f64() * 1000.0;
                 let started = Instant::now();
-                let parsed = shader::parse(&String::from_utf8_lossy(&asset.bytes));
+                let parsed = shader::parse_recovering(&String::from_utf8_lossy(&asset.bytes));
                 parsed_files.push(ParsedFile {
                     name: name.clone(),
                     source: asset.source,
@@ -613,7 +637,10 @@ fn shader_library_internal(
     for file in parsed_files {
         diagnostics.parse_cpu_ms += file.parse_ms;
         match file.parsed {
-            Ok(parsed) => {
+            Ok((parsed, parse_warnings)) => {
+                for warning in parse_warnings {
+                    warnings.push(format!("{}: {warning}", file.name));
+                }
                 if file.mtr_override {
                     diagnostics.mtr_definitions += parsed.len();
                 } else {
@@ -673,6 +700,9 @@ pub struct Textures {
     shader_policy_cache: BTreeMap<(usize, bool, bool), usize>,
     pub images: Vec<TextureData>,
     cache: BTreeMap<(String, bool, bool), Option<usize>>,
+    /// Actual errors that caused normal texture loads to return None.
+    /// Only failed loads are recorded; consulted solely by map-load diagnostics.
+    load_failures: BTreeMap<(String, bool, bool), String>,
     /// Source-affine cache for active `.mtr` dependencies. The same qpath may
     /// legitimately resolve to a different image when owned by a different
     /// material provider, so it must not alias the ordinary global VFS cache.
@@ -728,6 +758,7 @@ impl Textures {
             video_cache: BTreeMap::new(),
             images: Vec::new(),
             cache: BTreeMap::new(),
+            load_failures: BTreeMap::new(),
             source_cache: BTreeMap::new(),
             generated_normal_cache: BTreeMap::new(),
             warnings: Vec::new(),
@@ -818,10 +849,22 @@ impl Textures {
         value
     }
 
+    pub fn load_failure(&self, path: &str, clamp: bool, srgb: bool) -> Option<&str> {
+        let path = path.replace('\\', "/").to_ascii_lowercase();
+        self.load_failures
+            .get(&(path, clamp, srgb))
+            .map(String::as_str)
+    }
+
     pub fn load(&mut self, assets: &mut AssetSearchPath, path: &str, clamp: bool) -> Option<usize> {
         let path = path.replace('\\', "/").to_ascii_lowercase();
-        if let Some(value) = self.cache.get(&(path.clone(), clamp, true)) {
-            return *value;
+        if let Some(&value) = self.cache.get(&(path.clone(), clamp, true)) {
+            if value.is_none() {
+                self.load_failures
+                    .entry((path.clone(), clamp, true))
+                    .or_insert_with(|| "negative cached image lookup (prior optional request)".into());
+            }
+            return value;
         }
         let result = self.decode(assets, &path, clamp, true);
         let value = match result {
@@ -831,6 +874,7 @@ impl Textures {
                 Some(index)
             }
             Err(error) => {
+                self.load_failures.insert((path.clone(), clamp, true), error.clone());
                 self.warnings.push(error);
                 None
             }
@@ -979,18 +1023,7 @@ impl Textures {
             if self.cache.contains_key(&key) {
                 continue;
             }
-            let stem = path
-                .rsplit_once('.')
-                .filter(|(_, ext)| ["tga", "jpg", "jpeg", "png"].contains(ext))
-                .map(|(stem, _)| stem)
-                .unwrap_or(path.as_str());
-            let mut candidates = vec![path.clone()];
-            for ext in ["tga", "jpg", "png"] {
-                let candidate = format!("{stem}.{ext}");
-                if !candidates.contains(&candidate) {
-                    candidates.push(candidate);
-                }
-            }
+            let candidates = texture_lookup_candidates(&path);
 
             let clamp = *clamp;
             let srgb = *srgb;
@@ -1049,6 +1082,7 @@ impl Textures {
                     self.load_stats.decoded_images += 1;
                 }
                 TexturePreloadOutcome::Decoded(Err(error)) => {
+                    self.load_failures.insert(key.clone(), error.clone());
                     self.warnings.push(error);
                     self.cache.insert(key, None);
                 }
@@ -1221,18 +1255,7 @@ impl Textures {
         srgb: bool,
         source: &Path,
     ) -> Result<TextureData, String> {
-        let stem = path
-            .rsplit_once('.')
-            .filter(|(_, ext)| ["tga", "jpg", "jpeg", "png"].contains(ext))
-            .map(|(stem, _)| stem)
-            .unwrap_or(path);
-        let mut candidates = vec![path.to_string()];
-        for ext in ["tga", "jpg", "png"] {
-            let candidate = format!("{stem}.{ext}");
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
-        }
+        let candidates = texture_lookup_candidates(path);
 
         for name in &candidates {
             let read_started = Instant::now();
@@ -1266,18 +1289,7 @@ impl Textures {
         clamp: bool,
         srgb: bool,
     ) -> Result<TextureData, String> {
-        let stem = path
-            .rsplit_once('.')
-            .filter(|(_, ext)| ["tga", "jpg", "jpeg", "png"].contains(ext))
-            .map(|(stem, _)| stem)
-            .unwrap_or(path);
-        let mut candidates = vec![path.to_string()];
-        for ext in ["tga", "jpg", "png"] {
-            let candidate = format!("{stem}.{ext}");
-            if !candidates.contains(&candidate) {
-                candidates.push(candidate);
-            }
-        }
+        let candidates = texture_lookup_candidates(path);
 
         if !assets.asset_overrides_allowed() {
             for name in &candidates {
@@ -2766,6 +2778,7 @@ pub fn describe(
         offset: definition.polygon_offset,
         sort: definition.sort,
         planar_reflection: definition.portal,
+        authored_translucent: definition.translucent,
         water: definition.water,
         water_amplitude: crate::ocean::appearance::amplitude_from_shader(definition),
         water_deformed: crate::ocean::appearance::deformation_amplitude(definition).is_some(),
@@ -2791,6 +2804,23 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn implicit_texture_probe_uses_exact_loader_candidate_order() {
+        assert_eq!(
+            texture_lookup_candidates("textures/chocobo_v3/chocobov3_grate2"),
+            [
+                "textures/chocobo_v3/chocobov3_grate2",
+                "textures/chocobo_v3/chocobov3_grate2.tga",
+                "textures/chocobo_v3/chocobov3_grate2.jpg",
+                "textures/chocobo_v3/chocobov3_grate2.png",
+            ].map(str::to_owned)
+        );
+        assert_eq!(
+            texture_lookup_candidates("TEXTURES/EXAMPLE/GRID.JPG"),
+            ["textures/example/grid.jpg", "textures/example/grid.tga", "textures/example/grid.png"].map(str::to_owned)
+        );
+    }
 
     #[test]
     fn authored_texture_policies_do_not_mutate_shared_images() {

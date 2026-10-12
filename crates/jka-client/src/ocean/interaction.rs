@@ -1401,7 +1401,7 @@ mod tests {
                     })
                     .unwrap();
                 rx.recv().unwrap().unwrap();
-                let result = buffer.slice(..).get_mapped_range().to_vec();
+                let result = buffer.slice(..).get_mapped_range().expect("GPU readback range").to_vec();
                 buffer.unmap();
                 result
             };

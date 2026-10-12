@@ -704,7 +704,7 @@ impl RainSystem {
             return;
         };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("JKA rain haze exposure"),
+            label: Some("JKA precipitation haze exposure"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.haze.pipeline);

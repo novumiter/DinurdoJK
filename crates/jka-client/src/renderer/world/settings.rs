@@ -783,11 +783,35 @@ impl Renderer {
         }
     }
 
-    /// Rain haze follows the selected fog renderer automatically. Volumetric
-    /// fog uses the froxel rain volume; legacy/off modes use the cheaper
-    /// depth-aware 2D weather haze. Fog Off still keeps rain haze visible.
-    pub(in crate::renderer) fn rain_uses_2d_haze(&self) -> bool {
+    /// Rain and snow use one atmospheric-haze policy. Fog Off/Legacy keep
+    /// weather haze via the cheap depth-aware post, while Volumetric puts both
+    /// kinds of precipitation into the shared froxel volume. Fog Off must not
+    /// suppress precipitation, only its expensive fog implementation.
+    pub(in crate::renderer) fn weather_uses_2d_haze(&self) -> bool {
         self.weather.fog.mode != ui::FogMode::Volumetric
+    }
+
+    /// One authority for froxel uniforms, dispatch and final compositing.
+    /// In particular, snow must not launch froxels in Off/Legacy modes.
+    pub(in crate::renderer) fn weather_froxels_needed(&self) -> bool {
+        self.weather.fog.volumetric_effective()
+            || (!self.weather_uses_2d_haze()
+                && (self.weather.rain.enabled
+                    || (self.weather.snow.enabled && self.weather.snow.density_scale > 0.001)))
+    }
+
+    /// Only run the per-pixel precipitation haze when a 2D weather effect
+    /// actually contributes; keep the flag off on clear-weather frames.
+    pub(in crate::renderer) fn precipitation_2d_haze_active(&self) -> bool {
+        self.weather_uses_2d_haze()
+            && ((self.weather.rain.enabled && !self.weather.rain.fast_post)
+                || (self.weather.snow.enabled && self.weather.snow.density_scale > 0.001))
+    }
+
+    /// Shared outdoor/shelter exposure for 2D rain/snow and legacy acid rain.
+    /// Snow still needs it when rain's fast_post A/B option is selected.
+    pub(in crate::renderer) fn precipitation_haze_mask_needed(&self) -> bool {
+        self.precipitation_2d_haze_active() || self.weather.rain.acid_strength > 0.001
     }
 
     pub(in crate::renderer) fn set_puddle_debug(&mut self, mode: u32) {

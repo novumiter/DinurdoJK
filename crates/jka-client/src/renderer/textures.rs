@@ -526,14 +526,6 @@ pub(in crate::renderer) fn upload_texture_bc3_picmip(
     }
 }
 
-pub(in crate::renderer) fn upload_texture_bc3(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    data: &TextureData,
-) -> GpuImage {
-    upload_texture_bc3_picmip(device, queue, data, 0)
-}
-
 pub(in crate::renderer) fn upload_texture_picmip(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

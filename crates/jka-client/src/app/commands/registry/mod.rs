@@ -174,6 +174,7 @@ mod buttons;
 pub(crate) mod client_cvars;
 pub(crate) mod cloud_cvars;
 pub(crate) mod color_cvars;
+pub(crate) mod hdr_output_cvars;
 mod connection;
 mod core;
 pub(crate) mod crosshair_cvars;
@@ -270,6 +271,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(japro_cvars::DEFINITIONS.iter());
         definitions.extend(postprocess_cvars::DEFINITIONS.iter());
         definitions.extend(color_cvars::DEFINITIONS.iter());
+        definitions.extend(hdr_output_cvars::DEFINITIONS.iter());
         definitions.extend(crt_cvars::DEFINITIONS.iter());
         definitions.extend(effects_cvars::DEFINITIONS.iter());
         definitions.extend(cloud_cvars::DEFINITIONS.iter());

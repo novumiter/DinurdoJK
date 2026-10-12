@@ -2210,11 +2210,11 @@ fn create_grass_shadow_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &BLADE_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2262,11 +2262,11 @@ fn create_prepared_grass_wireframe_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &BLADE_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2308,8 +2308,8 @@ fn create_grass_wireframe_pipeline(
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[
-                wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &BLADE_ATTRIBUTES },
-                wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Instance, attributes: &VISIBLE_INDEX_ATTRIBUTES },
+                Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Vertex, attributes: &BLADE_ATTRIBUTES }),
+                Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress, step_mode: wgpu::VertexStepMode::Instance, attributes: &VISIBLE_INDEX_ATTRIBUTES }),
             ],
         },
         primitive: wgpu::PrimitiveState {
@@ -2344,11 +2344,11 @@ fn create_prepared_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &BLADE_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2404,16 +2404,16 @@ fn create_pipeline(
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
             buffers: &[
-                wgpu::VertexBufferLayout {
+                Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<BladeVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &BLADE_ATTRIBUTES,
-                },
-                wgpu::VertexBufferLayout {
+                }),
+                Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<u32>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Instance,
                     attributes: &VISIBLE_INDEX_ATTRIBUTES,
-                },
+                }),
             ],
         },
         primitive: wgpu::PrimitiveState {

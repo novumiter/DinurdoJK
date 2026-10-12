@@ -34,6 +34,9 @@ struct SkinDraw {
     // even though this compute path does not evaluate Source material lighting.
     source_phong: vec4<f32>,
     source_fresnel: vec4<f32>,
+    water_bands0: vec4<f32>,
+    water_bands1: vec4<f32>,
+    water_base: vec4<f32>,
 };
 // q3 RB_CalcSpecularAlpha: (reflected light . viewer)^4, all in JKA world space.
 fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> f32 {
@@ -68,8 +71,8 @@ struct InputVertex {
 @group(0) @binding(1) var<storage, read> draw_indices: array<u32>;
 @group(1) @binding(0) var<storage, read> bones: array<BoneMatrix>;
 @group(1) @binding(1) var<storage, read> skin_draws: array<SkinDraw>;
-// Packed DynamicModelVertex words: position3, normal3, uv2, color4, depth_hack1
-// = 13 words. DYNAMIC_MODEL_VERTEX_WORDS in api.rs static-asserts the match;
+// Packed DynamicModelVertex words: position3, normal3, uv2, color4, depth_hack1, water_wetness1
+// = 14 words. DYNAMIC_MODEL_VERTEX_WORDS in api.rs static-asserts the match;
 // a new DynamicModelVertex field must be added to write_vertex below as well.
 @group(1) @binding(2) var<storage, read_write> output_words: array<u32>;
 
@@ -162,8 +165,9 @@ fn write_vertex(
     normal: vec3<f32>,
     uv: vec2<f32>,
     color: vec4<f32>,
+    wetness: f32,
 ) {
-    let base = output_vertex * 13u;
+    let base = output_vertex * 14u;
     write_f32(base + 0u, position.x);
     write_f32(base + 1u, position.y);
     write_f32(base + 2u, position.z);
@@ -180,6 +184,7 @@ fn write_vertex(
     // part of the stride and the reserved range is only zero-filled on the CPU,
     // so write it rather than leaving the previous frame's value behind.
     write_f32(base + 12u, 0.0);
+    write_f32(base + 13u, wetness);
 }
 
 @compute @workgroup_size(64, 1, 1)
@@ -251,5 +256,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let original_uv = vec2<f32>(input.position_uv_x.w, input.normal_uv_y.w);
     let uv = original_uv * draw.uv_xform.xy + draw.uv_xform.zw
         + vec2<f32>(original_uv.y * draw.uv_cross.x, original_uv.x * draw.uv_cross.y);
-    write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv, draw_color);
+    var wetness = 0.0;
+    if (draw.water_base.w > 0.5) {
+        let band = clamp((render_position.y - draw.water_base.x) * 0.125, 0.0, 7.0);
+        let levels = array<f32, 8>(
+            draw.water_bands0.x, draw.water_bands0.y, draw.water_bands0.z, draw.water_bands0.w,
+            draw.water_bands1.x, draw.water_bands1.y, draw.water_bands1.z, draw.water_bands1.w
+        );
+        let lo = u32(band);
+        wetness = mix(levels[lo], levels[min(lo + 1u, 7u)], fract(band));
+    }
+    write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv, draw_color, wetness);
 }

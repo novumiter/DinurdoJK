@@ -66,6 +66,7 @@ pub(in crate::renderer) struct CpuPackJob {
     pub vertices: Range<usize>,
     pub indices: Range<usize>,
     pub light: Option<scene::ClassicEntityLight>,
+    pub water: Option<crate::water_wetness::WaterProfile>,
 }
 
 /// Split only at surface boundaries, retaining exact primitive order. Gaps may
@@ -112,6 +113,11 @@ pub(in crate::renderer) fn pack_jobs(
         return;
     }
     for job in jobs {
+        if let Some(water) = job.water {
+            for vertex in &mut vertices[job.vertices.start - vertex_base..job.vertices.end - vertex_base] {
+                vertex.water_wetness = water.wetness_at_z(vertex.position[1]);
+            }
+        }
         if let Some(light) = &job.light {
             for vertex in
                 &mut vertices[job.vertices.start - vertex_base..job.vertices.end - vertex_base]
@@ -278,11 +284,13 @@ mod tests {
                 vertices: 4..4000,
                 indices: 3..4000,
                 light: Some(light),
+                water: None,
             },
             CpuPackJob {
                 vertices: 4004..9000,
                 indices: 4003..9000,
                 light: None,
+                water: None,
             },
         ];
         let mut serial_vertices = input.clone();

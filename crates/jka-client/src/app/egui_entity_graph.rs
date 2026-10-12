@@ -182,7 +182,7 @@ impl App {
 
     pub(super) fn egui_entity_graph(&mut self, root: &mut egui::Ui) {
         let Some(graph) = self.entity_graph.clone() else {
-            egui::CentralPanel::default().show_inside(root, |ui| {
+            egui::CentralPanel::default().show(root, |ui| {
                 theme::banner(ui, "No entity data for this map.", theme::WARNING);
                 if theme::ghost_button(ui, "CLOSE").clicked() {
                     self.set_overlay(OverlayMode::None);
@@ -206,7 +206,7 @@ impl App {
         self.entity_graph_inspector(root, &graph, &mut st, can_teleport, can_use, &mut actions);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BLUEPRINT).inner_margin(egui::Margin::ZERO))
-            .show_inside(root, |ui| match st.mode {
+            .show(root, |ui| match st.mode {
                 GraphMode::Plan => plan_canvas(ui, &graph, &mut st, player),
                 GraphMode::Flow => flow_canvas(ui, &graph, &mut st, can_use, &mut actions),
             });
@@ -237,7 +237,7 @@ impl App {
                     .fill(theme::CHROME)
                     .inner_margin(egui::Margin::symmetric(16, 0)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 ui.horizontal_centered(|ui| {
                     theme::glow_label(ui, "ENTITY BLUEPRINT", 15.0, theme::TEXT);
                     theme::label(
@@ -314,7 +314,7 @@ impl App {
                     .fill(theme::CHROME)
                     .inner_margin(egui::Margin::symmetric(16, 0)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 ui.horizontal_centered(|ui| {
                     let hint = match st.mode {
                         GraphMode::Plan => "Drag: pan   Wheel: zoom   Click: select   ESC: close",
@@ -338,7 +338,7 @@ impl App {
                     .fill(theme::SURFACE)
                     .inner_margin(egui::Margin::symmetric(10, 10)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut st.search)
                         .hint_text("search class, targetname, value")
@@ -440,7 +440,7 @@ impl App {
                     .fill(theme::SURFACE)
                     .inner_margin(egui::Margin::symmetric(12, 10)),
             )
-            .show_inside(root, |ui| {
+            .show(root, |ui| {
                 let Some(index) = st.selected else {
                     theme::label(ui, theme::plain("Nothing selected", 13.0, theme::TEXT_DIM));
                     ui.add_space(4.0);

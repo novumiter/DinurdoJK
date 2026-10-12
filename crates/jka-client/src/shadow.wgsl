@@ -82,13 +82,18 @@ fn generated_uv(input: VertexIn) -> vec2<f32> {
         let b = material.mods[i * 2u + 1u];
         let kind = u32(a.x + 0.5);
         if (kind == 1u) {
-            uv = uv + a.yz * time;
+            // TaystJK RB_CalcScrollTexCoords wraps the offset before later tcMods.
+            // This matters when rotate follows scroll: a whole-texture offset
+            // cannot be discarded after the rotation.
+            let scroll = a.yz * time;
+            uv = uv + scroll - floor(scroll);
         }
         if (kind == 2u) {
             uv = uv * a.yz;
         }
         if (kind == 3u) {
-            let radians = a.y * time * 0.017453292519943295;
+            // TaystJK RB_CalcRotateTexCoords negates degrees-per-second.
+            let radians = -a.y * time * 0.017453292519943295;
             let c = cos(radians);
             let sn = sin(radians);
             let p = uv - vec2<f32>(0.5);

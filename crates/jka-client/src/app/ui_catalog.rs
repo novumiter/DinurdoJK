@@ -30,6 +30,8 @@ pub(super) struct DecodedImage {
 
 pub(super) enum CatalogRequest {
     AssetViewer,
+    DemoGames { token: u64 },
+    Demos { token: u64 },
     ChatLogs,
     ChatLogDetail { path: PathBuf },
     Profile,
@@ -47,6 +49,8 @@ type ProfileCatalog = (Vec<ProfileModelEntry>, Vec<ProfileSaberEntry>);
 
 pub(super) enum CatalogPayload {
     AssetViewer(Result<Vec<AssetEntry>, String>),
+    DemoGames { token: u64, games: Result<Vec<String>, String> },
+    Demos { token: u64, game: Option<PathBuf>, demos: Result<Vec<frontend::DemoEntry>, String> },
     ChatLogs(Result<Vec<ChatLogIndexEntry>, String>),
     ChatLogDetail { path: PathBuf, detail: Result<ChatLogDetail, String> },
     Profile(Result<ProfileCatalog, String>),
@@ -179,6 +183,23 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
         // potentially large recursive scan/parsing on this worker, but do not
         // pay for opening/reopening the game PK3 search path.
         match &job.request {
+            CatalogRequest::DemoGames { token } => {
+                let payload = CatalogPayload::DemoGames {
+                    token: *token,
+                    games: frontend::scan_demo_game_directories(&job.base),
+                };
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
+            CatalogRequest::Demos { token } => {
+                let payload = CatalogPayload::Demos {
+                    token: *token,
+                    game: job.game.clone(),
+                    demos: frontend::scan_demos(&job.base, job.game.as_deref()),
+                };
+                let _ = results.send(CatalogResult { generation: job.generation, payload });
+                continue;
+            }
             CatalogRequest::ChatLogs => {
                 let payload = CatalogPayload::ChatLogs(crate::chat_log::scan_browser_index(&job.base));
                 devprintln!(
@@ -234,6 +255,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     let error = error.to_string();
                     let payload = match job.request {
                         CatalogRequest::AssetViewer => Some(CatalogPayload::AssetViewer(Err(error))),
+                        CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } => unreachable!("demo requests handled before VFS"),
                         // Handled before VFS open above.
                         CatalogRequest::ChatLogs | CatalogRequest::ChatLogDetail { .. } => None,
                         CatalogRequest::Profile => Some(CatalogPayload::Profile(Err(error))),
@@ -262,6 +284,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
 
         let scan_started = Instant::now();
         let (label, payload) = match job.request {
+            CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } => unreachable!("demo requests handled before VFS"),
             CatalogRequest::AssetViewer => (
                 "asset viewer",
                 CatalogPayload::AssetViewer(frontend::scan_asset_viewer_assets(assets)),

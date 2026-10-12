@@ -123,6 +123,18 @@ impl AssetFilter {
     }
 }
 
+/// Derived asset-browser indexes, retained across egui repaints. UI changes
+/// invalidate by key; new catalog results explicitly clear the cache.
+pub(super) struct AssetViewCache {
+    pub filter: AssetFilter,
+    pub search: String,
+    pub folder: String,
+    pub shader_file: String,
+    pub shader_files: Vec<String>,
+    pub folder_counts: std::collections::BTreeMap<String, usize>,
+    pub filtered: Vec<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct AssetEntry {
     /// Stable browser identity. For shader definitions this includes both the

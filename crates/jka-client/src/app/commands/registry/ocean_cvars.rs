@@ -2,6 +2,38 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_CG_WATERWAKE {
+        runtime: CvarDef::new("cg_waterwake", "1", "0|1|2",
+            "0 off; 1 original JKA water wake on vanilla water; 2 enhanced vanilla wake and enabled Godot water interaction.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.water_wake.to_string()),
+            |app, value| App::cvar_set_water_wake(app, APP_CG_WATERWAKE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_water_wake, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    settings.water_wake = mode.min(2);
+                }
+            }),
+            archive: Some((25007, |state| state.video.water_wake.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_water_wake(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode: u8 = value.trim().parse()
+                    .map_err(|_| format!("{name} expects 0, 1 or 2"))?;
+                if mode > 2 { return Err(format!("{name} expects 0, 1 or 2")); }
+                self.video.water_wake = mode;
+                if let Some(session) = self.game_session.as_mut() {
+                    session.water_wake_mode = mode;
+                }
+                // The stored r_oceanInteraction preference remains untouched.
+                // Only the renderer-facing copy is gated by mode 2.
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
     APP_R_COASTAL {
         runtime: CvarDef::new("r_coastal", "0", "0|1",
             "Opt-in GPU shallow-bank solver for one promoted pool; r_coastalPool selects its 1-based pool number (0 automatic).",
@@ -235,7 +267,7 @@ app_cvars! {
                     {
                         self.video.ocean = Self::parse_cvar_bool(name, value)?;
                         if let Some(session) = self.game_session.as_mut() {
-                            session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction;
+                            session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
                         }
                         // OFF releases the FFT resources immediately, and ON can be
                         // restored live only when the loaded world already carries its

@@ -353,7 +353,7 @@ async fn run(map_size: u32, frames: usize) {
         queue.submit(Some(enc.finish()));
         buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        let data = buf.slice(..).get_mapped_range().to_vec();
+        let data = buf.slice(..).get_mapped_range().expect("GPU readback range").to_vec();
         let mut out = Vec::with_capacity((map_size * map_size * 4 * CASCADES as u32) as usize);
         for layer in 0..CASCADES {
             for y in 0..map_size {
@@ -462,7 +462,7 @@ async fn run(map_size: u32, frames: usize) {
         queue.submit(Some(enc.finish()));
         rbuf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-        let raw = rbuf.slice(..).get_mapped_range().to_vec();
+        let raw = rbuf.slice(..).get_mapped_range().expect("GPU readback range").to_vec();
         let vals: &[f32] = bytemuck::cast_slice(&raw);
         let ch = |k: usize| vals.iter().skip(k).step_by(4).copied().collect::<Vec<f32>>();
         println!("\nVERTEX-PATH REPLICA (128x128 samples over 1280 world units, 10u spacing):");

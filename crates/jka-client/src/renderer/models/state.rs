@@ -276,6 +276,7 @@ impl DynamicModelRenderer {
             model_brightness: 1.0,
             entity_legacy_fog: EntityLegacyFog::default(),
             entity_weather: EntityWeather::default(),
+            entity_water: Arc::new(std::collections::HashMap::new()),
             cloud_shadow_sun: [0.0; 4],
             legacy_fog_compiled: false,
             pipeline_layout,

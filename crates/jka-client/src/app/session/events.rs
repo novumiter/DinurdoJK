@@ -644,6 +644,11 @@ impl GameSession {
             .or(fx_dispatch)
             .unwrap_or_else(|| self.event_presenter.dispatch_prepared(&event, visual));
         self.record_event_stat(event.event, event.server_time, dispatch.class());
+        if !self.seeking_demo && self.extension_events.len() < 1024 {
+            self.extension_events.push(crate::extensions::GameEvent::from_accepted(
+                &event, &self.client_game,
+            ));
+        }
         if debug_events >= 1 {
             self.push_event_debug_line(event_debug::accepted_line(&event, &dispatch.status()));
         }

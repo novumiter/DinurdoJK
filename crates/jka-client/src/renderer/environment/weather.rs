@@ -54,7 +54,8 @@ impl Renderer {
     /// permanently wet.
     pub(in crate::renderer) fn update_entity_weather(&mut self) {
         let wetness = self.weather.rain.entity_wetness();
-        let weather = if wetness <= weather::RAIN_WETNESS_EPSILON {
+        let weather = if wetness <= weather::RAIN_WETNESS_EPSILON
+            && self.dynamic_model_renderer.entity_water.is_empty() {
             EntityWeather::default()
         } else {
             let sun = self.active_sun();

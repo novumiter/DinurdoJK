@@ -42,6 +42,26 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_water(&mut self, ui: &mut egui::Ui) {
+        let mut wake_mode = self.video.water_wake;
+        ui.horizontal(|ui| {
+            ui.label("Water Wake");
+            egui::ComboBox::from_id_salt("cg_waterwake_mode")
+                .selected_text(match wake_mode {
+                    0 => "Off", 1 => "JKA", _ => "Enhanced",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut wake_mode, 0, "Off");
+                    ui.selectable_value(&mut wake_mode, 1, "JKA");
+                    ui.selectable_value(&mut wake_mode, 2, "Enhanced");
+                });
+        }).response.on_hover_text("cg_waterwake: original wake shader on vanilla water, or enhanced movement-driven wake plus the existing Godot ocean wake in mode 2.");
+        if wake_mode != self.video.water_wake {
+            self.video.water_wake = wake_mode;
+            if let Some(session) = self.game_session.as_mut() {
+                session.water_wake_mode = wake_mode;
+            }
+            self.commit_ocean_settings();
+        }
         let mut interaction = self.video.ocean_settings.interaction;
         let mut strength = self.video.ocean_settings.interaction_strength;
         let mut splash_mode = self.video.ocean_settings.interaction_splash_mode;

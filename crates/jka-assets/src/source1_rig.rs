@@ -730,50 +730,6 @@ fn resolve_spine_chain(
 struct BoneRebind {
     /// GLA bone this Source bone drives.
     gla_bone: usize,
-    /// Takes a Source model-space point into base-pose space. See the module
-    /// documentation for the construction and why it is not `basePose * rest^-1`.
-    matrix: Matrix3x4,
-}
-
-/// The Source child that continues a limb: the child with the largest rest offset
-/// whose mapped GLA bone differs from this bone's, so the direction it defines has
-/// a real counterpart on the GLA side. Returns the pair of rest directions, the
-/// Source one already carried into JKA space.
-fn bone_direction_pair(
-    bone: usize,
-    skeleton: &SourceSkeleton,
-    rest_world: &[Matrix3x4],
-    gla: &GlaAnimation,
-    gla_for_bone: &[Option<usize>],
-    fit: &SkeletonFit,
-) -> Option<([f32; 3], [f32; 3])> {
-    let gla_bone = gla_for_bone[bone]?;
-    let here = origin(&rest_world[bone]);
-    let child = skeleton
-        .bones
-        .iter()
-        .enumerate()
-        .filter(|(index, candidate)| {
-            candidate.parent == Some(bone)
-                && gla_for_bone[*index].is_some_and(|mapped| mapped != gla_bone)
-        })
-        .max_by(|(a, _), (b, _)| {
-            let span = |index: usize| {
-                let there = origin(&rest_world[index]);
-                (0..3).map(|k| (there[k] - here[k]).powi(2)).sum::<f32>()
-            };
-            span(*a).total_cmp(&span(*b))
-        })
-        .map(|(index, _)| index)?;
-    let gla_child = gla_for_bone[child]?;
-    let source_offset: [f32; 3] =
-        std::array::from_fn(|k| origin(&rest_world[child])[k] - here[k]);
-    let gla_here = origin(&gla.skeleton[gla_bone].base_pose);
-    let gla_offset: [f32; 3] =
-        std::array::from_fn(|k| origin(&gla.skeleton[gla_child].base_pose)[k] - gla_here[k]);
-    // The fit's linear part carries the Source direction into JKA space; its
-    // uniform scale drops out when the direction is normalized.
-    Some((rotate(&fit.transform, source_offset), gla_offset))
 }
 
 /// `_humanoid` splits several chain bones from a sibling twist helper
@@ -1369,13 +1325,7 @@ pub fn build_source_rig(
     }
     let rebinds: Vec<BoneRebind> = gla_for_bone.iter().map(|slot| {
         let gla_bone = slot.expect("every bone is mapped above");
-        BoneRebind {
-            gla_bone,
-            matrix: if let Some(ref src_matrices) = source_bake {
-                // Legacy caller only needs GLA ownership in this mode.
-                src_matrices[owner_of_gla[&gla_bone]]
-            } else { matrix_of_gla[&gla_bone] },
-        }
+        BoneRebind { gla_bone }
     }).collect();
     let dual_quat_of_source: Option<Vec<([f32; 4], [f32; 4], f32)>> = source_bake
         .as_ref().map(|mats| mats.iter().map(dual_quat_from_scaled_matrix).collect());

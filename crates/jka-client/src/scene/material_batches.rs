@@ -1,7 +1,7 @@
 //! Materials.
 use crate::scene::{
     bsp_fog_params, material_legacy2_in_stage_safe, materials, stage_fog_color_override, AlphaGen,
-    BTreeMap, BlendFactor, BlendMode, Bsp, CullMode, DrawBatch, DrawClass, MaterialDebugEntry,
+    AssetSearchPath, BTreeMap, BlendFactor, BlendMode, Bsp, CullMode, DrawBatch, DrawClass, MaterialDebugEntry,
     MaterialDebugInfo, MaterialStage, PipelineKey, Range, RgbGen, Shader, StageTexture,
     SurfaceMaterial, TcGen, Textures,
 };
@@ -70,6 +70,59 @@ pub(in crate::scene) fn stage_class(stage: &MaterialStage) -> DrawClass {
         DrawClass::Opaque
     }
 }
+
+/// Computed during map/shader preparation, not in the per-frame render loop.
+/// TaystJK framebuffer blendFunc is stage-local: an opaque material may use
+/// alpha/additive blending for later stages (lightmaps, terrain splats,
+/// caustics, depthfade). Those siblings must not be composited over an already
+/// cloud-shadowed base. Genuine translucent shaders remain deferred.
+pub(in crate::scene) fn opaque_composite_before_clouds(material: &SurfaceMaterial) -> bool {
+    if material.sky
+        || material.water
+        || material.planar_reflection
+        || material.authored_translucent
+        || material.auto_sprite2
+        // Explicit translucent sort classes start above the opaque/decal range.
+        || material.sort.is_some_and(|sort| !sort.is_finite() || sort >= 5.0)
+    {
+        return false;
+    }
+    material.stages.first().is_some_and(|base| {
+        let first = stage_pipeline(material, base, true);
+        first.depth_write && matches!(first.class, DrawClass::Opaque | DrawClass::Mask)
+    })
+}
+
+/// Per-stage refinement of `opaque_composite_before_clouds`. An alpha-blended
+/// stage AFTER the material's lightmap filter is an overlay on the already lit
+/// result (e.g. costadelsol's `depthfade.tga` height haze), not albedo or
+/// sunlight. Darkening it with the cloud multiplier turned the authored haze
+/// into hard blotches, so it and the stages after it go behind the multiplier.
+/// Albedo splats before the lightmap and additive caustics stay in front.
+/// Returns how many authored stages, counted from the end, start at the first
+/// such overlay (the overlay itself plus everything after it).
+fn lit_overlay_trailing_stages(material: &SurfaceMaterial) -> Option<usize> {
+    if !opaque_composite_before_clouds(material) {
+        return None;
+    }
+    let lightmap = material
+        .stages
+        .iter()
+        .position(|s| matches!(s.texture, StageTexture::Lightmap))?;
+    let overlay = lightmap
+        + 1
+        + material.stages[lightmap + 1..].iter().position(|s| {
+            s.blend
+                == Some(materials::BlendFunc {
+                    src: BlendFactor::SrcAlpha,
+                    dst: BlendFactor::OneMinusSrcAlpha,
+                })
+        })?;
+    Some(material.stages.len() - overlay)
+}
+
+const LIT_OVERLAY_BLEND: BlendMode =
+    BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha);
 
 pub(in crate::scene) fn class_for(material: &SurfaceMaterial) -> DrawClass {
     if material.sky {
@@ -185,6 +238,7 @@ pub(in crate::scene) fn stage_pipeline(
     first: bool,
 ) -> PipelineKey {
     PipelineKey {
+        legacy_srgb_three_stage: false,
         auto_sprite2: material.auto_sprite2,
         class: if material.sky {
             DrawClass::Sky
@@ -295,7 +349,9 @@ pub(in crate::scene) fn stage_batch(
         bsp_shader_index: bsp_shader_index.map_or(u32::MAX, |index| index as u32),
         material_debug_index: material_debug_index.map_or(u32::MAX, |index| index as u32),
         surface_material: material.surface_material,
+        opaque_composite_before_clouds: opaque_composite_before_clouds(material),
         texture,
+        legacy_srgb_overlay: None,
         animation: stage.animation.clone(),
         texture_is_lightmap,
         texture_is_white,
@@ -506,8 +562,90 @@ pub(in crate::scene) fn build_material_debug_entry(
     origin: Option<&materials::ShaderDefinitionOrigin>,
     material: &SurfaceMaterial,
     textures: &Textures,
+    assets: &AssetSearchPath,
 ) -> MaterialDebugEntry {
     let mut lines = Vec::new();
+    let mut resolution_lines = Vec::new();
+    resolution_lines.push(format!(
+        "SHADER LOOKUP: {} ({})",
+        if origin.is_some() { "FOUND" } else { "NO MATCH" },
+        if origin.is_some() {
+            "exact name in parsed shader library"
+        } else {
+            "no exact name in parsed shader library; this is not a disk search"
+        }
+    ));
+    if let Some(origin) = origin {
+        resolution_lines.push(format!(
+            "SHADER DEFINITION: {} @ {}",
+            origin.file, origin.source.display()
+        ));
+    }
+    if !material.explicit {
+        // This is the exact fallback path in materials::describe(), not an
+        // approximation of authored stages. Only probe the already indexed VFS.
+        resolution_lines.push(format!("IMPLICIT DIFFUSE REQUEST: {name} (clamp=false, sRGB=true)"));
+        resolution_lines.push(format!(
+            "ASSET OVERRIDES: {} | candidate probe is INDEX ONLY (no read/decode)",
+            if assets.asset_overrides_allowed() { "ENABLED" } else { "DISABLED (stock-first)" }
+        ));
+        let candidates = materials::texture_lookup_candidates(name);
+        let mut first_indexed = None;
+        // Decode tries every stock candidate first when overrides are disabled,
+        // then falls back to normal VFS resolution in candidate order.
+        if !assets.asset_overrides_allowed() {
+            for candidate in &candidates {
+                if let Some(provider) = assets.indexed_provider_path(candidate, true) {
+                    first_indexed = Some(format!("{candidate} @ {} (stock)", provider.display()));
+                    break;
+                }
+            }
+        }
+        for (index, candidate) in candidates.iter().enumerate() {
+            let provider = assets.indexed_provider_path(candidate, false);
+            if first_indexed.is_none() {
+                if let Some(provider) = provider {
+                    first_indexed = Some(format!("{candidate} @ {}", provider.display()));
+                }
+            }
+            resolution_lines.push(format!(
+                "IMAGE CANDIDATE {index}: {candidate} -> {}",
+                provider.map_or_else(|| "NOT INDEXED".to_owned(), |p| p.display().to_string())
+            ));
+        }
+        resolution_lines.push(format!(
+            "FIRST INDEXED IMAGE (load order): {}",
+            first_indexed.as_deref().unwrap_or("NONE")
+        ));
+        match material.stages.first().map(|stage| stage.texture) {
+            Some(StageTexture::Image(index)) => {
+                resolution_lines.push(format!(
+                    "IMPLICIT IMAGE RESULT: LOADED {}",
+                    debug_texture_source(Some(index), textures)
+                ));
+                resolution_lines.push("IMPLICIT RECIPE: decoded diffuse * BSP lightmap when surface is lightmapped".into());
+            }
+            Some(StageTexture::White) => {
+                resolution_lines.push("IMPLICIT IMAGE RESULT: FALLBACK $whiteimage (not authored)".into());
+                if let Some(error) = textures.load_failure(name, false, true) {
+                    let kind = if error.starts_with("Missing texture:") {
+                        "MISSING ASSET"
+                    } else if error.starts_with("negative cached") {
+                        "NEGATIVE CACHE"
+                    } else {
+                        "READ/DECODE FAILURE"
+                    };
+                    resolution_lines.push(format!("FALLBACK CAUSE: {kind}: {error}"));
+                } else {
+                    resolution_lines.push("FALLBACK CAUSE: no recorded texture-load error (inspect cache/resolution path)".into());
+                }
+            }
+            Some(StageTexture::Lightmap) => resolution_lines.push("IMPLICIT IMAGE RESULT: $lightmap only".into()),
+            None => resolution_lines.push("IMPLICIT IMAGE RESULT: no render stages".into()),
+        }
+    } else {
+        resolution_lines.push("IMPLICIT IMAGE LOOKUP: NOT USED (authored shader stages)".into());
+    }
     if let Some(definition) = definition {
         let stage_unsupported = definition
             .stages
@@ -756,6 +894,7 @@ pub(in crate::scene) fn build_material_debug_entry(
             stage.depth_equal, stage.depth_write, stage.alpha_cutoff,
         )).collect(),
         image_sources,
+        resolution_lines,
         lines,
     }
 }
@@ -765,6 +904,7 @@ pub(in crate::scene) fn material_debug_info(
     names_and_materials: impl IntoIterator<Item = (String, SurfaceMaterial)>,
     library: &BTreeMap<String, Shader>,
     textures: &Textures,
+    assets: &AssetSearchPath,
 ) -> MaterialDebugInfo {
     let mut entries = names_and_materials
         .into_iter()
@@ -775,6 +915,7 @@ pub(in crate::scene) fn material_debug_info(
                 library_debug.origins.get(&name),
                 &material,
                 textures,
+                assets,
             )
         })
         .collect::<Vec<_>>();
@@ -831,6 +972,55 @@ pub(in crate::scene) fn can_fold_jka_lightmap_pair(
 /// glow (separate bloom extraction), secondary depth writes, PBR companion maps,
 /// or dynamically transformed texcoords. Caller also rules out BSP fog, water
 /// and special reflections so this opt-in cannot silently change those paths.
+/// Conservatively recognize the exact, commonplace TaystJK three-stage idiom:
+/// opaque $lightmap; DST_COLOR/ZERO diffuse; SRC_ALPHA/ONE_MINUS_SRC_ALPHA
+/// vertex-alpha overlay. Its blending occurs in encoded RGB in the original
+/// framebuffer. The separate WGPU draws instead blend in linear light.
+///
+/// This does not pattern-match shader names or pixel colors. We reject any
+/// stage needing a distinct sampler, animation, texcoord generation, depth
+/// operation, enhanced lighting, custom tint, glow, or special environment.
+/// Unsupported materials retain the original authored stage recipe.
+pub(in crate::scene) fn legacy_srgb_three_stage_overlay(
+    material: &SurfaceMaterial,
+    stages: &[MaterialStage],
+    fog: [f32; 4],
+) -> Option<usize> {
+    if stages.len() != 3
+        || !material.explicit
+        || material.sky || material.water || material.planar_reflection
+        || material.offset || material.auto_sprite2 || material.water_deformed
+        || !material.surface_sprite_effects.is_empty()
+        || material.authored_detail || material.sort.is_some()
+        || fog[3] > 0.001
+        || !can_fold_jka_lightmap_pair(&stages[0], &stages[1])
+        || stages.iter().any(|stage| stage.animation.is_some()
+            || stage.glow || has_stage_enhancements(stage)
+            || !stage.tc_mods.is_empty() || stage.depth_equal
+            || stage.alpha_cutoff != 0.0)
+        || stages[0].depth_write || stages[1].depth_write
+        || stages[2].depth_write
+    {
+        return None;
+    }
+    let overlay = &stages[2];
+    if overlay.blend != Some(materials::BlendFunc {
+        src: BlendFactor::SrcAlpha,
+        dst: BlendFactor::OneMinusSrcAlpha,
+    }) || !matches!(overlay.tc_gen, TcGen::Base)
+        || !matches!(overlay.rgb_gen, RgbGen::Identity)
+        || !matches!(overlay.alpha_gen, AlphaGen::Vertex)
+        || overlay.opacity != 1.0 || overlay.color != [1.0; 3]
+    {
+        return None;
+    }
+    if let StageTexture::Image(image) = overlay.texture {
+        Some(image)
+    } else {
+        None
+    }
+}
+
 pub(in crate::scene) fn can_fold_openjk_reverse_lightmap_modulate_pair(
     lightmap_stage: &MaterialStage,
     material_stage: &MaterialStage,
@@ -960,8 +1150,21 @@ pub(in crate::scene) fn append_material_batches(
     // surface would ignore every runtime/per-pixel light.
     let emitted = &mut out[start..];
     if !emitted.iter().any(|batch| batch.texture_is_lightmap) {
-        for batch in emitted {
+        for batch in emitted.iter_mut() {
             batch.dlight_in_lightmap_stage = false;
+        }
+    }
+    // Lightmap folding only merges stages at the front, so the authored stages
+    // after the overlay map 1:1 onto the tail of the emitted batches. Confirm
+    // the batch really is the alpha overlay before moving it behind clouds.
+    if let Some(trailing) = lit_overlay_trailing_stages(material) {
+        if trailing <= emitted.len() {
+            let tail = emitted.len() - trailing;
+            if emitted[tail].pipeline.blend == LIT_OVERLAY_BLEND {
+                for batch in &mut emitted[tail..] {
+                    batch.opaque_composite_before_clouds = false;
+                }
+            }
         }
     }
 }
@@ -1079,8 +1282,22 @@ pub(in crate::scene) fn append_material_batches_unflagged(
             fog_is_global,
         );
         batch.modulate_lightmap = true;
+        // Three authored stages, but one opaque draw: reproduce the exact
+        // encoded-RGB stage equation (validated against TaystJK with #12).
+        // Ordinary materials stay on their original pipeline, with no pow().
+        if let Some(overlay_image) = legacy_srgb_three_stage_overlay(material, &stages, fog) {
+            batch.legacy_srgb_overlay = Some(overlay_image);
+            batch.pipeline.legacy_srgb_three_stage = true;
+            // The composite is not a single diffuse stage; automatic detail
+            // promotion would alter the authored third-stage semantics.
+            batch.detail_texture_eligible = false;
+        }
+        let fused = batch.pipeline.legacy_srgb_three_stage;
         out.push(batch);
 
+        if fused {
+            return;
+        }
         for stage in stages.iter().skip(2) {
             out.push(stage_batch(
                 material,
@@ -1135,5 +1352,102 @@ pub(in crate::scene) fn append_material_batches_unflagged(
             }
         }
         out.push(batch);
+    }
+}
+
+#[cfg(test)]
+mod cloud_composite_order_tests {
+    use super::*;
+
+    fn base_stage() -> MaterialStage {
+        MaterialStage {
+            texture: StageTexture::White,
+            animation: None,
+            enhancements: Default::default(),
+            blend: None,
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+            glow: false,
+        }
+    }
+
+    #[test]
+    fn authored_opaque_terrain_stays_together_but_water_does_not() {
+        let base = base_stage();
+        let mut wet_sand = base.clone();
+        wet_sand.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha,
+            dst: BlendFactor::OneMinusSrcAlpha,
+        });
+        let mut caustics = base.clone();
+        caustics.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha,
+            dst: BlendFactor::One,
+        });
+        let terrain = SurfaceMaterial {
+            stages: vec![base.clone(), wet_sand, caustics.clone()],
+            ..Default::default()
+        };
+        assert!(opaque_composite_before_clouds(&terrain));
+        for stage in &terrain.stages {
+            assert!(stage_batch(&terrain, stage, false, false, 0..3,
+                Some(109), None, None, &[], [0; 4], [0.0; 4], false)
+                .opaque_composite_before_clouds);
+        }
+
+        let water = SurfaceMaterial { water: true, ..terrain.clone() };
+        assert!(!opaque_composite_before_clouds(&water));
+        let trans = SurfaceMaterial { authored_translucent: true, ..terrain.clone() };
+        assert!(!opaque_composite_before_clouds(&trans));
+        let sorted = SurfaceMaterial { sort: Some(9.0), ..terrain.clone() };
+        assert!(!opaque_composite_before_clouds(&sorted));
+        let fully_blended = SurfaceMaterial { stages: vec![caustics], ..terrain };
+        assert!(!opaque_composite_before_clouds(&fully_blended));
+    }
+
+    #[test]
+    fn lit_alpha_overlay_after_lightmap_goes_behind_clouds() {
+        // costadelsol terrain_sand2wetsand: sand, wet-sand splat, lightmap,
+        // caustics, depthfade height haze.
+        let base = base_stage();
+        let alpha = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha,
+            dst: BlendFactor::OneMinusSrcAlpha,
+        });
+        let wet_sand = MaterialStage { blend: alpha, ..base.clone() };
+        let lightmap = MaterialStage {
+            texture: StageTexture::Lightmap,
+            blend: Some(materials::BlendFunc {
+                src: BlendFactor::DstColor,
+                dst: BlendFactor::Zero,
+            }),
+            ..base.clone()
+        };
+        let caustics = MaterialStage {
+            blend: Some(materials::BlendFunc {
+                src: BlendFactor::SrcAlpha,
+                dst: BlendFactor::One,
+            }),
+            ..base.clone()
+        };
+        let depthfade = MaterialStage { blend: alpha, ..base.clone() };
+        let terrain = SurfaceMaterial {
+            stages: vec![base, wet_sand.clone(), lightmap.clone(), caustics, depthfade],
+            ..Default::default()
+        };
+        assert_eq!(lit_overlay_trailing_stages(&terrain), Some(1));
+        // The pre-lightmap wet-sand splat is albedo and must stay in front.
+        let splat_only = SurfaceMaterial {
+            stages: vec![base_stage(), wet_sand, lightmap],
+            ..Default::default()
+        };
+        assert_eq!(lit_overlay_trailing_stages(&splat_only), None);
     }
 }

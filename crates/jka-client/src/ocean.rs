@@ -435,6 +435,7 @@ impl PromotedClipmapLayout {
 /// Shortest render-space distance from the camera to the undisplaced
 /// rectangular water footprint. Renderer Y is JKA Z, so flying above the sea
 /// naturally increases this distance even when X/Z remain inside its bounds.
+#[cfg(test)]
 pub fn promoted_surface_distance(camera: [f32; 3], surface: OceanSurface) -> f32 {
     let axis_distance = |value: f32, minimum: f32, maximum: f32| {
         if value < minimum {
@@ -506,6 +507,7 @@ pub fn build_clipmap(
 /// profile. A calm pool retains the same 0.25 m / 1 m innermost cell spacing,
 /// but its fine rings end much sooner; extra very-coarse rings preserve the old
 /// maximum world-space reach without paying for huge near-field grids.
+#[cfg(test)]
 pub fn build_promoted_clipmap(
     base_spacing: f32,
     plane_height: f32,
@@ -821,6 +823,7 @@ pub struct OceanMasks {
 /// CPU twin of the promoted vertex shader's two-stage centre snapping. The
 /// global clipmap moves on the legacy coarse lattice; each promoted surface
 /// then clamps that point into its bounds and snaps it to its live outer ring.
+#[cfg(test)]
 pub fn promoted_clipmap_centre(
     camera: [f32; 3],
     surface: OceanSurface,
@@ -1231,8 +1234,10 @@ impl WaterVolume {
 }
 
 pub use jka_assets::bsp::bathymetry::{
-    build_water_footprints, cluster_water_faces, WaterFace, WaterFootprint,
+    build_water_footprints, WaterFace, WaterFootprint,
 };
+#[cfg(test)]
+use jka_assets::bsp::bathymetry::cluster_water_faces;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CascadeSettings {
@@ -1679,6 +1684,7 @@ impl OceanGpu {
         })
     }
 
+    #[cfg(test)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,

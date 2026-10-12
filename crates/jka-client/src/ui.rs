@@ -48,6 +48,7 @@ use hud::draw::{
     build_hud, lighten, CHATBOX_CUTOFF, CHATBOX_FONT_HEIGHT, CHATBOX_FONT_SCALE, CHATBOX_Y,
 };
 use hud::layout::draw_placed;
+use hud::extensions::build_extension_hud;
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
@@ -994,6 +995,8 @@ pub struct UiSnapshot {
     pub hud: Option<HudState>,
     pub team_overlay: Option<TeamOverlayUi>,
     pub hud_layout: HudLayout,
+    /// Cached draw list from the extension worker (no per-render-frame scripting).
+    pub extension_hud: Vec<crate::extensions::PlacedHudWidget>,
     pub crosshair: CrosshairSettings,
     pub crosshair_target: UiCrosshairTarget,
     /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
@@ -1066,6 +1069,7 @@ impl Default for UiSnapshot {
             hud: None,
             team_overlay: None,
             hud_layout: HudLayout::default(),
+            extension_hud: Vec::new(),
             crosshair: CrosshairSettings::default(),
             crosshair_target: UiCrosshairTarget::default(),
             force_select: None,

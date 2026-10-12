@@ -11,6 +11,8 @@ pub mod entity_event;
 pub mod gamestate;
 mod huffman_codes;
 mod player_fields;
+// Public, read-only protocol field descriptors used by the extension bridge.
+pub use player_fields::{PLAYER_FIELDS, VEHICLE_ONLY_FIELDS};
 pub mod message;
 pub mod netchan;
 pub mod server;

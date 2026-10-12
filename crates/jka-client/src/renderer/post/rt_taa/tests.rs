@@ -295,7 +295,7 @@ fn probe(@builtin(global_invocation_id) id: vec3<u32>) {
                 .unwrap();
             rx.recv().unwrap().unwrap();
             let result =
-                bytemuck::cast_slice::<u8, [f32; 4]>(&readback.slice(..).get_mapped_range())
+                bytemuck::cast_slice::<u8, [f32; 4]>(&readback.slice(..).get_mapped_range().expect("GPU readback range"))
                     .to_vec();
             readback.unmap();
             result

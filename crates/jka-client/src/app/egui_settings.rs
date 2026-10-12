@@ -5,6 +5,7 @@ mod color;
 mod debug;
 mod display;
 mod effects;
+mod extensions;
 mod fog;
 mod game;
 mod image;
@@ -116,6 +117,7 @@ const OCEAN_WIND_FOAM: u8 = 8;
 
 fn pending_video_reset(key: &str) -> Option<theme::Reset> {
     Some(match key {
+        "hdr_output" | "cvar:r_hdroutput" => theme::Reset::Color("r_hdrOutput"),
         "render_backend" => theme::Reset::Video(ui::VIDEO_ROW_RENDER_BACKEND),
         "display_mode" => theme::Reset::Video(ui::VIDEO_ROW_FULLSCREEN),
         "resolution" => theme::Reset::Video(ui::VIDEO_ROW_RESOLUTION),

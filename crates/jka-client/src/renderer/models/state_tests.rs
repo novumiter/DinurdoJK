@@ -122,7 +122,7 @@ fn rt_compute_reads_multiple_complete_draw_records() {
             })
             .unwrap();
         rx.recv().unwrap().unwrap();
-        let data = readback.slice(..).get_mapped_range();
+        let data = readback.slice(..).get_mapped_range().expect("GPU readback range");
         let vertices = bytemuck::cast_slice::<u8, DynamicModelVertex>(&data);
         assert_eq!(vertices[0].position, [11.0, 33.0, -22.0]);
         assert_eq!(vertices[1].position, [101.0, 303.0, -202.0]);

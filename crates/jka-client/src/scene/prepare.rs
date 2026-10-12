@@ -634,6 +634,7 @@ pub(in crate::scene) fn prepare_internal(
         }),
         &library,
         &textures,
+        &assets,
     );
     load_timings.material_ms = material_stage.elapsed().as_secs_f64() * 1000.0;
     devprintln!(
@@ -1755,13 +1756,10 @@ pub(in crate::scene) fn prepare_internal(
         let flare = surface.flare?;
         Some(WorldFlare {
             shader_clamp_time: surface_materials[surface.shader].clamp_time,
-            surface_id: surface_id as u32,
             origin: flare.origin,
             normal: flare.normal,
             color: flare.color,
-            shader: String::from_utf8_lossy(&bsp.shaders[surface.shader].name).into_owned(),
             shader_index: surface.shader,
-            fog_num: surface.fog_num,
             fog: resolved_bsp_surface_fog(
                 &bsp, &library, &surface_materials[surface.shader],
                 surface.fog_num, global_fog_num, global_fog,

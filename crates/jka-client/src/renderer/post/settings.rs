@@ -61,8 +61,11 @@ impl Renderer {
         let cloud_history_key = CloudHistoryKey::of(&effects);
         let cloud_history_changed = self.cloud_history_key.as_ref() != Some(&cloud_history_key);
         self.cloud_history_key = Some(cloud_history_key);
-        self.hdr_enabled = effects.hdr;
+        self.hdr_enabled = effects.hdr || self.hdr_output.is_some();
         self.tone_mapping_enabled = effects.tone_mapping;
+        if let Some(output) = self.hdr_output.as_mut() {
+            output.write_settings(&self.queue, effects.hdr_paper_white, effects.hdr_peak, effects.tone_mapping);
+        }
         self.auto_exposure_enabled = effects.auto_exposure;
         let auto_exposure_effective =
             self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled;
@@ -290,7 +293,7 @@ impl Renderer {
                     if self.vignette_enabled { 1.0 } else { 0.0 },
                     self.color_grade.exposure_ev,
                 ],
-                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0],
             }),
         );
         self.rebuild_frame_plan();

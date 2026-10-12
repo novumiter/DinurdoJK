@@ -332,6 +332,7 @@ pub(in crate::renderer) fn render_thread_main(
         &base,
         game.as_deref(),
         initial_ui.video.max_frame_latency,
+        initial_ui.video.hdr_output,
         &detail_texture_path,
     )) {
         Ok(renderer) => renderer,
@@ -399,6 +400,8 @@ pub(in crate::renderer) fn render_thread_main(
         .set_mode(&renderer.queue, initial_ui.video.footprints);
     renderer.set_post_effects(PostEffects {
         hdr: initial_ui.video.hdr,
+            hdr_paper_white: initial_ui.video.hdr_paper_white,
+            hdr_peak: initial_ui.video.hdr_peak,
         auto_exposure: initial_ui.video.auto_exposure,
         tone_mapping: initial_ui.video.tone_mapping,
         glow: initial_ui.video.glow,
@@ -574,6 +577,8 @@ pub(in crate::renderer) fn render_thread_main(
     let _ = proxy.send_event(UserEvent::RendererReady {
         supported_msaa: renderer.supported_msaa.clone(),
         wireframe_supported: renderer.wireframe_supported,
+        hdr_output_status: renderer.hdr_output.as_ref().map_or_else(|| "SDR".to_owned(), |o| o.status()),
+        hdr_output_active: renderer.hdr_output.as_ref().is_some_and(|o| matches!(o.selection.encoding, 1 | 2)),
     });
     let mut companion_renderers: HashMap<CompanionId, CompanionRenderThread> = HashMap::new();
 
@@ -663,6 +668,10 @@ pub(in crate::renderer) fn render_thread_main(
     let mut deferred_load_map = None;
 
     loop {
+        if renderer.poll_hdr_display() {
+            let output = renderer.hdr_output.as_ref().unwrap();
+            let _ = proxy.send_event(UserEvent::HdrOutputChanged { status: output.status(), active: matches!(output.selection.encoding, 1 | 2) });
+        }
         // Before any encoding, so the capture's first frames carry timestamps.
         let diag_recording = input_diagnostic.is_recording();
         if diag_recording != diag_forced_gpu_timings {
@@ -715,7 +724,7 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::StartPerfCapture { stem, frames }) => {
                         // Re-arming discards an incomplete run. Drop clears the
                         // global hook flag before the new capture enables it.
-                        perf_capture = None;
+                        drop(perf_capture.take());
                         eprintln!("[RENDER PERF] armed {} samples -> {} (2s delay + 120 warmup frames)",
                             frames.clamp(30, 6_000), stem.display());
                         perf_capture = Some(PerfCapture::arm(stem, frames, &renderer));
@@ -1109,6 +1118,7 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
                     Ok(RenderCommand::CaptureVideoFrame { frame_index, depth }) => renderer.request_video_frame_capture(frame_index, depth),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
+                    Ok(RenderCommand::SetExtensionHud(widgets)) => renderer.set_extension_hud(widgets),
                     Ok(RenderCommand::SetTransientUi {
                         chat_lines,
                         console_notify_lines,
@@ -1381,6 +1391,7 @@ pub(in crate::renderer) fn render_thread_main(
             }
             renderer.model_frame_log.set_source(model_source);
             renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
+            renderer.dynamic_model_renderer.entity_water = Arc::clone(&snapshot.player_water);
             let _activity = crate::thread_activity::activity(
                 crate::thread_activity::ThreadSlot::Render,
                 crate::thread_activity::Task::RenderFrame,
@@ -1915,7 +1926,7 @@ pub(in crate::renderer) fn render_thread_main(
                 u8::from(renderer.weather.rain.opaque_depth),
                 u8::from(renderer.weather.rain.lean_models),
                 u8::from(renderer.weather.rain.lean_post),
-                u8::from(renderer.rain_uses_2d_haze()),
+                u8::from(renderer.weather_uses_2d_haze()),
                 u8::from(renderer.frame_plan.rain_only_linear_depth),
                 u8::from(renderer.frame_plan.rain_only_post),
                 gpu_ms(GpuPass::RainSim),

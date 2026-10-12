@@ -105,6 +105,7 @@ impl App {
         self.asset_viewer_catalog_loaded = false;
         self.asset_viewer_catalog_error = None;
         self.asset_viewer_entries.clear();
+        self.asset_viewer_cache = None;
         self.asset_viewer_selected = None;
         self.asset_viewer_shader_file.clear();
         self.asset_viewer_detail_path = None;
@@ -146,6 +147,8 @@ impl App {
             game: self.game.clone(),
         });
         self.demo_catalog_loaded = false;
+        self.demo_catalog_pending = false;
+        self.demo_catalog_generation = self.demo_catalog_generation.wrapping_add(1);
         self.demo_catalog_error = None;
         self.demo_entries.clear();
         self.demo_metadata_generation = self.demo_metadata_generation.wrapping_add(1);

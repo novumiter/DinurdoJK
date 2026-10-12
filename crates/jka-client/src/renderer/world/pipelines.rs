@@ -367,6 +367,7 @@ impl Renderer {
             // relatively rare; a transactional async format switch is separate
             // work because old targets must remain valid until all PSOs are ready.
             self.rebuild_world_pipelines();
+            self.cloud_shadow_opaque_pipeline = None;
             self.cull_debug_pipeline = None;
             self.wireframe_pipeline = None;
             self.world_wireframe_pipelines.clear();
@@ -555,6 +556,15 @@ pub(in crate::renderer) fn material_uniform(
     }
     if matches!(source.pipeline.blend, BlendMode::Opaque) {
         out.header[2] |= 33554432;
+    }
+    // One legacy RGB policy for the original fused overlay and the additive
+    // source approximation. The exact fusion uses its existing opaque shader
+    // entry point; only the additive mode needs a fragment-uniform bit.
+    // No new pipeline variant, render pass, or draw is introduced here.
+    if matches!(source.legacy_rgb_compositing(),
+        scene::LegacyRgbCompositing::EncodedAdditiveSource)
+    {
+        out.header[2] |= 536870912; // MATERIAL_LEGACY_ADDITIVE_SRGB
     }
     // Depth prepass packs this into the reflection-policy attachment so the
     // final Legacy 1 display-space fog affects exactly the BSP surfaces that
@@ -1224,6 +1234,7 @@ pub(in crate::renderer) fn legacy_fog_pass_pipeline_key(
     depth_equal: bool,
 ) -> PipelineKey {
     PipelineKey {
+        legacy_srgb_three_stage: false,
         auto_sprite2: source.auto_sprite2,
         class: source.class,
         blend: BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha),
@@ -1273,6 +1284,7 @@ pub(in crate::renderer) fn create_legacy_fog_pass_pipelines(
 
 pub(in crate::renderer) fn ocean_pipeline_key() -> PipelineKey {
     PipelineKey {
+        legacy_srgb_three_stage: false,
         auto_sprite2: false,
         class: DrawClass::Transparent,
         blend: BlendMode::Opaque,
@@ -1369,11 +1381,11 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1415,6 +1427,7 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
     })
 }
 
+
 /// Rain-only linear-depth pipeline: one R32F target instead of the general
 /// prepass's linear-depth + motion-vector + reflection-policy MRT set.
 pub(in crate::renderer) fn create_rain_depth_prepass_pipeline(
@@ -1434,11 +1447,11 @@ pub(in crate::renderer) fn create_rain_depth_prepass_pipeline(
             module: shader,
             entry_point: Some(if alpha_test { "vs_mask" } else { "vs_main" }),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1487,11 +1500,11 @@ pub(in crate::renderer) fn create_hiz_prepass_pipeline(
             module: shader,
             entry_point: Some(if alpha_test { "vs_mask" } else { "vs_main" }),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1529,11 +1542,11 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline(
             module: shader,
             entry_point: Some("vs_mask"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &VERTEX_ATTRIBUTES,
-            }],
+            })],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1590,7 +1603,7 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
             module: shader,
             entry_point: Some("vs_prepass"),
             compilation_options: Default::default(),
-            buffers: &[vertex_layout],
+            buffers: &[Some(vertex_layout)],
         },
         // Same winding/culling as the entity colour pipelines.
         primitive: wgpu::PrimitiveState {
@@ -1655,7 +1668,7 @@ pub(in crate::renderer) fn create_entity_rain_prepass_pipeline(
             module: shader,
             entry_point: Some("vs_prepass"),
             compilation_options: Default::default(),
-            buffers: &[vertex_layout],
+            buffers: &[Some(vertex_layout)],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -1713,7 +1726,7 @@ pub(in crate::renderer) fn create_entity_shadow_pipeline(
             module: shader,
             entry_point: Some("vs_prepass"),
             compilation_options: Default::default(),
-            buffers: &[vertex_layout],
+            buffers: &[Some(vertex_layout)],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,

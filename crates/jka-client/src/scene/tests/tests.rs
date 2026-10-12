@@ -455,6 +455,103 @@ fn legacy_lightmap_modulate_pair(enhanced: bool) -> [MaterialStage; 2] {
 }
 
 #[test]
+fn authored_three_stage_vertex_overlay_uses_single_encoded_rgb_draw() {
+    let [lightmap, rock] = legacy_lightmap_modulate_pair(false);
+    let overlay = MaterialStage {
+        texture: StageTexture::Image(31),
+        blend: Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha,
+            dst: BlendFactor::OneMinusSrcAlpha,
+        }),
+        alpha_gen: AlphaGen::Vertex,
+        ..rock.clone()
+    };
+    let material = SurfaceMaterial {
+        stages: vec![lightmap, rock, overlay],
+        explicit: true,
+        ..Default::default()
+    };
+    let collect = |material: &SurfaceMaterial, fog: [f32; 4]| {
+        let mut batches = Vec::new();
+        super::material_batches::append_material_batches_unflagged(
+            &mut batches, material, 69, Some(0), false, 0..3,
+            Some(52), &[], [0; 4], fog, false,
+        );
+        batches
+    };
+    let fused = collect(&material, [0.0; 4]);
+    assert_eq!(fused.len(), 1);
+    assert_eq!(fused[0].texture, Some(7));
+    assert_eq!(fused[0].legacy_srgb_overlay, Some(31));
+    assert!(fused[0].pipeline.legacy_srgb_three_stage);
+    assert_eq!(fused[0].legacy_rgb_compositing(), super::LegacyRgbCompositing::ExactFusedOverlay);
+    assert!(fused[0].modulate_lightmap);
+    assert!(!fused[0].detail_texture_eligible);
+    assert_eq!(fused[0].pipeline.blend, BlendMode::Opaque);
+
+    let mut tinted = material.clone();
+    tinted.stages[2].color = [1.0, 0.8, 1.0];
+    assert_eq!(collect(&tinted, [0.0; 4]).len(), 2);
+    let mut animated = material.clone();
+    animated.stages[2].tc_mods.push(TcMod::Scale(2.0, 2.0));
+    assert_eq!(collect(&animated, [0.0; 4]).len(), 2);
+    let mut wrong_blend = material.clone();
+    wrong_blend.stages[2].blend = Some(materials::BlendFunc {
+        src: BlendFactor::One,
+        dst: BlendFactor::One,
+    });
+    assert_eq!(collect(&wrong_blend, [0.0; 4]).len(), 2);
+    assert_eq!(collect(&material, [0.0, 0.0, 0.0, 128.0]).len(), 2);
+}
+
+#[test]
+fn multi_stage_water_uses_encoded_additive_without_losing_authored_stage_order() {
+    // sephtestmap/oceanwater uses five animated additive stages. The ordinary
+    // BSP renderer must preserve all draws and their independent tcMods.
+    let [_, mut stage] = legacy_lightmap_modulate_pair(false);
+    stage.blend = Some(materials::BlendFunc {
+        src: BlendFactor::SrcAlpha,
+        dst: BlendFactor::One,
+    });
+    stage.alpha_gen = AlphaGen::Vertex;
+    let mut stages = vec![stage; 5];
+    stages[3].tc_mods = vec![
+        TcMod::Scale(0.4, 0.4),
+        TcMod::Scroll(-0.05, 0.0008),
+        TcMod::Rotate(4.5),
+    ];
+    stages[2].glow = true;
+    let material = SurfaceMaterial {
+        explicit: true,
+        water: true,
+        sort: Some(15.0),
+        stages,
+        ..Default::default()
+    };
+    let mut draws = Vec::new();
+    super::material_batches::append_material_batches_unflagged(
+        &mut draws, &material, 42, None, true, 0..15,
+        None, &[], [0; 4], [0.0; 4], false,
+    );
+    assert_eq!(draws.len(), 5);
+    assert_eq!(draws[3].tc_mods.len(), 3);
+    assert!(draws[2].authored_glow);
+    for draw in &draws {
+        assert_eq!(draw.legacy_rgb_compositing(), super::LegacyRgbCompositing::EncodedAdditiveSource);
+        assert!(!draw.pipeline.legacy_srgb_three_stage);
+    }
+    // A promoted GodotOcean draw must not receive the legacy encoded source.
+    draws[0].authored_ocean = Some(0);
+    assert_eq!(draws[0].legacy_rgb_compositing(), super::LegacyRgbCompositing::Linear);
+    // Unsupported alpha compositing continues to use ordinary linear blending
+    // until an exact general compositor exists.
+    draws[1].pipeline.blend = BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha);
+    assert_eq!(draws[1].legacy_rgb_compositing(), super::LegacyRgbCompositing::Linear);
+    draws[4].pipeline.blend = BlendMode::Custom(BlendFactor::One, BlendFactor::One);
+    assert_eq!(draws[4].legacy_rgb_compositing(), super::LegacyRgbCompositing::EncodedAdditiveSource);
+}
+
+#[test]
 fn plain_jka_lightmap_then_dst_color_diffuse_collapses_to_modulation() {
     let [lightmap, diffuse] = legacy_lightmap_modulate_pair(false);
     assert!(can_fold_jka_lightmap_pair(&lightmap, &diffuse));

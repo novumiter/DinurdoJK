@@ -481,7 +481,7 @@ impl Renderer {
             return None;
         }
         let supported_format = matches!(
-            self.config.format,
+            self.hdr_output.as_ref().map_or(self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb),
             wgpu::TextureFormat::Bgra8Unorm
                 | wgpu::TextureFormat::Bgra8UnormSrgb
                 | wgpu::TextureFormat::Rgba8Unorm
@@ -490,7 +490,7 @@ impl Renderer {
         if !supported_format {
             self.screenshot_result = Some(Err(format!(
                 "unsupported screenshot surface format {:?}",
-                self.config.format
+                self.hdr_output.as_ref().map_or(self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb)
             )));
             return None;
         }
@@ -537,7 +537,7 @@ impl Renderer {
             height,
             padded_bytes_per_row,
             buffer_size,
-            format: self.config.format,
+            format: self.hdr_output.as_ref().map_or(self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb),
             submission_index: None,
             copy_record_ms: 0.0,
             copy_submit_ms: 0.0,
@@ -675,12 +675,21 @@ impl Renderer {
         }
 
         let copy_started = Instant::now();
-        let mapped = slice.get_mapped_range();
+        let mapped = slice.get_mapped_range().map_err(|error| {
+            staging.buffer.unmap();
+            if let Some(depth_staging) = depth_staging {
+                depth_staging.buffer.unmap();
+            }
+            format!("GPU screenshot readback range failed: {error}")
+        })?;
         let pixels = mapped.to_vec();
         drop(mapped);
         staging.buffer.unmap();
         let depth_pixels = if let (Some(depth_staging), Some(depth_slice)) = (depth_staging, depth_slice) {
-            let mapped = depth_slice.get_mapped_range();
+            let mapped = depth_slice.get_mapped_range().map_err(|error| {
+                depth_staging.buffer.unmap();
+                format!("GPU depth readback range failed: {error}")
+            })?;
             let pixels = mapped.to_vec();
             drop(mapped);
             depth_staging.buffer.unmap();

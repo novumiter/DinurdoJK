@@ -47,6 +47,7 @@ struct VertexIn {
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
     @location(4) depth_hack: f32,
+    @location(5) water_wetness: f32,
 };
 
 struct VertexOut {
@@ -55,6 +56,7 @@ struct VertexOut {
     @location(1) normal: vec3<f32>,
     @location(2) color: vec4<f32>,
     @location(3) world_position: vec3<f32>,
+    @location(4) water_wetness: f32,
 };
 
 @vertex
@@ -80,6 +82,7 @@ fn vs_main(input: VertexIn) -> VertexOut {
     output.normal = normalize(input.normal);
     output.color = input.color;
     output.world_position = input.position;
+    output.water_wetness = input.water_wetness;
     return output;
 }
 
@@ -147,7 +150,7 @@ fn fs_wireframe() -> @location(0) vec4<f32> {
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     return fogged(
-        model_wet_color(lit_color(input.normal, tex) * input.color, input.normal, input.world_position),
+        model_wet_color_with_water(lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );
@@ -160,7 +163,7 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
     return fogged(
-        model_wet_color(lit_color(input.normal, tex) * input.color, input.normal, input.world_position),
+        model_wet_color_with_water(lit_color(input.normal, tex) * input.color, input.normal, input.world_position, input.water_wetness),
         input.world_position,
         false
     );

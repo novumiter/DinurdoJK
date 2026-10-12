@@ -15,7 +15,8 @@ See `bench/plans/README.txt`. It calls this script once per launch.
 
 ## Steps
 
-1. **Build** (about 30 s, fast profile):
+1. **Build** (about 1 min per change; ThinLTO, ~2% below a full release build.
+   Use plain `build.ps1` for final numbers; never bench `-Faster`, it is ~23% slower):
    `powershell.exe -NoProfile -ExecutionPolicy Bypass -File build.ps1 -Fast`
    The bench uses `target/release/DinurdoJK.exe`; the script copies it to a
    scratch folder, so a game the user has open is not disturbed.

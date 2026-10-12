@@ -350,7 +350,7 @@ fn parallel_finish_preserves_loaded_color_depth_submission_and_queries() {
                     })
                     .unwrap();
                 rx.recv().unwrap().unwrap();
-                let data = pixels.slice(..).get_mapped_range();
+                let data = pixels.slice(..).get_mapped_range().expect("GPU readback range");
                 images.push(
                     data.chunks_exact(256)
                         .flat_map(|r| r[..128].iter().copied())
@@ -358,7 +358,7 @@ fn parallel_finish_preserves_loaded_color_depth_submission_and_queries() {
                 );
                 if let Some(times) = times.as_ref() {
                     rx_time.recv().unwrap().unwrap();
-                    let data = times.slice(..).get_mapped_range();
+                    let data = times.slice(..).get_mapped_range().expect("GPU readback range");
                     let values = bytemuck::cast_slice::<u8, u64>(&data);
                     assert!(values.windows(2).all(|v| v[0] <= v[1]));
                     assert!(values[3] > values[0]);

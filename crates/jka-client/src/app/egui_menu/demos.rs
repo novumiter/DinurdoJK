@@ -1,6 +1,6 @@
 //! Demos.
 use crate::app::egui_menu::{
-    frontend, rail_item, theme, thread, App, BTreeMap, DemoConsoleFilter, DemoMetadata,
+    frontend, rail_item, theme, ui_catalog, App, BTreeMap, DemoConsoleFilter, DemoMetadata,
     DemoMetadataResult, Path, PathBuf,
 };
 
@@ -40,21 +40,12 @@ impl App {
         let tx = self.demo_metadata_tx.clone();
         let generation = self.demo_metadata_generation;
         let worker_demo_name = demo_name.clone();
-        let thread_name = format!(
-            "demo-meta:{}",
-            demo_name.chars().take(24).collect::<String>()
-        );
-        if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
+        if let Err(error) = self.background_jobs.cpu(move || {
             let result = frontend::index_demo_metadata(&base, game.as_deref(), &worker_demo_name);
-            let _ = tx.send(DemoMetadataResult {
-                generation,
-                demo_name: worker_demo_name,
-                result,
-            });
+            let _ = tx.send(DemoMetadataResult { generation, demo_name: worker_demo_name, result });
         }) {
             self.demo_metadata_inflight.remove(&demo_name);
-            self.demo_metadata_errors
-                .insert(demo_name, format!("metadata worker: {error}"));
+            self.demo_metadata_errors.insert(demo_name, format!("metadata queue: {error}"));
         }
     }
 
@@ -64,53 +55,11 @@ impl App {
         }
 
         self.demo_catalog_loaded = true;
+        self.demo_catalog_pending = true;
         self.demo_entries.clear();
         self.demo_catalog_error = None;
-        match frontend::scan_demo_game_directories(&self.base) {
-            Ok(games) => self.demo_game_choices = games,
-            Err(error) => {
-                eprintln!("Could not scan demo game directories: {error}");
-                self.demo_catalog_error = Some(error);
-                return;
-            }
-        }
-        let selected_game = if self.demo_game_filter.is_empty() {
-            "base"
-        } else {
-            self.demo_game_filter.as_str()
-        };
-        if !self
-            .demo_game_choices
-            .iter()
-            .any(|game| game.eq_ignore_ascii_case(selected_game))
-        {
-            self.demo_game_filter = self
-                .demo_game_choices
-                .first()
-                .map(|game| {
-                    if game.eq_ignore_ascii_case("base") {
-                        String::new()
-                    } else {
-                        game.clone()
-                    }
-                })
-                .unwrap_or_default();
-        }
-        if self.demo_game_choices.is_empty() {
-            return;
-        }
-
-        let game = self.demo_browser_game_path();
-        match frontend::scan_demos(&self.base, game.as_deref()) {
-            Ok(demos) => self.demo_entries = demos,
-            Err(error) => {
-                eprintln!("Could not build Play Demo catalog: {error}");
-                self.demo_catalog_error = Some(error);
-            }
-        }
-        self.demo_selected = self
-            .demo_selected
-            .min(self.demo_entries.len().saturating_sub(1));
+        self.ui_catalog.request(&self.base, None,
+            ui_catalog::CatalogRequest::DemoGames { token: self.demo_catalog_generation });
     }
 
     pub(in crate::app) fn demo_browser_game_path(&self) -> Option<PathBuf> {
@@ -124,6 +73,8 @@ impl App {
 
     fn reset_demo_browser_catalog(&mut self) {
         self.demo_catalog_loaded = false;
+        self.demo_catalog_pending = false;
+        self.demo_catalog_generation = self.demo_catalog_generation.wrapping_add(1);
         self.demo_catalog_error = None;
         self.demo_entries.clear();
         self.demo_selected = 0;
@@ -546,6 +497,10 @@ impl App {
 
         if let Some(error) = &self.demo_catalog_error {
             theme::banner(ui, &format!("Demo scan failed: {error}"), theme::WARNING);
+            return;
+        }
+        if self.demo_catalog_pending {
+            theme::label(ui, theme::plain("Scanning demos...", 12.0, theme::TEXT_FAINT));
             return;
         }
         if self.demo_entries.is_empty() {
