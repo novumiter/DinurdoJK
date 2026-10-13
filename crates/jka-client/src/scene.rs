@@ -34,6 +34,7 @@ mod visibility;
 pub(crate) use cache::FoldHasher;
 pub(crate) use shader_remap::{
     apply_shader_remaps, apply_shader_remaps_in_place, apply_reverse_lightmap_collapse_in_place,
+    expand_additive_stage_fusion_in_place, fuse_additive_stage_fusion_in_place,
     canonical_shader_name, ShaderRemapState,
 };
 use cache::{map_content_hash, static_bsp_ao_cache_info, StageFingerprint};
@@ -70,11 +71,12 @@ use lightmaps::{
     try_load_external_deluxemap, try_load_hdr_lightmap,
 };
 pub(crate) use material_batches::append_sky_batches;
+pub(crate) use material_batches::additive_fusion_rejection_reason;
 use material_batches::{
     append_material_batches, class_for, material_debug_info,
     material_has_promotable_environment_stage,
     material_render_is_guaranteed_discarded, prepared_stages, resolved_bsp_surface_fog,
-    stage_batch,
+    recover_impossible_masked_depth_seed, stage_batch,
 };
 use material_batches::can_fold_jka_lightmap_pair;
 #[cfg(test)]
@@ -215,8 +217,13 @@ pub(crate) enum LegacyRgbCompositing {
 pub struct PipelineKey {
     /// Shader-specific entry point; ordinary materials compile without legacy conversion.
     pub legacy_srgb_three_stage: bool,
+    /// Number of coalesced consecutive additive shader stages (0 = ordinary).
+    pub additive_fusion_count: u8,
     /// Dedicated vertex shader for TaystJK autoSprite2, absent from normal BSP pipelines.
     pub auto_sprite2: bool,
+    /// True only for a sky outerbox with six authored images. Selects the
+    /// minimal, no-discard sky fragment entry point, never a renderer path.
+    pub sky_outer: bool,
     pub class: DrawClass,
     pub blend: BlendMode,
     pub cull: CullMode,
@@ -226,6 +233,25 @@ pub struct PipelineKey {
 }
 
 impl DrawBatch {
+    /// Whether this resolved BSP stage can affect the scene color or depth.
+    ///
+    /// A server shader remap to `clear` (`GL_ZERO GL_ONE`, without depthWrite)
+    /// changes neither framebuffer color nor depth. A diagnostic wireframe
+    /// must not resurrect that invisible stage. Do not suppress fused stages:
+    /// their other shader inputs may still contribute visible pixels.
+    ///
+    /// This is only a submission decision. Keep all BSP vertices/indices in
+    /// their immutable map cache, since remaps can be removed at runtime.
+    pub(crate) fn contributes_to_world_wireframe(&self) -> bool {
+        self.pipeline.depth_write
+            || !matches!(
+                self.pipeline.blend,
+                BlendMode::Custom(BlendFactor::Zero, BlendFactor::One)
+            )
+            || !self.additive_companions.is_empty()
+            || self.legacy_srgb_overlay.is_some()
+    }
+
     /// Evaluated when uploading this draw's material uniform, not per frame
     /// pixel. Modern promoted ocean and opaque/PBR stages remain linear.
     pub(crate) fn legacy_rgb_compositing(&self) -> LegacyRgbCompositing {
@@ -264,12 +290,19 @@ pub struct DrawBatch {
     /// material must finish before fullscreen cloud attenuation. A blended
     /// sibling stage does not make the *whole* material transparent.
     pub opaque_composite_before_clouds: bool,
+    /// Explicit TaystJK shader sort at/after SS_SEE_THROUGH (including
+    /// `sort additive`). The complete stage chain, even an alpha-tested
+    /// depth-writing base, must be presented in the late-sorted world queue.
+    pub late_sorted_material: bool,
     /// Image index when this stage samples a regular texture.
     pub texture: Option<usize>,
     /// For a safely fused authored lightmap/diffuse/vertex-alpha overlay, the
     /// secondary image is sampled through the otherwise unused sky-right slot.
     /// None leaves every original stage and binding unchanged.
     pub legacy_srgb_overlay: Option<usize>,
+    /// Authored additive siblings folded into this one draw. All retain their exact
+    /// per-stage texture coordinates, rgb/alpha generators and shader clock.
+    pub additive_companions: Vec<DrawBatch>,
     /// Pre-resolved animMap frame indices (absent for ordinary stages).
     pub animation: Option<materials::MaterialAnimation>,
     /// True when binding 0 should be the BSP lightmap instead of `texture`.
@@ -325,6 +358,10 @@ pub struct DrawBatch {
     pub alpha_gen: AlphaGen,
     pub color: [f32; 4],
     pub alpha_cutoff: f32,
+    /// BSP-only: recover an 8-bit alpha boundary that would otherwise make a
+    /// masked depth-seeding stage impossible, leaving its depth-equal siblings
+    /// with no pixels. Set once during map preparation, not in the shader parser.
+    pub alpha_test_texture_only: bool,
     /// OpenJK/TaystJK shader remap animation origin. Renderer shader time is
     /// `refdef.floatTime - timeOffset`; zero is the normal authored timeline.
     /// This is resolved on the cold remap path, so normal draw submission has

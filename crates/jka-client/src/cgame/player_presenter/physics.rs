@@ -638,6 +638,8 @@ impl PlayerPresenter {
         };
         Some(DynamicModelSurface {
             geometry_source: crate::renderer::ModelGeometrySource::BlobShadow,
+            authored_lighting: false,
+            material_trace: None,
             entity_num: u16::MAX,
             wireframe_class: DynamicWireframeClass::Effect,
             raster_visible: true,

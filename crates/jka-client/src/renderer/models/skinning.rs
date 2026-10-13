@@ -338,7 +338,8 @@ impl DynamicModelRenderer {
                 continue;
             }
             let classic_light = if surface.raster_visible
-                && self.entity_ambient_lighting == EntityAmbientLightingMode::BspLightgridClassic
+                && (self.entity_ambient_lighting == EntityAmbientLightingMode::BspLightgridClassic
+                    || (surface.authored_lighting && self.entity_ambient_lighting == EntityAmbientLightingMode::Off))
                 && !matches!(
                     surface.alpha_mode,
                     DynamicModelAlphaMode::AdditiveOne

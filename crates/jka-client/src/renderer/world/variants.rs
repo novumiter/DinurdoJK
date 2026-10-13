@@ -63,9 +63,213 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     /// Deluxe GGX specular lobe; implies `deluxe` and a non-zero r_deluxeSpecular.
     pub(in crate::renderer) deluxe_specular: bool,
     pub(in crate::renderer) detail_textures_enabled: bool,
+    /// Snow shells / Snowflow / stock footprint stamps compiled in: footprints are
+    /// not Off and the loaded map has snow surfaces.
+    pub(in crate::renderer) surface_deformation: bool,
+    /// r_dynamicLightDebug receiver view.
+    pub(in crate::renderer) dynamic_light_debug: bool,
+    /// Sky cost probe or the experimental fractal sky override is active.
+    pub(in crate::renderer) sky_debug: bool,
+    /// r_fragmentShaderMode 1: base-pass PSOs are also compiled per
+    /// MaterialFragmentKey. Only selects which programs a variant holds; no WGSL
+    /// override of its own.
+    pub(in crate::renderer) material_specialization: bool,
+    /// r_fragmentShaderMode 2: eligible specialized PSOs use the dedicated
+    /// minimal entry points (`vs_world_minimal` / `fs_world_minimal`).
+    pub(in crate::renderer) minimal_entries: bool,
+}
+
+// MaterialUniform header.z bits that are never read by the world WGSL (CPU,
+// depth-prepass or RT only). Fixing them would only split pipelines.
+const MATERIAL_FLAGS_UNREAD: u32 = 8192 | 4194304 | 67108864 | 65536;
+const MATERIAL_FLAGS_PBR: u32 =
+    8 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 262144;
+const MATERIAL_FLAGS_PLANAR: u32 = 4096 | 16384 | 32768;
+const MATERIAL_FLAG_IMPLICIT_LIGHTMAP: u32 = 2;
+const MATERIAL_FLAG_DYNAMIC_RECEIVER: u32 = 4;
+const MATERIAL_FLAG_VERTEX_LIT: u32 = 131072;
+const MATERIAL_FLAGS_VERTEX_COLOR: u32 = 1 | 524288 | 1048576 | 2097152;
+const MATERIAL_FLAG_EXPLICIT_LIGHTMAP: u32 = 8388608;
+const MATERIAL_FLAG_HAS_LIGHTMAP: u32 = 16777216;
+const MATERIAL_FLAG_OPAQUE_STAGE: u32 = 33554432;
+const MATERIAL_FLAGS_WAVES: u32 = 134217728 | 268435456;
+const MATERIAL_FLAG_LEGACY_SRGB: u32 = 536870912;
+const MATERIAL_FLAG_MASK_TEXTURE_ALPHA: u32 = 1073741824;
+/// MATERIAL_KEY_TC_GEN value that leaves tcGen read from the uniform.
+const MATERIAL_TC_GEN_DYNAMIC: u32 = u32::MAX;
+const MATERIAL_FLAGS_W_DETAIL: u32 = 2;
+const MATERIAL_FLAGS_W_PLANAR: u32 = 4;
+const MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP: u32 = 65536;
+
+/// TaystJK-style per-material fragment specialization (r_fragmentShaderMode 1).
+///
+/// The material checks in the world WGSL read `MaterialUniform.header` through
+/// `material_flags()` / `material_flags_w()` / `material_tc_gen()`. A pipeline built
+/// with this key fixes the bits in `flags_mask` / `flags_w_mask` (and tcGen and the
+/// alpha function) as override constants, so the driver folds those branches away.
+/// The key is taken from the uploaded uniform itself and every batch drawn with the
+/// PSO has the same key, so the specialized program is exact by construction.
+/// Masks only drop bits whose code is compiled out by the global variant anyway,
+/// to keep the PSO count down; dropped bits are still read from the uniform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(in crate::renderer) struct MaterialFragmentKey {
+    pub(in crate::renderer) flags: u32,
+    pub(in crate::renderer) flags_mask: u32,
+    pub(in crate::renderer) flags_w: u32,
+    pub(in crate::renderer) flags_w_mask: u32,
+    pub(in crate::renderer) tc_gen: u32,
+    /// 1 none, 2 discard below params.x, 3 discard at/above -params.x.
+    pub(in crate::renderer) alpha_func: u32,
+}
+
+impl MaterialFragmentKey {
+    /// The full key of an uploaded material; `for_variant` narrows it.
+    pub(in crate::renderer) fn from_material(header: [u32; 4], alpha_cutoff: f32) -> Self {
+        Self {
+            flags: header[2] & !MATERIAL_FLAGS_UNREAD,
+            flags_mask: !MATERIAL_FLAGS_UNREAD,
+            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP),
+            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP,
+            tc_gen: header[0],
+            alpha_func: if alpha_cutoff > 0.0 {
+                2
+            } else if alpha_cutoff < 0.0 {
+                3
+            } else {
+                1
+            },
+        }
+    }
+
+    /// TaystJK-style classification (r_fragmentShaderMode 1): keep only the
+    /// header bits whose code the global variant actually compiles in, so
+    /// materials that differ elsewhere share one PSO (TaystJK collapses stages
+    /// into a small set of shader types the same way). On Minimal that leaves
+    /// lightmap multiply, colour/alpha source, waves, legacy sRGB output and the
+    /// alpha function. Dropped bits stay readable from the uniform, so a dropped
+    /// bit can never change the image; it only keeps a check whose code is dead.
+    pub(in crate::renderer) fn for_variant(
+        mut self,
+        variant: WorldShaderVariantKey,
+        alpha_test: bool,
+    ) -> Self {
+        let (keep, keep_w, fix_tc_gen) = Self::relevant_bits(variant, alpha_test);
+        self.flags &= keep;
+        self.flags_mask &= keep;
+        self.flags_w &= keep_w;
+        self.flags_w_mask &= keep_w;
+        if !fix_tc_gen {
+            self.tc_gen = MATERIAL_TC_GEN_DYNAMIC;
+        }
+        if !alpha_test {
+            self.alpha_func = 0;
+        }
+        self
+    }
+
+    /// Header bits (z, w) and tcGen whose WGSL reads are live under `variant`.
+    /// Mirrors the `material_flags()` / `material_flags_w()` / `material_tc_gen()`
+    /// reads in shade_surface and its helpers (bsp_lean.wgsl / bsp.wgsl).
+    fn relevant_bits(variant: WorldShaderVariantKey, alpha_test: bool) -> (u32, u32, bool) {
+        // Always live: implicit lightmap multiply, rgbGen/alphaGen vertex and
+        // one-minus-vertex, rgbGen/alphaGen wave, legacy sRGB additive output.
+        let mut keep = MATERIAL_FLAG_IMPLICIT_LIGHTMAP
+            | MATERIAL_FLAGS_VERTEX_COLOR
+            | MATERIAL_FLAGS_WAVES
+            | MATERIAL_FLAG_LEGACY_SRGB;
+        let mut keep_w = 0;
+        let mut fix_tc_gen = false;
+        if alpha_test {
+            keep |= MATERIAL_FLAG_MASK_TEXTURE_ALPHA;
+        }
+        if variant.pbr || variant.pom {
+            keep |= MATERIAL_FLAGS_PBR | MATERIAL_FLAG_DYNAMIC_RECEIVER;
+        }
+        if variant.planar_reflections || variant.planar_debug {
+            keep |= MATERIAL_FLAGS_PLANAR;
+            keep_w |= MATERIAL_FLAGS_W_PLANAR;
+            fix_tc_gen = true;
+        }
+        if variant.classic_render_flags {
+            keep |= MATERIAL_FLAG_EXPLICIT_LIGHTMAP
+                | MATERIAL_FLAG_HAS_LIGHTMAP
+                | MATERIAL_FLAG_OPAQUE_STAGE
+                | MATERIAL_FLAG_VERTEX_LIT;
+        }
+        if variant.dynamic_light_debug || variant.jump_shade {
+            keep |= MATERIAL_FLAG_OPAQUE_STAGE | MATERIAL_FLAG_DYNAMIC_RECEIVER;
+        }
+        if variant.static_bsp_ao {
+            keep |= MATERIAL_FLAG_VERTEX_LIT;
+            fix_tc_gen = true;
+        }
+        if variant.map_light_simulation || variant.source_map_world {
+            keep |= MATERIAL_FLAG_DYNAMIC_RECEIVER | MATERIAL_FLAG_VERTEX_LIT;
+        }
+        if variant.voxel_gi
+            || variant.cascaded_shadows
+            || variant.vertex_dlights
+            || variant.legacy_dlights
+            || variant.clustered_lite_dlights
+            || variant.point_lights
+            || variant.area_lights
+        {
+            keep |= MATERIAL_FLAG_DYNAMIC_RECEIVER;
+        }
+        if variant.detail_textures_enabled {
+            keep_w |= MATERIAL_FLAGS_W_DETAIL;
+        }
+        if variant.legacy_dlights {
+            keep_w |= MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP;
+        }
+        (keep, keep_w, fix_tc_gen)
+    }
+
+    pub(in crate::renderer) fn compilation_constants(self) -> [(&'static str, f64); 6] {
+        [
+            ("MATERIAL_KEY_FLAGS", f64::from(self.flags)),
+            ("MATERIAL_KEY_FLAGS_MASK", f64::from(self.flags_mask)),
+            ("MATERIAL_KEY_FLAGS_W", f64::from(self.flags_w)),
+            ("MATERIAL_KEY_FLAGS_W_MASK", f64::from(self.flags_w_mask)),
+            ("MATERIAL_KEY_TC_GEN", f64::from(self.tc_gen)),
+            ("MATERIAL_KEY_ALPHA_FUNC", f64::from(self.alpha_func)),
+        ]
+    }
 }
 
 impl WorldShaderVariantKey {
+    /// Whether the minimal world entries equal fs_main under these settings: every
+    /// global feature they leave out is compiled out. Static AO, legacy fog and
+    /// the jump-shade helper are kept by the minimal entries themselves. The base
+    /// pass never compiles Legacy dlights in (see `base_pass_key`).
+    pub(in crate::renderer) fn minimal_entry_compatible(self) -> bool {
+        self.minimal_entries
+            && self.material_specialization
+            && self.family() == WorldShaderFamily::Lean
+            && !self.pbr
+            && !self.pom
+            && !self.point_lights
+            && !self.map_light_simulation
+            && !self.source_map_world
+            && !self.vertex_dlights
+            && !self.clustered_lite_dlights
+            && !self.area_lights
+            && !self.irradiance_volume
+            && !self.voxel_gi
+            && !self.local_shadows
+            && !self.cascaded_shadows
+            && !self.ray_traced_shadows
+            && !self.planar_reflections
+            && !self.ocean
+            && !self.weather_surface
+            && !self.classic_render_flags
+            && !self.planar_debug
+            && !self.deluxe
+            && !self.detail_textures_enabled
+            && !self.surface_deformation
+            && !self.dynamic_light_debug
+    }
+
     /// The authored Legacy dlight contribution is a separate depth-equal pass.
     /// The base material BSP pass has ENABLE_LEGACY_DLIGHTS=0 even while the
     /// selected dynamic-light mode is Legacy. Treat its compiled PSOs as the
@@ -180,6 +384,15 @@ impl WorldShaderVariantKey {
                 "ENABLE_DELUXE_SPECULAR",
                 f64::from(u8::from(self.deluxe_specular)),
             ),
+            (
+                "ENABLE_SURFACE_DEFORMATION",
+                f64::from(u8::from(self.surface_deformation)),
+            ),
+            (
+                "ENABLE_DYNAMIC_LIGHT_DEBUG",
+                f64::from(u8::from(self.dynamic_light_debug)),
+            ),
+            ("ENABLE_SKY_DEBUG", f64::from(u8::from(self.sky_debug))),
         ];
         // The stock BSP shaders intentionally do not declare the experimental
         // ray-query override. Only the lazily-created RT shader receives it, so
@@ -291,6 +504,18 @@ impl WorldShaderVariantKey {
         }
         if self.detail_textures_enabled {
             enabled.push("detail");
+        }
+        if self.surface_deformation {
+            enabled.push("snow-deform");
+        }
+        if self.dynamic_light_debug {
+            enabled.push("dlight-debug");
+        }
+        if self.material_specialization {
+            enabled.push(if self.minimal_entries { "mat-spec+minimal" } else { "mat-spec" });
+        }
+        if self.sky_debug {
+            enabled.push("sky-debug");
         }
         if enabled.is_empty() {
             "base".to_string()

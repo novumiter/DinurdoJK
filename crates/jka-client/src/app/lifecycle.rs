@@ -72,6 +72,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.applied_fullscreen = self.video.fullscreen;
         self.applied_renderer_backend = self.video.renderer_backend;
+        self.applied_gpu_adapter = self.video.gpu_adapter;
         self.applied_resolution = self.video.resolution;
         self.applied_grass = self.video.grass;
         self.applied_ocean = self.video.ocean;
@@ -171,7 +172,11 @@ impl ApplicationHandler<UserEvent> for App {
                 wireframe_supported,
                 hdr_output_status,
                 hdr_output_active,
+                adapter_name,
+                adapter_type,
             } => {
+                self.active_gpu_name = adapter_name;
+                self.active_gpu_type = adapter_type;
                 self.hdr_output_status = hdr_output_status;
                 self.hdr_output_active = hdr_output_active;
                 self.supported_msaa = supported_msaa;
@@ -747,6 +752,11 @@ impl ApplicationHandler<UserEvent> for App {
                 // authored two-pass recipe without BSP/asset re-preparation.
                 if self.video.stage_collapse_extra {
                     scene::apply_reverse_lightmap_collapse_in_place(map.as_mut());
+                }
+                if self.video.additive_stage_fusion {
+                    scene::fuse_additive_stage_fusion_in_place(map.as_mut());
+                } else {
+                    scene::expand_additive_stage_fusion_in_place(map.as_mut());
                 }
                 if shader_remap_map_matches_session {
                     // This upload now represents the complete remap/reset state
@@ -1603,6 +1613,61 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // Both inspection pages are dismissible with the Dev bind. Handle
+        // keyboard and mouse bindings ahead of egui, which otherwise consumes
+        // them on these fullscreen/popup pages. A press only dismisses; it
+        // must not also open the wheel or invoke a tool.
+        if matches!(self.overlay, OverlayMode::Trace | OverlayMode::EntityGraph) {
+            let dismiss = match &event {
+                WindowEvent::KeyboardInput { event: key, .. } => {
+                    key.state == ElementState::Pressed
+                        && !key.repeat
+                        && match key.physical_key {
+                            PhysicalKey::Code(code) => self.key_bound_to_dev(code),
+                            _ => false,
+                        }
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    *state == ElementState::Pressed && self.mouse_button_bound_to_dev(*button)
+                }
+                _ => false,
+            };
+            if dismiss {
+                self.toggle_dev_radial(); // Context-sensitive Back; no wheel opens.
+                return;
+            }
+        }
+
+        // Developer wheel owns mouse clicks *before* egui/normal game binds.
+        // Clicking confirms the current relative-motion selection; releasing
+        // the bound mouse button simply dismisses, without performing a tool.
+        if self.overlay == OverlayMode::DevRadial {
+            if let WindowEvent::MouseInput { state, button, .. } = &event {
+                if *state == ElementState::Released && self.mouse_button_bound_to_dev(*button) {
+                    let number = match button {
+                        MouseButton::Left => Some(1),
+                        MouseButton::Right => Some(2),
+                        MouseButton::Middle => Some(3),
+                        MouseButton::Back => Some(4),
+                        MouseButton::Forward => Some(5),
+                        _ => None,
+                    };
+                    if let Some(number) = number {
+                        self.mouse_buttons_down.remove(&number);
+                        self.execute_binding_release(BindKey::Mouse(number));
+                    }
+                    self.close_dev_radial();
+                } else if *state == ElementState::Pressed
+                    && *button == MouseButton::Left
+                    && !self.mouse_button_bound_to_dev(*button)
+                {
+                    self.activate_dev_radial_selection();
+                }
+                // Do not leak other buttons to egui or gameplay. In particular,
+                // clicking a non-selected region closes without attacking.
+                return;
+            }
+        }
         if self.route_egui_window_event(&event) {
             return;
         }
@@ -1765,6 +1830,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                // Focus loss is cancellation, never a tool commit. Otherwise
+                // Alt+Tab could leave a hidden/locked wheel stranded.
+                if !focused && self.overlay == OverlayMode::DevRadial {
+                    self.close_dev_radial();
+                }
                 self.sync_gamma_focus();
                 self.apply_audio_mix();
 
@@ -2136,11 +2206,17 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     OverlayMode::DevRadial => {
-                        if event.state == ElementState::Pressed
-                            && !event.repeat
-                            && self.key_bound_to_dev(code)
-                        {
-                            self.close_dev_radial();
+                        if self.key_bound_to_dev(code) {
+                            if event.state == ElementState::Released {
+                                self.keys.remove(&code);
+                                self.execute_binding_release_from(
+                                    keybinds::bind_key_for_code(code),
+                                    BindKey::Keyboard(code),
+                                );
+                                self.close_dev_radial();
+                            }
+                        } else {
+                            self.handle_dev_wheel_gameplay_key(code, event.state, event.repeat);
                         }
                         return;
                     }
@@ -2275,6 +2351,25 @@ impl ApplicationHandler<UserEvent> for App {
         event: DeviceEvent,
     ) {
         if self.demo_video_export.is_some() {
+            return;
+        }
+        if self.overlay == OverlayMode::DevRadial {
+            if self.window_focused {
+                if let DeviceEvent::MouseMotion { delta } = event {
+                    // Raw relative mouse movement drives a virtual stick.
+                    // Clamp its *length*, not X/Y independently: this avoids
+                    // building up an off-screen offset that makes switching
+                    // segments feel like hunting for the selection again.
+                    let dpi = self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32).max(0.25);
+                    let scale = 0.01 / dpi;
+                    let x = self.dev_radial_offset[0] + delta.0 as f32 * scale;
+                    let y = self.dev_radial_offset[1] + delta.1 as f32 * scale;
+                    let length = x.hypot(y);
+                    let adjust = if length > 1.0 { 1.0 / length } else { 1.0 };
+                    self.dev_radial_offset = [x * adjust, y * adjust];
+                    self.egui_repaint_requested = true;
+                }
+            }
             return;
         }
         if !self.captured || self.overlay != OverlayMode::None {

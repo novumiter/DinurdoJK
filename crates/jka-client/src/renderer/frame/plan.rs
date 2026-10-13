@@ -20,6 +20,7 @@ impl WorldTransparencyOrder {
     pub(super) fn defer_stage(
         &mut self, vertices: &std::ops::Range<u32>, shader: u32,
         class: crate::scene::DrawClass, opaque_composite_before_clouds: bool,
+        late_sorted_material: bool,
     ) -> bool {
         let same_surface = self.surface.as_ref().is_some_and(|(previous, previous_shader)|
             previous == vertices && *previous_shader == shader);
@@ -27,8 +28,12 @@ impl WorldTransparencyOrder {
             self.surface = Some((vertices.clone(), shader));
             self.deferred = false;
         }
-        self.deferred |= class == crate::scene::DrawClass::Transparent
-            && !opaque_composite_before_clouds;
+        // TaystJK sorts the *shader*, not individual stages. An explicit
+        // late sort must defer the alpha-tested/opaque depth seed as well as
+        // its blended siblings, preserving `depthFunc equal` overlays.
+        self.deferred |= late_sorted_material
+            || (class == crate::scene::DrawClass::Transparent
+                && !opaque_composite_before_clouds);
         self.deferred
     }
 }
@@ -45,7 +50,7 @@ mod transparency_order_tests {
             (3..6, 1, Opaque), (6..9, 2, Opaque)];
         let (mut before_entities, mut after_entities) = (Vec::new(), Vec::new());
         for (index, (vertices, shader, class)) in stages.iter().enumerate() {
-            if order.defer_stage(vertices, *shader, *class, false) {
+            if order.defer_stage(vertices, *shader, *class, false, false) {
                 after_entities.push(index);
             } else {
                 before_entities.push(index);
@@ -60,20 +65,35 @@ mod transparency_order_tests {
         let mut order = WorldTransparencyOrder::default();
         // Mirrors sand -> wet sand -> lightmap -> caustics -> depthfade.
         for class in [Opaque, Transparent, Transparent, Transparent, Transparent] {
-            assert!(!order.defer_stage(&(0..6), 109, class, true));
+            assert!(!order.defer_stage(&(0..6), 109, class, true, false));
         }
         // Stock water is additive and remains behind the cloud multiplier.
-        assert!(order.defer_stage(&(6..12), 102, Transparent, false));
-        assert!(order.defer_stage(&(6..12), 102, Transparent, false));
+        assert!(order.defer_stage(&(6..12), 102, Transparent, false, false));
+        assert!(order.defer_stage(&(6..12), 102, Transparent, false, false));
+    }
+
+    #[test]
+    fn additive_sorted_masked_depth_seed_waits_with_its_depth_equal_overlays() {
+        use crate::scene::DrawClass::Mask;
+        let mut order = WorldTransparencyOrder::default();
+        // seph_seaweed2: masked GL_ONE GL_ZERO depth seed, followed by
+        // additive caustics and a source-alpha depthfade overlay.
+        let range = 18..198;
+        assert!(order.defer_stage(&range, 114, Mask, false, true));
+        for _ in 0..4 {
+            assert!(order.defer_stage(&range, 114, Transparent, false, true));
+        }
+        // The next material must not inherit the late-sort decision.
+        assert!(!order.defer_stage(&(198..204), 115, Opaque, false, false));
     }
 
     #[test]
     fn distinct_materials_do_not_inherit_another_surfaces_deferred_state() {
         let mut order = WorldTransparencyOrder::default();
-        assert!(order.defer_stage(&(0..3), 0, Transparent, false));
-        assert!(!order.defer_stage(&(0..3), 1, Opaque, false));
-        assert!(order.defer_stage(&(0..3), 1, Transparent, false));
-        assert!(!order.defer_stage(&(3..6), 1, Opaque, false));
+        assert!(order.defer_stage(&(0..3), 0, Transparent, false, false));
+        assert!(!order.defer_stage(&(0..3), 1, Opaque, false, false));
+        assert!(order.defer_stage(&(0..3), 1, Transparent, false, false));
+        assert!(!order.defer_stage(&(3..6), 1, Opaque, false, false));
     }
 }
 

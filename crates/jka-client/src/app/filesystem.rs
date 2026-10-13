@@ -92,6 +92,10 @@ impl App {
         self.prepared_map_cache = None;
         self.stringed = None;
         self.ui_catalog.reset();
+        *self.console_map_suggest_cache.borrow_mut() = None;
+        *self.console_arg_suggest_cache.borrow_mut() = None;
+        self.console_file_catalog_loaded = false;
+        self.console_files = Default::default();
         self.solo_catalog_loaded = false;
         self.solo_catalog_error = None;
         self.solo_maps.clear();

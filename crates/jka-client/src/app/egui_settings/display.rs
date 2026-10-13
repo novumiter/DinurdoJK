@@ -157,6 +157,30 @@ impl App {
         if self.video.renderer_backend != self.applied_renderer_backend {
             theme::hint(ui, "Render backend changed: needs Apply", theme::WARNING);
         }
+        theme::row(
+            ui,
+            "Graphics processor",
+            "Select which WGPU adapter runs Unified. Automatic prefers the system's high-performance GPU. Dedicated or Integrated selects a matching compatible adapter. Software requires a CPU adapter exposed by the chosen graphics backend. Switching devices requires Apply; it does not move individual draws onto the CPU.",
+            theme::Reset::Video(ui::VIDEO_ROW_GPU_ADAPTER),
+            |ui| {
+                egui::ComboBox::from_id_salt("video_gpu_adapter")
+                    .selected_text(crate::renderer::gpu_adapter::label(self.video.gpu_adapter))
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        for (index, label) in crate::renderer::gpu_adapter::LABELS.iter().enumerate() {
+                            if ui.selectable_label(self.video.gpu_adapter == index as u8, *label).clicked() {
+                                self.video.gpu_adapter = index as u8;
+                                self.video_selected = ui::VIDEO_ROW_GPU_ADAPTER;
+                                self.mark_config_dirty();
+                            }
+                        }
+                    });
+            },
+        );
+        ui.label(format!("Currently rendering on: {} ({})", self.active_gpu_name, self.active_gpu_type));
+        if self.video.gpu_adapter != self.applied_gpu_adapter {
+            theme::hint(ui, "Graphics processor changed: needs Apply", theme::WARNING);
+        }
 
         const DISPLAY_MODES: [(FullscreenMode, &str); 3] = [
             (FullscreenMode::Windowed, "Windowed"),

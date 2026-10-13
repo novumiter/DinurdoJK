@@ -122,7 +122,10 @@ impl App {
             .is_some_and(|session| session.local && session.phase == SessionPhase::Playing);
         let mut deformation_stamps = Vec::new();
         let mut local_movement_error = None;
-        if local_is_playing && self.overlay == OverlayMode::None && self.captured {
+        if local_is_playing
+            && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial)
+            && self.captured
+        {
             // Local play originates the same CL_CreateCmd action payload as
             // remote play. The old offline path only forwarded attack/alt
             // while noclip was enabled, so normal +attack never reached Pmove.

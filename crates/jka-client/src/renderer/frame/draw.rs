@@ -1,24 +1,34 @@
 //! Frame draw.
 use crate::renderer::{
-    aabb_behind_plane, aabb_intersects_clip_frustum, aabb_intersects_shadow_frustum,
+    world_stage_probe_excludes, aabb_behind_plane, aabb_intersects_clip_frustum, aabb_intersects_shadow_frustum,
     advance_world_animations,
     aabb_screen_rect,
     active_batch_selection, batch_area_visible, bevy_cascade_shadow_matrices, block_on,
-    camera_depth_clear, claim_ocean_clipmap, draw_snow_shell, draw_world_batch,
-    effective_area_mask, inline_run_fog_depth, inline_stage_info, inspector_index_range,
+    camera_depth_clear, claim_ocean_clipmap, draw_snow_shell, draw_world_batch, fast_sky_clear_color,
+    effective_area_mask, hidden_inline_batch, inline_run_fog_depth, inline_stage_info, inspector_index_range,
     legacy_dlight_batch_selection, legacy_dlight_receives, ocean_pipeline_key,
     ocean_suppresses_batch, pack_inline_draws, refresh_auto4_lazy_collapse, same_world_surface,
     sample_view_rotation, scene, select_planar_reflection_views, snow_shell_draw_near_center,
     temporal_jitter, ui, update_active_cull_indices, update_visibility, weather, Arc,
     AutoExposureUniform, BlendMode, Camera, CameraUniform, CompanionSceneView, CullDebugMode,
-    DofUniform, DrawClass, DrawIndexedIndirectArgs, DynamicLightsMode, DynamicModelSurface,
+    DeferredCommand, DeferredResources, DofUniform, DrawClass, DrawIndexedIndirectArgs, DynamicLightsMode, DynamicModelSurface,
     DynamicShadowsMode, FootprintMode, FrameInfo, GlowMode, GpuPass, Instant, LatestViewState, Mat4,
+    WorldPipelineBinding, is_sky_cloud_stage,
     PlanarReflectionDebugMode, PlanarReflectionMode, PlanarReflectionUniform, PvsMode, RenderError,
     Renderer, SpectatorHighlight, SunVisibilityMode, TcGen, TransientLight, Vec3, ViewLatchMode, WorldBatch,
     WorldBatchSet, WorldRenderPath, WorldShaderFamily, CLOUD_INTERLEAVE_GRID, CLUSTER_COUNT,
     ENTITY_SHADOW_CAMERAS, PLANAR_REFLECTION_SLOTS, SHADOW_CASCADES,
 };
 use bytemuck::Zeroable;
+
+/// r_fragmentShaderMode diagnostics: which kind of world program a bind selected.
+fn count_world_program_bind(info: &mut FrameInfo, binding: WorldPipelineBinding) {
+    if binding.1.is_some() {
+        info.world_specialized_binds = info.world_specialized_binds.saturating_add(1);
+    } else {
+        info.world_general_binds = info.world_general_binds.saturating_add(1);
+    }
+}
 
 impl Renderer {
     pub(in crate::renderer) fn render(
@@ -95,6 +105,21 @@ impl Renderer {
             .map(|world| world.active_pipeline_variant);
         let enhanced_world_shader =
             active_world_variant.is_some_and(|key| key.family() == WorldShaderFamily::Enhanced);
+        // The RT variant binds different group 2/3 layouts; it keeps the
+        // per-pixel BSP sky.
+        // JKA_SKY_BOX=0 forces the per-pixel BSP sky (A/B diagnostics only).
+        static SKY_BOX_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sky_box_env = *SKY_BOX_ENV
+            .get_or_init(|| std::env::var_os("JKA_SKY_BOX").is_none_or(|value| value != "0"));
+        let sky_box_allowed = sky_box_env
+            && active_world_variant.is_some_and(|key| !key.ray_traced_shadows)
+            && self.fast_sky == 0
+            && !self.sky_debug_shader_needed()
+            && !self.dynamic_light_debug
+            && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off;
+        if sky_box_allowed {
+            self.ensure_sky_box_pipelines(enhanced_world_shader);
+        }
         // Ocean resources are created/released immediately by SetOceanEnabled.
         // Promote authored water only once both the setting and active compiled
         // PSO agree that ocean support is live; until then stock water remains.
@@ -131,8 +156,12 @@ impl Renderer {
 
         // Snowflow state advances only when new brushes/window movement/relaxation
         // require it. This is deliberately before the fast-path early return.
-        self.surface_deformation
-            .prepare_frame(&self.device, &self.queue);
+        // Its 2048^2 relax pass only ever shades authored snow, so maps without
+        // snow surfaces skip it entirely.
+        if self.map_has_snow_surfaces {
+            self.surface_deformation
+                .prepare_frame(&self.device, &self.queue);
+        }
         self.update_world_videos();
         if let Some(world) = self.world.as_mut() {
             advance_world_animations(world, self.started.elapsed().as_secs_f32());
@@ -358,7 +387,8 @@ impl Renderer {
                 0,
                 (u32::from(self.static_bsp_ao_enabled)
                     | (u32::from(self.sky_fractal_override) << 1)
-                    | (u32::from(self.temporal_resolve_active()) << 2)),
+                    | (u32::from(self.temporal_resolve_active()) << 2)
+                    | (u32::from(self.sky_perf_probe) << 8)),
                 self.classic_world_render_flags(),
                 if self.temporal_resolve_active() {
                     self.taa_frame_index
@@ -379,6 +409,7 @@ impl Renderer {
         let sky_portal_view =
             self.world
                 .as_ref()
+                .filter(|_| self.fast_sky == 0)
                 .and_then(|world| world.sky_portal)
                 .map(|portal| {
                     let position =
@@ -402,6 +433,8 @@ impl Renderer {
                     (position, portal_view_proj)
                 });
         self.ensure_wireframe_pipelines();
+        self.ensure_shader_complexity_target();
+        self.ensure_shader_complexity_pipelines();
         self.update_sun_ray_preview(camera, player_position);
         self.prepare_rt_sun_shadow(view_proj, camera.position);
         if self.weather.rain.enabled {
@@ -748,7 +781,8 @@ impl Renderer {
                     clip_plane: view.plane,
                     render_flags: [
                         1,
-                        (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)),
+                        (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)
+                            | (u32::from(self.sky_perf_probe) << 8)),
                         self.classic_world_render_flags(),
                         0,
                     ],
@@ -852,67 +886,23 @@ impl Renderer {
             .sum();
 
         info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
-        // One-shot diagnostic for CurrentSurfaceTexture::Validation. Wgpu's
-        // Validation variant means a validation error occurred inside
-        // Surface::get_current_texture(). Capture that exact call in a validation
-        // scope so we can print the real error rather than guessing from the
-        // generic surface status. This path is completely dormant unless
-        // JKA_SURFACE_DIAG=1 is set.
-        let surface_scope = self
-            .surface_diag_pending
-            .then(|| self.device.push_error_scope(wgpu::ErrorFilter::Validation));
-        if self.surface_diag_pending {
-            eprintln!(
-                "[JKA SURFACE DIAG] before acquire: config={}x{} format={:?} present={:?} latency={} usage={:?} alpha={:?} view_formats={:?}",
-                self.config.width,
-                self.config.height,
-                self.config.format,
-                self.config.present_mode,
-                self.config.desired_maximum_frame_latency,
-                self.config.usage,
-                self.config.alpha_mode,
-                self.config.view_formats,
-            );
-        }
-        let acquire_started = Instant::now();
-        let surface_result = self.surface.get_current_texture();
-        info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        if let Some(scope) = surface_scope {
-            let scoped_error = block_on(scope.pop());
-            match scoped_error {
-                Some(error) => {
-                    eprintln!("[JKA SURFACE DIAG] get_current_texture validation: {error}");
-                    eprintln!("[JKA SURFACE DIAG] debug: {error:?}");
-                }
-                None => {
-                    eprintln!("[JKA SURFACE DIAG] get_current_texture scope: no validation error captured");
-                }
-            }
-            eprintln!("[JKA SURFACE DIAG] returned: {surface_result:?}");
-            self.surface_diag_pending = false;
-        }
-        let frame = match surface_result {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Timeout);
-            }
-            wgpu::CurrentSurfaceTexture::Occluded => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Occluded);
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Outdated);
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                self.flush_staged_queue_writes();
-                return Err(RenderError::Lost);
-            }
-            wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
+        // r_earlySubmit: record into an offscreen frame and acquire the
+        // swapchain image only after the main submit (see early_submit.rs).
+        let early_submit = self.early_submit_frame(menu_backdrop_active);
+        info.early_submit = early_submit;
+        // r_presentCopy: acquire as usual, render offscreen, copy at the end of
+        // the main encoder (see present_copy_frame).
+        let present_copy = !early_submit && self.present_copy_frame(menu_backdrop_active);
+        let (frame, surface_view) = if early_submit {
+            (None, self.early_present_view())
+        } else if present_copy {
+            let frame = self.acquire_surface_frame(&mut info)?;
+            (Some(frame), self.early_present_view())
+        } else {
+            let frame = self.acquire_surface_frame(&mut info)?;
+            let surface_view = self.surface_texture_view(&frame);
+            (Some(frame), surface_view)
         };
-        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
 
@@ -1208,6 +1198,10 @@ impl Renderer {
                             wgpu::IndexFormat::Uint32,
                         );
                         for batch in &world.coarse_batches {
+                            if (batch.is_inline_entity && !self.draw_inline_models)
+                                || hidden_inline_batch(batch, &world.inline_models) {
+                                continue;
+                            }
                             // Cloud-layer batches share the outer box's geometry;
                             // one admission draw per sky surface is enough.
                             if batch.source.pipeline.class != DrawClass::Sky
@@ -1248,6 +1242,10 @@ impl Renderer {
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
+                        if (batch.is_inline_entity && !self.draw_inline_models)
+                            || hidden_inline_batch(batch, &world.inline_models) {
+                            continue;
+                        }
                         // A depthFunc equal stage is only an overlay on pixels admitted
                         // by an earlier stage. Rendering it as an independent caster
                         // would fill the holes of an alpha-tested first stage.
@@ -1684,6 +1682,8 @@ impl Renderer {
                     if let Some(cull_bind_group) = &world.cull_bind_group {
                         if self.gpu_compaction_supported && !world.compact_groups.is_empty() {
                             encoder.clear_buffer(&world.compact_count_buffer, 0, None);
+                            // GPU culling now owns the contents.
+                            self.cpu_compact_uploaded = None;
                         }
                         self.gpu_profiler.write_encoder_timestamp(
                             &mut encoder,
@@ -1820,7 +1820,10 @@ impl Renderer {
                     .clone();
                 let reflection_visible = |batch: &WorldBatch| {
                     let sky = batch.source.pipeline.class == DrawClass::Sky;
-                    batch_area_visible(batch, reflection_area_mask)
+                    (!sky || self.fast_sky == 0)
+                        && (!batch.is_inline_entity || self.draw_inline_models)
+                        && !hidden_inline_batch(batch, &world.inline_models)
+                        && batch_area_visible(batch, reflection_area_mask)
                         && !ocean_suppresses_batch(ocean_enabled, batch)
                         // The reflection shader discards every fragment behind
                         // the mirror plane (OpenJK's portal clip plane), so a
@@ -1923,6 +1926,8 @@ impl Renderer {
                                     b: 0.12,
                                     a: 1.0,
                                 }
+                            } else if self.fast_sky != 0 {
+                                fast_sky_clear_color(self.fast_sky)
                             } else {
                                 self.weather.fog.clear_color()
                             }),
@@ -2373,6 +2378,13 @@ impl Renderer {
                 info.perf_world_material_stages =
                     vec![crate::renderer::api::WorldStagePerf::default(); world.material_debug.entries.len()];
                 info.perf_world_cpu_visibility = !self.gpu_driven_enabled;
+                for mover in &world.inline_models {
+                    match mover.uploaded {
+                        Some(Some(_)) => info.perf_inline_models_active += 1,
+                        Some(None) => info.perf_inline_models_hidden += 1,
+                        None => info.perf_inline_models_uninitialized += 1,
+                    }
+                }
             }
 
             // OpenJK batches visible drawsurfs by shader/fog state after BSP/PVS
@@ -2466,20 +2478,29 @@ impl Renderer {
                         .iter().filter(|&&count| count == 1).count() as u32;
                 }
                 if compact_capacity != 0 {
-                    self.queue.write_buffer(
-                        &world.compact_indirect_buffer,
-                        0,
-                        bytemuck::cast_slice(
-                            &self.cpu_compact_indirect_scratch[..compact_capacity],
-                        ),
+                    let args: &[u8] = bytemuck::cast_slice(
+                        &self.cpu_compact_indirect_scratch[..compact_capacity],
                     );
-                    self.queue.write_buffer(
-                        &world.compact_count_buffer,
-                        0,
-                        bytemuck::cast_slice(
-                            &self.cpu_compact_count_scratch[..world.compact_groups.len()],
-                        ),
+                    let counts: &[u8] = bytemuck::cast_slice(
+                        &self.cpu_compact_count_scratch[..world.compact_groups.len()],
                     );
+                    let unchanged = self.cpu_compact_uploaded.as_ref().is_some_and(|(buffer, bytes)| {
+                        *buffer == world.compact_indirect_buffer
+                            && bytes.len() == args.len() + counts.len()
+                            && bytes[..args.len()] == *args
+                            && bytes[args.len()..] == *counts
+                    });
+                    if !unchanged {
+                        self.queue.write_buffer(&world.compact_indirect_buffer, 0, args);
+                        self.queue.write_buffer(&world.compact_count_buffer, 0, counts);
+                        let (_, bytes) = self.cpu_compact_uploaded.get_or_insert_with(|| {
+                            (world.compact_indirect_buffer.clone(), Vec::new())
+                        });
+                        bytes.clear();
+                        bytes.extend_from_slice(args);
+                        bytes.extend_from_slice(counts);
+                        self.cpu_compact_uploaded.as_mut().unwrap().0 = world.compact_indirect_buffer.clone();
+                    }
                 }
             }
 
@@ -2525,7 +2546,11 @@ impl Renderer {
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                            load: wgpu::LoadOp::Clear(if self.fast_sky != 0 {
+                                fast_sky_clear_color(self.fast_sky)
+                            } else {
+                                self.weather.fog.clear_color()
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -2650,10 +2675,20 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: if sky_portal_drawn {
+                        // r_colorClearMode 1: like vanilla/TaystJK, no colour clear
+                        // when the sky box covers everything the world does not.
+                        load: if sky_portal_drawn
+                            || (self.color_clear_mode == 1
+                                && self.fast_sky == 0
+                                && world.sky_covers_background)
+                        {
                             wgpu::LoadOp::Load
                         } else {
-                            wgpu::LoadOp::Clear(self.weather.fog.clear_color())
+                            wgpu::LoadOp::Clear(if self.fast_sky != 0 {
+                                fast_sky_clear_color(self.fast_sky)
+                            } else {
+                                self.weather.fog.clear_color()
+                            })
                         },
                         store: wgpu::StoreOp::Store,
                     },
@@ -2767,8 +2802,90 @@ impl Renderer {
             // Track consecutive surviving sibling stages without counting their
             // shared geometry as a new logical BSP surface for each stage.
             let mut perf_last_selected_world_stage: Option<usize> = None;
+            // TaystJK RB_StageIteratorSky: when the visible sky is one opaque outer
+            // box and/or up to four cloud layers, skip the BSP sky polygons and
+            // draw the box faces, then the cloud layers on the subdivided box,
+            // after the opaque world (see the skybox code in bsp_lean.wgsl).
+            // Anything else keeps the per-pixel BSP sky for this frame.
+            let mut sky_box_batch: Option<&WorldBatch> = None;
+            let mut sky_cloud_batches: [Option<&WorldBatch>; 4] = [None; 4];
+            let mut sky_box_path = false;
+            // A sky portal view already filled the background (the BSP sky
+            // stages are skipped below as well).
+            if sky_box_allowed && !sky_portal_drawn {
+                let mut eligible = true;
+                let mut clouds = 0usize;
+                let mut any_sky = false;
+                for &index in active.indices.iter() {
+                    let batch = &active.batches[index];
+                    if batch.source.pipeline.class != DrawClass::Sky
+                        || !batch_area_visible(batch, effective_area_mask)
+                    {
+                        continue;
+                    }
+                    any_sky = true;
+                    if is_sky_cloud_stage(&batch.source) {
+                        if clouds == sky_cloud_batches.len()
+                            || !self.sky_cloud_pipelines.contains_key(&batch.source.pipeline.blend)
+                        {
+                            eligible = false;
+                            break;
+                        }
+                        sky_cloud_batches[clouds] = Some(batch);
+                        clouds += 1;
+                        continue;
+                    }
+                    if !batch.source.pipeline.sky_outer
+                        || batch.source.pipeline.blend != BlendMode::Opaque
+                        || sky_box_batch.is_some_and(|sky| sky.source.skybox != batch.source.skybox)
+                    {
+                        eligible = false;
+                        break;
+                    }
+                    sky_box_batch.get_or_insert(batch);
+                }
+                sky_box_path = eligible && any_sky;
+                if !sky_box_path {
+                    sky_box_batch = None;
+                    sky_cloud_batches = [None; 4];
+                }
+            }
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
+                // Opt-in render-only A/B: no new render pass or GPU readback.
+                // Sky is intentionally retained so the diagnostic preserves the
+                // background; transparent-only lacks authored opaque depth.
+                if !self.draw_bsp_model_surfaces && !batch.is_inline_entity
+                    && world.material_debug.entries
+                        .get(batch.source.material_debug_index as usize)
+                        .is_some_and(|entry| entry.name.starts_with("models/"))
+                {
+                    continue;
+                }
+                if ((self.fast_sky != 0 || sky_box_path)
+                    && batch.source.pipeline.class == DrawClass::Sky)
+                    || world_stage_probe_excludes(
+                        self.world_stage_probe,
+                        batch.source.pipeline,
+                        batch.source.water,
+                    ) {
+                    continue;
+                }
+                // Explicit hidden-mover visibility is handled without collapsing
+                // geometry. Filter BEFORE inline packing,
+                // transparent deferral, perf geometry and glow replay.
+                if !self.gpu_driven_enabled && !self.draw_inline_models && batch.is_inline_entity {
+                    continue;
+                }
+                if !self.gpu_driven_enabled && hidden_inline_batch(batch, &world.inline_models) {
+                    if capture_api_calls {
+                        info.perf_count_hidden_world_stage(
+                            batch.source.material_debug_index,
+                            batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+                        );
+                    }
+                    continue;
+                }
                 if !batch_area_visible(batch, effective_area_mask) {
                     continue;
                 }
@@ -2818,6 +2935,7 @@ impl Renderer {
                     batch.source.bsp_shader_index,
                     batch.source.pipeline.class,
                     batch.source.opaque_composite_before_clouds && cloud_multiplier_active,
+                    batch.source.late_sorted_material,
                 );
                 if inline_grouping
                     && batch.is_inline_entity
@@ -2831,6 +2949,8 @@ impl Renderer {
                             batch.source.material_debug_index,
                             batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
                             distinct, true, batch.source.pipeline.class,
+                            if batch.source.pipeline.legacy_srgb_three_stage { 3 }
+                            else { batch.source.pipeline.additive_fusion_count.max(1) },
                         );
                         perf_last_selected_world_stage = Some(batch_index);
                     }
@@ -2890,6 +3010,8 @@ impl Renderer {
                         distinct,
                         batch.is_inline_entity,
                         batch.source.pipeline.class,
+                        if batch.source.pipeline.legacy_srgb_three_stage { 3 }
+                        else { batch.source.pipeline.additive_fusion_count.max(1) },
                     );
                     perf_last_selected_world_stage = Some(batch_index);
                 }
@@ -2932,13 +3054,14 @@ impl Renderer {
                                         &world.full_batches[group.representative_index]
                                     }
                                 };
-                                if current_pipeline != Some(representative.source.pipeline) {
+                                let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(representative);
+                                if current_pipeline != Some(base_binding) {
                                     if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                     pass.set_pipeline(
-                                        &active_pipeline_variant.pipelines
-                                            [&representative.source.pipeline],
+                                        base_pso,
                                     );
-                                    current_pipeline = Some(representative.source.pipeline);
+                                    current_pipeline = Some(base_binding);
+                                    count_world_program_bind(&mut info, base_binding);
                                 }
                                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                                 pass.set_bind_group(1, &representative.bind_group, &[]);
@@ -2952,14 +3075,16 @@ impl Renderer {
                                     if capture_api_calls { info.perf_encode_calls.world_helper_draw_indexed += 1; }
                                     draw_world_batch(&mut pass, batch, 0..1, None);
                                 } else {
+                                    // The CPU compacted this group, so the count is
+                                    // known here. *_indirect_count with max_count is
+                                    // emulated on Intel Gen9 by walking every slot up
+                                    // to max_count; pass the exact count instead.
                                     if capture_api_calls { info.perf_encode_calls.multi_draw_indexed_indirect_count = info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1); }
-                                    pass.multi_draw_indexed_indirect_count(
+                                    pass.multi_draw_indexed_indirect(
                                         &world.compact_indirect_buffer,
                                         u64::from(group.output_base)
                                             * std::mem::size_of::<DrawIndexedIndirectArgs>() as u64,
-                                        &world.compact_count_buffer,
-                                        group_index as u64 * std::mem::size_of::<u32>() as u64,
-                                        group.max_count,
+                                        compacted_count,
                                     );
                                     info.world_multidraw_groups =
                                         info.world_multidraw_groups.saturating_add(1);
@@ -2996,14 +3121,12 @@ impl Renderer {
                                             draw_world_batch(&mut pass, batch, 0..1, None);
                                         } else {
                                             if capture_api_calls { info.perf_encode_calls.multi_draw_indexed_indirect_count = info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1); }
-                                            pass.multi_draw_indexed_indirect_count(
+                                            pass.multi_draw_indexed_indirect(
                                                 &world.compact_indirect_buffer,
                                                 u64::from(group.output_base)
                                                     * std::mem::size_of::<DrawIndexedIndirectArgs>()
                                                         as u64,
-                                                &world.compact_count_buffer,
-                                                group_index as u64 * std::mem::size_of::<u32>() as u64,
-                                                group.max_count,
+                                                compacted_count,
                                             );
                                         }
                                         current_pipeline = None;
@@ -3029,13 +3152,14 @@ impl Renderer {
                                     &world.full_batches[group.representative_index]
                                 }
                             };
-                            if current_pipeline != Some(representative.source.pipeline) {
+                            let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(representative);
+                            if current_pipeline != Some(base_binding) {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(
-                                    &active_pipeline_variant.pipelines
-                                        [&representative.source.pipeline],
+                                    base_pso,
                                 );
-                                current_pipeline = Some(representative.source.pipeline);
+                                current_pipeline = Some(base_binding);
+                                count_world_program_bind(&mut info, base_binding);
                             }
                             if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                             pass.set_bind_group(1, &representative.bind_group, &[]);
@@ -3053,10 +3177,12 @@ impl Renderer {
                         continue;
                     }
                 }
-                if current_pipeline != Some(batch.source.pipeline) {
+                let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                if current_pipeline != Some(base_binding) {
                     if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
-                    pass.set_pipeline(&active_pipeline_variant.pipelines[&batch.source.pipeline]);
-                    current_pipeline = Some(batch.source.pipeline);
+                    pass.set_pipeline(base_pso);
+                    current_pipeline = Some(base_binding);
+                    count_world_program_bind(&mut info, base_binding);
                 }
                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                 pass.set_bind_group(1, &batch.bind_group, &[]);
@@ -3234,12 +3360,14 @@ impl Renderer {
                     for (run_index, &(first, count)) in scratch.runs.iter().enumerate() {
                         let batch =
                             &active.batches[inline_visible[scratch.order[first as usize] as usize]];
-                        if current_pipeline != Some(batch.source.pipeline) {
+                        let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                        if current_pipeline != Some(base_binding) {
                             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                             pass.set_pipeline(
-                                &active_pipeline_variant.pipelines[&batch.source.pipeline],
+                                base_pso,
                             );
-                            current_pipeline = Some(batch.source.pipeline);
+                            current_pipeline = Some(base_binding);
+                            count_world_program_bind(&mut info, base_binding);
                         }
                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(1, &batch.bind_group, &[]);
@@ -3320,12 +3448,14 @@ impl Renderer {
                     let kinds = inline_stage_info(active.batches, &inline_visible).1;
                     for (position, &batch_index) in inline_visible.iter().enumerate() {
                         let batch = &active.batches[batch_index];
-                        if current_pipeline != Some(batch.source.pipeline) {
+                        let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                        if current_pipeline != Some(base_binding) {
                             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                             pass.set_pipeline(
-                                &active_pipeline_variant.pipelines[&batch.source.pipeline],
+                                base_pso,
                             );
-                            current_pipeline = Some(batch.source.pipeline);
+                            current_pipeline = Some(base_binding);
+                            count_world_program_bind(&mut info, base_binding);
                         }
                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                         pass.set_bind_group(1, &batch.bind_group, &[]);
@@ -3379,6 +3509,57 @@ impl Renderer {
                         }
                     }
                 }
+            }
+            if let (Some(sky), Some((_, faces))) = (sky_box_batch, self.sky_box_pipelines.as_ref()) {
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                pass.set_bind_group(1, &sky.bind_group, &[]);
+                if enhanced_world_shader {
+                    if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                    pass.set_bind_group(
+                        6,
+                        Self::ocean_bind_group_for(
+                            sky,
+                            &self.authored_oceans,
+                            &self.ocean,
+                            &self.ocean_inert_bind_group,
+                        ),
+                        &[],
+                    );
+                }
+                for face in faces {
+                    if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                    pass.set_pipeline(face);
+                    if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
+                    pass.draw(0..6, 0..1);
+                }
+                current_pipeline = None;
+            }
+            // Cloud layers in authored stage order over the box: 8x8 cells per
+            // face (6 vertices each), faces rt, bk, lf, ft, up (no bottom).
+            for cloud in sky_cloud_batches.iter().flatten() {
+                let Some(pipeline) = self.sky_cloud_pipelines.get(&cloud.source.pipeline.blend) else {
+                    continue;
+                };
+                if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                pass.set_bind_group(1, &cloud.bind_group, &[]);
+                if enhanced_world_shader {
+                    if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
+                    pass.set_bind_group(
+                        6,
+                        Self::ocean_bind_group_for(
+                            cloud,
+                            &self.authored_oceans,
+                            &self.ocean,
+                            &self.ocean_inert_bind_group,
+                        ),
+                        &[],
+                    );
+                }
+                if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                pass.set_pipeline(pipeline);
+                if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
+                pass.draw(0..8 * 8 * 6, 0..5);
+                current_pipeline = None;
             }
             self.inline_visible_scratch = inline_visible;
             // Keep projected lighting after authored world stages. The ocean
@@ -3930,15 +4111,107 @@ impl Renderer {
                 if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
+                // Reuse this *ordered* transparent command stream when its exact
+                // pipelines, bindings, indices and target format are unchanged.
+                // Unlike grouping by shader, the bundle cannot reorder alpha
+                // blending or depth-equal siblings. Legacy fog replay is left on
+                // the original direct path until it can be included in the key.
+                let cache_deferred = !self.gpu_driven_enabled
+                    && !render_ocean
+                    && optical_volumes.is_none()
+                    && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
+                    && deferred_transparent.len() >= 48
+                    && !deferred_transparent.iter().any(|&position| {
+                        let batch = &active.batches[active.indices[position]];
+                        self.weather.fog.legacy_uses_separate_pass(
+                            batch.source.fog_is_global,
+                            batch.source.legacy2_fog_in_stage_safe,
+                            batch.source.global_fog_post_eligible,
+                        ) && (batch.source.fog[3] > 0.001
+                            || self.weather.fog.legacy_drawfog_value() == 1)
+                    });
+                let mut used_deferred_bundle = false;
+                if cache_deferred {
+                    let bundle_cache = &mut self.deferred_world_bundles;
+                    bundle_cache.scratch.clear();
+                    for &active_pos in &deferred_transparent {
+                        let batch = &active.batches[active.indices[active_pos]];
+                        bundle_cache.scratch.push(DeferredCommand {
+                            pipeline: active_pipeline_variant.base_pipeline(batch).1.clone(),
+                            surface: batch.bind_group.clone(),
+                            ocean: enhanced_world_shader.then(||
+                                Self::ocean_bind_group_for(
+                                    batch, &self.authored_oceans, &self.ocean,
+                                    &self.ocean_inert_bind_group,
+                                ).clone()),
+                            indices: batch.indexed_range.clone(),
+                        });
+                    }
+                    let resources = DeferredResources {
+                        camera: self.camera_bind_group.clone(),
+                        lighting: if enhanced_world_shader {
+                            world.lighting_bind_group.clone()
+                        } else {
+                            world.lighting_bind_group_lean.clone()
+                        },
+                        shadow: world_shadow_receiver_bind_group.clone(),
+                        planar: self.planar_reflection.bind_group.clone(),
+                        optical: enhanced_world_shader.then(|| self.ocean_optics.bind_group.clone()),
+                        vertices: world.vertex_buffer.clone(),
+                        dlight_ids: world.legacy_dlight_surface_id_buffer.clone(),
+                        indices: world.index_buffer.clone(),
+                        color_format: self.config.format,
+                        sample_count: self.msaa_samples,
+                    };
+                    let result = bundle_cache.update(&self.device, resources);
+                    if capture_api_calls {
+                        info.perf_deferred_bundle_hit = u32::from(result.reused);
+                        info.perf_deferred_bundle_build = u32::from(result.built);
+                    }
+                    if let Some(bundle) = bundle_cache.bundle() {
+                        pass.execute_bundles(std::iter::once(bundle));
+                        if capture_api_calls {
+                            info.perf_deferred_bundle_draws = result.represented_draws;
+                        }
+                        used_deferred_bundle = true;
+                        // execute_bundles invalidates the render pass draw state.
+                        // Restore the same baseline bindings as the direct path
+                        // so following projected lights/FX never inherit stale
+                        // or missing inputs. The next pipeline is bound by its
+                        // own draw path.
+                        pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                        pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        pass.set_bind_group(2, if enhanced_world_shader {
+                            &world.lighting_bind_group
+                        } else {
+                            &world.lighting_bind_group_lean
+                        }, &[]);
+                        pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
+                        pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                        if enhanced_world_shader {
+                            pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                        }
+                        current_pipeline = None;
+                    }
+                } else {
+                    // Don't keep a cached plan across paths with different
+                    // attachments/order (underwater, planar, GPU-driven, fog).
+                    self.deferred_world_bundles.clear();
+                }
+                if !used_deferred_bundle {
                 for &active_pos in &deferred_transparent {
                     let batch_index = active.indices[active_pos];
                     let batch = &active.batches[batch_index];
-                    if current_pipeline != Some(batch.source.pipeline) {
+                    let (base_binding, base_pso) = active_pipeline_variant.base_pipeline(batch);
+                    if current_pipeline != Some(base_binding) {
                         if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(
-                            &active_pipeline_variant.pipelines[&batch.source.pipeline],
+                            base_pso,
                         );
-                        current_pipeline = Some(batch.source.pipeline);
+                        current_pipeline = Some(base_binding);
+                        count_world_program_bind(&mut info, base_binding);
                     }
                     if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                     pass.set_bind_group(1, &batch.bind_group, &[]);
@@ -4025,6 +4298,7 @@ impl Renderer {
                         }
                     }
                 }
+                } // direct ordered transparent draws
             }
             if optical_volumes.is_none() {
                 draw_legacy_dlights(&mut pass, &mut self.gpu_profiler, &mut info);
@@ -4123,6 +4397,9 @@ impl Renderer {
                                 mask & ui::wireframe::MAP != 0
                             };
                             if category_enabled
+                                // World wireframe must follow the resolved remap, not
+                                // resurrect framebuffer/depth no-op shaders (e.g. clear).
+                                && batch.source.contributes_to_world_wireframe()
                                 && (!render_ocean || batch.ocean_clipmap.is_none())
                                 && batch.source.pipeline.class != DrawClass::Sky
                                 && aabb_intersects_clip_frustum(
@@ -4374,13 +4651,16 @@ impl Renderer {
                 .wind_visuals
                 .render(&mut pass, &self.camera_bind_group);
 
+            // Finish the main world pass before starting any diagnostic or glow pass.
+            // This makes scene depth and color resolves available to the heatmap.
+            drop(pass);
+
             // OpenJK Dynamic Glow is authored at shader-stage granularity: only
             // stages carrying the exact `glow` marker are replayed into a black
             // glow buffer while testing against the already-rendered scene depth.
             // Reuse the normal material pipelines so rgbGen/alphaGen, tcMods,
             // animation, blending and fog stay identical to the visible stage.
             if self.glow_mode.authored() {
-                drop(pass);
                 if let Some(glow_target) = self.targets.authored_glow.as_ref() {
                     let (glow_color_view, glow_resolve_target) =
                         if let Some(msaa_view) = glow_target.msaa_view.as_ref() {
@@ -4452,6 +4732,7 @@ impl Renderer {
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
                         if !batch.source.authored_glow
+                            || (self.fast_sky != 0 && batch.source.pipeline.class == DrawClass::Sky)
                             || batch.is_inline_entity
                             || !batch_area_visible(batch, effective_area_mask)
                             || ocean_suppresses_batch(render_ocean, batch)
@@ -4504,6 +4785,11 @@ impl Renderer {
                         draw_world_batch(&mut glow_pass, batch, 0..1, None);
                         if capture_api_calls {
                             info.perf_world_glow_replay_stages += 1;
+                            if let Some(material) = info.perf_world_material_stages
+                                .get_mut(batch.source.material_debug_index as usize)
+                            {
+                                material.glow_replay_draws += 1;
+                            }
                             info.perf_world_glow_replay_indices += u64::from(
                                 batch.indexed_range.end.saturating_sub(batch.indexed_range.start));
                         }
@@ -4627,6 +4913,67 @@ impl Renderer {
                         .draw_authored_glow(&mut glow_pass, &self.camera_bind_group);
                 }
             }
+            // BSP shader complexity: real per-pixel accumulation of estimated stage cost.
+            // Unlike v1, additive transparent layers increase the final cost.
+            if self.shader_complexity_enabled {
+                if let (Some(target), Some(pipelines)) = (
+                    self.shader_complexity_target.as_ref(),
+                    world.complexity_pipelines.get(&world.active_pipeline_variant),
+                ) {
+                    {
+                        let color = target.multisampled_view.as_ref().unwrap_or(&target.resolved_view);
+                        let resolve = target.multisampled_view.as_ref().map(|_| &target.resolved_view);
+                        let mut cost_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("BSP cost accumulation (advanced)"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: color, depth_slice: None, resolve_target: resolve,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                            })],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &self.targets.depth_view,
+                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                        });
+                        cost_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        cost_pass.set_bind_group(2, if enhanced_world_shader { &world.lighting_bind_group } else { &world.lighting_bind_group_lean }, &[]);
+                        cost_pass.set_bind_group(3, world_shadow_receiver_bind_group, &[]);
+                        cost_pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
+                        if enhanced_world_shader {
+                            cost_pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                            cost_pass.set_bind_group(6, &self.ocean_inert_bind_group, &[]);
+                        }
+                        cost_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        cost_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                        cost_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        let mut last_key = None;
+                        for &batch_index in active.indices {
+                            let batch = &active.batches[batch_index];
+                            if !self.draw_bsp_model_surfaces && !batch.is_inline_entity
+                                && world.material_debug.entries.get(batch.source.material_debug_index as usize)
+                                    .is_some_and(|entry| entry.name.starts_with("models/")) { continue; }
+                            if ocean_suppresses_batch(render_ocean, batch)
+                                || world_stage_probe_excludes(self.world_stage_probe, batch.source.pipeline, batch.source.water)
+                                || batch.source.pipeline.class == DrawClass::Sky
+                                || batch.ocean_clipmap.is_some()
+                                || (!self.draw_inline_models && batch.is_inline_entity)
+                                || hidden_inline_batch(batch, &world.inline_models)
+                                || !batch_area_visible(batch, effective_area_mask)
+                                || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                            { continue; }
+                            if last_key != Some(batch.source.pipeline) {
+                                let Some(pipeline) = pipelines.get(&batch.source.pipeline) else { continue; };
+                                cost_pass.set_pipeline(pipeline);
+                                last_key = Some(batch.source.pipeline);
+                            }
+                            cost_pass.set_bind_group(1, &batch.bind_group, &[]);
+                            draw_world_batch(&mut cost_pass, batch, 0..1, None);
+                        }
+                    }
+                    target.composite(&mut encoder, self.targets.msaa_view.as_ref(), scene_output);
+                }
+            }
         } else {
             // Worldless live/demo sessions intentionally have no BSP, but their
             // CGame still produces players, sabers, missiles and FX. Render those
@@ -4645,7 +4992,11 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.weather.fog.clear_color()),
+                        load: wgpu::LoadOp::Clear(if self.fast_sky != 0 {
+                                fast_sky_clear_color(self.fast_sky)
+                            } else {
+                                self.weather.fog.clear_color()
+                            }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -5443,6 +5794,18 @@ impl Renderer {
             }
         }
 
+        if present_copy {
+            if let (Some(frame), Some(target)) = (frame.as_ref(), self.early_present_target.as_ref()) {
+                let size = target.texture.size();
+                if frame.texture.size() == size {
+                    encoder.copy_texture_to_texture(
+                        target.texture.as_image_copy(),
+                        frame.texture.as_image_copy(),
+                        size,
+                    );
+                }
+            }
+        }
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, true);
         self.gpu_profiler.resolve(&mut encoder);
@@ -5459,7 +5822,14 @@ impl Renderer {
                     .buffer;
                 Self::encode_screenshot_copy(
                     &mut encoder,
-                    &frame.texture,
+                    match &frame {
+                        Some(frame) => &frame.texture,
+                        None => &self
+                            .early_present_target
+                            .as_ref()
+                            .expect("early-submit frames render into the early present target")
+                            .texture,
+                    },
                     staging_buffer,
                     readback,
                 );
@@ -5580,12 +5950,35 @@ impl Renderer {
             .as_mut()
             .filter(|readback| !readback.inline_copy)
         {
+            let frame = frame.as_ref().expect("late screenshot copies only run on acquire-first frames");
             self.submit_screenshot_copy(self.hdr_output.as_ref().map_or(&frame.texture, |output| &output.capture), readback);
         }
         if let Some(started) = perf_followup_started {
             info.perf_followup_ms = started.elapsed().as_secs_f64() * 1000.0;
         }
         info.cpu_submit_ms = submit_started.elapsed().as_secs_f64() * 1000.0;
+        let frame = match frame {
+            Some(frame) => frame,
+            None => {
+                // Early submit: the GPU already has this frame. Wait for the
+                // image now and copy the offscreen result into it.
+                match self.acquire_surface_frame(&mut info) {
+                    Ok(frame) => {
+                        self.submit_early_present_copy(&frame);
+                        frame
+                    }
+                    Err(error) => {
+                        // The frame's readback copies were already submitted.
+                        self.gpu_profiler.submit();
+                        if self.cull_debug_mode != CullDebugMode::Off {
+                            self.cull_diagnostics_readback.submit();
+                        }
+                        self.ocean_visibility.submit();
+                        return Err(error);
+                    }
+                }
+            }
+        };
         let present_started = Instant::now();
         self.window.pre_present_notify();
         self.queue.present(frame);

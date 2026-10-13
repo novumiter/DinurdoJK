@@ -1,6 +1,6 @@
 //! Visibility compaction.
 use crate::renderer::{
-    gpu_vertex_key, mpsc, thread, Arc, AtomicBool, BTreeMap, DrawBatch, DrawClass,
+    gpu_vertex_key, mpsc, thread, world_blend_probe_bucket, Arc, AtomicBool, BTreeMap, DrawBatch, DrawClass,
     DrawIndexedIndirectArgs, GpuCullRecord, GpuVertex, JoinHandle, Ordering,
     PreparedPortalDrawPlan, PreparedPortalPlanBatchRef, Receiver, WorldBatch, WorldGpu,
     AUTO4_COLLAPSE_QUEUE_DEPTH,
@@ -539,7 +539,12 @@ pub(in crate::renderer) fn auto4_upload_variant_record(
                 .saturating_sub(batch.indexed_range.start),
             batch.indexed_range.start,
             u32::from(batch.source.pipeline.class == DrawClass::Sky),
-            0,
+            (u32::from(!batch.is_inline_entity && world.material_debug.entries
+                .get(batch.source.material_debug_index as usize)
+                .is_some_and(|entry| entry.name.starts_with("models/"))) << 2)
+                | (u32::from(batch.source.pipeline.class == DrawClass::Transparent) << 3)
+                | (world_blend_probe_bucket(batch.source.pipeline) << 5)
+                | (u32::from(batch.source.water) << 8),
         ],
         compact: [u32::MAX, 0, 0, 0],
     };

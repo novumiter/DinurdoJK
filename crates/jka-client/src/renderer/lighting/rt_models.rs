@@ -112,7 +112,7 @@ impl Renderer {
                 });
                 let pipeline = |alpha| {
                     create_dynamic_model_pipeline_inner(
-                        &device, &layout, &shader, key.0, key.1, alpha, key.2, true, false,
+                        &device, &layout, &shader, key.0, key.1, alpha, key.2, true, true, false,
                     )
                 };
                 CompiledRtModelReceivers {
@@ -458,7 +458,7 @@ mod tests {
                         DynamicModelAlphaMode::MaskBlend,
                     ] {
                         create_dynamic_model_pipeline_inner(
-                            &device, &layout, &shader, format, samples, alpha, fog, true, false,
+                            &device, &layout, &shader, format, samples, alpha, fog, true, true, false,
                         );
                     }
                 }

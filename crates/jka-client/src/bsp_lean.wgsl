@@ -156,6 +156,54 @@ override ENABLE_DELUXE: bool = true; // directional baked lighting (deluxemap / 
 override ENABLE_DELUXE_SPECULAR: bool = true; // GGX lobe from the baked light direction
 override ENABLE_PLANAR_DEBUG: bool = true; // r_planarDebug views
 override ENABLE_DETAIL_TEXTURES: bool = false;
+override ENABLE_DYNAMIC_LIGHT_DEBUG: bool = true; // r_dynamicLightDebug receiver view
+// Sky cost probe and the experimental fractal sky (sky_debug key): together they
+// were most of the sky program (469 -> 125 DXIL instructions without them).
+override ENABLE_SKY_DEBUG: bool = true;
+// Snow shells, Snowflow deformation and stock footprint stamps: only compiled in
+// while footprints are on and the map has snow surfaces (surface_deformation key).
+override ENABLE_SURFACE_DEFORMATION: bool = true;
+// Per pipeline, not per variant key: off for DrawClass::Opaque so plain walls carry
+// no discard and keep early depth rejection; on for Mask/Transparent/Sky.
+override ENABLE_ALPHA_TEST: bool = true;
+// Per-material specialization (r_fragmentShaderMode 1, MaterialFragmentKey). Header
+// bits inside a *_MASK are compile-time constants for that pipeline, so the material
+// checks on them fold away; bits outside it are still read from the uniform. Every
+// material drawn with such a pipeline has exactly those bits, so the program stays
+// exact. The defaults leave every check dynamic (the general program).
+override MATERIAL_KEY_FLAGS: u32 = 0u;
+override MATERIAL_KEY_FLAGS_MASK: u32 = 0u;
+override MATERIAL_KEY_FLAGS_W: u32 = 0u;
+override MATERIAL_KEY_FLAGS_W_MASK: u32 = 0u;
+// header.x (tcGen mode); 0xffffffff reads it from the uniform.
+override MATERIAL_KEY_TC_GEN: u32 = 4294967295u;
+// 0: runtime alpha function, 1: none, 2: discard below params.x, 3: discard at/above -params.x.
+override MATERIAL_KEY_ALPHA_FUNC: u32 = 0u;
+fn material_flags() -> u32 {
+    return (material.header.z & ~MATERIAL_KEY_FLAGS_MASK) | (MATERIAL_KEY_FLAGS & MATERIAL_KEY_FLAGS_MASK);
+}
+fn material_flags_w() -> u32 {
+    return (material.header.w & ~MATERIAL_KEY_FLAGS_W_MASK) | (MATERIAL_KEY_FLAGS_W & MATERIAL_KEY_FLAGS_W_MASK);
+}
+fn material_tc_gen() -> u32 {
+    if (MATERIAL_KEY_TC_GEN != 4294967295u) {
+        return MATERIAL_KEY_TC_GEN;
+    }
+    return material.header.x;
+}
+fn material_alpha_rejects(alpha: f32) -> bool {
+    let cutoff = material.params.x;
+    if (MATERIAL_KEY_ALPHA_FUNC == 1u) {
+        return false;
+    }
+    if (MATERIAL_KEY_ALPHA_FUNC == 2u) {
+        return alpha < cutoff;
+    }
+    if (MATERIAL_KEY_ALPHA_FUNC == 3u) {
+        return alpha >= -cutoff;
+    }
+    return (cutoff > 0.0 && alpha < cutoff) || (cutoff < 0.0 && alpha >= -cutoff);
+}
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var base_texture: texture_2d<f32>;
 @group(1) @binding(1) var base_sampler: sampler;
@@ -169,6 +217,13 @@ override ENABLE_DETAIL_TEXTURES: bool = false;
 @group(1) @binding(9) var sky_up: texture_2d<f32>;
 @group(1) @binding(10) var sky_dn: texture_2d<f32>;
 @group(1) @binding(11) var sky_sampler: sampler;
+// Fused additive siblings share the base draw geometry, but NOT material state.
+// These are the same MaterialUniform blocks as their original separate passes.
+@group(1) @binding(32) var<uniform> additive_stage1: Material;
+@group(1) @binding(33) var<uniform> additive_stage2: Material;
+@group(1) @binding(24) var additive_clamp_sampler: sampler;
+
+
 @group(1) @binding(12) var normal_texture: texture_2d<f32>;
 @group(1) @binding(13) var roughness_texture: texture_2d<f32>;
 @group(1) @binding(14) var height_texture: texture_2d<f32>;
@@ -231,6 +286,23 @@ struct VertexOut {
     @location(11) @interpolate(flat) legacy_dlight_bits: u32,
 };
 
+// Fused additive stages only. Reuse locations unused by this shader family;
+// ordinary world vertex/fragment entry points keep their original varyings.
+// Affine tcMods commute with perspective-correct interpolation, so calculate
+// each stage's coordinates per vertex as the original JKA stage path did.
+struct AdditiveVertexOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) additive_uv1: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) additive_uv2: vec2<f32>,
+    @location(4) world_position: vec3<f32>,
+    @location(5) world_normal: vec3<f32>,
+    @location(6) @interpolate(flat) shell_kind: u32,
+    @location(7) shell_coverage: f32,
+};
+
+
 // Waveform generators (rgbGen wave / alphaGen wave). Same functions as id Tech 3's
 // tables: value = base + func(phase + time * frequency) * amplitude.
 fn wave_noise(t: f32) -> f32 {
@@ -271,11 +343,11 @@ fn shader_stage_time() -> f32 {
 fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
     let time = shader_stage_time();
-    if ((material.header.z & 134217728u) != 0u) {
+    if ((material_flags() & 134217728u) != 0u) {
         let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
         out = vec4<f32>(vec3<f32>(g), out.a);
     }
-    if ((material.header.z & 268435456u) != 0u) {
+    if ((material_flags() & 268435456u) != 0u) {
         out.a = clamp(wave_value(material.wave_funcs.y, material.wave_alpha, time), 0.0, 1.0);
     }
     return out;
@@ -342,16 +414,16 @@ fn apply_tc_mods(base_uv: vec2<f32>, world_pos: vec3<f32>) -> vec2<f32> {
 
 fn generated_uv(input: VertexIn) -> vec2<f32> {
     var uv = input.uv;
-    if (material.header.x == 1u) {
+    if (material_tc_gen() == 1u) {
         uv = input.lightmap_uv;
     }
-    if (material.header.x == 2u) {
+    if (material_tc_gen() == 2u) {
         uv = vec2<f32>(
             dot(input.position, material.vector_s.xyz),
             dot(input.position, material.vector_t.xyz)
         );
     }
-    if (material.header.x == 3u) {
+    if (material_tc_gen() == 3u) {
         // Q3/JKA sphere-style environment mapping: view direction reflected by
         // the surface normal. Coordinates are in this renderer's transformed
         // [x,z,-y] space, so use render-space Y/Z for the two lookup axes.
@@ -375,12 +447,12 @@ fn sample_vertex_static_lightgrid(world_position: vec3<f32>) -> VertexLightgridS
     var result: VertexLightgridSample;
     result.direction = vec4<f32>(0.0);
     result.lighting = vec4<f32>(0.0);
-    let has_pbr_brdf_map = (material.header.z & (8u | 16u | 64u | 128u)) != 0u;
+    let has_pbr_brdf_map = (material_flags() & (8u | 16u | 64u | 128u)) != 0u;
     if (!PBR_VERTEX_LIGHTGRID
         || !ENABLE_PBR
         || !ENABLE_DELUXE
         || static_lightgrid.origin_enabled.w < 0.5
-        || (material.header.z & 2u) == 0u
+        || (material_flags() & 2u) == 0u
         || !has_pbr_brdf_map) {
         return result;
     }
@@ -496,13 +568,16 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     // Only the planar-reflection pass sets render_flags.x, and it only exists while
     // ENABLE_PLANAR_REFLECTIONS is on.
     let allow_shell = !ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u;
-    let deformation = deform_surface_deformation_vertex(
-        input.position,
-        input.normal,
-        material.header.w,
-        instance_index,
-        allow_shell
-    );
+    var deformation = vec4<f32>(input.position, 0.0);
+    if (ENABLE_SURFACE_DEFORMATION) {
+        deformation = deform_surface_deformation_vertex(
+            input.position,
+            input.normal,
+            material_flags_w(),
+            instance_index,
+            allow_shell
+        );
+    }
     let world_position = deformation.xyz;
     output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
     output.uv = generated_uv(input);
@@ -510,9 +585,12 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     output.color = input.color;
     output.sky_dir_ao = vec4<f32>(world_position - camera.camera_pos_time.xyz, input.static_ao);
     output.world_position = world_position;
-    output.world_normal = surface_deformation_vertex_normal(
-        input.position, input.normal, material.header.w, instance_index, allow_shell
-    );
+    output.world_normal = normalize(input.normal);
+    if (ENABLE_SURFACE_DEFORMATION) {
+        output.world_normal = surface_deformation_vertex_normal(
+            input.position, input.normal, material_flags_w(), instance_index, allow_shell
+        );
+    }
     output.vertex_dlight = transient_vertex_dlight(world_position, output.world_normal);
     output.shell_kind = select(0u, 1u, instance_index != 0u);
     output.shell_coverage = deformation.w;
@@ -657,7 +735,7 @@ fn companion_sample_normal(uv: vec2<f32>) -> vec4<f32> {
 }
 
 fn parallax_uv(input: VertexOut, shared_frame: mat3x3<f32>) -> vec2<f32> {
-    if (!ENABLE_POM || (material.header.z & 32u) == 0u) {
+    if (!ENABLE_POM || (material_flags() & 32u) == 0u) {
         return input.uv;
     }
     var frame = shared_frame;
@@ -701,7 +779,7 @@ fn parallax_uv(input: VertexOut, shared_frame: mat3x3<f32>) -> vec2<f32> {
     var previous_uv = uv;
     var current_layer_depth = 0.0;
     let first_height_sample = companion_sample_height(uv, uv_dx, uv_dy);
-    var sampled_depth = 1.0 - select(first_height_sample.r, first_height_sample.a, (material.header.z & 1024u) != 0u);
+    var sampled_depth = 1.0 - select(first_height_sample.r, first_height_sample.a, (material_flags() & 1024u) != 0u);
     var previous_sampled_depth = sampled_depth;
     var i = 0u;
     loop {
@@ -713,7 +791,7 @@ fn parallax_uv(input: VertexOut, shared_frame: mat3x3<f32>) -> vec2<f32> {
         uv -= uv_step;
         current_layer_depth += layer_depth;
         let height_sample = companion_sample_height(uv, uv_dx, uv_dy);
-        sampled_depth = 1.0 - select(height_sample.r, height_sample.a, (material.header.z & 1024u) != 0u);
+        sampled_depth = 1.0 - select(height_sample.r, height_sample.a, (material_flags() & 1024u) != 0u);
         i += 1u;
     }
 
@@ -731,7 +809,7 @@ fn parallax_uv(input: VertexOut, shared_frame: mat3x3<f32>) -> vec2<f32> {
 
 fn cotangent_normal(input: VertexOut, uv: vec2<f32>, shared_frame: mat3x3<f32>) -> vec3<f32> {
     let geometric = normalize(input.world_normal);
-    if (!ENABLE_PBR || (material.header.z & 8u) == 0u) {
+    if (!ENABLE_PBR || (material_flags() & 8u) == 0u) {
         return geometric;
     }
     var map_normal = companion_sample_normal(uv).xyz * 2.0 - vec3<f32>(1.0);
@@ -1141,6 +1219,7 @@ struct LegacyDynamicLighting { diffuse_factor: vec3<f32>, wet_specular: vec3<f32
 fn dynamic_light_debug_enabled() -> bool {
     // feature_flags.z low byte is the normal point-light/cluster mode. Bit 8 is
     // a session-only receiver diagnostic flag so the uniform ABI stays stable.
+    // Callers test ENABLE_DYNAMIC_LIGHT_DEBUG first so the branch folds away.
     return (lighting_settings.feature_flags.z & 0x100u) != 0u;
 }
 
@@ -1530,28 +1609,28 @@ fn sample_pbr_material(uv: vec2<f32>) -> PbrMaterialSample {
     result.dielectric_f0 = vec3<f32>(0.04);
     result.specular_scale = 1.0;
 
-    let packed_rmo = (material.header.z & 512u) != 0u;
-    if (packed_rmo && (material.header.z & 16u) != 0u) {
+    let packed_rmo = (material_flags() & 512u) != 0u;
+    if (packed_rmo && (material_flags() & 16u) != 0u) {
         let rmo = companion_sample_roughness(uv);
         result.roughness = rmo.r;
         result.metallic = rmo.g;
         result.ao = rmo.b;
-        if ((material.header.z & 262144u) != 0u) {
+        if ((material_flags() & 262144u) != 0u) {
             result.specular_scale = rmo.a;
         }
     } else {
-        if ((material.header.z & 16u) != 0u) {
+        if ((material_flags() & 16u) != 0u) {
             result.roughness = companion_sample_roughness(uv).r;
         }
-        if ((material.header.z & 64u) != 0u) {
+        if ((material_flags() & 64u) != 0u) {
             result.metallic = companion_sample_metallic(uv).r;
         }
     }
 
-    if ((material.header.z & 128u) != 0u) {
+    if ((material_flags() & 128u) != 0u) {
         let specular = companion_sample_specular(uv);
         result.dielectric_f0 = clamp(specular.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-        if ((material.header.z & 16u) == 0u) {
+        if ((material_flags() & 16u) == 0u) {
             result.roughness = 1.0 - specular.a;
         }
     }
@@ -1634,7 +1713,7 @@ fn reflection_probe_specular(
     shared_frame: mat3x3<f32>,
     shared_surface: PbrSurface,
 ) -> vec3<f32> {
-    if (!ENABLE_PBR || lighting_settings.feature_flags.w < 1u || (material.header.z & 2048u) == 0u) {
+    if (!ENABLE_PBR || lighting_settings.feature_flags.w < 1u || (material_flags() & 2048u) == 0u) {
         return vec3<f32>(0.0);
     }
     let surface = pbr_surface_for_path(input, albedo, uv, weather, shared_frame, shared_surface);
@@ -1760,14 +1839,14 @@ fn static_baked_pbr(
         // ratios): remapped / lightmap == remap_factor for all channels.
         let direct_scale = 1.0 / max(geometric_ndotl, 0.25);
         let ambient_share = max(1.0 - geometric_ndotl * direct_scale, 0.0);
-        if ((material.header.z & 8u) != 0u) {
+        if ((material_flags() & 8u) != 0u) {
             let remap_factor = mapped_ndotl * direct_scale + ambient_share;
             result.diffuse_factor *= vec3<f32>(clamp(remap_factor, 0.25, 1.85));
         }
         ambient_fraction = clamp(ambient_share, 0.0, 1.0);
         specular_radiance = lightmap_color * direct_scale;
     } else {
-        if ((material.header.z & 8u) != 0u) {
+        if ((material_flags() & 8u) != 0u) {
             let safe_geometric_ndotl = max(geometric_ndotl, 0.12);
             let ratio = clamp(mapped_ndotl / safe_geometric_ndotl, 0.25, 1.85);
             result.diffuse_factor *= vec3<f32>(mix(1.0, ratio, encoded_direction.a * 0.85));
@@ -1923,7 +2002,7 @@ fn openjk_global_fog_alpha(forward_normalized: f32) -> f32 {
 // Compiled out unless the pipeline variant carries ENABLE_JUMP_SHADE.
 fn apply_jump_shade(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     if (!ENABLE_JUMP_SHADE || camera.jump_shade.w <= 0.0
-        || (material.header.z & MATERIAL_OPAQUE_STAGE) == 0u) {
+        || (material_flags() & MATERIAL_OPAQUE_STAGE) == 0u) {
         return color;
     }
     // Only tint surfaces flat enough to land on. The facet slope comes from
@@ -2253,28 +2332,28 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let classic_fullbright = (classic_flags & CLASSIC_FULLBRIGHT) != 0u;
     let classic_vertex_light = (classic_flags & CLASSIC_VERTEX_LIGHT) != 0u;
     let classic_lightmap_only = (classic_flags & CLASSIC_LIGHTMAP_ONLY) != 0u;
-    let explicit_lightmap_stage = (material.header.z & MATERIAL_EXPLICIT_LIGHTMAP) != 0u;
-    let has_lightmap = (material.header.z & MATERIAL_HAS_LIGHTMAP) != 0u;
-    let opaque_stage = (material.header.z & MATERIAL_OPAQUE_STAGE) != 0u;
+    let explicit_lightmap_stage = (material_flags() & MATERIAL_EXPLICIT_LIGHTMAP) != 0u;
+    let has_lightmap = (material_flags() & MATERIAL_HAS_LIGHTMAP) != 0u;
+    let opaque_stage = (material_flags() & MATERIAL_OPAQUE_STAGE) != 0u;
 
     var stage_color = material.color;
-    if ((material.header.z & 1u) != 0u) {
+    if ((material_flags() & 1u) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
-    } else if ((material.header.z & 524288u) != 0u) {
+    } else if ((material_flags() & 524288u) != 0u) {
         stage_color = vec4<f32>(
             stage_color.rgb * (vec3<f32>(1.0) - input.color.rgb),
             stage_color.a,
         );
     }
-    if ((material.header.z & 1048576u) != 0u) {
+    if ((material_flags() & 1048576u) != 0u) {
         stage_color.a = stage_color.a * input.color.a;
-    } else if ((material.header.z & 2097152u) != 0u) {
+    } else if ((material_flags() & 2097152u) != 0u) {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
     stage_color = apply_wave_gens(stage_color);
 
-    let authored_planar = ENABLE_PLANAR_REFLECTIONS && (material.header.z & 4096u) != 0u;
-    let tcgen_environment = material.header.x == 3u;
+    let authored_planar = ENABLE_PLANAR_REFLECTIONS && (material_flags() & 4096u) != 0u;
+    let tcgen_environment = material_tc_gen() == 3u;
     let environment_mode = ENABLE_PLANAR_REFLECTIONS && planar_reflection.viewport.w > 0.5;
     // For promoted environment stages, the tcGen mode itself is authoritative.
     // The CPU-only candidate bit is still useful for discovery/budgeting, but
@@ -2283,10 +2362,10 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // Preserve multi-pass authored environment effects (e.g. glass whose
     // first stage filters the framebuffer and whose env stage adds the tint).
     // A selected Ultra planar slot must not silently replace their texture.
-    let authored_environment_effect = (material.header.w & 4u) != 0u;
+    let authored_environment_effect = (material_flags_w() & 4u) != 0u;
     let promoted_environment = tcgen_environment && environment_mode && !authored_environment_effect;
     let planar_candidate = authored_planar || promoted_environment;
-    let planar_debug_surface = (material.header.z & 16384u) != 0u || promoted_environment;
+    let planar_debug_surface = (material_flags() & 16384u) != 0u || promoted_environment;
     var planar_debug_mode = 0u;
     if (ENABLE_PLANAR_DEBUG) {
         planar_debug_mode = u32(planar_reflection.debug.x + 0.5);
@@ -2321,16 +2400,16 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         return vec4<f32>(selection_color, 1.0);
     }
 
-    let has_pbr_brdf_map = (material.header.z & (8u | 16u | 64u | 128u)) != 0u;
+    let has_pbr_brdf_map = (material_flags() & (8u | 16u | 64u | 128u)) != 0u;
     let static_pbr_path = ENABLE_DELUXE
         && has_pbr_brdf_map
         && classic_flags == 0u
-        && (material.header.z & 2u) != 0u
+        && (material_flags() & 2u) != 0u
         && input.lightmap_uv.x >= 0.0;
-    let reflection_pbr_path = (material.header.z & 2048u) != 0u;
-    let gi_pbr_path = ENABLE_VOXEL_GI && (material.header.z & 4u) != 0u;
+    let reflection_pbr_path = (material_flags() & 2048u) != 0u;
+    let gi_pbr_path = ENABLE_VOXEL_GI && (material_flags() & 4u) != 0u;
     let dynamic_pbr_path = has_pbr_brdf_map
-        && (material.header.z & 4u) != 0u
+        && (material_flags() & 4u) != 0u
         && (ENABLE_POINT_LIGHTS || ENABLE_CLUSTERED_LITE_DLIGHTS || ENABLE_AREA_LIGHTS);
     let needs_pbr_surface = ENABLE_PBR
         && (static_pbr_path || reflection_pbr_path || gi_pbr_path || dynamic_pbr_path);
@@ -2340,8 +2419,8 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         vec3<f32>(0.0, 1.0, 0.0),
         vec3<f32>(0.0, 0.0, 1.0)
     );
-    let needs_shared_frame = (ENABLE_POM && (material.header.z & 32u) != 0u)
-        || (needs_pbr_surface && (material.header.z & 8u) != 0u);
+    let needs_shared_frame = (ENABLE_POM && (material_flags() & 32u) != 0u)
+        || (needs_pbr_surface && (material_flags() & 8u) != 0u);
     if (PBR_SHARED_TANGENT_FRAME && needs_shared_frame) {
         shared_frame = cotangent_frame(input);
     }
@@ -2350,7 +2429,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         surface_uv = parallax_uv(input, shared_frame);
     }
     var source_sample = textureSample(base_texture, base_sampler, surface_uv);
-    if (ENABLE_DETAIL_TEXTURES && (material.header.w & 2u) != 0u) {
+    if (ENABLE_DETAIL_TEXTURES && (material_flags_w() & 2u) != 0u) {
         // Synthetic neutral 2x fallback only, at authored-style tcMod scale 8 8.
         // Authored stages are never routed through this block.
         //
@@ -2409,7 +2488,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
             // added. Replacing that with an unmasked HDR-ish scene sample makes
             // the floor look transparent. Preserve both its RGB response and
             // alpha while replacing only the reflected *content*.
-            let blended_environment = (material.header.z & 32768u) != 0u;
+            let blended_environment = (material_flags() & 32768u) != 0u;
             let response = select(
                 vec3<f32>(1.0),
                 source_sample.rgb,
@@ -2439,7 +2518,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // base*lightmap path is handled below without needing a second pass.
     if (classic_lightmap_only && has_lightmap
         && !explicit_lightmap_stage
-        && (material.header.z & 2u) == 0u) {
+        && (material_flags() & 2u) == 0u) {
         if (opaque_stage) {
             source_sample = vec4<f32>(1.0);
             stage_color = vec4<f32>(1.0);
@@ -2449,15 +2528,21 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     }
 
     var base = source_sample * stage_color;
-    if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
+    // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot
+    // seed depth. For the narrowly identified multi-stage depth-equal case,
+    // test the source texture's alpha while retaining the vertex alpha for
+    // the actual stage output and for all sibling shaders.
+    let mask_alpha = select(base.a, source_sample.a * material.color.a,
+        (material_flags() & 1073741824u) != 0u);
+    if (ENABLE_ALPHA_TEST && material_alpha_rejects(mask_alpha)) {
         discard;
     }
-    if (dynamic_light_debug_enabled()) {
+    if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         if (!opaque_stage) {
             discard;
         }
         var debug_light = vec3<f32>(0.0);
-        if ((material.header.z & 4u) != 0u) {
+        if ((material_flags() & 4u) != 0u) {
             debug_light = runtime_dynamic_light_debug(input);
         }
         return vec4<f32>(vec3<f32>(0.035) + debug_light, base.a);
@@ -2469,7 +2554,11 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let wetness = weather.wetness;
     let puddle = weather.puddle;
     // `puddle_debug <mode>`; see weather_surface_debug for what each mode paints.
-    let weather_debug_mode = u32(max(weather_surface.puddle.w, 0.0) + 0.5);
+    // Branch form: the uniform load itself must vanish from dry variants.
+    var weather_debug_mode = 0u;
+    if (ENABLE_WEATHER_SURFACE) {
+        weather_debug_mode = u32(max(weather_surface.puddle.w, 0.0) + 0.5);
+    }
     if (ENABLE_WEATHER_SURFACE && weather_debug_mode != 0u) {
         return vec4<f32>(weather_surface_debug(input, weather, weather_debug_mode), 1.0);
     }
@@ -2478,13 +2567,13 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     }
     let albedo = base.rgb;
     let source_map_unbaked_receiver = ENABLE_SOURCE_MAP_WORLD
-        && (material.header.z & 4u) != 0u
+        && (material_flags() & 4u) != 0u
         && input.lightmap_uv.x < 0.0
-        && (material.header.z & 131072u) == 0u;
+        && (material_flags() & 131072u) == 0u;
     if (ENABLE_MAP_LIGHT_SIMULATION
-        && (material.header.z & 4u) != 0u
+        && (material_flags() & 4u) != 0u
         && input.lightmap_uv.x < 0.0
-        && (material.header.z & 131072u) == 0u) {
+        && (material_flags() & 131072u) == 0u) {
         // q3map2 LightingAtSample starts style 0 at worldspawn `_ambient`
         // (tinted by worldspawn `_color`) before direct lights are accumulated.
         base = vec4<f32>(albedo * lighting_settings.map_ambient.rgb, base.a);
@@ -2500,7 +2589,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // Only the synthesized implicit material uses a single-pass
     // base-texture Ã— lightmap path. Explicit JKA shader scripts render their
     // `$lightmap` as its own ordered blend stage instead.
-    if ((material.header.z & 2u) != 0u && input.lightmap_uv.x >= 0.0) {
+    if ((material_flags() & 2u) != 0u && input.lightmap_uv.x >= 0.0) {
         var lightmap_color = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
         if (classic_fullbright) {
             // Vanilla r_fullbright keeps the diffuse texture but replaces the
@@ -2527,7 +2616,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // LIGHTMAP_BY_VERTEX surfaces have no lightmap texture to expose. Preserve
     // their compiled vertex lighting for r_lightmap; vanilla r_vertexLight +
     // r_lightmap deliberately resolves to white instead.
-    if (classic_lightmap_only && (material.header.z & 131072u) != 0u && !has_lightmap) {
+    if (classic_lightmap_only && (material_flags() & 131072u) != 0u && !has_lightmap) {
         base = vec4<f32>(select(input.color.rgb, vec3<f32>(1.0), classic_vertex_light), base.a);
     }
 
@@ -2535,21 +2624,21 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // Classic debug/compatibility modes should show their source lighting rather
     // than a second modern AO modulation.
     if (ENABLE_STATIC_BSP_AO && (camera.render_flags.y & 1u) != 0u && classic_flags == 0u
-        && (material.header.x == 1u || (material.header.z & 2u) != 0u || (material.header.z & 131072u) != 0u)) {
+        && (material_tc_gen() == 1u || (material_flags() & 2u) != 0u || (material_flags() & 131072u) != 0u)) {
         let static_ao = clamp(input.sky_dir_ao.w, 0.0, 1.0);
         base = vec4<f32>(base.rgb * static_ao, base.a);
     }
-    if (ENABLE_PBR && lighting_settings.feature_flags.w >= 1u && (material.header.z & 2048u) != 0u) {
+    if (ENABLE_PBR && lighting_settings.feature_flags.w >= 1u && (material_flags() & 2048u) != 0u) {
         base = vec4<f32>(base.rgb + reflection_probe_specular(input, albedo, surface_uv, weather, shared_frame, shared_pbr), base.a);
     }
-    if (ENABLE_CASCADED_SHADOWS && (material.header.z & 4u) != 0u) {
+    if (ENABLE_CASCADED_SHADOWS && (material_flags() & 4u) != 0u) {
         let shadow_rgb = sun_shadow_transmission(input, input.world_normal);
         let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);
         let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);
         let shadow_strength = shadow_settings.params.z * sun_facing;
         base = vec4<f32>(base.rgb * (vec3<f32>(1.0) - shadow_strength * (vec3<f32>(1.0) - shadow_rgb)), base.a);
     }
-    if ((material.header.z & 4u) != 0u) {
+    if ((material_flags() & 4u) != 0u) {
         if (ENABLE_VERTEX_DLIGHTS) {
             base = vec4<f32>(base.rgb + albedo * input.vertex_dlight, base.a);
         }
@@ -2568,9 +2657,9 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         }
     }
     if (ENABLE_MAP_LIGHT_SIMULATION
-        && (material.header.z & 4u) != 0u
+        && (material_flags() & 4u) != 0u
         && input.lightmap_uv.x < 0.0
-        && (material.header.z & 131072u) == 0u) {
+        && (material_flags() & 131072u) == 0u) {
         base = vec4<f32>(max(base.rgb, albedo * lighting_settings.map_minlight.rgb), base.a);
     }
     if (source_map_unbaked_receiver && !ENABLE_MAP_LIGHT_SIMULATION) {
@@ -2584,17 +2673,20 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     if (ENABLE_WEATHER_SURFACE && (wetness > 0.001 || puddle > 0.001)) {
         base = vec4<f32>(base.rgb + weather_surface_coat(input, weather) + weather_sun_glint(input, weather), base.a);
     }
-    if (ENABLE_PBR && (material.header.z & 256u) != 0u) {
+    if (ENABLE_PBR && (material_flags() & 256u) != 0u) {
         // Emissive companions are authored as color data (sRGB texture format,
         // sampled here in linear space). They intentionally bypass scene light
         // attenuation, while bloom/HDR can consume the resulting bright color.
         base = vec4<f32>(base.rgb + textureSample(emissive_texture, base_sampler, surface_uv).rgb, base.a);
     }
+    if (!ENABLE_SURFACE_DEFORMATION) {
+        return base;
+    }
     return shade_surface_deformation(
         input.world_position,
         input.world_normal,
-        material.header.w,
-        material.header.x,
+        material_flags_w(),
+        material_tc_gen(),
         input.shell_kind,
         input.shell_coverage,
         base
@@ -2602,7 +2694,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
 }
 
 @fragment fn fs_legacy_dlight_pass(input: VertexOut) -> @location(0) vec4<f32> {
-    if (input.legacy_dlight_bits == 0u || (material.header.z & 4u) == 0u || camera.render_flags.x != 0u) {
+    if (input.legacy_dlight_bits == 0u || (material_flags() & 4u) == 0u || camera.render_flags.x != 0u) {
         discard;
     }
 
@@ -2618,7 +2710,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     // Separate Legacy fog has already been composited into the base world pass.
     // The old inline dlight lived underneath it, so attenuate this late additive
     // redraw by the same transmittance without re-running any material stages.
-    if (ENABLE_LEGACY_FOG && !dynamic_light_debug_enabled()) {
+    if (ENABLE_LEGACY_FOG && !(ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         contribution *= 1.0 - legacy_separate_fog(input.world_position).a;
     }
     return vec4<f32>(contribution, 0.0);
@@ -2632,7 +2724,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
 // the SAME transfer function. Keep alpha and authored blend factors unchanged.
 const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
-    if ((material.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
+    if ((material_flags() & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
         return vec4<f32>(legacy_rgb_encode(color.rgb), color.a);
     }
     return color;
@@ -2669,52 +2761,229 @@ fn classic_three_stage_rgb(input: VertexOut, shaded_base: vec4<f32>) -> vec4<f32
 }
 
 @fragment fn fs_legacy_srgb_three_stage(input: VertexOut) -> @location(0) vec4<f32> {
-    if (surface_deformation_should_discard(input.world_position, material.header.w,
+    if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(input.world_position, material_flags_w(),
         input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u))) {
         discard;
     }
     let shaded_base = shade_surface(input);
-    if (dynamic_light_debug_enabled()) { return shaded_base; }
+    if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) { return shaded_base; }
     let result = apply_jump_shade(classic_three_stage_rgb(input, shaded_base), input.world_position);
     if (ENABLE_LEGACY_FOG) { return apply_legacy_fog(result, input.world_position); }
     return result;
 }
 
+
+// Source additive draws previously computed each of these transformations in
+// its own vertex shader. Reversing the primary affine tcMods gives the exact
+// common pre-modified coordinates; applying each sibling's own tcMods then
+// evaluates the same independent animated UV in one fragment shader.
+fn additive_time(m: Material) -> f32 {
+    let elapsed = camera.camera_pos_time.w - m.params.w;
+    return select(elapsed, min(elapsed, m.vector_t.w), m.vector_t.w > 0.0);
+}
+fn additive_transform_uv(raw: vec2<f32>, m: Material) -> vec2<f32> {
+    var uv = raw;
+    let time = additive_time(m);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        if (i >= m.header.y) { break; }
+        let a = m.mods[i * 2u];
+        let b = m.mods[i * 2u + 1u];
+        let kind = u32(a.x + 0.5);
+        if (kind == 1u) {
+            let scroll = a.yz * time;
+            uv += scroll - floor(scroll);
+        } else if (kind == 2u) {
+            uv *= a.yz;
+        } else if (kind == 3u) {
+            let radians = -a.y * time * 0.017453292519943295;
+            let c = cos(radians);
+            let sn = sin(radians);
+            let p = uv - vec2<f32>(0.5);
+            uv = vec2<f32>(p.x * c - p.y * sn, p.x * sn + p.y * c) + vec2<f32>(0.5);
+        } else if (kind == 4u) {
+            uv = vec2<f32>(uv.x * a.y + uv.y * a.z + a.w,
+                           uv.x * b.x + uv.y * b.y + b.z);
+        }
+    }
+    return uv;
+}
+fn additive_untransform_uv(modified: vec2<f32>, m: Material) -> vec2<f32> {
+    var uv = modified;
+    let time = additive_time(m);
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        if (j >= m.header.y) { break; }
+        let i = m.header.y - 1u - j;
+        let a = m.mods[i * 2u];
+        let b = m.mods[i * 2u + 1u];
+        let kind = u32(a.x + 0.5);
+        if (kind == 1u) {
+            let scroll = a.yz * time;
+            uv -= scroll - floor(scroll);
+        } else if (kind == 2u) {
+            uv /= a.yz;
+        } else if (kind == 3u) {
+            let radians = a.y * time * 0.017453292519943295;
+            let c = cos(radians);
+            let sn = sin(radians);
+            let p = uv - vec2<f32>(0.5);
+            uv = vec2<f32>(p.x * c - p.y * sn, p.x * sn + p.y * c) + vec2<f32>(0.5);
+        } else if (kind == 4u) {
+            let determinant = a.y * b.y - a.z * b.x;
+            let p = uv - vec2<f32>(a.w, b.z);
+            uv = vec2<f32>((p.x * b.y - p.y * a.z) / determinant,
+                           (p.y * a.y - p.x * b.x) / determinant);
+        }
+    }
+    return uv;
+}
+// The source stage tcMods run on vertices in JKA. A fused fragment can use
+// interpolated UVs for its companions instead of rebuilding/inverting tcMods
+// for each covered pixel (especially expensive on screen-filling water).
+fn additive_vertex_output(base: VertexOut, count: u32) -> AdditiveVertexOut {
+    var out: AdditiveVertexOut;
+    out.clip_position = base.clip_position;
+    out.uv = base.uv;
+    out.color = base.color;
+    out.world_position = base.world_position;
+    out.world_normal = base.world_normal;
+    out.shell_kind = base.shell_kind;
+    out.shell_coverage = base.shell_coverage;
+    let raw_uv = additive_untransform_uv(base.uv, material);
+    out.additive_uv1 = additive_transform_uv(raw_uv, additive_stage1);
+    out.additive_uv2 = vec2<f32>(0.0);
+    if (count == 3u) {
+        out.additive_uv2 = additive_transform_uv(raw_uv, additive_stage2);
+    }
+    return out;
+}
+
+@vertex fn vs_additive_fused2(input: VertexIn, @builtin(instance_index) instance_index: u32) -> AdditiveVertexOut {
+    return additive_vertex_output(world_vertex(input, instance_index, 0xffffffffu), 2u);
+}
+@vertex fn vs_additive_fused3(input: VertexIn, @builtin(instance_index) instance_index: u32) -> AdditiveVertexOut {
+    return additive_vertex_output(world_vertex(input, instance_index, 0xffffffffu), 3u);
+}
+
+@vertex fn vs_additive_fused2_legacy(input: VertexIn, @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32) -> AdditiveVertexOut {
+    return additive_vertex_output(world_vertex(input, instance_index, legacy_dlight_surface_id), 2u);
+}
+@vertex fn vs_additive_fused3_legacy(input: VertexIn, @location(6) legacy_dlight_surface_id: u32,
+    @builtin(instance_index) instance_index: u32) -> AdditiveVertexOut {
+    return additive_vertex_output(world_vertex(input, instance_index, legacy_dlight_surface_id), 3u);
+}
+
+fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
+    var color = m.color;
+    if ((m.header.z & 1u) != 0u) {
+        color = vec4<f32>(color.rgb * vertex_color.rgb, color.a);
+    } else if ((m.header.z & 524288u) != 0u) {
+        color = vec4<f32>(color.rgb * (vec3<f32>(1.0) - vertex_color.rgb), color.a);
+    }
+    if ((m.header.z & 1048576u) != 0u) {
+        color.a *= vertex_color.a;
+    } else if ((m.header.z & 2097152u) != 0u) {
+        color.a *= (1.0 - vertex_color.a);
+    }
+    if ((m.header.z & 134217728u) != 0u) {
+        let wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+        color = vec4<f32>(vec3<f32>(wave), color.a);
+    }
+    if ((m.header.z & 268435456u) != 0u) {
+        color.a = clamp(wave_value(m.wave_funcs.y, m.wave_alpha, additive_time(m)), 0.0, 1.0);
+    }
+    return color;
+}
+fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
+    var sample = texel * additive_stage_tint(m, vertex_color);
+    // Same material flag as the source stages (1u << 29u). Keep this
+    // fusion-only check independent of optional legacy helper declarations.
+    if ((m.header.z & 536870912u) != 0u) {
+        // Inline the exact sRGB transfer function used by the legacy stage
+        // path. Fused entry points must not depend on the optional three-stage
+        // compositing helper being present in a specialized BSP module.
+        let v = max(sample.rgb, vec3<f32>(0.0));
+        let encoded = select(
+            1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+            12.92 * v,
+            v <= vec3<f32>(0.0031308),
+        );
+        sample = vec4<f32>(encoded, sample.a);
+    }
+    // GL_SRC_ALPHA GL_ONE applies source alpha to both RGB and alpha. The
+    // fused pipeline uses GL_ONE GL_ONE with already-weighted contributions.
+    return vec4<f32>(sample.rgb * sample.a, sample.a * sample.a);
+}
+fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
+    let base = textureSample(base_texture, base_sampler, input.uv);
+    var total = additive_weighted_sample(base, material, input.color);
+    // Every companion shares the same primary inverse tcMods. Evaluate that
+    // inverse once per fragment, then apply independent authored sibling tcMods.
+    // Three-stage fusion previously recomputed the inverse twice; no sampling,
+    // stage ordering, blending or shader permutation changes.
+    let uv1 = input.additive_uv1;
+    if ((additive_stage1.header.w & 65536u) != 0u) {
+        total += additive_weighted_sample(textureSample(sky_rt, additive_clamp_sampler, uv1), additive_stage1, input.color);
+    } else {
+        total += additive_weighted_sample(textureSample(sky_rt, detail_sampler, uv1), additive_stage1, input.color);
+    }
+    if (count >= 3u) {
+        let uv2 = input.additive_uv2;
+        if ((additive_stage2.header.w & 65536u) != 0u) {
+            total += additive_weighted_sample(textureSample(sky_bk, additive_clamp_sampler, uv2), additive_stage2, input.color);
+        } else {
+            total += additive_weighted_sample(textureSample(sky_bk, detail_sampler, uv2), additive_stage2, input.color);
+        }
+    }
+    return total;
+}
+
+
+@fragment fn fs_additive_fused2(input: AdditiveVertexOut) -> @location(0) vec4<f32> {
+    if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(input.world_position, material_flags_w(),
+        input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
+        (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u))) { discard; }
+    return additive_fused_contributions(input, 2u);
+}
+@fragment fn fs_additive_fused3(input: AdditiveVertexOut) -> @location(0) vec4<f32> {
+    if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy, (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u))) { discard; }
+    return additive_fused_contributions(input, 3u);
+}
 @fragment fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-    if (surface_deformation_should_discard(
-        input.world_position, material.header.w, input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
+    if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(
+        input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
     }
     let shaded = shade_surface(input);
-    if (dynamic_light_debug_enabled()) {
+    if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         return shaded;
     }
     return legacy_rgb_output(apply_jump_shade(shaded, input.world_position));
 }
 
 @fragment fn fs_main_legacy_fog(input: VertexOut) -> @location(0) vec4<f32> {
-    if (surface_deformation_should_discard(
-        input.world_position, material.header.w, input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
+    if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(
+        input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
     }
     let shaded = shade_surface(input);
-    if (dynamic_light_debug_enabled()) {
+    if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         return shaded;
     }
     return legacy_rgb_output(apply_legacy_fog(apply_jump_shade(shaded, input.world_position), input.world_position));
 }
 
 @fragment fn fs_legacy_fog_pass(input: VertexOut) -> @location(0) vec4<f32> {
-    if (dynamic_light_debug_enabled()) {
+    if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         discard;
     }
-    if (surface_deformation_should_discard(
-        input.world_position, material.header.w, input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
+    if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(
+        input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
@@ -2749,6 +3018,21 @@ fn sky_cloud_uv(d: vec3<f32>, height: f32) -> vec2<f32> {
     return vec2<f32>(acos(clamp(v.x, -1.0, 1.0)), acos(clamp(v.y, -1.0, 1.0)));
 }
 
+fn sky_cloud_stage_color(vertex_color: vec4<f32>) -> vec4<f32> {
+    var stage_color = material.color;
+    if ((material_flags() & 1u) != 0u) {
+        stage_color = vec4<f32>(stage_color.rgb * vertex_color.rgb, stage_color.a);
+    } else if ((material_flags() & 524288u) != 0u) {
+        stage_color = vec4<f32>(stage_color.rgb * (vec3<f32>(1.0) - vertex_color.rgb), stage_color.a);
+    }
+    if ((material_flags() & 1048576u) != 0u) {
+        stage_color.a = stage_color.a * vertex_color.a;
+    } else if ((material_flags() & 2097152u) != 0u) {
+        stage_color.a = stage_color.a * (1.0 - vertex_color.a);
+    }
+    return apply_wave_gens(stage_color);
+}
+
 fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     // The engine never draws clouds on the bottom face of the sky box.
     let a = abs(d);
@@ -2756,71 +3040,111 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
         discard;
     }
     let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z), vec3<f32>(0.0));
-    var stage_color = material.color;
-    if ((material.header.z & 1u) != 0u) {
-        stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
-    } else if ((material.header.z & 524288u) != 0u) {
-        stage_color = vec4<f32>(stage_color.rgb * (vec3<f32>(1.0) - input.color.rgb), stage_color.a);
-    }
-    if ((material.header.z & 1048576u) != 0u) {
-        stage_color.a = stage_color.a * input.color.a;
-    } else if ((material.header.z & 2097152u) != 0u) {
-        stage_color.a = stage_color.a * (1.0 - input.color.a);
-    }
-    stage_color = apply_wave_gens(stage_color);
-    let base = textureSample(base_texture, base_sampler, uv) * stage_color;
+    let base = textureSample(base_texture, base_sampler, uv) * sky_cloud_stage_color(input.color);
     if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
         discard;
     }
     return base;
 }
 
+// The six Quake/JKA sky faces are projective: scaling the direction does
+// not change S/T. The old shader normalized d on every pixel BEFORE dividing
+// by its dominant component; the normalization cancels exactly. Work with
+// the unnormalized view ray, and use one reciprocal for both UV components.
+// This retains the BSP sky brush as the visibility mask; unlike moving UVs to
+// the raw BSP vertices it cannot introduce cube-face seams when the camera
+// moves across a large sky polygon.
+fn sample_outer_sky(d: vec3<f32>) -> vec4<f32> {
+    let a = abs(d);
+    if (a.x >= a.y && a.x >= a.z) {
+        let inv = 1.0 / max(a.x, 0.0000001);
+        if (d.x >= 0.0) {
+            return textureSample(sky_rt, sky_sampler, sky_uv(-d.y * inv, d.z * inv));
+        }
+        return textureSample(sky_lf, sky_sampler, sky_uv(d.y * inv, d.z * inv));
+    }
+    if (a.y >= a.x && a.y >= a.z) {
+        let inv = 1.0 / max(a.y, 0.0000001);
+        if (d.y >= 0.0) {
+            return textureSample(sky_bk, sky_sampler, sky_uv(d.x * inv, d.z * inv));
+        }
+        return textureSample(sky_ft, sky_sampler, sky_uv(-d.x * inv, d.z * inv));
+    }
+    let inv = 1.0 / max(a.z, 0.0000001);
+    if (d.z >= 0.0) {
+        return textureSample(sky_up, sky_sampler, sky_uv(-d.y * inv, -d.x * inv));
+    }
+    return textureSample(sky_dn, sky_sampler, sky_uv(-d.y * inv, d.x * inv));
+}
+
+// Fast native PSO for the normal TaystJK outerbox stage only. Its material
+// identity guarantees six sky faces, so it never tests cloud/no-outerbox modes
+// and never uses discard; this permits early depth rejection of covered sky.
+// The optional fractal override still behaves exactly as before.
+// Sky cost sweep. Diagnostic modes affect only outer skybox texture shading.
+// They deliberately retain sky BSP geometry, its pipeline, and framebuffer writes.
+// Mode 1: raster/fill/color write, no texture. Mode 2: one texel repeatedly.
+// Mode 3: one face with varying projective UV. Mode 0: original six-face selection.
+fn sample_sky_cost_probe(d: vec3<f32>, probe: u32) -> vec4<f32> {
+    if (probe == 1u) {
+        return vec4<f32>(0.2, 0.4, 0.6, 1.0);
+    }
+    if (probe == 2u) {
+        return textureSample(sky_rt, sky_sampler, vec2<f32>(0.5, 0.5));
+    }
+    if (probe == 3u) {
+        let inv = 1.0 / max(abs(d.z), 0.0000001);
+        return textureSample(sky_up, sky_sampler, sky_uv(-d.y * inv, -d.x * inv));
+    }
+    return sample_outer_sky(d);
+}
+
+@fragment fn fs_sky_outer(input: VertexOut) -> @location(0) vec4<f32> {
+    if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
+        return vec4<f32>(0.012, 0.012, 0.012, 1.0);
+    }
+    let direction = vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y);
+    if (ENABLE_SKY_DEBUG) {
+        let probe = (camera.render_flags.y >> 8u) & 3u;
+        if (probe != 0u) { return sample_sky_cost_probe(direction, probe); }
+        if ((camera.render_flags.y & 2u) != 0u) {
+            return experimental_star_nest_sky(normalize(direction));
+        }
+    }
+    return sample_outer_sky(direction);
+}
+
 @fragment fn fs_sky(input: VertexOut) -> @location(0) vec4<f32> {
-    if (dynamic_light_debug_enabled()) {
+    if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         return vec4<f32>(0.012, 0.012, 0.012, 1.0);
     }
     // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
-    let d = normalize(vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y));
+    let raw_direction = vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y);
+    if (ENABLE_SKY_DEBUG) {
+        let probe = (camera.render_flags.y >> 8u) & 3u;
+        if (probe != 0u && material_tc_gen() != 4u && (material_flags_w() & 1u) != 0u) {
+            return sample_sky_cost_probe(raw_direction, probe);
+        }
+    }
+    let d = normalize(raw_direction);
     // The runtime override replaces sky cubemaps AND authored sky-cloud stages.
     // World geometry is never touched. Restore the OpenJK sky on the next frame
-    // by switching this bit off; this requires no pipeline rebuild.
-    if ((camera.render_flags.y & 2u) != 0u) {
-        if (material.header.x == 4u) { discard; }
+    // by switching this bit off.
+    if (ENABLE_SKY_DEBUG && (camera.render_flags.y & 2u) != 0u) {
+        if (material_tc_gen() == 4u) { discard; }
         return experimental_star_nest_sky(d);
     }
-    if (material.header.x == 4u) {
+    if (material_tc_gen() == 4u) {
         // A cloud-layer stage of the sky shader (tcGen sky cloud).
         return sky_cloud_color(input, d);
     }
-    if ((material.header.w & 1u) == 0u) {
+    if ((material_flags_w() & 1u) == 0u) {
         // skyParms "-" has no outerbox. OpenJK draws no skybox here, so leave
         // the scene clear color visible (global-fog color when the BSP has one).
         discard;
     }
 
-    let a = abs(d);
-    if (a.x >= a.y && a.x >= a.z) {
-        if (d.x >= 0.0) {
-            let m = a.x;
-            return textureSample(sky_rt, sky_sampler, sky_uv(-d.y / m, d.z / m));
-        }
-        let m = a.x;
-        return textureSample(sky_lf, sky_sampler, sky_uv(d.y / m, d.z / m));
-    }
-    if (a.y >= a.x && a.y >= a.z) {
-        if (d.y >= 0.0) {
-            let m = a.y;
-            return textureSample(sky_bk, sky_sampler, sky_uv(d.x / m, d.z / m));
-        }
-        let m = a.y;
-        return textureSample(sky_ft, sky_sampler, sky_uv(-d.x / m, d.z / m));
-    }
-    if (d.z >= 0.0) {
-        let m = a.z;
-        return textureSample(sky_up, sky_sampler, sky_uv(-d.y / m, -d.x / m));
-    }
-    let m = a.z;
-    return textureSample(sky_dn, sky_sampler, sky_uv(-d.y / m, d.x / m));
+    return sample_outer_sky(d);
 }
 
 
@@ -2829,4 +3153,173 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
 @fragment
 fn fs_wireframe() -> @location(0) vec4<f32> {
     return vec4<f32>(0.0, 1.0, 0.0, 1.0);
+}
+
+// TaystJK DrawSkyBox: the outer box is drawn as six face quads with a one-texture
+// program (vk.std_pipeline.skybox_pipeline, TYPE_SINGLE_TEXTURE_FIXED_COLOR)
+// instead of choosing the face per pixel on the BSP sky polygons. The renderer
+// draws it after the opaque world at far depth, so the depth test leaves only
+// the pixels no world surface covered (TaystJK bounds it by clipping the sky
+// polygons on the CPU instead). Each face samples only its own image with the
+// same coordinates as sample_outer_sky: (p, q) are the sky_uv inputs on that
+// face, so the interpolated UV equals the per-pixel projection exactly.
+struct SkyBoxOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+// JKA-space view direction of face point (p, q) in [-1, 1]^2: the inverse of
+// sample_outer_sky, so (p, q) are that face's sky_uv inputs.
+fn sky_box_direction(face: u32, p: f32, q: f32) -> vec3<f32> {
+    switch face {
+        case 0u: { return vec3<f32>(1.0, -p, q); }   // rt: +X, sky_uv(-d.y, d.z)
+        case 1u: { return vec3<f32>(p, 1.0, q); }    // bk: +Y, sky_uv(d.x, d.z)
+        case 2u: { return vec3<f32>(-1.0, p, q); }   // lf: -X, sky_uv(d.y, d.z)
+        case 3u: { return vec3<f32>(-p, -1.0, q); }  // ft: -Y, sky_uv(-d.x, d.z)
+        case 4u: { return vec3<f32>(-q, -p, 1.0); }  // up: +Z, sky_uv(-d.y, -d.x)
+        default: { return vec3<f32>(q, -p, -1.0); }  // dn: -Z, sky_uv(-d.y, d.x)
+    }
+}
+
+// Renderer space is JKA [x, z, -y]. Any box size works: depth is forced to the
+// far value exactly as sky_vertex does for the BSP sky polygons.
+fn sky_box_clip(d: vec3<f32>) -> vec4<f32> {
+    let position = camera.camera_pos_time.xyz + vec3<f32>(d.x, d.z, -d.y) * 1024.0;
+    var clip = camera.view_proj * vec4<f32>(position, 1.0);
+    clip.z = 0.0;
+    return clip;
+}
+
+fn sky_box_vertex(face: u32, vertex_index: u32) -> SkyBoxOut {
+    // Two triangles over the face, corners in (p, q) = [-1, 1]^2.
+    let corners = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0),
+    );
+    let pq = corners[vertex_index];
+    var out: SkyBoxOut;
+    out.clip_position = sky_box_clip(sky_box_direction(face, pq.x, pq.y));
+    out.uv = vec2<f32>((pq.x + 1.0) * 0.5, (1.0 - pq.y) * 0.5);
+    return out;
+}
+
+// TaystJK FillCloudBox + R_InitSkyTexCoords: a cloud-layer stage is drawn on the
+// box faces subdivided SKY_SUBDIVISIONS (8) times, never the bottom face, with
+// the cloud coordinate computed per grid vertex and the stage's tcMods applied
+// per vertex, then shaded like any single-texture stage. Instance = face 0..4.
+struct SkyCloudOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) color: vec4<f32>,
+};
+
+@vertex fn vs_sky_cloud(@builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) face: u32) -> SkyCloudOut {
+    let corners = array<vec2<u32>, 6>(
+        vec2<u32>(0u, 0u), vec2<u32>(1u, 0u), vec2<u32>(1u, 1u),
+        vec2<u32>(0u, 0u), vec2<u32>(1u, 1u), vec2<u32>(0u, 1u),
+    );
+    let cell = vertex_index / 6u;
+    let grid = vec2<u32>(cell % 8u, cell / 8u) + corners[vertex_index % 6u];
+    let p = f32(grid.x) * 0.25 - 1.0;
+    let q = f32(grid.y) * 0.25 - 1.0;
+    let d = sky_box_direction(face, p, q);
+    var out: SkyCloudOut;
+    out.clip_position = sky_box_clip(d);
+    out.uv = apply_tc_mods(sky_cloud_uv(d, material.params.z), vec3<f32>(0.0));
+    // Per vertex like TaystJK ComputeColors; cloud-box vertices carry no colour,
+    // so rgbGen/alphaGen vertex see white and the result is constant per draw.
+    out.color = sky_cloud_stage_color(vec4<f32>(1.0));
+    return out;
+}
+
+@fragment fn fs_sky_cloud(input: SkyCloudOut) -> @location(0) vec4<f32> {
+    let base = textureSample(base_texture, base_sampler, input.uv) * input.color;
+    if (material_alpha_rejects(base.a)) {
+        discard;
+    }
+    return base;
+}
+
+@vertex fn vs_sky_box_rt(@builtin(vertex_index) i: u32) -> SkyBoxOut { return sky_box_vertex(0u, i); }
+@vertex fn vs_sky_box_bk(@builtin(vertex_index) i: u32) -> SkyBoxOut { return sky_box_vertex(1u, i); }
+@vertex fn vs_sky_box_lf(@builtin(vertex_index) i: u32) -> SkyBoxOut { return sky_box_vertex(2u, i); }
+@vertex fn vs_sky_box_ft(@builtin(vertex_index) i: u32) -> SkyBoxOut { return sky_box_vertex(3u, i); }
+@vertex fn vs_sky_box_up(@builtin(vertex_index) i: u32) -> SkyBoxOut { return sky_box_vertex(4u, i); }
+@vertex fn vs_sky_box_dn(@builtin(vertex_index) i: u32) -> SkyBoxOut { return sky_box_vertex(5u, i); }
+
+// sky_uv's edge inset, kept per pixel so the result matches sample_outer_sky.
+fn sky_box_uv(uv: vec2<f32>) -> vec2<f32> {
+    return clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999));
+}
+@fragment fn fs_sky_box_rt(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_rt, sky_sampler, sky_box_uv(input.uv)); }
+@fragment fn fs_sky_box_bk(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_bk, sky_sampler, sky_box_uv(input.uv)); }
+@fragment fn fs_sky_box_lf(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_lf, sky_sampler, sky_box_uv(input.uv)); }
+@fragment fn fs_sky_box_ft(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_ft, sky_sampler, sky_box_uv(input.uv)); }
+@fragment fn fs_sky_box_up(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_up, sky_sampler, sky_box_uv(input.uv)); }
+@fragment fn fs_sky_box_dn(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_dn, sky_sampler, sky_box_uv(input.uv)); }
+
+// r_fragmentShaderMode 2: dedicated minimal entry points for ordinary world stages
+// (texture x colour source x optional lightmap, alpha test, waves, legacy sRGB
+// output). Selected per PSO only while every global feature these entries leave
+// out is compiled out (WorldShaderVariantKey::minimal_entry_compatible), so the
+// result equals fs_main / fs_main_legacy_fog for those stages. Unlike fs_main the
+// vertex stage writes only the interpolants these stages read (TaystJK's
+// gen_vert/gen_frag pair passes only what the stage uses), instead of
+// VertexOut's twelve. Material checks still go through material_flags(), so the
+// per-material override constants fold them exactly as in mode 1.
+struct MinimalVertexOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) lightmap_uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    // xyz: world position (legacy fog, jump shade); w: cached static BSP AO.
+    @location(3) world_ao: vec4<f32>,
+};
+
+@vertex fn vs_world_minimal(input: VertexIn) -> MinimalVertexOut {
+    var output: MinimalVertexOut;
+    output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
+    output.uv = generated_uv(input);
+    output.lightmap_uv = input.lightmap_uv;
+    output.color = input.color;
+    output.world_ao = vec4<f32>(input.position, input.static_ao);
+    return output;
+}
+
+// shade_surface with PBR, POM, planar, detail, classic flags, weather, map light
+// simulation, dynamic lights, shadows and surface deformation compiled out.
+@fragment fn fs_world_minimal(input: MinimalVertexOut) -> @location(0) vec4<f32> {
+    var stage_color = material.color;
+    if ((material_flags() & 1u) != 0u) {
+        stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
+    } else if ((material_flags() & 524288u) != 0u) {
+        stage_color = vec4<f32>(stage_color.rgb * (vec3<f32>(1.0) - input.color.rgb), stage_color.a);
+    }
+    if ((material_flags() & 1048576u) != 0u) {
+        stage_color.a = stage_color.a * input.color.a;
+    } else if ((material_flags() & 2097152u) != 0u) {
+        stage_color.a = stage_color.a * (1.0 - input.color.a);
+    }
+    stage_color = apply_wave_gens(stage_color);
+    let source_sample = textureSample(base_texture, base_sampler, input.uv);
+    var base = source_sample * stage_color;
+    let mask_alpha = select(base.a, source_sample.a * material.color.a,
+        (material_flags() & 1073741824u) != 0u);
+    if (ENABLE_ALPHA_TEST && material_alpha_rejects(mask_alpha)) {
+        discard;
+    }
+    if ((material_flags() & 2u) != 0u && input.lightmap_uv.x >= 0.0) {
+        let lightmap_color = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
+        base = vec4<f32>(base.rgb * lightmap_color, base.a);
+    }
+    if (ENABLE_STATIC_BSP_AO && (camera.render_flags.y & 1u) != 0u
+        && (material_tc_gen() == 1u || (material_flags() & 2u) != 0u || (material_flags() & 131072u) != 0u)) {
+        base = vec4<f32>(base.rgb * clamp(input.world_ao.w, 0.0, 1.0), base.a);
+    }
+    var result = apply_jump_shade(base, input.world_ao.xyz);
+    if (ENABLE_LEGACY_FOG) {
+        result = apply_legacy_fog(result, input.world_ao.xyz);
+    }
+    return legacy_rgb_output(result);
 }

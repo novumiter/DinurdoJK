@@ -36,3 +36,51 @@ transition. Clearing a never-rendered surface still works as upstream intends.
 Measured 2026-10-11 with a bare clear+present loop (Vulkan, Immediate):
 wgpu 29 present 72 us, wgpu 30 present 93 us, wgpu 30 patched present 72 us.
 Remove the vendor and the patch entry once upstream wgpu fixes this.
+
+# wgpu-hal vendor
+
+`wgpu-hal-30.0.1` is the crates.io release with one change in
+`src/vulkan/descriptor.rs` (`create_descriptor_pool`, marked "DinurdoJK
+patch"). It is wired in through `[patch.crates-io]` in the root `Cargo.toml`.
+
+wgpu-core's `Device::new` always creates an empty bind group layout, and
+wgpu-hal's `register_layout` creates a descriptor pool up front for every new
+layout type. For an empty layout every pool-size count is zero, so
+`vkCreateDescriptorPool` was called with `poolSizeCount = 0`, which is invalid
+usage. Some Intel Vulkan drivers (`igvk64.dll`, `iigd_dch` package) fault inside
+that call, crashing every launch with `0xC0000005` at `igvk64.dll+0x6181c6`
+during renderer init (minidumps 2026-10-12). The patch adds one placeholder
+`UNIFORM_BUFFER` pool size when the list would be empty.
+Remove the vendor and the patch entry once upstream wgpu fixes this.
+
+Second change, in `src/vulkan/swapchain/native.rs` (`create_swapchain`, marked
+"DinurdoJK patch"): on Windows, upstream creates an acquire fence for every
+swapchain and makes each `acquire_texture` wait on it on the CPU (added for
+vsync pacing, gfx-rs/wgpu#8310 and #8354). With IMMEDIATE/MAILBOX that wait
+blocked the render thread until the presentation engine released the image:
+on an Intel UHD 630 window the GPU worked ~2 ms per frame while acquire took
+~7 ms, about half of TaystJK's Vulkan FPS with the same present mode and image
+count. TaystJK passes only a semaphore. The patch keeps the fence for FIFO and
+FIFO_RELAXED only. `JKA_VK_ACQUIRE_FENCE=1` restores upstream behaviour.
+
+# winit vendor
+
+`winit-0.30.13` is the crates.io release with one change in
+`src/platform_impl/windows/event_loop.rs` (`handle_raw_input`, marked
+"DinurdoJK patch"). It is wired in through `[patch.crates-io]` in the root
+`Cargo.toml`.
+
+Upstream tests `has_flag(usFlags, MOUSE_MOVE_RELATIVE)`, but
+`MOUSE_MOVE_RELATIVE` is 0, so the test is always true and
+`MOUSE_MOVE_ABSOLUTE` raw reports (Remote Desktop, NoMachine, VMs, tablets:
+`lLastX/lLastY` are 0..65535 positions) were delivered as
+`DeviceEvent::MouseMotion` deltas. On a remote session the view spun at
+"sensitivity 999999999" and pinned the pitch. The patch converts absolute
+reports to the pixel delta from the previous absolute position (reset on focus)
+and leaves relative reports untouched.
+Remove the vendor and the patch entry once upstream winit fixes this.
+
+wgpu-core also has a second DinurdoJK patch in `src/instance.rs`:
+`Instance::new` logs "failed to create <backend> backend" at `warn` instead of
+`debug`, so the reason a backend is unavailable reaches latest.log (otherwise
+`create_surface` only reports "any enabled backend: {}").

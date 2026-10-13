@@ -3,6 +3,31 @@ use crate::app::{demo_recording_timestamp, App, GameSession, RenderCommand, Sess
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
+    cmd_gpu_info ["gpu_info"] ("gpu_info", "Show the active graphics adapter and staged GPU preference.", CommandScope::Always) |self, line| {
+        if line.split_whitespace().count() != 1 { self.push_console_line("usage: gpu_info".to_owned()); return CommandResult::Handled; }
+        self.push_console_line(format!("GPU ACTIVE: {} ({}) | backend {}", self.active_gpu_name,
+            self.active_gpu_type, self.applied_renderer_backend.label()));
+        self.push_console_line(format!("GPU PREFERENCE: applied {} / selected {}", crate::renderer::gpu_adapter::label(self.applied_gpu_adapter),
+            crate::renderer::gpu_adapter::label(self.video.gpu_adapter)));
+        CommandResult::Handled
+    }
+    cmd_gpu_list ["gpu_list"] ("gpu_list", "Enumerate graphics adapters available on the current DX12/Vulkan backend.", CommandScope::Always) |self, line| {
+        if line.split_whitespace().count() != 1 { self.push_console_line("usage: gpu_list".to_owned()); return CommandResult::Handled; }
+        let backend = if self.video.renderer_backend == crate::ui::RendererBackend::Dx12 { wgpu::Backends::DX12 } else { wgpu::Backends::VULKAN };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: backend, ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapters = futures_lite::future::block_on(crate::renderer::gpu_adapter::enumerate(&instance));
+        self.push_console_line(format!("GPU ADAPTERS: {} found ({})", adapters.len(), self.video.renderer_backend.label()));
+        for (index, adapter) in adapters.iter().enumerate() {
+            let info = adapter.get_info();
+            self.push_console_line(format!("  {}. {} | {:?} | {:?} | driver {} {}", index, info.name,
+                info.device_type, info.backend, info.driver, info.driver_info));
+        }
+        self.push_console_line("Use r_gpuAdapter 0/1/2/3, then vid_restart. 3 is available only if listed as Cpu.".to_owned());
+        CommandResult::Handled
+    }
+
     cmd_coastal_debug ["coastal_debug", ] ("coastal_debug", "Print background BSP bathymetry results and the interactive debug report path.", CommandScope::Always) |self, command| {
         if command.split_whitespace().count() != 1 {
             self.push_console_line("usage: coastal_debug".to_owned());
@@ -108,6 +133,33 @@ commands! {
             }
             _ => return CommandResult::Unhandled,
         }
+    }
+
+    cmd_sky_perf_sweep ["sky_perf_sweep", "skyperfsweep"] ("sky_perf_sweep [frames_per_case=300]", "Automated six-phase Unified sky GPU benchmark: normal, solid fill, constant sample, one-face varying UV, fastsky, normal repeat. Restores sky, stage, timestamp settings; writes one CSV and JSON. Stand still and close the console.", CommandScope::Always) |self, command| {
+        let args: Vec<_> = command.split_whitespace().collect();
+        if args.len() > 2 {
+            self.push_console_line("^3usage:^7 sky_perf_sweep [frames_per_case=300]".to_owned());
+            return CommandResult::Handled;
+        }
+        let frames = match args.get(1).map(|s| s.parse::<usize>()).transpose() {
+            Ok(Some(n)) if (60..=1000).contains(&n) => n,
+            Ok(None) => 300,
+            _ => {
+                self.push_console_line("^1sky_perf_sweep:^7 frames per case must be 60..1000".to_owned());
+                return CommandResult::Handled;
+            }
+        };
+        let stem = self.game_write_path(std::path::PathBuf::from("renderperf")
+            .join(format!("sky-sweep-{}", demo_recording_timestamp())));
+        let result = self.render.as_ref().ok_or("renderer is unavailable")
+            .and_then(|render| render.start_sky_perf_sweep(stem.clone(), frames));
+        match result {
+            Ok(()) => self.push_console_line(format!(
+                "^2SKY SWEEP ARMED^7 Six cases × {frames} frames. Hold camera still, close console. Automatically restores settings. Output: {}.csv/.json", stem.display()
+            )),
+            Err(error) => self.push_console_line(format!("^1sky_perf_sweep:^7 {error}")),
+        }
+        CommandResult::Handled
     }
 
     cmd_render_perf_capture ["render_perf_capture", "renderperfcapture"] ("render_perf_capture [frames=600] [label]", "Record per-frame renderer CPU stage timings to CSV/JSON after a 2s delay and 120 warmup frames. Opt-in; no GPU stalls.", CommandScope::Always) |self, command| {
@@ -332,7 +384,7 @@ commands! {
         CommandResult::Status
     }
 
-    cmd_dev ["dev", ] ("dev", "Toggle the mouse-driven developer radial: Trace, 3D Entities, Entity Viewer, and Remap Shader (planned).", CommandScope::Always) |self, command| {
+    cmd_dev ["dev", ] ("dev", "Hold bound key/button for the relative-mouse developer wheel: Trace, 3D Entities, Entity Viewer, Remap Shader (planned), and Shader Complexity. Left click selects; releasing the dev bind cancels.", CommandScope::Always) |self, command| {
         match command.split_whitespace().collect::<Vec<_>>().as_slice() {
             [_verb] => {
                 self.toggle_dev_radial();

@@ -839,6 +839,9 @@ pub const VIDEO_ROW_GPU_TIMINGS: usize = 40;
 
 pub const VIDEO_ROW_RENDER_BACKEND: usize = 41;
 
+/// Added after the existing row IDs; never renumber saved UI row ids.
+pub const VIDEO_ROW_GPU_ADAPTER: usize = 103;
+
 pub const VIDEO_ROW_BAKED_AO_SAMPLES: usize = 42;
 
 pub const VIDEO_ROW_BAKED_AO_RESOLUTION: usize = 43;

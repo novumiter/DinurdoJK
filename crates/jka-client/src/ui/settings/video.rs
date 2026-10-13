@@ -12,10 +12,20 @@ use crate::ui::{
 pub struct VideoSettings {
     pub fullscreen: FullscreenMode,
     pub renderer_backend: RendererBackend,
+    /// 0 Auto, 1 discrete, 2 integrated, 3 CPU/software (if WGPU exposes it).
+    pub gpu_adapter: u8,
     pub vsync: VsyncMode,
     /// Maximum number of frames the WGPU presentation surface may keep in flight.
     /// Lower values favor latency; higher values favor throughput.
     pub max_frame_latency: u32,
+    /// Render the frame offscreen and submit it before acquiring the swapchain
+    /// image, then copy (r_earlySubmit). Session-only.
+    pub early_submit: bool,
+    /// Render offscreen and copy into the swapchain image (r_presentCopy). Session-only.
+    pub present_copy: bool,
+    /// r_ext_compress_textures: 0 off, 1 BC1/BC3 like jamp, 2 also lightmaps.
+    /// Latched to the next map load.
+    pub texture_compression: u8,
     pub msaa_samples: u32,
     pub resolution: [u32; 2],
     pub window_position: Option<[i32; 2]>,
@@ -30,6 +40,8 @@ pub struct VideoSettings {
     pub detail_texture_fade: bool,
     pub detail_texture_fade_distance: f32,
     pub wireframe_mask: u32,
+    /// Opt-in BSP material cost heatmap. No work while disabled.
+    pub shader_complexity: bool,
     pub skip_ui: bool,
     pub pvs_mode: PvsMode,
     pub fps_cap: u32,
@@ -46,7 +58,7 @@ pub struct VideoSettings {
     pub fx_count_scale: f32,
     /// `r_fxLodScale`: multiplies authored EFX cullRange (default 5, like r_lodscale).
     pub fx_lod_scale: f32,
-    /// `r_lodScale`: Ghoul2 projected-size LOD scale (OpenJK default 5).
+    /// `r_lodScale`: Ghoul2 and MD3 projected-size LOD scale (OpenJK default 5).
     pub lod_scale: f32,
     /// View-dependent EFX geometry expansion path. FX simulation itself already
     /// runs on the dedicated `jka-fx` worker; this controls the later sprite/line
@@ -62,6 +74,19 @@ pub struct VideoSettings {
     /// Server-placed MD3 map props (misc_model_* / func_static models). Inline
     /// BSP brush models and geometry compiled into the BSP are unaffected.
     pub draw_map_models: bool,
+    /// Draw inline BSP mover instances (func_rotating, doors, lifts).
+    pub draw_inline_models: bool,
+    /// r_fragmentShaderMode: 0 general world fragment program, 1 TaystJK-style
+    /// per-material specialized programs (MaterialFragmentKey).
+    pub fragment_shader_mode: u8,
+    /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
+    pub color_clear_mode: u8,
+    /// Render-only heuristic: keep BSP-authored stages whose shader qpath starts with models/.
+    pub draw_bsp_model_surfaces: bool,
+    /// Session diagnostic. 0 full, 1 opaque+masked only, 2 transparent only (no opaque depth).
+    pub world_stage_probe: u8,
+    /// TaystJK `r_fastsky`: 0 normal textured sky, 1 black, 2..9 palette, 10 red.
+    pub fast_sky: u8,
     /// Debug overlays for trigger volumes and clip/collision-only brushes.
     /// Session-only: never written to the config.
     pub draw_triggers: bool,
@@ -102,6 +127,9 @@ pub struct VideoSettings {
     pub world_compact_min_draws: u32,
     pub model_prepare_threads: u32,
     pub md3_geometry_cache: bool,
+    /// Use authored MD3 variants (always); optionally generate missing LODs in background.
+    pub md3_auto_lod: bool,
+    pub md3_lod_debug: bool,
     pub model_render_bundles: bool,
     pub encoder_finish_threads: u32,
     pub model_index_upload_cache: bool,
@@ -390,6 +418,9 @@ pub struct VideoSettings {
     /// Experiment: permit conservative reverse-lightmap pair fusion when the
     /// CPU world-material recipe is rebuilt from its retained baseline.
     pub stage_collapse_extra: bool,
+    /// Reversible CPU-prepared composite of compatible consecutive additive world stages.
+    /// Disable for exact authored multi-draw A/B comparisons (cold GPU world reupload).
+    pub additive_stage_fusion: bool,
     /// Optional world-flare override; either world cvar enables the same renderer.
     pub world_flares: bool,
     /// Screen-space saber clash flare overlay, separate from authored hit EFX.
@@ -516,8 +547,12 @@ impl Default for VideoSettings {
         let mut settings = Self {
             fullscreen: FullscreenMode::Windowed,
             renderer_backend: RendererBackend::Vulkan,
+            gpu_adapter: 0,
             vsync: VsyncMode::Off,
             max_frame_latency: 3,
+            early_submit: false,
+            present_copy: false,
+            texture_compression: 0,
             msaa_samples: 1,
             resolution: [1280, 800],
             window_position: None,
@@ -528,6 +563,7 @@ impl Default for VideoSettings {
             detail_texture_fade: false,
             detail_texture_fade_distance: 512.0,
             wireframe_mask: 0,
+            shader_complexity: false,
             skip_ui: false,
             pvs_mode: PvsMode::Auto,
             fps_cap: 0,
@@ -542,6 +578,12 @@ impl Default for VideoSettings {
             fx_zero_alpha_discard: false,
             debug_world_vertex_alpha_one: false,
             draw_map_models: true,
+            draw_inline_models: true,
+            fragment_shader_mode: 1,
+            color_clear_mode: 1,
+            draw_bsp_model_surfaces: true,
+            world_stage_probe: 0,
+            fast_sky: 0,
             draw_triggers: false,
             draw_clip_brushes: false,
             draw_entities: false,
@@ -565,9 +607,11 @@ impl Default for VideoSettings {
             world_compact_min_draws: 1,
             model_prepare_threads: 0,
             md3_geometry_cache: true,
+            md3_auto_lod: false,
+            md3_lod_debug: false,
             model_render_bundles: false,
             encoder_finish_threads: 2,
-            model_index_upload_cache: false,
+            model_index_upload_cache: true,
             ghoul2_batch_key_cache: false,
             ghoul2_anim_smooth: 0.3,
             timer_resolution_1ms: false,
@@ -772,6 +816,7 @@ impl Default for VideoSettings {
             modern_sabers: false,
             flares: true,
             stage_collapse_extra: false,
+            additive_stage_fusion: true,
             world_flares: false,
             saber_flares: true,
             saber_impact_fx: true,

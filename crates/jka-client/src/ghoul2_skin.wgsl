@@ -560,6 +560,7 @@ fn shaded_color(input: VertexOut, tex: vec4<f32>) -> vec4<f32> {
 // Profile is addressed by each skin instance, not the global camera rain.
 // World (render) Y is JKA Z; 8 samples every 8 JKA units, blended in height.
 fn immersion_wetness(input: VertexOut) -> f32 {
+    if (!ENABLE_MODEL_WET) { return 0.0; }
     let draw = skin_draws[input.draw_index];
     if (draw.water_base.w < 0.5) { return 0.0; }
     let band = clamp((input.world_position.y - draw.water_base.x) * 0.125, 0.0, 7.0);

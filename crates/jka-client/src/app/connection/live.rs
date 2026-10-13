@@ -160,7 +160,8 @@ impl App {
         if net.state() >= jka_protocol::session::ConnectionState::Primed {
             // Subframe CL_MouseMove already advanced cl.viewangles on each raw
             // mouse event. Client-frame work only packages the current angles.
-            let playing = self.overlay == OverlayMode::None && self.captured;
+            let playing = matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial)
+                && self.captured;
             if let Some(ps) = self
                 .game_session
                 .as_ref()
@@ -178,7 +179,7 @@ impl App {
                 any_key: playing && (!self.keys.is_empty() || !self.mouse_buttons_down.is_empty()),
                 // jaPRO CL_CmdButtons: `Key_GetCatcher() || (unfocused &&
                 // cl_chatBubbleUnfocused)`, then `cl_chatBubbleSelf`.
-                talking: (self.overlay != OverlayMode::None
+                talking: (!matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial)
                     || (!self.window_focused && self.network.chat_bubble_unfocused))
                     && self.network.chat_bubble_self,
             };

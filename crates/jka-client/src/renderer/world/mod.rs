@@ -1,6 +1,7 @@
 //! world implementation modules.
 pub(in crate::renderer) mod bindings;
 pub(in crate::renderer) mod detail_textures;
+pub(in crate::renderer) mod deferred_bundles;
 pub(in crate::renderer) mod draw;
 pub(in crate::renderer) mod geometry;
 pub(in crate::renderer) mod inline_models;

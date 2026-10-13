@@ -30,7 +30,9 @@ commands! {
         }
     }
 
-    cmd_remap_shader ["remapShader", ] ("/remapShader <old> <new>", "Locally remap one renderer shader to another, matching TaystJK R_RemapShader behavior.", CommandScope::Connected) |self, command| {
+    // This changes local renderer state, not a server command. Register it in
+    // the always-available console set (also used by completion in devmap).
+    cmd_remap_shader ["remapShader", ] ("remapShader <old> <new>", "Locally remap one renderer shader to another, matching TaystJK R_RemapShader behavior.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb, old, new] => {
@@ -38,7 +40,21 @@ commands! {
                 CommandResult::Handled
             }
             [_verb, ..] => {
-                self.push_console_line("^3usage:^7 /remapShader <old> <new>".to_owned());
+                self.push_console_line("^3usage:^7 remapShader <old> <new>".to_owned());
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
+    cmd_list_remaps ["listRemaps", ] ("listRemaps", "List active renderer shader remaps (local and server-provided).", CommandScope::Always) |self, command| {
+        match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [_verb] => {
+                self.local_list_shader_remaps();
+                CommandResult::Handled
+            }
+            [_verb, ..] => {
+                self.push_console_line("^3usage:^7 listRemaps".to_owned());
                 CommandResult::Handled
             }
             _ => return CommandResult::Unhandled,

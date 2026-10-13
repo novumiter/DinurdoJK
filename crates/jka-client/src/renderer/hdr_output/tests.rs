@@ -412,6 +412,7 @@ fn native_hdr_surface_capabilities_and_configuration() {
                 1,
                 1,
                 "auto",
+                0,
             )
             .await
             .unwrap();

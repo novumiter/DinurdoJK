@@ -263,6 +263,52 @@ app_cvars! {
         ]
     }
 
+    APP_R_EXT_COMPRESS_TEXTURES {
+        runtime: CvarDef::new("r_ext_compress_textures", "", "0..2", "Texture compression at upload: 0 off (RGBA8), 1 BC1/BC3 like jamp, 2 also compresses 8-bit lightmaps. Applies on the next map load or vid_restart.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart, |app| CvarValue::String(App::cvar_get_r_ext_compress_textures(app)), |app, value| App::cvar_set_r_ext_compress_textures(app, APP_R_EXT_COMPRESS_TEXTURES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_ext_compress_textures, Some(|name, value| { value
+                        .trim()
+                        .parse::<u8>()
+                        .map(|level| level.min(2).to_string())
+                        .map_err(|_| format!("{name}: expected 0, 1 or 2")) })),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(level) = value.parse::<u8>() {
+                        settings.texture_compression = level.min(2);
+                    }
+                }),
+                apply_latched: Some(|settings, value| {
+                    if let Ok(level) = value.parse::<u8>() {
+                        settings.texture_compression = level.min(2);
+                    }
+                }),
+                archive: Some((12, |state| {
+                    let settings = state.video;
+                    format!("{}", settings.texture_compression)
+                })),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_ext_compress_textures(&self) -> String {
+                    self.video.texture_compression.to_string()
+                }
+                fn cvar_set_r_ext_compress_textures(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        let level = value
+                            .trim()
+                            .parse::<u8>()
+                            .map_err(|_| format!("{name}: expected 0, 1 or 2"))?
+                            .min(2);
+                        self.video.texture_compression = level;
+                        self.render_command(RenderCommand::SetTextureCompression(level));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_PICMIP {
         runtime: CvarDef::new("r_picmip", "", "0..16", "Classic texture-quality mip bias: omit this many highest map-texture mip levels on upload.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart, |app| CvarValue::String(App::cvar_get_r_picmip(app)), |app, value| App::cvar_set_r_picmip(app, APP_R_PICMIP.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_picmip, Some(|name, value| { value
                         .trim()

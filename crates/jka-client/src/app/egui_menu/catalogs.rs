@@ -2,7 +2,14 @@
 use crate::app::egui_menu::{frontend, theme, ui_catalog, App, CatalogPayload, PathBuf};
 
 impl App {
-    pub(in crate::app::egui_menu) fn ensure_asset_viewer_catalog(&mut self) {
+    pub(in crate::app) fn ensure_console_file_catalog(&mut self) {
+        if self.console_file_catalog_loaded { return; }
+        self.console_file_catalog_loaded = true;
+        self.ui_catalog.pending.console_files = true;
+        self.ui_catalog.request(&self.base, self.game.as_deref(), ui_catalog::CatalogRequest::ConsoleFiles);
+    }
+
+    pub(in crate::app) fn ensure_asset_viewer_catalog(&mut self) {
         if self.asset_viewer_catalog_loaded {
             return;
         }
@@ -53,6 +60,7 @@ impl App {
             return;
         }
         let ctx = self.egui_ctx.clone();
+        let mut map_catalog_changed = false;
         for result in results {
             match result.payload {
                 CatalogPayload::DemoGames { token, games } => {
@@ -96,6 +104,10 @@ impl App {
                         }
                         Err(error) => self.demo_catalog_error = Some(error),
                     }
+                }
+                CatalogPayload::ConsoleFiles(result) => {
+                    self.ui_catalog.pending.console_files = false;
+                    if let Ok(files) = result { self.console_files = files; }
                 }
                 CatalogPayload::AssetViewer(result) => {
                     self.ui_catalog.pending.asset_viewer = false;
@@ -210,6 +222,7 @@ impl App {
                     self.apply_profile_catalog(result);
                 }
                 CatalogPayload::SoloMaps(result) => {
+                    map_catalog_changed = true;
                     self.ui_catalog.pending.solo_maps = false;
                     match result {
                         Ok(maps) => self.solo_maps = maps,
@@ -225,6 +238,7 @@ impl App {
                     self.solo_levelshot_texture_map = None;
                 }
                 CatalogPayload::SourceMaps(result) => {
+                    map_catalog_changed = true;
                     self.ui_catalog.pending.source_maps = false;
                     match result {
                         Ok(maps) => self.source_maps = maps,
@@ -303,7 +317,25 @@ impl App {
                 }
             }
         }
+        *self.console_arg_suggest_cache.borrow_mut() = None;
+        if self.overlay == crate::app::OverlayMode::Console
+            && crate::app::console_completion::arguments::context(&self.console_input, self.console_cursor).is_some()
+        {
+            self.console_suggest_index = 0;
+            self.console_suggest_picked = false;
+            self.publish_ui();
+        }
         self.egui_repaint_requested = true;
+        if map_catalog_changed {
+            *self.console_map_suggest_cache.borrow_mut() = None;
+            if self.overlay == crate::app::OverlayMode::Console
+                && App::console_map_argument_span(&self.console_input, self.console_cursor).is_some()
+            {
+                self.console_suggest_index = 0;
+                self.console_suggest_picked = false;
+                self.publish_ui();
+            }
+        }
     }
 
     pub(in crate::app::egui_menu) fn ensure_chat_log_browser_catalog(&mut self) {

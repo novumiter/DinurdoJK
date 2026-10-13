@@ -1,6 +1,6 @@
 //! Lighting local shadows.
 use crate::renderer::{
-    draw_world_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode, DynamicShadowsMode,
+    draw_world_batch, hidden_inline_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode, DynamicShadowsMode,
     GpuPointLight, LocalShadowCacheEntry, LocalShadowResources, Mat4, Renderer,
     ShadowCasterUniform, Vec3, WorldGpu, DEPTH_FORMAT, LOCAL_SHADOW_CACHE_SLOTS,
     LOCAL_SHADOW_HYSTERESIS, LOCAL_SHADOW_MAP_SIZE, LOCAL_SHADOW_NEAR,
@@ -248,6 +248,10 @@ impl Renderer {
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     let mut mask_pipeline_active = false;
                     for batch in &world.coarse_batches {
+                        if (batch.is_inline_entity && !self.draw_inline_models)
+                            || hidden_inline_batch(batch, &world.inline_models) {
+                            continue;
+                        }
                         if self.tinted_glass_enabled
                             && crate::renderer::lighting::glass_transmission::classify_glass(
                                 &batch.source,

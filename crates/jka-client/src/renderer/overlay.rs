@@ -931,6 +931,8 @@ impl Renderer {
         self.ui_transient_stable_vertex_count = self.ui_transient_vertices.len();
         self.ui_transient_vertex_count =
             u32::try_from(self.ui_transient_vertices.len()).unwrap_or(u32::MAX);
+        // The stable part changed, so the tail's resident copy is no longer known.
+        self.ui_transient_tail_uploaded = None;
         if self.ui_transient_vertex_count != 0 {
             self.queue.write_buffer(
                 &self.ui_transient_vertex_buffer,
@@ -1018,11 +1020,19 @@ impl Renderer {
         let tail = &self.ui_transient_vertices[tail_start.min(self.ui_transient_vertices.len())..];
         if !tail.is_empty() {
             let byte_offset = (tail_start * std::mem::size_of::<UiVertex>()) as u64;
-            self.queue.write_buffer(
-                &self.ui_transient_vertex_buffer,
-                byte_offset,
-                bytemuck::cast_slice(tail),
-            );
+            let bytes: &[u8] = bytemuck::cast_slice(tail);
+            // A static crosshair re-sends the same vertices every frame; each
+            // queue write is its own GPU copy (~9 us on a UHD 630).
+            let unchanged = self.ui_transient_tail_uploaded.as_ref()
+                .is_some_and(|(offset, uploaded)| *offset == byte_offset && uploaded.as_slice() == bytes);
+            if !unchanged {
+                self.queue.write_buffer(&self.ui_transient_vertex_buffer, byte_offset, bytes);
+                let (offset, uploaded) = self.ui_transient_tail_uploaded
+                    .get_or_insert_with(|| (byte_offset, Vec::new()));
+                *offset = byte_offset;
+                uploaded.clear();
+                uploaded.extend_from_slice(bytes);
+            }
         }
     }
 }

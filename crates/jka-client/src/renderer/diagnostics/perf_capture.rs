@@ -15,7 +15,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 139] = [
+const FIELDS: [&str; 147] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -49,6 +49,9 @@ const FIELDS: [&str; 139] = [
     "frame_inline_draw_indexed_indirect_calls",
     "frame_inline_multi_draw_indexed_indirect_calls",
     "frame_inline_multi_draw_indexed_indirect_count_calls",
+    "deferred_world_bundle_hit",
+    "deferred_world_bundle_build",
+    "deferred_world_bundle_draws_represented",
     "world_cpu_compaction_active",
     "world_cpu_compact_visible_members",
     "world_cpu_compact_singleton_groups",
@@ -155,6 +158,11 @@ const FIELDS: [&str; 139] = [
     "world_main_sky_stage_triangles",
     "world_main_glow_replay_stages_noninline",
     "world_main_glow_replay_triangles_noninline",
+    "inline_models_active",
+    "inline_models_hidden",
+    "inline_models_uninitialized",
+    "inline_hidden_stage_batches_skipped",
+    "inline_hidden_stage_triangle_equivalents_skipped",
 ];
 
 #[derive(Clone)]
@@ -218,6 +226,9 @@ impl PerfRow {
                 f64::from(info.perf_encode_calls.draw_indexed_indirect),
                 f64::from(info.perf_encode_calls.multi_draw_indexed_indirect),
                 f64::from(info.perf_encode_calls.multi_draw_indexed_indirect_count),
+                f64::from(info.perf_deferred_bundle_hit),
+                f64::from(info.perf_deferred_bundle_build),
+                f64::from(info.perf_deferred_bundle_draws),
                 f64::from(u8::from(info.world_cpu_compaction_active)),
                 f64::from(info.world_cpu_compact_visible_members),
                 f64::from(info.world_cpu_compact_singleton_groups),
@@ -324,6 +335,11 @@ impl PerfRow {
                 info.perf_world_sky_indices as f64 / 3.0,
                 info.perf_world_glow_replay_stages as f64,
                 info.perf_world_glow_replay_indices as f64 / 3.0,
+                info.perf_inline_models_active as f64,
+                info.perf_inline_models_hidden as f64,
+                info.perf_inline_models_uninitialized as f64,
+                info.perf_inline_hidden_stage_batches as f64,
+                info.perf_inline_hidden_stage_indices as f64 / 3.0,
             ],
         }
     }
@@ -376,7 +392,7 @@ impl PerfCapture {
             pvs_candidate_indices: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             main_view_stages: vec![crate::renderer::api::WorldStagePerf::default(); renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             fingerprint: format!(
-                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={}",
+                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={};world_stage_probe={};fastsky={};inline_models={};bsp_model_surfaces={};early_submit={}",
                 renderer.config.width,
                 renderer.config.height,
                 renderer.config.present_mode,
@@ -402,6 +418,11 @@ impl PerfCapture {
                 renderer.ocean_enabled && renderer.world.as_ref().is_some_and(|w| w.active_pipeline_variant.ocean),
                 renderer.dynamic_model_renderer.model_render_bundles,
                 renderer.encoder_finish_threads,
+                renderer.world_stage_probe,
+                renderer.fast_sky,
+                renderer.draw_inline_models,
+                renderer.draw_bsp_model_surfaces,
+                renderer.early_submit_enabled,
             ),
         }
     }
@@ -446,9 +467,13 @@ impl PerfCapture {
             for (total, frame) in self.main_view_stages.iter_mut().zip(&info.perf_world_material_stages) {
                 total.stages = total.stages.saturating_add(frame.stages);
                 total.stage_indices = total.stage_indices.saturating_add(frame.stage_indices);
+                total.resolved_stage_equivalents = total.resolved_stage_equivalents.saturating_add(frame.resolved_stage_equivalents);
+                total.glow_replay_draws = total.glow_replay_draws.saturating_add(frame.glow_replay_draws);
                 total.distinct_surfaces = total.distinct_surfaces.saturating_add(frame.distinct_surfaces);
                 total.distinct_indices = total.distinct_indices.saturating_add(frame.distinct_indices);
                 total.inline_stages = total.inline_stages.saturating_add(frame.inline_stages);
+                total.skipped_hidden_stages = total.skipped_hidden_stages.saturating_add(frame.skipped_hidden_stages);
+                total.skipped_hidden_indices = total.skipped_hidden_indices.saturating_add(frame.skipped_hidden_indices);
             }
         }
         self.frames.push(PerfRow::from_frame(info, renderer, client));
@@ -526,25 +551,39 @@ impl PerfCapture {
     fn sampled_main_view_geometry(&self) -> serde_json::Value {
         let n = self.frames.len().max(1) as f64;
         let mut rows = self.main_view_stages.iter().enumerate().filter_map(|(id, row)| {
-            if row.stages == 0 { return None; }
+            if row.stages == 0 && row.skipped_hidden_stages == 0 { return None; }
             Some(serde_json::json!({
                 "material": self.pvs_candidate_names.get(id),
                 "resolved_stages": self.pvs_candidate_stages.get(id),
                 "mean_stage_batches_per_frame": row.stages as f64 / n,
+                "mean_resolved_stage_equivalents_per_frame": row.resolved_stage_equivalents as f64 / n,
+                "mean_stage_draws_saved_by_fusion_per_frame": row.resolved_stage_equivalents.saturating_sub(row.stages) as f64 / n,
+                "mean_actual_glow_replay_draws_per_frame": row.glow_replay_draws as f64 / n,
                 "mean_stage_triangles_per_frame": row.stage_indices as f64 / (n * 3.0),
                 "mean_distinct_surfaces_per_frame": row.distinct_surfaces as f64 / n,
                 "mean_distinct_triangles_per_frame": row.distinct_indices as f64 / (n * 3.0),
                 "mean_inline_stage_batches_per_frame": row.inline_stages as f64 / n,
+                "mean_skipped_hidden_stage_batches_per_frame": row.skipped_hidden_stages as f64 / n,
+                "mean_skipped_hidden_triangles_per_frame": row.skipped_hidden_indices as f64 / (n * 3.0),
             }))
         }).collect::<Vec<_>>();
         rows.sort_unstable_by(|a,b| {
             b["mean_stage_triangles_per_frame"].as_f64().unwrap_or(0.0)
                 .total_cmp(&a["mean_stage_triangles_per_frame"].as_f64().unwrap_or(0.0))
         });
+        let mut hidden = rows.clone();
+        hidden.sort_unstable_by(|a, b| {
+            b["mean_skipped_hidden_stage_batches_per_frame"].as_f64().unwrap_or(0.0)
+                .total_cmp(&a["mean_skipped_hidden_stage_batches_per_frame"].as_f64().unwrap_or(0.0))
+        });
+        let top20_hidden = hidden.into_iter()
+            .filter(|row| row["mean_skipped_hidden_stage_batches_per_frame"].as_f64().unwrap_or(0.0) > 0.0)
+            .take(20).collect::<Vec<_>>();
         serde_json::json!({
-            "method": "Main-camera BSP stage geometry surviving CPU area/frustum/optical checks and ocean suppression in unified renderer. Deferred and inline stages included; authored passes counted individually. Counts are conservative candidates, NOT executed GPU geometry when GPU-driven culling is enabled, and exclude fog/glow replays, additional passes/views, non-BSP models and pixel overdraw. Distinct uses adjacent stage sibling equivalence; it is not globally deduplicated triangles. No extra GPU readbacks.",
+            "method": "Main-camera prepared world draw-batch candidates after CPU visibility filters; the new stage-equivalent counter includes fused shader stages (2/3 represented by one candidate draw), and their difference measures avoided *candidate* draw submissions. GPU-driven frames include GPU-culled candidates. Authored glow replay draws are actual emitted non-inline glow-pass draw_indexed calls; inline glow batches are not included there. No per-material GPU times, fragment invocations, fog or secondary-view calls. Distinct triangle count uses adjacent-stage equivalence. No additional GPU readbacks.",
             "sampled_frames": self.frames.len(),
             "top20_by_stage_triangles": rows.iter().take(20).cloned().collect::<Vec<_>>(),
+            "top20_by_skipped_hidden_stages": top20_hidden,
             "all_materials": rows,
         })
     }
@@ -571,7 +610,7 @@ impl PerfCapture {
             });
         }
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "dinurdojk-cpu-renderperf-v7",
+            "schema": "dinurdojk-cpu-renderperf-v8",
             "sample_count": self.frames.len(),
             "warmup_seconds_before_frame_skip": 2,
             "warmup_skipped_frames": self.warmup_frames,
@@ -591,6 +630,8 @@ impl PerfCapture {
                 "primary_command_buffers counts the principal frame command buffer and optional profiler-readback command buffer ONLY",
                 "world_multidraw_groups counts API groups, not executed per-surface indexed draws",
                 "world_main_* counts post-CPU-filtered main-camera authored BSP stage index spans, including repeated shader stages; not unique global triangles, pixel count, or GPU timing. GPU-driven frames provide conservative candidates, not actual executed draws. Material table omits fog/glow replay and secondary-view draws",
+                "inline_models_* are render-instance slots (not distinct BSP model handles): active=Some(Some(pose)), hidden=Some(None), uninitialized=None. Only explicit hidden slots are skipped on the CPU-driven main camera; GPU-driven visibility retains the conservative collapsed-geometry fallback",
+                "inline_hidden_stage_* are PVS-selected CPU main-view stages omitted before area/frustum checks; thus not equivalent to the number of draw calls saved. Additional reflection views also skip explicitly hidden slots but do not contribute to this count",
                 "frame_inline_* counters are exact call-site counts for instrumented frame functions, not all nested renderer modules and not executed GPU indirect draw totals",
                 "model_phase_* are actual API calls in DynamicModelRenderer::draw_phase, including secondary/glow views; exclude wireframe, shadow helper and compute commands",
                 "ghoul2_prepared_* and *_prepared_ranges describe prepared main-view geometry, not actual per-pass calls; cpu_model includes MD3, CPU-skinned models, mesh FX and RT-skinned indexed streams",

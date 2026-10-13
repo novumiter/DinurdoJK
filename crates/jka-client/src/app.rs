@@ -156,6 +156,7 @@ use crate::{
     },
 };
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fs::File,
     io::Cursor,
@@ -651,6 +652,8 @@ pub struct App {
     overlay_before_console: OverlayMode,
     /// UI to restore when `/dev` is canceled (including when invoked from console).
     dev_radial_return_overlay: OverlayMode,
+    /// Accumulated raw mouse delta normalized to the Dev wheel's outer radius.
+    dev_radial_offset: [f32; 2],
     console_input: String,
     /// UTF-8 byte offset of the editable console caret inside `console_input`.
     console_cursor: usize,
@@ -694,6 +697,14 @@ pub struct App {
     /// Esc / history browsing hides the popup until the next edit so Up/Down
     /// keep meaning "history" and Esc can still close the console.
     console_suggest_hidden: bool,
+    /// Last filtered map results. Indexed VFS names are matched only on edits,
+    /// not on every UI snapshot/frame in an uncapped renderer.
+    console_map_suggest_cache: RefCell<Option<(String, usize, usize, usize, Vec<console_completion::ConsoleHit>, usize)>>,
+    /// Typed completion results cached for this edit; invalidated by every edit
+    /// and by relevant background catalog changes.
+    console_arg_suggest_cache: RefCell<Option<(String, console_completion::arguments::Source, Vec<console_completion::ConsoleHit>, usize)>>,
+    console_file_catalog_loaded: bool,
+    console_files: frontend::ConsoleFileCatalog,
     /// Pointer is over the console header's `?` button (shows the shortcut card).
     console_help_hover: bool,
     ui_vgs: i32,
@@ -795,6 +806,9 @@ pub struct App {
     quality_preset_values: Vec<(String, String)>,
     applied_fullscreen: FullscreenMode,
     applied_renderer_backend: RendererBackend,
+    applied_gpu_adapter: u8,
+    active_gpu_name: String,
+    active_gpu_type: String,
     applied_hdr_output: u32,
     hdr_output_status: String,
     hdr_output_active: bool,

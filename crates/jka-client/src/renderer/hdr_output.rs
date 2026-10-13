@@ -378,10 +378,12 @@ impl HdrOutput {
 
 impl Renderer {
     pub(super) fn configure_surface(&self) {
-        let mut config = self.config.clone();
+        let mut config =
+            super::context::presentation_config(&self.config, self.surface_linear_present);
         if let Some(hdr) = &self.hdr_output {
             config.format = hdr.selection.format;
             config.color_space = hdr.selection.color_space;
+            config.view_formats.clear();
         }
         self.surface.configure(&self.device, &config);
     }

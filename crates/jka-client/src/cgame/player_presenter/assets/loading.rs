@@ -871,8 +871,9 @@ fn build_character_model(
             .get(&hierarchy.name.to_ascii_lowercase())
             .map(String::as_str);
         let skin_off = skin_shader.is_some_and(|shader| shader.eq_ignore_ascii_case("*off"));
-        const G2SURFACEFLAG_OFF: u32 = 0x0000_0002;
-        let default_visible = !skin_off && hierarchy.flags & G2SURFACEFLAG_OFF == 0;
+        // TaystJK RenderSurfaces: only zero-flag surfaces are rendered.
+        // ISBOLT (0x1) is attachment geometry; OFF (0x2) is hidden geometry.
+        let default_visible = !skin_off && hierarchy.flags == 0;
         let shader_name = if skin_off {
             hierarchy.shader.as_str()
         } else {
@@ -1060,8 +1061,10 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
                 surface.surface_index
             )
         })?;
-        // Ghoul2 tag surfaces are attachment metadata, not visible hilt geometry.
-        if hierarchy.name.starts_with('*') {
+        // Match TaystJK's RenderSurfaces: nonzero hierarchy flags don't draw.
+        // This excludes bolt triangles and authored OFF surfaces without relying
+        // on naming conventions; the original GLM still retains attachment data.
+        if hierarchy.flags != 0 {
             continue;
         }
         let shader_name = skin_map

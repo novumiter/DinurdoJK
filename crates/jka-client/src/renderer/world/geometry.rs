@@ -4,27 +4,21 @@ use crate::renderer::{
     WorldBatchSet, WorldDrawGroup,
 };
 
-/// Pose an inline model's compiled vertices. `None` (not in the snapshot)
-/// collapses every vertex onto one point: zero-area triangles rasterize
-/// nothing, and the returned bounds are that point.
+/// Transform real, present inline model geometry. Hidden models never call
+/// this function: they retain their existing vertex storage and are culled
+/// by explicit visibility, not collapsed into zero-area triangles.
 pub(in crate::renderer) fn posed_inline_vertices(
     base: &[GpuVertex],
-    pose: Option<InlineModelInstance>,
+    pose: InlineModelInstance,
 ) -> (Vec<GpuVertex>, [f32; 3], [f32; 3]) {
     let mut minimum = [f32::INFINITY; 3];
     let mut maximum = [f32::NEG_INFINITY; 3];
-    let hidden_point = base.first().map_or([0.0; 3], |vertex| vertex.position);
     let vertices = base
         .iter()
         .map(|vertex| {
             let mut out = *vertex;
-            match pose {
-                Some(pose) => {
-                    out.position = pose.transform_point(vertex.position);
-                    out.normal = pose.transform_normal(vertex.normal);
-                }
-                None => out.position = hidden_point,
-            }
+            out.position = pose.transform_point(vertex.position);
+            out.normal = pose.transform_normal(vertex.normal);
             for axis in 0..3 {
                 minimum[axis] = minimum[axis].min(out.position[axis]);
                 maximum[axis] = maximum[axis].max(out.position[axis]);

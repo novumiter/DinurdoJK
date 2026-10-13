@@ -1,9 +1,9 @@
 //! World types.
 use crate::renderer::{
-    legacy_dlight_receives, legacy_fog_pass_jobs, scene, Arc, Auto4CollapseCache, BTreeMap,
+    legacy_dlight_receives, legacy_fog_pass_jobs, material_specialization_jobs, scene, Arc, Auto4CollapseCache, BTreeMap,
     BTreeSet, CullMode, DirectionalSun, DrawBatch, GpuImage, GpuVertex, GrassMapGpu, Hash,
     InlineModelInstance, InspectorTextureMeta, InspectorVertex, LocalShadowResources, Mat4, Mutex,
-    PipelineKey, PreparedPortalPlanBatchRef, PvsMode, RtAlphaMaskSource, SnowShellGpu,
+    MaterialFragmentKey, PipelineKey, PreparedPortalPlanBatchRef, PvsMode, RtAlphaMaskSource, SnowShellGpu,
     StaticAoWorldSource, SurfaceSpriteEffectGpu, TextureData, Vec3, WorldShaderVariantKey,
 };
 
@@ -147,8 +147,12 @@ pub(in crate::renderer) struct WorldBatch {
     /// intentionally leave this empty and use their existing all-light fallback.
     pub(in crate::renderer) legacy_dlight_runs: Vec<LegacyDlightRun>,
     /// True for a CG_Mover inline BSP model rather than static world geometry.
-    /// Debug-only classification; normal world submission never branches on it.
+    /// Used by grouped mover submission and diagnostics.
     pub(in crate::renderer) is_inline_entity: bool,
+    /// Stable index in WorldGpu.inline_models, or u32::MAX for static geometry.
+    /// Unlike model handles, this identifies each distinct render instance,
+    /// including multiple movers sharing the same BSP model handle.
+    pub(in crate::renderer) inline_model_slot: u32,
     /// Clipmap index ranges for this promoted water surface, low then high.
     pub(in crate::renderer) ocean_clipmap: Option<[std::ops::Range<u32>; 2]>,
     /// Which promoted surface `ocean_clipmap` belongs to. Every face merged into
@@ -157,6 +161,8 @@ pub(in crate::renderer) struct WorldBatch {
     /// An uploaded ocean replaces this stage, including its sibling passes.
     pub(in crate::renderer) ocean_replaced: bool,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
+    /// Fixed at upload from the material uniform (r_fragmentShaderMode 1).
+    pub(in crate::renderer) fragment_key: MaterialFragmentKey,
     pub(in crate::renderer) animation: Option<WorldBatchAnimation>,
     /// Same authored stage resources as `bind_group`, but with OpenJK's
     /// Dynamic Glow fog override: glow stages fog toward black during replay.
@@ -167,6 +173,7 @@ pub(in crate::renderer) struct WorldBatch {
     pub(in crate::renderer) _ocean_material_buffer: Option<UniformSlot>,
     pub(in crate::renderer) fast_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) _material_buffer: UniformSlot,
+    pub(in crate::renderer) additive_uniforms: [UniformSlot; 2],
     pub(in crate::renderer) _fog_buffer: UniformSlot,
     pub(in crate::renderer) _authored_glow_fog_buffer: Option<UniformSlot>,
     pub(in crate::renderer) cull_index: u32,
@@ -197,6 +204,8 @@ pub(in crate::renderer) struct WorldPipelineCompilePlan {
     pub(in crate::renderer) base_keys: Vec<PipelineKey>,
     pub(in crate::renderer) legacy_dlight_keys: Vec<PipelineKey>,
     pub(in crate::renderer) fog_jobs: Vec<(PipelineKey, bool)>,
+    /// Every eligible (pipeline, material key) pair; see `material_specialization_eligible`.
+    pub(in crate::renderer) material_jobs: Vec<(PipelineKey, MaterialFragmentKey)>,
     pub(in crate::renderer) has_planar_reflectors: bool,
 }
 
@@ -221,6 +230,7 @@ impl WorldPipelineCompilePlan {
             base_keys,
             legacy_dlight_keys,
             fog_jobs: legacy_fog_pass_jobs(&world.coarse_batches),
+            material_jobs: material_specialization_jobs(world.all_world_batches()),
             has_planar_reflectors: !world.planar_reflectors.is_empty(),
         }
     }
@@ -240,6 +250,35 @@ pub(in crate::renderer) struct WorldPipelineVariant {
     pub(in crate::renderer) reflection_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     pub(in crate::renderer) reflection_fog_pass_pipelines:
         BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline>,
+    /// r_fragmentShaderMode 1: base-pass PSOs per material, keyed by the batch's
+    /// full key; the value carries the narrowed key the PSO was built with, which
+    /// identifies the program for redundant-bind checks. Empty in mode 0.
+    pub(in crate::renderer) specialized_pipelines: std::collections::HashMap<
+        (PipelineKey, MaterialFragmentKey),
+        (MaterialFragmentKey, wgpu::RenderPipeline),
+    >,
+}
+
+/// Which base-pass program is bound: the general one (`None`) or a specialized one.
+pub(in crate::renderer) type WorldPipelineBinding = (PipelineKey, Option<MaterialFragmentKey>);
+
+impl WorldPipelineVariant {
+    /// Base-pass PSO for a world batch: its specialized program when this variant
+    /// has one, otherwise the general program.
+    pub(in crate::renderer) fn base_pipeline(
+        &self,
+        batch: &WorldBatch,
+    ) -> (WorldPipelineBinding, &wgpu::RenderPipeline) {
+        let key = batch.source.pipeline;
+        if !self.specialized_pipelines.is_empty() {
+            if let Some((narrowed, pipeline)) =
+                self.specialized_pipelines.get(&(key, batch.fragment_key))
+            {
+                return ((key, Some(*narrowed)), pipeline);
+            }
+        }
+        ((key, None), &self.pipelines[&key])
+    }
 }
 
 pub(in crate::renderer) struct StaticLightGridGpu {
@@ -348,6 +387,13 @@ pub(in crate::renderer) struct InlineModelGpu {
     pub(in crate::renderer) uploaded: Option<Option<InlineModelInstance>>,
 }
 
+impl WorldGpu {
+    /// Every uploaded world batch representation (MINIMAL, FULL and AUTO).
+    pub(in crate::renderer) fn all_world_batches(&self) -> impl Iterator<Item = &WorldBatch> {
+        self.coarse_batches.iter().chain(&self.full_batches).chain(&self.auto4_batches)
+    }
+}
+
 pub(in crate::renderer) struct WorldGpu {
     /// Drawn, markable world surfaces shared with saber marks (R_MarkFragments).
     pub(in crate::renderer) mark_surfaces: Option<Arc<jka_assets::bsp::MarkSurfaces>>,
@@ -363,6 +409,8 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) sky_portal: Option<scene::SkyPortal>,
     /// Representative authored map skybox used by non-sky surfaces that need environment sampling (ocean).
     pub(in crate::renderer) primary_skybox: Option<[usize; 6]>,
+    /// Every sky shader draws an outer box (see `sky_outer_box_covers_background`).
+    pub(in crate::renderer) sky_covers_background: bool,
     /// Distinct promoted water planes/footprints; also drives Godot-style spray placement.
     pub(in crate::renderer) ocean_surfaces: Vec<crate::ocean::OceanSurface>,
     /// Whether FFT clipmaps were prepared when the map was loaded.
@@ -451,6 +499,8 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) pipeline_variants:
         BTreeMap<WorldShaderVariantKey, WorldPipelineVariant>,
     pub(in crate::renderer) fast_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    pub(in crate::renderer) fast_complexity_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    pub(in crate::renderer) complexity_pipelines: BTreeMap<WorldShaderVariantKey, BTreeMap<PipelineKey, wgpu::RenderPipeline>>,
     pub(in crate::renderer) planar_reflectors: Vec<PlanarReflector>,
     /// Original material/lightmap-first batches. OFF draws all of these; MINIMAL
     /// applies conservative PVS visibility to them.

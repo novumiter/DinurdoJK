@@ -21,6 +21,7 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
     footprint_marks: &[&GpuImage; 2],
     source: &DrawBatch,
     material_buffer: &UniformSlot,
+    additive_uniforms: &[UniformSlot; 2],
     surface_deformation_buffer: &wgpu::Buffer,
     deformation_field_views: [&wgpu::TextureView; 2],
     deformation_field_sampler: &wgpu::Sampler,
@@ -58,6 +59,10 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
         .map(|clamp| if clamp { clamp_sampler } else { repeat_sampler })
         .unwrap_or(sky_sampler);
     let sky_faces: [&GpuImage; 6] = std::array::from_fn(|face| {
+        if face < source.additive_companions.len() {
+            return source.additive_companions[face].texture
+                .and_then(|i| textures.get(i)).unwrap_or(missing);
+        }
         if face == 0 {
             if let Some(overlay) = source.legacy_srgb_overlay.and_then(|index| textures.get(index)) {
                 return overlay;
@@ -122,6 +127,18 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
                 resource: wgpu::BindingResource::Sampler(overlay_sampler),
             },
             wgpu::BindGroupEntry {
+                binding: 32,
+                resource: additive_uniforms[0].binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 33,
+                resource: additive_uniforms[1].binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 31,
+                resource: wgpu::BindingResource::Sampler(repeat_sampler),
+            },
+            wgpu::BindGroupEntry {
                 binding: 21,
                 resource: surface_deformation_buffer.as_entire_binding(),
             },
@@ -176,6 +193,7 @@ pub(in crate::renderer) fn create_world_bind_group(
     reflection_probes: &ReflectionProbeGpuSet,
     source: &DrawBatch,
     material_buffer: &UniformSlot,
+    additive_uniforms: &[UniformSlot; 2],
     fog_buffer: &UniformSlot,
     surface_deformation_buffer: &wgpu::Buffer,
     deformation_field_views: [&wgpu::TextureView; 2],
@@ -268,6 +286,10 @@ pub(in crate::renderer) fn create_world_bind_group(
         .map(|clamp| if clamp { clamp_sampler } else { repeat_sampler })
         .unwrap_or(sky_sampler);
     let sky_faces: [&GpuImage; 6] = std::array::from_fn(|face| {
+        if face < source.additive_companions.len() {
+            return source.additive_companions[face].texture
+                .and_then(|i| textures.get(i)).unwrap_or(missing);
+        }
         if face == 0 {
             if let Some(overlay) = source.legacy_srgb_overlay.and_then(|index| textures.get(index)) {
                 return overlay;
@@ -366,6 +388,14 @@ pub(in crate::renderer) fn create_world_bind_group(
             wgpu::BindGroupEntry {
                 binding: 20,
                 resource: wgpu::BindingResource::Sampler(&reflection_probes.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 32,
+                resource: additive_uniforms[0].binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 33,
+                resource: additive_uniforms[1].binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 21,
@@ -511,6 +541,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             reflection_probes,
             &batch.source,
             &batch._material_buffer,
+            &batch.additive_uniforms,
             &batch._fog_buffer,
             surface_deformation_buffer,
             deformation_field_views,
@@ -532,6 +563,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             &footprint_marks,
             &batch.source,
             &batch._material_buffer,
+            &batch.additive_uniforms,
             surface_deformation_buffer,
             deformation_field_views,
             deformation_field_sampler,
@@ -543,7 +575,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
                 lightmap_sampler, sky_sampler, selected_detail_texture,
                 textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
                 &footprint_marks, reflection_probes, &batch.source,
-                &batch._material_buffer, glow_fog, surface_deformation_buffer,
+                &batch._material_buffer, &batch.additive_uniforms, glow_fog, surface_deformation_buffer,
                 deformation_field_views, deformation_field_sampler,
             )
         });
@@ -557,13 +589,14 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
                     lightmap_sampler, sky_sampler, selected_detail_texture,
                     textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
                     &footprint_marks, reflection_probes, alternate,
-                    &batch._material_buffer, &batch._fog_buffer, surface_deformation_buffer,
+                    &batch._material_buffer, &batch.additive_uniforms, &batch._fog_buffer, surface_deformation_buffer,
                     deformation_field_views, deformation_field_sampler,
                 ),
                 fast: create_fast_world_bind_group(
                     device, fast_surface_layout, white, missing, repeat_sampler, clamp_sampler,
                     lightmap_sampler, sky_sampler, textures, lightmaps, texture_clamp,
                     *primary_skybox, &footprint_marks, alternate, &batch._material_buffer,
+            &batch.additive_uniforms,
                     surface_deformation_buffer, deformation_field_views, deformation_field_sampler,
                 ),
                 glow: batch._authored_glow_fog_buffer.as_ref().map(|glow_fog| {
@@ -573,7 +606,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
                         lightmap_sampler, sky_sampler, selected_detail_texture,
                         textures, lightmaps, deluxemaps, texture_clamp, *primary_skybox,
                         &footprint_marks, reflection_probes, alternate,
-                        &batch._material_buffer, glow_fog, surface_deformation_buffer,
+                        &batch._material_buffer, &batch.additive_uniforms, glow_fog, surface_deformation_buffer,
                         deformation_field_views, deformation_field_sampler,
                     )
                 }),

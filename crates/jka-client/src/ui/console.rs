@@ -842,16 +842,24 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         if !ui.console_suggest_hint && cursor == ui.console_input.len() {
             let typed = ui.console_input.trim_start();
             if let Some(best) = ui.console_suggestions.get(ui.console_suggest_selected) {
-                let name = best.name;
-                if !typed.contains(char::is_whitespace)
-                    && name.len() > typed.len()
-                    && name.as_bytes()[..typed.len()].eq_ignore_ascii_case(typed.as_bytes())
-                {
+                let name = best.name.as_str();
+                let fragment = if matches!(best.kind, ConsoleSuggestKind::Map | ConsoleSuggestKind::Argument) {
+                    typed.rsplit(char::is_whitespace).next()
+                } else if !typed.contains(char::is_whitespace) {
+                    Some(typed)
+                } else {
+                    None
+                };
+                if let Some(fragment) = fragment.filter(|fragment| {
+                    name.len() > fragment.len()
+                        && name.as_bytes()[..fragment.len()]
+                            .eq_ignore_ascii_case(fragment.as_bytes())
+                }) {
                     let end_x =
                         text_x + visible_text_len(&ui.console_input) as f32 * CONSOLE_CHAR_WIDTH;
                     console_plain(
                         out,
-                        &name[typed.len()..],
+                        &name[fragment.len()..],
                         end_x,
                         input_y,
                         with_alpha(CON_CYAN, 0.42),
@@ -1051,6 +1059,8 @@ pub(in crate::ui) fn build_console_suggestions(
             ConsoleSuggestKind::Cvar => ("VAR", CON_CYAN),
             ConsoleSuggestKind::Command => ("CMD", CON_AMBER),
             ConsoleSuggestKind::Server => ("SRV", CON_MAGENTA),
+            ConsoleSuggestKind::Map => ("MAP", CON_CYAN),
+            ConsoleSuggestKind::Argument => ("ARG", CON_CYAN),
         };
         console_plain(
             out,
@@ -1163,6 +1173,8 @@ pub(in crate::ui) fn build_console_suggestions(
             ConsoleSuggestKind::Server => {
                 meta("SERVER COMMAND", "sent to the server", CON_DIM, out)
             }
+            ConsoleSuggestKind::Map => meta("MAP", "available in active fs_game", CON_DIM, out),
+            ConsoleSuggestKind::Argument => meta("ARGUMENT", "from the current command", CON_DIM, out),
         }
     }
 

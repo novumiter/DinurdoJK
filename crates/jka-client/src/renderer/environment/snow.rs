@@ -1,7 +1,8 @@
 //! Environment snow.
 use crate::renderer::{
     aabb_intersects_clip_frustum, mpsc, Arc, BTreeMap, DrawBatch, DrawClass, Duration, GpuVertex,
-    HashMap, HashSet, Instant, Mat4, Mutex, PipelineKey, Vec2, Vec3, WorldGpu, MATERIAL_SNOW,
+    HashMap, HashSet, Instant, Mat4, Mutex, PipelineKey, Vec2, Vec3, WorldGpu,
+    WorldPipelineBinding, MATERIAL_SNOW,
     SNOW_SHELL_CHUNK_SIZE, SNOW_SHELL_DRAW_RADIUS, SNOW_SHELL_TESSELLATION,
 };
 use wgpu::util::DeviceExt;
@@ -575,7 +576,7 @@ pub(in crate::renderer) fn draw_snow_shell<'a>(
     pipelines: &'a BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     view_proj: Mat4,
     deform_center: Vec2,
-    current_pipeline: &mut Option<PipelineKey>,
+    current_pipeline: &mut Option<WorldPipelineBinding>,
 ) {
     if world.snow_shell.chunks.is_empty() {
         return;
@@ -601,9 +602,10 @@ pub(in crate::renderer) fn draw_snow_shell<'a>(
             let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
                 continue;
             };
-            if *current_pipeline != Some(batch.source.pipeline) {
+            // Snow shells always use the general program.
+            if *current_pipeline != Some((batch.source.pipeline, None)) {
                 pass.set_pipeline(&pipelines[&batch.source.pipeline]);
-                *current_pipeline = Some(batch.source.pipeline);
+                *current_pipeline = Some((batch.source.pipeline, None));
             }
             pass.set_bind_group(1, &batch.bind_group, &[]);
             pass.draw(draw.vertices.clone(), 1..2);

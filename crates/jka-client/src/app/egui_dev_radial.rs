@@ -1,14 +1,17 @@
-//! `/dev`: compact mouse-driven developer wheel drawn over the live scene.
-//! A mouse-down on any sector activates it; a mouse-down in the center, the
-//! separators, or anywhere outside the wheel dismisses it. Escape is not a
-//! dismissal shortcut (the same `/dev` bind may still toggle the wheel).
+//! Hold the `/dev` bind to open a relative-mouse developer wheel.
+//! Mouse movement chooses the closest sector by angle. Exactly one sector is
+//! always highlighted, even at the center or beyond the rim. Left click
+//! activates the selected tool; releasing the dev bind cancels unconditionally.
 
 use super::egui_theme as theme;
 use super::*;
 use std::f32::consts::{FRAC_PI_2, PI};
 
-const WHEEL_GAP: f32 = 0.045; // radians on either side of each sector
+const WHEEL_GAP: f32 = 0.045; // visual-only separation; no input dead zones
 const SEGMENTS_PER_SECTOR: usize = 24;
+const INNER_RADIUS: f32 = 0.32;
+const OUTER_RADIUS: f32 = 1.0;
+const SECTOR_ANGLE: f32 = 2.0 * PI / DevTool::ALL.len() as f32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DevTool {
@@ -16,14 +19,16 @@ enum DevTool {
     DrawEntities,
     EntityViewer,
     RemapShader,
+    ShaderComplexity,
 }
 
 impl DevTool {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Trace,
         Self::DrawEntities,
         Self::EntityViewer,
         Self::RemapShader,
+        Self::ShaderComplexity,
     ];
 
     fn label(self) -> &'static str {
@@ -32,61 +37,86 @@ impl DevTool {
             Self::DrawEntities => "3D ENTITIES",
             Self::EntityViewer => "ENTITY VIEWER",
             Self::RemapShader => "REMAP SHADER",
+            Self::ShaderComplexity => "SHADER COST",
         }
     }
 
-    fn subtitle(self, entities_enabled: bool) -> &'static str {
+    fn subtitle(self, entities_enabled: bool, complexity_enabled: bool) -> &'static str {
         match self {
             Self::Trace => "INSPECT SURFACE",
             Self::DrawEntities if entities_enabled => "OVERLAY ON",
             Self::DrawEntities => "OVERLAY OFF",
             Self::EntityViewer => "GRAPH EDITOR",
             Self::RemapShader => "COMING SOON",
+            Self::ShaderComplexity if complexity_enabled => "HEATMAP ON",
+            Self::ShaderComplexity => "HEATMAP OFF",
         }
     }
 }
 
-/// The painted annulus, *not* the enclosing rectangle, is clickable.
-/// Gaps and the central hub deliberately count as outside clicks.
-fn tool_at(pos: egui::Pos2, center: egui::Pos2, inner: f32, outer: f32) -> Option<DevTool> {
-    let delta = pos - center;
-    let distance_sq = delta.length_sq();
-    if distance_sq < inner * inner || distance_sq > outer * outer {
-        return None;
+/// The raw mouse deltas accumulate into a virtual stick; only its angle
+/// matters. Unlike the painted annulus, selection has no center, rim, or gap
+/// dead zones. On first open (zero offset), default to the top/Trace sector.
+fn tool_at(offset: egui::Vec2) -> DevTool {
+    if offset == egui::Vec2::ZERO {
+        return DevTool::Trace;
     }
-    let angle = delta.y.atan2(delta.x);
-    let sector = (angle + 3.0 * PI / 4.0).rem_euclid(2.0 * PI) / FRAC_PI_2;
-    let index = sector.floor() as usize;
-    let progress = sector.fract();
-    if !(WHEEL_GAP / FRAC_PI_2..=1.0 - WHEEL_GAP / FRAC_PI_2).contains(&progress) {
-        return None;
-    }
-    DevTool::ALL.get(index).copied()
+    // Center sector zero on 12 o'clock and proceed clockwise in screen space.
+    let start = -FRAC_PI_2 - SECTOR_ANGLE * 0.5;
+    let angle = offset.y.atan2(offset.x);
+    let sector = ((angle - start).rem_euclid(2.0 * PI) / SECTOR_ANGLE).floor() as usize;
+    DevTool::ALL[sector % DevTool::ALL.len()]
 }
 
 impl App {
+    /// Invoked only by a left mouse press. Release of the dev bind instead
+    /// calls `close_dev_radial()` and never executes a tool.
+    pub(in crate::app) fn activate_dev_radial_selection(&mut self) {
+        if self.overlay != OverlayMode::DevRadial {
+            return;
+        }
+        let selected = tool_at(egui::vec2(self.dev_radial_offset[0], self.dev_radial_offset[1]));
+        self.close_dev_radial();
+        match selected {
+            DevTool::Trace => self.trace_surface_center(),
+            DevTool::DrawEntities => {
+                self.set_draw_entities(!self.video.draw_entities);
+            }
+            DevTool::EntityViewer => self.open_entity_graph(None),
+            DevTool::ShaderComplexity => {
+                // Use the normal cvar setter so UI, renderer, and session-only
+                // state stay in sync; do not add a second rendering path.
+                let value = if self.video.shader_complexity { "0" } else { "1" };
+                if let Err(error) = self.set_console_cvar("r_shaderComplexity", value) {
+                    self.console_status = error;
+                }
+            }
+            DevTool::RemapShader => {}
+        }
+    }
+
     pub(super) fn egui_dev_radial(&mut self, root: &mut egui::Ui) {
         let rect = root.max_rect();
         let center = rect.center();
         let outer = (rect.width().min(rect.height()) * 0.37).clamp(125.0, 205.0);
-        let inner = outer * 0.32;
-        let label_radius = inner + (outer - inner) * 0.60;
+        let inner = outer * INNER_RADIUS;
+        let label_radius = inner + (outer - inner) * 0.62;
         let painter = root.painter();
+        let selected = tool_at(egui::vec2(self.dev_radial_offset[0], self.dev_radial_offset[1]));
 
-        let pointer = root.ctx().input(|input| input.pointer.hover_pos());
-        let hovered = pointer.and_then(|pos| tool_at(pos, center, inner, outer));
-
-        // A modest backdrop retains the rendered world as useful context.
+        // The OS cursor is hidden and locked while held. Eguis absolute pointer
+        // position never influences the highlight; a left click commits it.
         painter.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_black_alpha(92));
         painter.circle_filled(center, outer + 14.0, egui::Color32::from_black_alpha(54));
         painter.circle_filled(center, outer + 5.0, egui::Color32::from_black_alpha(90));
 
         for (index, tool) in DevTool::ALL.iter().copied().enumerate() {
-            let start = -3.0 * PI / 4.0 + index as f32 * FRAC_PI_2 + WHEEL_GAP;
-            let end = start + FRAC_PI_2 - 2.0 * WHEEL_GAP;
-            let highlighted = hovered == Some(tool);
+            let angle = -FRAC_PI_2 + index as f32 * SECTOR_ANGLE;
+            let start = angle - SECTOR_ANGLE * 0.5 + WHEEL_GAP;
+            let end = angle + SECTOR_ANGLE * 0.5 - WHEEL_GAP;
+            let highlighted = selected == tool;
             let planned = tool == DevTool::RemapShader;
-            let fill = if highlighted && !planned {
+            let fill = if highlighted {
                 egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240)
             } else if planned {
                 egui::Color32::from_rgba_unmultiplied(24, 30, 39, 219)
@@ -94,7 +124,7 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(17, 25, 37, 234)
             };
             paint_annular_sector(painter, center, inner, outer, start, end, fill);
-            let arc_color = if highlighted && !planned {
+            let arc_color = if highlighted {
                 theme::ACCENT
             } else if planned {
                 theme::LINE
@@ -104,12 +134,11 @@ impl App {
             paint_arc(painter, center, outer, start, end, egui::Stroke::new(1.5, arc_color));
             paint_arc(painter, center, inner, start, end, egui::Stroke::new(1.0, theme::LINE));
 
-            let angle = -FRAC_PI_2 + index as f32 * FRAC_PI_2;
             let anchor = center + egui::vec2(angle.cos(), angle.sin()) * label_radius;
-            let foreground = if planned {
-                theme::TEXT_DISABLED
-            } else if highlighted {
+            let foreground = if highlighted {
                 egui::Color32::WHITE
+            } else if planned {
+                theme::TEXT_DISABLED
             } else {
                 theme::TEXT
             };
@@ -119,14 +148,14 @@ impl App {
                 anchor + egui::vec2(0.0, 8.0),
                 egui::Align2::CENTER_CENTER,
                 tool.label(),
-                egui::FontId::proportional(if outer < 165.0 { 11.5 } else { 14.0 }),
+                egui::FontId::proportional(if outer < 165.0 { 10.0 } else { 12.0 }),
                 foreground,
             );
             painter.text(
-                anchor + egui::vec2(0.0, 26.0),
+                anchor + egui::vec2(0.0, 25.0),
                 egui::Align2::CENTER_CENTER,
-                tool.subtitle(self.video.draw_entities),
-                egui::FontId::proportional(if outer < 165.0 { 9.0 } else { 10.5 }),
+                tool.subtitle(self.video.draw_entities, self.video.shader_complexity),
+                egui::FontId::proportional(if outer < 165.0 { 8.0 } else { 9.5 }),
                 muted,
             );
         }
@@ -150,31 +179,10 @@ impl App {
         painter.text(
             center + egui::vec2(0.0, outer + 28.0),
             egui::Align2::CENTER_CENTER,
-            "CLICK OUTSIDE TO CLOSE",
+            "LEFT CLICK TO SELECT · RELEASE DEV BIND TO CANCEL",
             egui::FontId::proportional(11.0),
             theme::TEXT_DIM,
         );
-
-        // Use press, not click/release. A press on the hub, a separator, or the
-        // empty screen dismisses immediately and must not reach gameplay binds.
-        let pressed_at = root.ctx().input(|input| {
-            input.pointer.any_pressed().then(|| input.pointer.interact_pos()).flatten()
-        });
-        if let Some(pos) = pressed_at {
-            let choice = tool_at(pos, center, inner, outer);
-            // Close first so tool entry can change overlays without the radial
-            // undoing it. Trace also needs the previous overlay gone before it
-            // starts the async crosshair inspection.
-            self.close_dev_radial();
-            match choice {
-                Some(DevTool::Trace) => self.trace_surface_center(),
-                Some(DevTool::DrawEntities) => {
-                    self.set_draw_entities(!self.video.draw_entities);
-                }
-                Some(DevTool::EntityViewer) => self.open_entity_graph(None),
-                Some(DevTool::RemapShader) | None => {}
-            }
-        }
     }
 }
 
@@ -270,6 +278,14 @@ fn paint_tool_icon(painter: &egui::Painter, center: egui::Pos2, tool: DevTool, c
             painter.rect_stroke(rect, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
             painter.line_segment([center + egui::vec2(-9.0, 5.0), center + egui::vec2(9.0, -5.0)], stroke);
         }
+        DevTool::ShaderComplexity => {
+            for (offset, height) in [(-12.0, 8.0), (-6.0, 15.0), (0.0, 21.0), (6.0, 12.0), (12.0, 17.0)] {
+                painter.line_segment([
+                    center + egui::vec2(offset, 11.0),
+                    center + egui::vec2(offset, 11.0 - height),
+                ], stroke);
+            }
+        }
     }
 }
 
@@ -278,16 +294,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wheel_picks_only_live_sectors() {
-        let center = egui::pos2(300.0, 300.0);
-        let inner = 64.0;
-        let outer = 200.0;
-        assert_eq!(tool_at(center + egui::vec2(0.0, -140.0), center, inner, outer), Some(DevTool::Trace));
-        assert_eq!(tool_at(center + egui::vec2(140.0, 0.0), center, inner, outer), Some(DevTool::DrawEntities));
-        assert_eq!(tool_at(center + egui::vec2(0.0, 140.0), center, inner, outer), Some(DevTool::EntityViewer));
-        assert_eq!(tool_at(center + egui::vec2(-140.0, 0.0), center, inner, outer), Some(DevTool::RemapShader));
-        assert_eq!(tool_at(center, center, inner, outer), None);
-        assert_eq!(tool_at(center + egui::vec2(250.0, 0.0), center, inner, outer), None);
-        assert_eq!(tool_at(center + egui::vec2(100.0, -100.0), center, inner, outer), None);
+    fn relative_wheel_always_selects_a_sector() {
+        // One default choice exists even before the mouse moves.
+        assert_eq!(tool_at(egui::Vec2::ZERO), DevTool::Trace);
+        for (index, tool) in DevTool::ALL.iter().copied().enumerate() {
+            let angle = -FRAC_PI_2 + index as f32 * SECTOR_ANGLE;
+            let direction = egui::vec2(angle.cos(), angle.sin());
+            for radius in [0.001, 0.15, 0.7, 1.15, 10.0] {
+                assert_eq!(tool_at(direction * radius), tool);
+            }
+        }
+        // The graphics still show small separators, but they are no longer
+        // unselectable wedges. Each boundary belongs to a neighboring sector.
+        for index in 0..DevTool::ALL.len() {
+            let boundary = -FRAC_PI_2 + (index as f32 + 0.5) * SECTOR_ANGLE;
+            let direction = egui::vec2(boundary.cos(), boundary.sin());
+            assert!(DevTool::ALL.contains(&tool_at(direction * 0.7)));
+        }
     }
 }

@@ -51,6 +51,18 @@ impl App {
             self.video.lightmap_only,
         );
 
+        theme::row(
+            ui,
+            "BSP shader complexity heatmap",
+            "r_shaderComplexity: estimated per-stage shader/material cost. Adds per-fragment estimated stage cost into a separate GPU buffer, including overlapping BSP stages. BSP-only; not hardware GPU time or instructions. Off adds no render passes or diagnostic shader modules.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.shader_complexity) {
+                    let _ = self.set_console_cvar("r_shaderComplexity", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+
         let supported = self.wireframe_supported;
         if !supported {
             theme::hint(

@@ -637,6 +637,11 @@ fn minimal_key() -> WorldShaderVariantKey {
         deluxe: false,
         deluxe_specular: false,
         detail_textures_enabled: false,
+        surface_deformation: false,
+        dynamic_light_debug: false,
+        material_specialization: false,
+        minimal_entries: false,
+        sky_debug: false,
     }
 }
 
@@ -650,9 +655,11 @@ fn specialized_lean_module(key: WorldShaderVariantKey) -> Module {
     )
     .validate(&module)
     .expect("bsp_lean validates");
+    // Audit the DrawClass::Opaque program (create_world_pipeline adds this per class).
     let constants: naga::back::PipelineConstants = key
         .compilation_constants()
         .into_iter()
+        .chain([("ENABLE_ALPHA_TEST", 0.0)])
         .map(|(name, value)| (name.to_owned(), value))
         .collect();
     let (specialized, _) =
@@ -680,22 +687,6 @@ fn fast_module() -> Module {
 /// runtime`): naga lowers `&&`/`||` as short-circuit control flow, so a constant
 /// on the right cannot fold the result.
 const ALLOWED_FRAGMENT_SETTINGS_BRANCHES: &[(&str, &str)] = &[
-    (
-        "shade_surface_deformation: surface_deformation.header",
-        "Snowflow/footprint data is per surface; identical in the bsp_fast reference",
-    ),
-    (
-        "shade_snowflow_state: surface_deformation.snowflow_params, surface_deformation.snowflow_params2",
-        "same as bsp_fast",
-    ),
-    ("shade_stock_2d_footprints: surface_deformation.header", "same as bsp_fast"),
-    (
-        "shade_stock_2d_footprints: surface_deformation.header, surface_deformation.stamps",
-        "same as bsp_fast",
-    ),
-    ("shade_stock_2d_footprints: surface_deformation.stamps", "same as bsp_fast"),
-    ("snowflow_falloff: surface_deformation.snowflow_header", "same as bsp_fast"),
-    ("snowflow_sample_uv: surface_deformation.snowflow_header", "same as bsp_fast"),
 ];
 
 /// Bindings the minimal lean fragment shader may still read beyond what
@@ -802,10 +793,13 @@ fn minimal_world_variant_shader_audit() {
 fn every_declared_world_override_is_supplied_by_the_variant_key() {
     // Declared in bsp_lean.wgsl but referenced nowhere; safe to delete, kept out of
     // the way of that file's owner.
-    const EXEMPT: &[&str] = &["ENABLE_CLOUD_SHADOWS"];
+    // ENABLE_ALPHA_TEST is supplied per pipeline class by create_world_pipeline.
+    const EXEMPT: &[&str] = &["ENABLE_CLOUD_SHADOWS", "ENABLE_ALPHA_TEST"];
+    // MATERIAL_KEY_* are supplied per specialized PSO by MaterialFragmentKey.
     let supplied: BTreeSet<&str> = minimal_key()
         .compilation_constants()
         .into_iter()
+        .chain(super::MaterialFragmentKey::default().compilation_constants())
         .map(|(name, _)| name)
         .collect();
     let mut missing = Vec::new();
@@ -909,4 +903,93 @@ fn world_pass_pipeline_dependencies_are_exact() {
                make(deluxe, base, native, format, 1));
     assert_ne!(make(minimal, base, native, format, 1),
                make(minimal, WorldPipelinePass::Base { authored_fog: true }, native, format, 1));
+}
+
+/// r_fragmentShaderMode 1: every world shader (lean, enhanced) must accept the
+/// material-key overrides for the entry points a specialized PSO uses, and the key
+/// must narrow only bits whose code the global variant compiles out.
+#[test]
+fn material_specialized_world_shaders_validate() {
+    use super::MaterialFragmentKey;
+    // Plain lightmapped wall, alpha-tested mask with vertex alpha, and an
+    // rgbGen wave + tcGen environment transparent stage.
+    let keys = [
+        (MaterialFragmentKey::from_material([0, 0, 2 | 4 | 16777216 | 33554432, 0], 0.0), false),
+        (MaterialFragmentKey::from_material([0, 1, 1 | 1048576 | 1073741824, 0], 0.5), true),
+        (MaterialFragmentKey::from_material([3, 2, 134217728 | 268435456 | 536870912, 4], -0.5), true),
+    ];
+    for (name, base) in [
+        ("bsp_lean", include_str!("../../bsp_lean.wgsl")),
+        ("bsp", include_str!("../../bsp.wgsl")),
+    ] {
+        let source = compose_world_shader(base);
+        let module = naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{name} validates: {e:?}"));
+        for &(key, alpha_test) in &keys {
+            let key = key.for_variant(minimal_key(), alpha_test);
+            let constants: naga::back::PipelineConstants = minimal_key()
+                .compilation_constants()
+                .into_iter()
+                .chain([("ENABLE_ALPHA_TEST", f64::from(u8::from(alpha_test)))])
+                .chain(key.compilation_constants())
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect();
+            let minimal: &[(ShaderStage, &str)] = if name == "bsp_lean" {
+                &[(ShaderStage::Fragment, "fs_world_minimal"), (ShaderStage::Vertex, "vs_world_minimal")]
+            } else {
+                &[]
+            };
+            for &(stage, entry) in [
+                (ShaderStage::Fragment, "fs_main"),
+                (ShaderStage::Fragment, "fs_main_legacy_fog"),
+                (ShaderStage::Fragment, "fs_legacy_srgb_three_stage"),
+                (ShaderStage::Vertex, "vs_main"),
+            ].iter().chain(minimal) {
+                naga::back::pipeline_constants::process_overrides(
+                    &module, &info, Some((stage, entry)), &constants,
+                )
+                .unwrap_or_else(|e| panic!("{name} {entry} {key:?}: {e:?}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn material_fragment_key_narrows_only_compiled_out_bits() {
+    use super::MaterialFragmentKey;
+    let pbr_normal_map = 8;
+    let planar = 4096;
+    let full = MaterialFragmentKey::from_material([0, 0, 2 | pbr_normal_map | planar, 2 | 4], 0.25);
+    assert_eq!(full.alpha_func, 2);
+    let minimal = full.for_variant(minimal_key(), true);
+    // Bits that only feed compiled-out code leave both the value and the mask, so
+    // they are read from the uniform rather than fixed to a wrong constant.
+    assert_eq!(minimal.flags_mask & (pbr_normal_map | planar), 0);
+    assert_eq!(minimal.flags & (pbr_normal_map | planar), 0);
+    assert_eq!(minimal.flags_w_mask & (2 | 4), 0);
+    assert_eq!(minimal.flags & 2, 2);
+    assert_eq!(minimal.alpha_func, 2);
+    let mut pbr = minimal_key();
+    pbr.pbr = true;
+    assert_eq!(full.for_variant(pbr, true).flags & pbr_normal_map, pbr_normal_map);
+    // Opaque pipelines are compiled without the alpha test.
+    assert_eq!(full.for_variant(minimal_key(), false).alpha_func, 0);
+    // TaystJK-style classification: on Minimal only the live stage bits split
+    // PSOs; tcGen stays dynamic unless static AO or planar reads it.
+    let wall = MaterialFragmentKey::from_material([0, 0, 2 | 4 | 16777216 | 33554432 | 131072, 0], 0.0)
+        .for_variant(minimal_key(), false);
+    assert_eq!(wall.flags, 2);
+    assert_eq!(wall.tc_gen, u32::MAX);
+    let mut ao = minimal_key();
+    ao.static_bsp_ao = true;
+    let wall_ao = MaterialFragmentKey::from_material([1, 0, 2 | 131072, 0], 0.0).for_variant(ao, false);
+    assert_eq!((wall_ao.flags, wall_ao.tc_gen), (2 | 131072, 1));
+    assert_eq!(MaterialFragmentKey::from_material([0; 4], -0.5).alpha_func, 3);
+    assert_eq!(MaterialFragmentKey::from_material([0; 4], 0.0).alpha_func, 1);
 }

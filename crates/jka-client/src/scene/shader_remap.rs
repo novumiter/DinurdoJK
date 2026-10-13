@@ -5,8 +5,9 @@
 //! remap branch in the renderer's per-frame/per-draw hot path.
 
 use super::{
-    material_batches::append_material_batches, materials, AssetSearchPath, BTreeMap, DrawBatch,
-    PreparedMap, SurfaceMaterial, Textures,
+    material_batches::{append_material_batches, fuse_prepared_additive_batches, has_unfused_additive_batches},
+    materials, AssetSearchPath, BTreeMap, DrawBatch,
+    InlineModelGeometry, PreparedMap, SurfaceMaterial, Textures,
 };
 use crate::materials::StageTexture;
 use std::path::Path;
@@ -40,6 +41,12 @@ impl ShaderRemapState {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.redirects.is_empty() && self.time_offsets.is_empty()
+    }
+
+    /// Local and server-provided shader redirects for console diagnostics.
+    /// Material hot paths consume already-resolved batches, not this iterator.
+    pub(crate) fn redirects(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.redirects.iter().map(|(from, to)| (from.as_str(), to.as_str()))
     }
 
     /// Port of R_RemapShader's state mutation. `time_offset=None` is the local
@@ -213,6 +220,127 @@ fn rebuild_batches(
     out
 }
 
+/// Rebuild stage lists separately for each inline model. A shader remap (or
+/// reverse-lightmap fold) can change a material from N stages to M stages;
+/// preserving old `InlineModelGeometry::batches` ranges would then index into
+/// the wrong model, or past the end of the rebuilt batch vector during upload.
+/// Keep the invariant that every model owns a contiguous, exact batch range.
+fn rewrite_inline_model_batches<T>(
+    source: &[T],
+    models: &[InlineModelGeometry],
+    mut rewrite: impl FnMut(&[T]) -> Vec<T>,
+) -> (Vec<T>, Vec<InlineModelGeometry>) {
+    let mut batches = Vec::with_capacity(source.len());
+    let mut remapped_models = Vec::with_capacity(models.len());
+    let mut previous_end = 0;
+    for original in models {
+        debug_assert_eq!(original.batches.start, previous_end);
+        debug_assert!(original.batches.end <= source.len());
+        let start = batches.len();
+        batches.extend(rewrite(&source[original.batches.clone()]));
+        let mut model = original.clone();
+        model.batches = start..batches.len();
+        remapped_models.push(model);
+        previous_end = original.batches.end;
+    }
+    debug_assert_eq!(previous_end, source.len());
+    (batches, remapped_models)
+}
+
+/// Expand the original authored additive stages retained inside each fused draw.
+/// Unlike disabling blend work, this restores every stage (and its separate draw)
+/// without reparsing shaders or BSP geometry. The prepared map cache remains fused.
+pub(crate) fn expand_additive_batches(source: &[DrawBatch]) -> Vec<DrawBatch> {
+    let mut out = Vec::with_capacity(source.iter().map(|b| 1 + b.additive_companions.len()).sum());
+    for original in source {
+        let mut primary = original.clone();
+        primary.pipeline.additive_fusion_count = 0;
+        primary.additive_companions.clear();
+        out.push(primary);
+        for companion in &original.additive_companions {
+            let mut stage = companion.clone();
+            stage.pipeline.additive_fusion_count = 0;
+            stage.additive_companions.clear();
+            out.push(stage);
+        }
+    }
+    out
+}
+
+/// Reapply compatible additive stage fusion on a derived presentation map.
+/// Handles a cache that was authored or uploaded with separate stage batches,
+/// and is safe on a map whose stages are already fused. Since the batch count
+/// can change, rebuild inline ranges and AUTO-4 portal lookup tables.
+pub(crate) fn fuse_additive_stage_fusion_in_place(map: &mut PreparedMap) -> usize {
+    // On the normal path stage fusion already ran on the map worker. Avoid
+    // cloning world/PVS/inline batches unless a cold cache really needs repair.
+    if !has_unfused_additive_batches(&map.batches)
+        && !has_unfused_additive_batches(&map.pvs_batches)
+        && !has_unfused_additive_batches(&map.inline_batches)
+    {
+        return 0;
+    }
+    let (coarse, saved_coarse) = fuse_prepared_additive_batches(&map.batches);
+    let (pvs, saved_pvs) = fuse_prepared_additive_batches(&map.pvs_batches);
+    let mut saved_inline = 0usize;
+    let (inline, models) = rewrite_inline_model_batches(
+        &map.inline_batches,
+        &map.inline_models,
+        |source| {
+            let (draws, saved) = fuse_prepared_additive_batches(source);
+            saved_inline += saved;
+            draws
+        },
+    );
+    let saved_total = saved_coarse + saved_pvs + saved_inline;
+    if saved_total == 0 {
+        return 0;
+    }
+    map.batches = coarse;
+    map.pvs_batches = pvs;
+    map.inline_batches = inline;
+    map.inline_models = models;
+    if let Some(visibility) = &map.visibility {
+        map.portal_draw_plan = super::visibility::build_prepared_portal_draw_plan(
+            &map.batches, &map.pvs_batches, visibility, &map.vertices, |_| {},
+        );
+    } else {
+        map.portal_draw_plan = Default::default();
+    }
+    saved_total
+}
+
+/// Restore fully independent additive stages on the presentation copy only.
+/// Inline model batch ranges and AUTO-4 portal indices must be rebuilt because
+/// expanding 2/3-stage composites changes the number of stage batches.
+pub(crate) fn expand_additive_stage_fusion_in_place(map: &mut PreparedMap) -> usize {
+    let fused_count: usize = map.batches.iter()
+        .chain(map.pvs_batches.iter())
+        .chain(map.inline_batches.iter())
+        .map(|b| b.additive_companions.len())
+        .sum();
+    if fused_count == 0 {
+        return 0;
+    }
+    map.batches = expand_additive_batches(&map.batches);
+    map.pvs_batches = expand_additive_batches(&map.pvs_batches);
+    let (inline, models) = rewrite_inline_model_batches(
+        &map.inline_batches,
+        &map.inline_models,
+        expand_additive_batches,
+    );
+    map.inline_batches = inline;
+    map.inline_models = models;
+    if let Some(visibility) = &map.visibility {
+        map.portal_draw_plan = super::visibility::build_prepared_portal_draw_plan(
+            &map.batches, &map.pvs_batches, visibility, &map.vertices, |_| {},
+        );
+    } else {
+        map.portal_draw_plan = Default::default();
+    }
+    fused_count
+}
+
 /// Re-resolve all currently active redirects into an already-prepared map.
 /// The caller must supply an unremapped map: stage flattening is rebuilt from
 /// its original batches so `old -> old` restores the authored material exactly.
@@ -276,10 +404,15 @@ pub(crate) fn apply_shader_remaps_in_place(
     // an initial CS_SHADERSTATE never causes an unnecessary second world upload.
     let source_batches = map.batches.clone();
     let source_pvs_batches = map.pvs_batches.clone();
-    let source_inline_batches = map.inline_batches.clone();
+    let (inline_batches, inline_models) = rewrite_inline_model_batches(
+        &map.inline_batches,
+        &map.inline_models,
+        |source| rebuild_batches(map, source, state, &replacements),
+    );
     map.batches = rebuild_batches(map, &source_batches, state, &replacements);
     map.pvs_batches = rebuild_batches(map, &source_pvs_batches, state, &replacements);
-    map.inline_batches = rebuild_batches(map, &source_inline_batches, state, &replacements);
+    map.inline_batches = inline_batches;
+    map.inline_models = inline_models;
 
     if let Some(visibility) = &map.visibility {
         map.portal_draw_plan = super::visibility::build_prepared_portal_draw_plan(
@@ -348,7 +481,13 @@ pub(in crate::scene) fn fold_reverse_lightmap_batches(source: &[DrawBatch]) -> (
             // Equivalent to stage_batch(material, second-without-blend,
             // first=true) in the existing folded forward-modulation path.
             let mut fused = group[1].clone();
-            fused.pipeline.class = super::DrawClass::Opaque;
+            // Opaque pipelines are compiled without the alpha test; a folded
+            // stage that still carries an alphaFunc cutoff stays Mask.
+            fused.pipeline.class = if fused.alpha_cutoff != 0.0 {
+                super::DrawClass::Mask
+            } else {
+                super::DrawClass::Opaque
+            };
             fused.pipeline.blend = super::BlendMode::Opaque;
             fused.pipeline.depth_write = true;
             fused.modulate_lightmap = true;
@@ -379,10 +518,20 @@ pub(in crate::scene) fn fold_reverse_lightmap_batches(source: &[DrawBatch]) -> (
 pub(crate) fn apply_reverse_lightmap_collapse_in_place(map: &mut PreparedMap) -> usize {
     let (coarse, count) = fold_reverse_lightmap_batches(&map.batches);
     let (full, full_count) = fold_reverse_lightmap_batches(&map.pvs_batches);
-    let (inline, inline_count) = fold_reverse_lightmap_batches(&map.inline_batches);
+    let mut inline_count = 0;
+    let (inline, inline_models) = rewrite_inline_model_batches(
+        &map.inline_batches,
+        &map.inline_models,
+        |source| {
+            let (batches, count) = fold_reverse_lightmap_batches(source);
+            inline_count += count;
+            batches
+        },
+    );
     map.batches = coarse;
     map.pvs_batches = full;
     map.inline_batches = inline;
+    map.inline_models = inline_models;
     // AUTO 4 plans refer to FULL indices. A recipe count change invalidates
     // their indices, so reconstruct the plan, not just its representative.
     if let Some(visibility) = &map.visibility {
@@ -393,4 +542,54 @@ pub(crate) fn apply_reverse_lightmap_collapse_in_place(map: &mut PreparedMap) ->
         map.portal_draw_plan = Default::default();
     }
     count + full_count + inline_count
+}
+
+#[cfg(test)]
+mod inline_batch_range_tests {
+    use super::*;
+
+    #[test]
+    fn shader_remap_stage_count_changes_update_each_inline_model_range() {
+        // Original models have five shader-stage batches and three batches.
+        let models = [
+            InlineModelGeometry { model: 1, vertices: 0..18, batches: 0..5 },
+            InlineModelGeometry { model: 2, vertices: 18..30, batches: 5..8 },
+        ];
+        let source = [1, 2, 3, 4, 5, 6, 7, 8];
+        // Five-stage fish material -> one-stage replacement; a later material
+        // expands from three to six stages. Both changes must adjust offsets.
+        let (batches, models) = rewrite_inline_model_batches(&source, &models, |old| {
+            if old[0] == 1 { vec![10] } else { vec![20, 21, 22, 23, 24, 25] }
+        });
+        assert_eq!(batches, [10, 20, 21, 22, 23, 24, 25]);
+        assert_eq!(models[0].batches, 0..1);
+        assert_eq!(models[1].batches, 1..7);
+        assert_eq!(models[0].vertices, 0..18);
+        assert_eq!(models[1].vertices, 18..30);
+        assert_eq!(models[0].model, 1);
+        assert_eq!(models[1].model, 2);
+
+        // A second rebuild (e.g. reverse-lightmap collapse) must use the
+        // updated ranges and cannot revive the stale 0..5 / 5..8 offsets.
+        let (folded, models) = rewrite_inline_model_batches(&batches, &models, |old| {
+            if old[0] == 10 { old.to_vec() } else { vec![30, 31] }
+        });
+        assert_eq!(folded, [10, 30, 31]);
+        assert_eq!(models[0].batches, 0..1);
+        assert_eq!(models[1].batches, 1..3);
+    }
+
+    #[test]
+    fn inline_range_rewrite_supports_empty_replacement_without_stale_indices() {
+        let models = [
+            InlineModelGeometry { model: 3, vertices: 0..3, batches: 0..2 },
+            InlineModelGeometry { model: 4, vertices: 3..6, batches: 2..3 },
+        ];
+        let (batches, models) = rewrite_inline_model_batches(&[1, 2, 3], &models, |old| {
+            if old[0] == 1 { vec![] } else { old.to_vec() }
+        });
+        assert_eq!(batches, [3]);
+        assert_eq!(models[0].batches, 0..0);
+        assert_eq!(models[1].batches, 0..1);
+    }
 }

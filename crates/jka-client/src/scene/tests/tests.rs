@@ -505,6 +505,45 @@ fn authored_three_stage_vertex_overlay_uses_single_encoded_rgb_draw() {
 }
 
 #[test]
+fn fourth_shader_stage_survives_safe_three_stage_prefix_fusion() {
+    let [lightmap, rock] = legacy_lightmap_modulate_pair(false);
+    let overlay = MaterialStage {
+        texture: StageTexture::Image(31),
+        blend: Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha,
+        }),
+        alpha_gen: AlphaGen::Vertex,
+        ..rock.clone()
+    };
+    // The animated glow suffix is NOT fused. The first three safe stages
+    // should still fold to one, and the fourth remains exactly authored.
+    let suffix = MaterialStage {
+        texture: StageTexture::Image(42),
+        blend: Some(materials::BlendFunc {
+            src: BlendFactor::One, dst: BlendFactor::One,
+        }),
+        glow: true,
+        tc_mods: vec![TcMod::Scroll(0.1, 0.2)],
+        ..rock.clone()
+    };
+    let material = SurfaceMaterial {
+        stages: vec![lightmap, rock, overlay, suffix],
+        explicit: true,
+        ..Default::default()
+    };
+    let mut batches = Vec::new();
+    super::material_batches::append_material_batches_unflagged(
+        &mut batches, &material, 69, Some(0), false, 0..3,
+        Some(52), &[], [0; 4], [0.0; 4], false,
+    );
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0].legacy_srgb_overlay, Some(31));
+    assert_eq!(batches[1].texture, Some(42));
+    assert!(batches[1].authored_glow);
+    assert_eq!(batches[1].tc_mods.len(), 1);
+}
+
+#[test]
 fn multi_stage_water_uses_encoded_additive_without_losing_authored_stage_order() {
     // sephtestmap/oceanwater uses five animated additive stages. The ordinary
     // BSP renderer must preserve all draws and their independent tcMods.
@@ -1734,4 +1773,69 @@ fn multiple_environment_layers_remain_an_authored_effect() {
     let material = SurfaceMaterial { explicit: true, stages: vec![first.clone(), second], ..Default::default() };
     assert!(authored_environment_composite(&material, &first));
     assert!(!material_has_promotable_environment_stage(&material));
+}
+
+#[test]
+fn remapped_clear_bsp_surface_has_no_wireframe_but_keeps_geometry() {
+    let clear_stage = MaterialStage {
+        texture: StageTexture::White,
+        animation: None,
+        enhancements: Default::default(),
+        blend: Some(materials::BlendFunc {
+            src: BlendFactor::Zero,
+            dst: BlendFactor::One,
+        }),
+        alpha_cutoff: 0.0,
+        opacity: 1.0,
+        color: [1.0; 3],
+        rgb_gen: RgbGen::Identity,
+        alpha_gen: AlphaGen::Identity,
+        tc_gen: TcGen::Base,
+        tc_mods: Vec::new(),
+        depth_write: false,
+        depth_equal: false,
+        glow: false,
+    };
+    let clear = SurfaceMaterial {
+        stages: vec![clear_stage.clone()],
+        explicit: true,
+        ..Default::default()
+    };
+    let mut batches = Vec::new();
+    append_material_batches(
+        &mut batches, &clear, 27, None, true, 0..9360, None,
+        &[], [0; 4], [0.0; 4], false,
+    );
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].vertices, 0..9360);
+    assert!(!batches[0].contributes_to_world_wireframe());
+
+    // Re-resolve the same preserved BSP vertices when a server removes or
+    // replaces the clear remap: the wireframe must come back immediately.
+    let visible = SurfaceMaterial {
+        stages: vec![MaterialStage { blend: None, ..clear_stage.clone() }],
+        ..clear.clone()
+    };
+    let mut restored = Vec::new();
+    append_material_batches(
+        &mut restored, &visible, 27, None, true, 0..9360, None,
+        &[], [0; 4], [0.0; 4], false,
+    );
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].vertices, batches[0].vertices);
+    assert!(restored[0].contributes_to_world_wireframe());
+
+    // An otherwise invisible RGB pass is not discarded if it explicitly
+    // writes depth, because it still has a framebuffer-visible effect.
+    let depth_only = SurfaceMaterial {
+        stages: vec![MaterialStage { depth_write: true, ..clear_stage }],
+        ..clear
+    };
+    let mut depth_batches = Vec::new();
+    append_material_batches(
+        &mut depth_batches, &depth_only, 27, None, true, 0..9360, None,
+        &[], [0; 4], [0.0; 4], false,
+    );
+    assert_eq!(depth_batches.len(), 1);
+    assert!(depth_batches[0].contributes_to_world_wireframe());
 }

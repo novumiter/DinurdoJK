@@ -417,6 +417,8 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) cloud_shadow_sun: [f32; 4],
     /// Whether the colour pipelines were built with ENABLE_LEGACY_FOG.
     pub(in crate::renderer) legacy_fog_compiled: bool,
+    /// ENABLE_MODEL_WET in the model pipelines (see `set_model_wet`).
+    pub(in crate::renderer) model_wet_compiled: bool,
     pub(in crate::renderer) pipeline_layout: wgpu::PipelineLayout,
     pub(in crate::renderer) shader: wgpu::ShaderModule,
     pub(in crate::renderer) wireframe_pipeline: Option<wgpu::RenderPipeline>,

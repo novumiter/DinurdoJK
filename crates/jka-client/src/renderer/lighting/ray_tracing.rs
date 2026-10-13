@@ -695,12 +695,14 @@ pub(in crate::renderer) fn hash_rt_transform(hasher: &mut impl Hasher, transform
 pub(in crate::renderer) fn rt_dynamic_scene_signature(
     world: &WorldGpu,
     inline_slot_count: usize,
+    draw_inline_models: bool,
     static_mask_present: bool,
     dynamic_models: &[DynamicModelSurface],
     dynamic_instance_capacity: usize,
 ) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     inline_slot_count.hash(&mut hasher);
+    draw_inline_models.hash(&mut hasher);
     static_mask_present.hash(&mut hasher);
     for (slot, model) in world
         .inline_models
@@ -712,7 +714,7 @@ pub(in crate::renderer) fn rt_dynamic_scene_signature(
         model.model.hash(&mut hasher);
         model.rt_indices.is_empty().hash(&mut hasher);
         model.rt_mask_sources.is_empty().hash(&mut hasher);
-        match inline_rt_pose(model) {
+        match if draw_inline_models { inline_rt_pose(model) } else { None } {
             Some(pose) => {
                 true.hash(&mut hasher);
                 hash_rt_transform(&mut hasher, pose.rt_transform());
@@ -1016,7 +1018,7 @@ impl Renderer {
             let Some(model) = world.inline_models.get(slot) else {
                 continue;
             };
-            let Some(pose) = inline_rt_pose(model) else {
+            let Some(pose) = (if self.draw_inline_models { inline_rt_pose(model) } else { None }) else {
                 continue;
             };
             let base = inline_base + slot * 2;
@@ -1329,6 +1331,7 @@ impl Renderer {
         let signature = rt_dynamic_scene_signature(
             world,
             rt_read.inline_slot_count,
+            self.draw_inline_models,
             rt_read.static_mask_blas.is_some(),
             dynamic_models,
             rigid_capacity,
@@ -1337,7 +1340,11 @@ impl Renderer {
             .inline_models
             .iter()
             .take(rt_read.inline_slot_count)
-            .map(|model| inline_rt_pose(model).map(|pose| pose.rt_transform()))
+            .map(|model| if self.draw_inline_models {
+                inline_rt_pose(model).map(|pose| pose.rt_transform())
+            } else {
+                None
+            })
             .collect::<Vec<_>>();
         // A deforming BLAS must be rebuilt even when entity transforms did not
         // change, because the current animation pose may have changed.
@@ -2017,8 +2024,8 @@ pub(in crate::renderer) fn ray_traced_world_shader_source_with_features(
     // enabled. The RT sun is not a cascade, so open that gate for it. Absent in
     // bsp.wgsl, which keeps the block unconditional; the no-op replace is fine.
     source = source.replacen(
-        "    if (ENABLE_CASCADED_SHADOWS && (material.header.z & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
-        "    if ((ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && (material.header.z & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
+        "    if (ENABLE_CASCADED_SHADOWS && (material_flags() & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
+        "    if ((ENABLE_CASCADED_SHADOWS || ENABLE_RAY_TRACED_SUN) && (material_flags() & 4u) != 0u) {\n        let shadow_rgb = sun_shadow_transmission(",
         1,
     );
 

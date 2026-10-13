@@ -278,6 +278,9 @@ pub struct SurfaceMaterial {
     pub shader_light: Option<ShaderLightPromotion>,
     /// Procedural per-blade grass emitted by a JKA `surfaceSprites vertical` stage.
     pub grass: Option<GrassMaterial>,
+    /// Grass-compatible vertical stages, retained independently instead of
+    /// treating the first vertical sprite (possibly a billboard tree) as grass.
+    pub grass_stages: Vec<GrassMaterial>,
     /// Raven QuickSprite effect stages retained separately from ordinary BSP
     /// material passes so they can be distributed over triangles at runtime.
     pub surface_sprite_effects: Vec<SurfaceSpriteEffectMaterial>,
@@ -323,6 +326,7 @@ impl Default for SurfaceMaterial {
             surface_light: None,
             shader_light: None,
             grass: None,
+            grass_stages: Vec::new(),
             surface_sprite_effects: Vec::new(),
             surface_sprite_cull_quirk: false,
             auto_sprite2: false,
@@ -461,7 +465,7 @@ impl TextureReaders {
                 for name in candidates {
                     let asset = assets
                         .read_stock(name, MAX_TEXTURE_FILE_BYTES)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|error| format!("{name}: {error}"))?;
                     if let Some(asset) = asset {
                         return Ok(Some((name.clone(), asset.source, asset.bytes)));
                     }
@@ -470,7 +474,7 @@ impl TextureReaders {
             for name in candidates {
                 let asset = assets
                     .read(name, MAX_TEXTURE_FILE_BYTES)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|error| format!("{name}: {error}"))?;
                 if let Some(asset) = asset {
                     return Ok(Some((name.clone(), asset.source, asset.bytes)));
                 }
@@ -1061,7 +1065,14 @@ impl Textures {
             match outcome {
                 // Not found anywhere: leave it uncached so a later load can warn.
                 TexturePreloadOutcome::Missing => {}
-                TexturePreloadOutcome::ReadError(error) => return Err(error),
+                TexturePreloadOutcome::ReadError(error) => {
+                    // Mirror normal texture loading: an unreadable image is
+                    // unavailable, not a fatal error for the entire map. This
+                    // includes malformed PK3 entries that fail ZIP CRC checks.
+                    self.load_failures.insert(key.clone(), error.clone());
+                    self.warnings.push(format!("Texture preload: {error}"));
+                    self.cache.insert(key, None);
+                },
                 TexturePreloadOutcome::Decoded(Ok((image, decode_ms, mip_ms, hash))) => {
                     let format = match image.label.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
                         "tga" => Some(0),
@@ -2476,6 +2487,7 @@ pub fn describe(
     };
     let mut stages = Vec::new();
     let mut grass = None;
+    let mut grass_stages = Vec::new();
     let mut surface_sprite_effects = Vec::new();
     // Removing a stage must not accidentally remove the opaque/depth seed for
     // the whole material. Scene preparation intentionally gives only the first
@@ -2506,8 +2518,21 @@ pub fn describe(
                 }
                 if let Some(sprite) = source.surface_sprite {
                     if matches!(sprite.kind, shader::SurfaceSpriteType::Vertical) {
-                        if grass.is_none() {
-                            grass = Some(GrassMaterial {
+                        // Native JKA surfaceSprites can describe grass, shrubs,
+                        // and huge billboard trees in the *same* material.
+                        // The Godot blade renderer is suitable for short cards,
+                        // not tree-sized sprites (which need their own renderer).
+                        // Classify per stage, not per parent material or by the
+                        // first encountered `surfaceSprites vertical` declaration.
+                        const MAX_GRASS_SPRITE_SIZE: f32 = 64.0;
+                        let grass_sized = sprite.width.is_finite()
+                            && sprite.height.is_finite()
+                            && sprite.width > 0.0
+                            && sprite.height > 0.0
+                            && sprite.width <= MAX_GRASS_SPRITE_SIZE
+                            && sprite.height <= MAX_GRASS_SPRITE_SIZE;
+                        if grass_sized {
+                            let candidate = GrassMaterial {
                                 authored_width: sprite.width,
                                 height: sprite.height,
                                 density: sprite.density,
@@ -2518,14 +2543,17 @@ pub fn describe(
                                     sprite.facing,
                                     shader::SurfaceSpriteFacing::AnyAngle
                                 ),
-                            });
+                            };
+                            grass.get_or_insert(candidate);
+                            grass_stages.push(candidate);
                         } else {
                             textures.warnings.push(format!(
-                                "{name}: multiple vertical surfaceSprites stages; using the first emitter"
+                                "{name}: surfaceSprites vertical {} {:.1}x{:.1} is not Godot grass; keeping it out of blade generation",
+                                source.image, sprite.width, sprite.height
                             ));
                         }
-                        // Vertical surfaceSprites is now procedural grass metadata,
-                        // never an ordinary alpha-card material pass.
+                        // Never interpret vertical surfaceSprites as ordinary
+                        // material passes stretched across the BSP polygon.
                         continue;
                     }
                     if matches!(sprite.kind, shader::SurfaceSpriteType::Effect) {
@@ -2770,6 +2798,7 @@ pub fn describe(
         surface_light,
         shader_light,
         grass,
+        grass_stages,
         surface_sprite_effects,
         surface_sprite_cull_quirk,
         auto_sprite2: definition.auto_sprite2,
@@ -3159,6 +3188,19 @@ mod tests {
         assert_eq!(grass.fade_max, 1500.0);
         assert_eq!(grass.wind, 0.5);
         assert!(material.surface_sprite_cull_quirk);
+    }
+
+    #[test]
+    fn mixed_tree_and_grass_sprites_keep_all_short_emitters() {
+        // Costa del Sol contains four huge Yavin billboard stages before its
+        // three short grass stages. The billboard cannot become a Godot blade.
+        let material = material(
+            "test {\n{\nmap $whiteimage\nblendFunc GL_ZERO GL_ONE\n}\n{\nmap models/map_objects/yavin/tree2\nsurfaceSprites vertical 256 256 1024 32768\n}\n{\nmap models/map_objects/yavin/tree08b\nsurfaceSprites vertical 1024 512 1536 32768\n}\n{\nclampmap gfx/sprites/y_grass_tall\nsurfaceSprites vertical 12 3 8 512\n}\n{\nclampmap gfx/sprites/y_grass_tall\nsurfaceSprites vertical 12 5 16 1024\n}\n{\nclampmap gfx/sprites/y_grass_tall\nsurfaceSprites vertical 48 12 256 4096\n}\n}"
+        );
+        assert_eq!(material.stages.len(), 1);
+        assert_eq!(material.grass_stages.len(), 3);
+        assert_eq!(material.grass_stages.iter().map(|g| g.height).collect::<Vec<_>>(), vec![3.0, 5.0, 12.0]);
+        assert_eq!(material.grass.unwrap().height, 3.0);
     }
 
     #[test]

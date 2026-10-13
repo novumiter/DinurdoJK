@@ -4,6 +4,7 @@ use crate::ui::GlowMode;
 use frame::plan::FramePlan;
 use lighting::legacy_dlights::legacy_dlight_runs_for_batch;
 use overlay::ScreenFxBatch;
+use world::deferred_bundles::{DeferredCommand, DeferredResources, DeferredWorldBundles};
 use world::videos::{WorldVideoPlayer, WORLD_VIDEO_MAX_CATCH_UP};
 mod api;
 mod bindings;
@@ -14,6 +15,7 @@ mod diagnostics;
 mod environment;
 mod frame;
 mod initialize;
+pub(crate) mod gpu_adapter;
 mod input_diagnostic;
 
 #[cfg(target_os = "windows")]
@@ -30,6 +32,7 @@ mod render_thread;
 mod static_ao;
 mod spectator_highlight;
 mod targets;
+mod texture_compression;
 mod textures;
 mod brightness;
 mod brightness_settings;
@@ -90,6 +93,7 @@ use environment::water::{
     is_upward_water_face, ocean_surface_key, water_surface_extent, OceanVisibility,
     MAX_OCEAN_SURFACES,
 };
+use frame::early_submit::EarlyPresentTarget;
 use frame::late_latch::{sample_view_rotation, LatestViewState, ViewSampleMeasurement};
 use input_diagnostic::{
     InputDiagFrameSample, InputDiagLatchPhase, InputDiagRendererMetadata, InputDiagnostic,
@@ -129,7 +133,9 @@ use lighting::shadow_resources::{
 use lighting::upload::{upload_reflection_probes, upload_static_light_grid, upload_voxel_probe_gi};
 use models::pipelines::{
     create_dynamic_model_pipeline_inner, create_fast_world_wireframe_pipeline,
-    create_world_pipeline, create_world_wireframe_pipeline, project_blob_shadow_mark,
+    create_world_pipeline, create_world_pipeline_specialized, create_world_wireframe_pipeline,
+    world_base_fragment_entry,
+    project_blob_shadow_mark,
 };
 pub(crate) use models::types::{EntityLegacyFog, EntityWeather};
 use models::types::{
@@ -229,6 +235,7 @@ use visibility::pvs::{
     visible_batches_by_cluster,
 };
 use visibility::readback::CullDiagnosticsReadback;
+use visibility::settings::{fast_sky_clear_color, world_blend_probe_bucket, world_stage_probe_excludes};
 use world::bindings::{
     advance_world_animations, build_world_animation, create_fast_world_bind_group,
     create_world_bind_group, rebuild_world_bind_groups, sync_auto4_bind_groups,
@@ -247,7 +254,7 @@ use world::geometry::{
 #[cfg(test)]
 use world::inline_models::plan_inline_runs;
 use world::inline_models::{
-    inline_run_fog_depth, inline_stage_info, pack_inline_draws, InlineDrawScratch,
+    hidden_inline_batch, inline_run_fog_depth, inline_stage_info, pack_inline_draws, InlineDrawScratch,
 };
 use world::pipelines::{
     create_depth_prepass_mask_pipeline, create_depth_prepass_pipeline,
@@ -256,9 +263,11 @@ use world::pipelines::{
     create_rain_depth_prepass_pipeline,
     create_legacy_dlight_pass_pipelines, create_legacy_fog_pass_pipelines,
     create_reflection_fog_pass_pipelines, create_reflection_pipelines,
-    create_world_pipeline_variant_from_plan, create_world_pipelines, legacy_dlight_receives,
+    create_world_pipeline_variant_from_plan, create_world_pipelines, create_shader_complexity_pipelines, legacy_dlight_receives,
     WorldPipelineReuseCatalog,
     legacy_fog_pass_jobs, material_uniform, ocean_pipeline_key, same_world_surface,
+    create_specialized_world_pipelines, material_specialization_eligible, material_specialization_jobs,
+    is_sky_cloud_stage,
 };
 #[cfg(test)]
 use world::pipelines::{WorldPassPipelineIdentity, WorldPipelinePass};
@@ -267,6 +276,7 @@ use world::types::{
     PlanarReflectionView, PlanarReflector, PlanarReflectorKind, ReflectionProbeGpuSet,
     RuntimeOceanClipmap, OceanPromotionDecision,
     StaticLightGridGpu, UniformArena, UniformSlot, VoxelProbeGiGpu, WorldBatch, WorldBatchSet,
+    WorldPipelineBinding,
     WorldAnimationFrame, WorldBatchAnimation,
     WorldDrawGroup, WorldGpu, WorldPipelineCompilePlan, WorldPipelineVariant,
     STATIC_AO_ADAPTIVE_MAX_CENTER_ERROR, STATIC_AO_ADAPTIVE_MAX_VISIBILITY_RANGE,
@@ -276,7 +286,9 @@ use world::types::{
     STATIC_AO_VERTEX_BIAS,
 };
 use world::upload::build_world;
-use world::variants::{WorldRenderPath, WorldShaderFamily, WorldShaderVariantKey};
+use world::variants::{
+    MaterialFragmentKey, WorldRenderPath, WorldShaderFamily, WorldShaderVariantKey,
+};
 
 #[path = "renderer/lighting/rt_models.rs"]
 mod rt_models;
@@ -657,6 +669,8 @@ struct Renderer {
     fast_world_shader: wgpu::ShaderModule,
     wireframe_supported: bool,
     wireframe_mask: u32,
+    shader_complexity_enabled: bool,
+    shader_complexity_target: Option<diagnostics::shader_complexity::ShaderComplexityTarget>,
     pvs_mode: PvsMode,
     wireframe_pipeline_layout: wgpu::PipelineLayout,
     wireframe_shader: wgpu::ShaderModule,
@@ -722,6 +736,9 @@ struct Renderer {
     ui_transient_vertex_count: u32,
     ui_transient_stable_vertex_count: usize,
     ui_transient_vertices: Vec<UiVertex>,
+    /// Byte offset and bytes of the last uploaded transient tail (crosshair,
+    /// player names); an identical tail skips its upload.
+    ui_transient_tail_uploaded: Option<(u64, Vec<u8>)>,
     player_names: Option<ui::UiWorldPlayerNames>,
     ui_trace: bool,
     ui_state: UiSnapshot,
@@ -756,7 +773,18 @@ struct Renderer {
     /// Latched `r_picmip`. Existing worlds retain their uploaded textures;
     /// the value is consumed the next time `load_map` builds a WorldGpu.
     picmip: u32,
+    /// Latched `r_ext_compress_textures`, consumed by `load_map` and new model
+    /// textures (see texture_compression.rs).
+    texture_compression: u8,
     detail_textures_enabled: bool,
+    /// Loaded map has authored snow surfaces; gates the surface-deformation
+    /// shader variant (see `surface_deformation_shader_needed`).
+    map_has_snow_surfaces: bool,
+    /// The loaded map draws water surfaces (model wetness can come from immersion).
+    map_has_water: bool,
+    /// Model wetness was needed at some point on this map; keeps ENABLE_MODEL_WET
+    /// compiled in until the next map so models never respecialize mid-game.
+    model_wet_latched: bool,
     jump_shade: JumpShadeState,
     detail_texture_fade: bool,
     detail_texture_fade_distance: f32,
@@ -873,6 +901,10 @@ struct Renderer {
     // existing indirect buffer without per-frame allocation churn.
     cpu_compact_indirect_scratch: Vec<DrawIndexedIndirectArgs>,
     cpu_compact_count_scratch: Vec<u32>,
+    /// Bytes last uploaded by CPU compaction (indirect args, then counts) and
+    /// the args buffer they went to. An unchanged frame skips both uploads: each
+    /// queue write is its own GPU copy (~9-14 us apiece on a UHD 630).
+    cpu_compact_uploaded: Option<(wgpu::Buffer, Vec<u8>)>,
     reflection_compact_scratch: Vec<DrawIndexedIndirectArgs>,
     /// Per compact group for the current reflection slot: (first packed
     /// entry, entry count). A drawn group's count is reset to 0.
@@ -885,10 +917,39 @@ struct Renderer {
     post_ocean_transparent_scratch: Vec<usize>,
     inline_pose_scratch: Vec<Vec<InlineModelInstance>>,
     inline_draw_scratch: InlineDrawScratch,
+    deferred_world_bundles: DeferredWorldBundles,
     gpu_driven_enabled: bool,
+    /// Debug A/B: omit inline BSP mover geometry, never gameplay entities.
+    draw_inline_models: bool,
+    /// Render-only classification by BSP shader qpath (not original model provenance).
+    draw_bsp_model_surfaces: bool,
+    /// 0 all, 1 opaque/masked only, 2 transparent only (diagnostic).
+    world_stage_probe: u8,
+    /// TaystJK fast-sky palette mode; never selects an alternate renderer.
+    fast_sky: u8,
+    /// Session-only sky fragment diagnostic; zero has no effect on authored rendering.
+    sky_perf_probe: u8,
     hiz_occlusion_enabled: bool,
     dynamic_lights_mode: DynamicLightsMode,
     dynamic_light_debug: bool,
+    /// r_fragmentShaderMode (see `MaterialFragmentKey`).
+    fragment_shader_mode: u8,
+    /// TaystJK-style sky box face PSOs, keyed by (scene format, MSAA, Enhanced).
+    sky_box_pipelines: Option<((wgpu::TextureFormat, u32, bool), [wgpu::RenderPipeline; 6])>,
+    /// Cloud-layer PSOs for the box sky, per authored blend; same key as above.
+    sky_cloud_pipelines: HashMap<BlendMode, wgpu::RenderPipeline>,
+    /// Index buffer of the map `sky_cloud_pipelines` was filled for.
+    sky_cloud_world: Option<wgpu::Buffer>,
+    /// r_colorClearMode: 0 always clear the world colour target, 1 skip it when
+    /// the map's sky box covers the background.
+    color_clear_mode: u8,
+    /// r_earlySubmit: see `EarlyPresentTarget`.
+    early_submit_enabled: bool,
+    /// r_presentCopy: see `Renderer::present_copy_frame`.
+    present_copy_enabled: bool,
+    /// The surface supports the UNORM twin of the sRGB render format.
+    surface_linear_present: bool,
+    early_present_target: Option<EarlyPresentTarget>,
     tinted_glass_enabled: bool,
     tinted_glass_debug: u32,
     rt_samples: u32,

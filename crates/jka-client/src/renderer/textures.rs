@@ -352,7 +352,12 @@ pub(in crate::renderer) fn rgb565_expand(value: u16) -> [u8; 3] {
 }
 
 pub(in crate::renderer) fn encode_bc3_block(pixels: &[[u8; 4]; 16], output: &mut Vec<u8>) {
-    // DXT5/BC3 alpha block.
+    encode_bc3_alpha_block(pixels, output);
+    encode_bc3_data_color_block(pixels, output);
+}
+
+/// DXT5/BC3 alpha block (8 bytes).
+pub(in crate::renderer) fn encode_bc3_alpha_block(pixels: &[[u8; 4]; 16], output: &mut Vec<u8>) {
     let alpha_max = pixels.iter().map(|p| p[3]).max().unwrap_or(255);
     let alpha_min = pixels.iter().map(|p| p[3]).min().unwrap_or(0);
     output.push(alpha_max);
@@ -391,7 +396,9 @@ pub(in crate::renderer) fn encode_bc3_block(pixels: &[[u8; 4]; 16], output: &mut
     for byte in 0..6 {
         output.push(((alpha_bits >> (8 * byte)) & 0xff) as u8);
     }
+}
 
+fn encode_bc3_data_color_block(pixels: &[[u8; 4]; 16], output: &mut Vec<u8>) {
     // BC3's RGB block always uses the four-colour BC1 interpolation mode.
     // Companion maps are data, not photographs, so preserve the full per-channel
     // range rather than choosing endpoints only from luminance extrema.

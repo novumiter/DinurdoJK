@@ -181,6 +181,82 @@ app_cvars! {
         ]
     }
 
+    APP_R_ADDITIVESTAGEFUSION {
+        runtime: CvarDef::new(
+            "r_additiveStageFusion", "", "0..1",
+            "A/B: fuse equivalent consecutive additive BSP shader stages into one draw. Default 1. Live toggle reuploads the cached render world (may briefly stall); no map reparse.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.additive_stage_fusion)),
+            |app, value| App::cvar_set_r_additivestagefusion(app, APP_R_ADDITIVESTAGEFUSION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_additivestagefusion, Some(|name, value| {
+            App::parse_cvar_bool(name, value).map(|enabled| u8::from(enabled).to_string())
+        })),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.additive_stage_fusion = parse_bool(value).unwrap_or(settings.additive_stage_fusion);
+            }),
+            archive: Some((427, |state| format!("{}", u8::from(state.video.additive_stage_fusion)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_additivestagefusion(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if enabled == self.video.additive_stage_fusion {
+                        return Ok(());
+                    }
+                    self.video.additive_stage_fusion = enabled;
+                    if let Err(error) = self.rebuild_shader_remapped_world() {
+                        self.video.additive_stage_fusion = !enabled;
+                        return Err(format!("{name}: {error}"));
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    self.console_status = format!(
+                        "ADDITIVE STAGE FUSION: {} (cached render-world swap)",
+                        if enabled { "ON" } else { "OFF" },
+                    );
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GPUADAPTER {
+        runtime: CvarDef::new(
+            "r_gpuAdapter", "", "0..3", "Graphics processor for Unified: 0 automatic, 1 dedicated, 2 integrated/APU, 3 CPU/software. Requires vid_restart.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::VidRestart,
+            |app: &App| CvarValue::String(app.video.gpu_adapter.to_string()),
+            |app, value| App::cvar_set_r_gpuadapter(app, APP_R_GPUADAPTER.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_gpuadapter, Some(|name, value| {
+            crate::renderer::gpu_adapter::parse(value)
+                .map(|v| v.to_string()).ok_or_else(|| format!("{name}: expected 0..3 (auto/dedicated/integrated/software)"))
+        })),
+        config: CvarBinding {
+            load_video: Some(|video, _name, value, _context| {
+                if let Some(mode) = crate::renderer::gpu_adapter::parse(value) { video.gpu_adapter = mode; }
+            }),
+            apply_latched: Some(|video, value| {
+                if let Some(mode) = crate::renderer::gpu_adapter::parse(value) { video.gpu_adapter = mode; }
+            }),
+            archive: Some((465, |state| state.video.gpu_adapter.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_gpuadapter(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.gpu_adapter = crate::renderer::gpu_adapter::parse(value)
+                        .ok_or_else(|| format!("{name}: expected 0..3"))?;
+                    self.mark_config_dirty();
+                    self.console_status = format!("GRAPHICS PROCESSOR: {} (APPLY VIDEO SETTINGS OR VID_RESTART)",
+                        crate::renderer::gpu_adapter::label(self.video.gpu_adapter));
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_BACKEND {
         runtime: CvarDef::new(
                 "r_backend",
@@ -735,6 +811,199 @@ app_cvars! {
                             }
                         );
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DRAWINLINEMODELS {
+        runtime: CvarDef::new("r_drawInlineModels", "", "0..1", "Render-only A/B: draw server-controlled BSP inline movers (doors, lifts, func_rotating). Does not change physics or static world.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.draw_inline_models)),
+            |app, value| App::cvar_set_r_drawinlinemodels(app, APP_R_DRAWINLINEMODELS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_drawinlinemodels, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.draw_inline_models = parse_bool(value).unwrap_or(settings.draw_inline_models);
+            }),
+            archive: Some((425, |state| format!("{}", u8::from(state.video.draw_inline_models)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_drawinlinemodels(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if self.video.draw_inline_models != enabled {
+                        self.video.draw_inline_models = enabled;
+                        self.render_command(RenderCommand::SetDrawInlineModels(enabled));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    self.console_status = format!("INLINE BSP MODELS: {}", if enabled { "ON" } else { "OFF" });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FRAGMENTSHADERMODE {
+        runtime: CvarDef::new("r_fragmentShaderMode", "", "0..2", "World pixel shader: 0 one general program for every material; 1 TaystJK-style, a specialized program per kind of stage (texture/lightmap, colour source, alpha test); 2 like 1, plus dedicated minimal vertex/pixel entry points for plain stages. Same image in every mode. Switches without a map reload once its shaders have compiled.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.fragment_shader_mode.to_string()),
+            |app, value| App::cvar_set_r_fragmentshadermode(app, APP_R_FRAGMENTSHADERMODE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_fragmentshadermode, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    settings.fragment_shader_mode = mode.min(2);
+                }
+            }),
+            archive: Some((428, |state| format!("{}", state.video.fragment_shader_mode))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_fragmentshadermode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|mode| *mode <= 2)
+                        .ok_or_else(|| format!("{name}: expected 0, 1 or 2"))?;
+                    if self.video.fragment_shader_mode != mode {
+                        self.video.fragment_shader_mode = mode;
+                        self.render_command(RenderCommand::SetFragmentShaderMode(mode));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    self.console_status = format!("FRAGMENT SHADERS: {}", match mode {
+                        1 => "TAYSTJK SPECIALIZED",
+                        2 => "SPECIALIZED + MINIMAL ENTRIES",
+                        _ => "GENERAL",
+                    });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_COLORCLEARMODE {
+        runtime: CvarDef::new("r_colorClearMode", "", "0..1", "World colour clear: 0 clear every frame, 1 skip it when every sky on the map draws a sky box or the map has no sky (vanilla/TaystJK behaviour; holes into the void then show the previous frame). Fastsky always clears.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.color_clear_mode.to_string()),
+            |app, value| App::cvar_set_r_colorclearmode(app, APP_R_COLORCLEARMODE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_colorclearmode, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    settings.color_clear_mode = mode.min(1);
+                }
+            }),
+            archive: Some((429, |state| format!("{}", state.video.color_clear_mode))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_colorclearmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|mode| *mode <= 1)
+                        .ok_or_else(|| format!("{name}: expected 0 or 1"))?;
+                    if self.video.color_clear_mode != mode {
+                        self.video.color_clear_mode = mode;
+                        self.render_command(RenderCommand::SetColorClearMode(mode));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    self.console_status = format!("WORLD COLOUR CLEAR: {}", if mode == 1 { "SKIP UNDER SKY BOX" } else { "ALWAYS" });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_DRAWBSPMODELSURFACES {
+        runtime: CvarDef::new("r_drawBspModelSurfaces", "", "0..1", "Render-only heuristic: draw static BSP surfaces whose original shader name begins models/. Not exact model provenance; may hide map geometry using models/ materials.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.draw_bsp_model_surfaces)),
+            |app, value| App::cvar_set_draw_bsp_model_surfaces(app, APP_R_DRAWBSPMODELSURFACES.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_draw_bsp_model_surfaces, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.draw_bsp_model_surfaces = parse_bool(value).unwrap_or(settings.draw_bsp_model_surfaces);
+            }),
+            archive: Some((426, |state| format!("{}", u8::from(state.video.draw_bsp_model_surfaces)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_draw_bsp_model_surfaces(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    self.video.draw_bsp_model_surfaces = enabled;
+                    self.render_command(RenderCommand::SetWorldStageDebug {
+                        draw_bsp_model_surfaces: enabled,
+                        probe: self.video.world_stage_probe,
+                    });
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    self.console_status = format!("BUILT-IN BSP MODEL-PATH SURFACES: {}", if enabled { "ON" } else { "OFF" });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FASTSKY {
+        runtime: CvarDef::new("r_fastsky", "", "0..10", "TaystJK fast sky: 0 authored skybox/cloud stages; 1 black; 2 green; 3 yellow; 4 blue; 5 cyan; 6 magenta; 7 white; 8 orange; 9 grey; 10 red. Skips sky drawing in Unified, without adding a rendering pass.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.fast_sky.to_string()),
+            |app, value| App::cvar_set_fast_sky(app, APP_R_FASTSKY.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_fast_sky, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mode) = value.trim().parse::<u8>() {
+                    settings.fast_sky = mode.min(10);
+                }
+            }),
+            archive: Some((427, |state| state.video.fast_sky.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_fast_sky(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>()
+                        .map_err(|_| "r_fastsky expects a number from 0 through 10".to_owned())?;
+                    if mode > 10 {
+                        return Err("r_fastsky expects a number from 0 through 10".to_owned());
+                    }
+                    if self.video.fast_sky != mode {
+                        self.video.fast_sky = mode;
+                        self.render_command(RenderCommand::SetFastSky(mode));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    self.console_status = format!("FAST SKY: {mode}");
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_WORLDSTAGEPROBE {
+        runtime: CvarDef::new("r_worldStageProbe", "", "0..8", "Session-only GPU A/B: 0 full; 1 omit transparent; 2 omit opaque/masked (changes depth); 3 omit multiply; 4 omit all additive; 5 omit alpha-composite; 6 omit other blends; 7 omit additive on authored water surfaces only; 8 omit additive on non-water BSP surfaces only. Compare at the same camera. Modes 3..8 retain depth-producing stages.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.world_stage_probe.to_string()),
+            |app, value| App::cvar_set_world_stage_probe(app, APP_R_WORLDSTAGEPROBE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_world_stage_probe, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_set_world_stage_probe(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>().map_err(|_| "r_worldStageProbe expects a mode from 0 through 8".to_owned())?;
+                    if mode > 8 { return Err("r_worldStageProbe expects a mode from 0 through 8".to_owned()); }
+                    self.video.world_stage_probe = mode;
+                    self.render_command(RenderCommand::SetWorldStageDebug {
+                        draw_bsp_model_surfaces: self.video.draw_bsp_model_surfaces,
+                        probe: mode,
+                    });
+                    self.console_status = format!("WORLD STAGE GPU PROBE: {mode}");
                     Ok(())
                 }
             }
@@ -2045,6 +2314,36 @@ app_cvars! {
         }]
     }
 
+    APP_R_MD3AUTOLOD {
+        runtime: CvarDef::new("r_md3AutoLod", "", "0..1", "Background-generate and disk-cache missing MD3 LOD levels with meshoptimizer. Authored _1/_2 always take priority. 0 authored only (default), 1 generate missing LODs.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.md3_auto_lod)),
+            |app, value| App::cvar_set_r_md3autolod(app, APP_R_MD3AUTOLOD.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_md3autolod, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.md3_auto_lod)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_md3autolod(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.md3_auto_lod = Self::parse_cvar_bool(name, value)?;
+                self.console_status = format!("MD3 AUTO LOD: {}", if self.video.md3_auto_lod { "THREADED + CACHED" } else { "AUTHORED ONLY" });
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_MD3LODDEBUG {
+        runtime: CvarDef::new("r_md3LodDebug", "", "0..1", "Log MD3 LOD selection changes and generated/cache LOD job completions. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.md3_lod_debug)),
+            |app, value| App::cvar_set_r_md3loddebug(app, APP_R_MD3LODDEBUG.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_md3loddebug, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.md3_lod_debug)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_md3loddebug(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.md3_lod_debug = Self::parse_cvar_bool(name, value)?;
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_MD3GEOMETRYCACHE {
         runtime: CvarDef::new("r_md3GeometryCache", "", "0..1", "A/B reuse unchanged transformed/lit MD3 geometry and resident GPU stream ranges. Animation/transforms/lights invalidate exact cached inputs. Raster stream cache; RT keeps its original preparation. Session-only A/B override; default 1.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.md3_geometry_cache)),
@@ -2065,7 +2364,7 @@ app_cvars! {
     }
 
     APP_R_MODELINDEXUPLOADCACHE {
-        runtime: CvarDef::new("r_modelIndexUploadCache", "", "0..1", "A/B skip unchanged index uploads and upload only a changed span on the raster CPU-model path. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_modelIndexUploadCache", "", "0..1", "A/B skip unchanged index uploads and upload only a changed span on the raster CPU-model path. Session-only; default 1 (each upload is a GPU copy, ~9 us on an iGPU).", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.model_index_upload_cache)),
             |app, value| App::cvar_set_r_modelindexuploadcache(app, APP_R_MODELINDEXUPLOADCACHE.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_modelindexuploadcache, None),
@@ -2531,7 +2830,7 @@ app_cvars! {
                 "r_lodbias",
                 "",
                 "0..8",
-                "JKA-style Ghoul2/model LOD bias; higher values select cheaper authored GLM LODs.",
+                "TaystJK Ghoul2/MD3 LOD bias; higher values select cheaper authored or generated geometry.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2576,7 +2875,7 @@ app_cvars! {
     }
 
     APP_R_LODSCALE {
-        runtime: CvarDef::new("r_lodScale", "", "0.1..100", "Ghoul2 model LOD scale (OpenJK default 5). Larger keeps higher-detail GLM LODs at greater distances; smaller switches to cheaper LODs sooner. r_lodbias is added afterward.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_lodscale(app)), |app, value| App::cvar_set_r_lodscale(app, APP_R_LODSCALE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lodscale, None),
+        runtime: CvarDef::new("r_lodScale", "", "0.1..100", "TaystJK Ghoul2 and MD3 projected-radius LOD scale (default 5). Larger keeps higher-detail models farther away; r_lodbias is added afterward.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_lodscale(app)), |app, value| App::cvar_set_r_lodscale(app, APP_R_LODSCALE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lodscale, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.lod_scale = normalize_lod_scale(value, settings.lod_scale);
@@ -2658,6 +2957,63 @@ app_cvars! {
                                 "OFF"
                             }
                         );
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_EARLYSUBMIT {
+        runtime: CvarDef::new("r_earlySubmit", "", "0..1", "Render the frame offscreen and submit it before waiting for a swapchain image, then copy it in. Lets the GPU start while the CPU waits. Ignored on frames with menus, CRT, SMAA or HDR output. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+         |app| CvarValue::String(App::cvar_get_r_earlysubmit(app)),
+         |app, value| App::cvar_set_r_earlysubmit(app, APP_R_EARLYSUBMIT.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_earlysubmit, None),
+        config: CvarBinding {
+                default: Some(|state| {
+                    bool_value(state.video.early_submit)
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_earlysubmit(&self) -> String {
+                    bool_value(self.video.early_submit)
+                }
+                fn cvar_set_r_earlysubmit(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        // Session-only (not config-dirty) A/B switch.
+                        self.video.early_submit = Self::parse_cvar_bool(name, value)?;
+                        self.render_command(RenderCommand::SetEarlySubmit(self.video.early_submit));
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_PRESENTCOPY {
+        runtime: CvarDef::new("r_presentCopy", "", "0..1", "Render into an offscreen image and copy it into the swapchain image at the end of the frame (TaystJK Vulkan structure). Ignored on frames with menus, CRT, SMAA or HDR output. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+         |app| CvarValue::String(App::cvar_get_r_presentcopy(app)),
+         |app, value| App::cvar_set_r_presentcopy(app, APP_R_PRESENTCOPY.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_presentcopy, None),
+        config: CvarBinding {
+                default: Some(|state| {
+                    bool_value(state.video.present_copy)
+                 }),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_get_r_presentcopy(&self) -> String {
+                    bool_value(self.video.present_copy)
+                }
+                fn cvar_set_r_presentcopy(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    {
+                        self.video.present_copy = Self::parse_cvar_bool(name, value)?;
+                        self.render_command(RenderCommand::SetPresentCopy(self.video.present_copy));
+                        self.publish_ui();
                     }
                     Ok(())
                 }
@@ -3367,6 +3723,26 @@ app_cvars! {
                             self.video.saber_marks.label().to_ascii_uppercase()
                         );
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_SHADER_COMPLEXITY {
+        runtime: CvarDef::new("r_shaderComplexity", "", "0..1", "Session-only BSP fragment-accumulating heatmap. Per-pixel sum of estimated visible stage costs, NOT driver GPU timing/instruction count. 0 off, 1 on.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_shadercomplexity(app)), |app, value| App::cvar_set_r_shadercomplexity(app, APP_R_SHADER_COMPLEXITY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_shadercomplexity, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_get_r_shadercomplexity(&self) -> String {
+                    bool_value(self.video.shader_complexity)
+                }
+                fn cvar_set_r_shadercomplexity(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    self.video.shader_complexity = enabled;
+                    self.render_command(RenderCommand::SetShaderComplexity(enabled));
+                    self.console_status = format!("BSP shader complexity: {} (estimated stage costs accumulated per visible pixel)", if enabled { "ON" } else { "OFF" });
+                    self.publish_ui();
                     Ok(())
                 }
             }

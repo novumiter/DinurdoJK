@@ -32,6 +32,8 @@ pub struct RenderStats {
     pub cull_hiz_rejected: u32,
     pub cull_pvs_rejected: u32,
     pub cull_area_rejected: u32,
+    /// Main world pass program binds last frame: specialized, general.
+    pub world_program_binds: (u32, u32),
     pub input_event_to_sim_ms: Option<f64>,
     pub input_sim_to_render_ms: Option<f64>,
     pub input_event_to_latch_ms: Option<f64>,
@@ -133,6 +135,8 @@ pub enum UserEvent {
         wireframe_supported: bool,
         hdr_output_status: String,
         hdr_output_active: bool,
+        adapter_name: String,
+        adapter_type: String,
     },
     CompanionReady { id: u32 },
     CompanionError { id: u32, error: String },

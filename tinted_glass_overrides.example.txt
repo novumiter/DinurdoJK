@@ -1,7 +1,0 @@
-# Copy to tinted_glass_overrides.txt beside the game executable / working directory.
-# Exact material/texture names (case-insensitive); 1=force glass, 0=block heuristics.
-# surfaceparm lightfilter always takes precedence over a 0 override.
-# auto = 0             # Disable filename-based automatic detection globally (default on)
-# textures/example/stainedglass = 1
-# textures/example/decoration_glass = 0
-# Restart the client after editing; entries are read once when a map loads.

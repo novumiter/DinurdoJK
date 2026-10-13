@@ -10,6 +10,7 @@ use crate::app::{
 pub(in crate::app) struct AppliedVideoMode {
     pub(in crate::app) fullscreen: FullscreenMode,
     pub(in crate::app) renderer_backend: RendererBackend,
+    pub(in crate::app) gpu_adapter: u8,
     pub(in crate::app) hdr_output: u32,
     pub(in crate::app) resolution: [u32; 2],
 }
@@ -460,6 +461,7 @@ impl App {
         AppliedVideoMode {
             fullscreen: self.applied_fullscreen,
             renderer_backend: self.applied_renderer_backend,
+            gpu_adapter: self.applied_gpu_adapter,
             hdr_output: self.applied_hdr_output,
             resolution: self.applied_resolution,
         }
@@ -584,6 +586,7 @@ impl App {
     pub(in crate::app) fn display_restart_required(&self) -> bool {
         self.video.fullscreen != self.applied_fullscreen
             || self.video.renderer_backend != self.applied_renderer_backend
+            || self.video.gpu_adapter != self.applied_gpu_adapter
             || self.video.hdr_output != self.applied_hdr_output
             || self.video.resolution != self.applied_resolution
     }
@@ -627,6 +630,11 @@ impl App {
 
         if self.video.hdr_output != self.applied_hdr_output {
             add("hdr_output", "Display output", format!("{} -> {}", crate::renderer::hdr_output::OUTPUT_LABELS[self.applied_hdr_output as usize], crate::renderer::hdr_output::OUTPUT_LABELS[self.video.hdr_output as usize]));
+        }
+        if self.video.gpu_adapter != self.applied_gpu_adapter {
+            add("gpu_adapter", "Graphics processor", format!("{} -> {}",
+                crate::renderer::gpu_adapter::label(self.applied_gpu_adapter),
+                crate::renderer::gpu_adapter::label(self.video.gpu_adapter)));
         }
         if self.video.renderer_backend != self.applied_renderer_backend {
             add(
@@ -755,6 +763,9 @@ impl App {
             self.apply_latched_values_to_settings(&mut target);
             for (name, value) in &self.latched_console_cvars {
                 match name.as_str() {
+                    "r_gpuadapter" => add("gpu_adapter", "Graphics processor",
+                        format!("{} -> {}", crate::renderer::gpu_adapter::label(self.applied_gpu_adapter),
+                            crate::renderer::gpu_adapter::label(target.gpu_adapter))),
                     "r_backend" => add(
                         "render_backend",
                         "Render backend",
@@ -899,6 +910,7 @@ impl App {
         };
         self.video.fullscreen = previous.fullscreen;
         self.video.renderer_backend = previous.renderer_backend;
+        self.video.gpu_adapter = previous.gpu_adapter;
         self.video.hdr_output = previous.hdr_output;
         self.video.resolution = previous.resolution;
         self.normalize_video_selection();
@@ -997,6 +1009,7 @@ impl App {
         self.render.is_some()
             && self.window.is_some()
             && self.video.renderer_backend == backend
+            && self.video.gpu_adapter == self.applied_gpu_adapter
             && self.video.hdr_output == self.applied_hdr_output
             && [self.applied_fullscreen, self.video.fullscreen]
                 .into_iter()
@@ -1145,6 +1158,7 @@ impl App {
     pub(in crate::app) fn set_requested_video_mode(&mut self, target: AppliedVideoMode) {
         self.video.fullscreen = target.fullscreen;
         self.video.renderer_backend = target.renderer_backend;
+        self.video.gpu_adapter = target.gpu_adapter;
         self.video.hdr_output = target.hdr_output;
         self.video.resolution = target.resolution;
     }
@@ -1198,6 +1212,7 @@ impl App {
                 // the retained VideoSettings state.
                 self.sync_classic_world_lighting();
                 self.applied_renderer_backend = self.video.renderer_backend;
+                self.applied_gpu_adapter = self.video.gpu_adapter;
                 self.applied_hdr_output = self.video.hdr_output;
                 self.applied_grass = self.video.grass;
                 self.applied_ocean = self.video.ocean;
@@ -1476,6 +1491,7 @@ impl App {
         let target = AppliedVideoMode {
             fullscreen: mode,
             renderer_backend: self.video.renderer_backend,
+            gpu_adapter: self.video.gpu_adapter,
             hdr_output: self.video.hdr_output,
             resolution: self.video.resolution,
         };

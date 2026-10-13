@@ -96,7 +96,7 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
         };
         info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let surface_view = self.surface_texture_view(&frame);
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
 
         let encode_started = Instant::now();

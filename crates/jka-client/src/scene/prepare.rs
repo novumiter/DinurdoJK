@@ -13,7 +13,7 @@ use crate::scene::{
     grass_local_fog_slots, hdr_lightmap_indexed, load_external_lightmap,
     load_legacy_footprint_marks, load_movement, load_reflection_probes, log_reflection_cache,
     map_asset_name, map_content_hash, material_debug_info, material_has_promotable_environment_stage,
-    material_render_is_guaranteed_discarded,
+    material_render_is_guaranteed_discarded, recover_impossible_masked_depth_seed,
     materials, neutral_deluxemap, order_pvs_pieces, phase_lap, planar_group_key,
     prepare_static_light_grid, pvs_signature, render_position, resolved_bsp_surface_fog,
     retain_authored_planar_mirrors, static_bsp_ao_cache_info, try_load_external_deluxemap,
@@ -1093,6 +1093,7 @@ pub(in crate::scene) fn prepare_internal(
             // This is especially wrong in misc_skyportal's second camera view.
             // OpenJK clips the sky from visible BSP surfaces, not the union of
             // every surface that happens to share a material.
+            let stage_start = pvs_batches.len();
             append_material_batches(
                 &mut pvs_batches,
                 material,
@@ -1106,6 +1107,9 @@ pub(in crate::scene) fn prepare_internal(
                 fog,
                 fog_is_global,
             );
+            recover_impossible_masked_depth_seed(
+                &mut pvs_batches[stage_start..], &piece.vertices,
+            );
         }
 
         let coarse_end =
@@ -1118,6 +1122,7 @@ pub(in crate::scene) fn prepare_internal(
             global_fog_num,
             global_fog,
         );
+        let stage_start = batches.len();
         append_material_batches(
             &mut batches,
             material,
@@ -1130,6 +1135,10 @@ pub(in crate::scene) fn prepare_internal(
             coarse_area_signature,
             fog,
             fog_is_global,
+        );
+        recover_impossible_masked_depth_seed(
+            &mut batches[stage_start..],
+            &vertices[coarse_start as usize..coarse_end as usize],
         );
     }
     load_timings.geometry_detail_ms = [
@@ -1188,6 +1197,7 @@ pub(in crate::scene) fn prepare_internal(
                     global_fog_num,
                     global_fog,
                 );
+                let stage_start = inline_batches.len();
                 append_material_batches(
                     &mut inline_batches,
                     material,
@@ -1200,6 +1210,9 @@ pub(in crate::scene) fn prepare_internal(
                     [0_u64; 4],
                     fog,
                     fog_is_global,
+                );
+                recover_impossible_masked_depth_seed(
+                    &mut inline_batches[stage_start..], &group_vertices,
                 );
             }
             // A moving brush cannot be promoted to the ocean clipmap, and

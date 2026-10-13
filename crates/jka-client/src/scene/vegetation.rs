@@ -321,8 +321,14 @@ pub(in crate::scene) fn collect_grass_emitters(
         let Some(material) = surface_materials.get(batch.shader) else {
             continue;
         };
-        let Some(grass) = material.grass else {
+        let Some(first_grass) = material.grass else {
             continue;
+        };
+        // Older/synthetic materials can still supply the single-stage field.
+        let grass_stages = if material.grass_stages.is_empty() {
+            std::slice::from_ref(&first_grass)
+        } else {
+            material.grass_stages.as_slice()
         };
         if material.hidden {
             continue;
@@ -382,9 +388,6 @@ pub(in crate::scene) fn collect_grass_emitters(
             if authored_normal.length_squared() > 0.25 {
                 normal = authored_normal;
             }
-            if !grass.any_angle && normal.y < 0.5 {
-                continue;
-            }
             let colors = source.map(|vertex| vertex.color[color_slot]);
             let lightmap_uv =
                 lightmap_slot.map(|slot| source.map(|vertex| vertex.lightmap_uv[slot]));
@@ -393,18 +396,30 @@ pub(in crate::scene) fn collect_grass_emitters(
                     ^ (triangle_index as u32).wrapping_mul(0x85eb_ca6b)
                     ^ (batch.shader as u32).wrapping_mul(0xc2b2_ae35),
             );
-            emitters.push(GrassEmitterTriangle {
-                positions,
-                colors,
-                lightmap_uv,
-                lightmap_page,
-                signature_id,
-                triangle_seed,
-                height: grass.height.max(1.0),
-                density: grass.density,
-                ground_tint_rgba,
-                fog_slot: fog_slots.get(&surface.fog_num).copied().unwrap_or(0),
-            });
+            for (stage_index, grass) in grass_stages.iter().enumerate() {
+                if !grass.any_angle && normal.y < 0.5 {
+                    continue;
+                }
+                // Independent per-stage seeds prevent overlapping blades when
+                // several grass sprite stages inhabit the same BSP triangle.
+                let stage_seed = if stage_index == 0 {
+                    triangle_seed // preserve existing distributions on single-stage maps
+                } else {
+                    grass_hash(triangle_seed ^ (stage_index as u32).wrapping_mul(0x517c_c1b7))
+                };
+                emitters.push(GrassEmitterTriangle {
+                    positions,
+                    colors,
+                    lightmap_uv,
+                    lightmap_page,
+                    signature_id,
+                    triangle_seed: stage_seed,
+                    height: grass.height.max(1.0),
+                    density: grass.density,
+                    ground_tint_rgba,
+                    fog_slot: fog_slots.get(&surface.fog_num).copied().unwrap_or(0),
+                });
+            }
         }
     }
     (emitters, signatures)

@@ -24,7 +24,7 @@ use crate::renderer::{
     unfilterable_texture_entry_stages, uniform_entry, upload_texture, weather, ui, Arc,
     AutoExposureState, AutoExposureUniform, BTreeMap, CameraUniform, CloudLayerSettings,
     CloudRenderResolution, CloudRenderSettings, CloudSunSettings, CloudType, ColorLutPreset,
-    CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DofQuality,
+    CullDebugMode, CullDiagnosticsReadback, DebugVolumeRenderer, DeferredWorldBundles, DofQuality,
     OceanVisibility,
     DofUniform, DynamicLightsMode, DynamicModelRenderer, DynamicShadowsMode, EntityShadowLight,
     EntityShadowState, FramePlan, GammaPostUniform, GpuCullSettings, GpuProfiler, GrassRenderer,
@@ -56,6 +56,7 @@ impl Renderer {
         desired_maximum_frame_latency: u32,
         hdr_output_mode: u32,
         _detail_texture_path: &str,
+        gpu_adapter_mode: u8,
     ) -> Result<Self, String> {
         let size = window.inner_size();
         // Per-phase wall times for the "[RENDER INIT] phases" line, so startup
@@ -69,21 +70,16 @@ impl Renderer {
             }};
         }
         let adapter_started = Instant::now();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-                apply_limit_buckets: false,
-            })
-            .await
-            .map_err(|e| format!("No compatible GPU adapter: {e}"))?;
+        let adapter = crate::renderer::gpu_adapter::select(&instance, &surface, gpu_adapter_mode).await?;
         rverbose!(
             1,
             "[RENDER INIT] adapter request {:.1} ms",
             adapter_started.elapsed().as_secs_f64() * 1000.0
         );
         let info = adapter.get_info();
+        eprintln!("[GPU] Requested {} ({}) -> selected {} ({:?}, {:?})",
+            crate::renderer::gpu_adapter::label(gpu_adapter_mode), gpu_adapter_mode,
+            info.name, info.device_type, info.backend);
         rverbose!(
             1,
             "GPU: {} ({:?}, {:?})",
@@ -290,11 +286,20 @@ impl Renderer {
             });
         config.format = surface_format;
         config.color_space = output_selection.color_space;
+        // TaystJK's Vulkan swapchain is VK_COMPOSITE_ALPHA_OPAQUE.
+        if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
+        let surface_linear_present = caps.formats.contains(&surface_format.remove_srgb_suffix());
         config.present_mode = no_vsync_mode(&caps.present_modes);
         config.desired_maximum_frame_latency = desired_maximum_frame_latency.clamp(1, 3);
         let screenshot_supported = hdr_output_mode != 0 || caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
+        }
+        // r_earlySubmit copies the offscreen frame into the acquired image.
+        if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
+            config.usage |= wgpu::TextureUsages::COPY_DST;
         }
         // Surface::configure reports validation through wgpu's device error
         // machinery. Capture the initial configure error instead of letting the
@@ -303,7 +308,9 @@ impl Renderer {
         // roll back to the last known-good renderer instead of waiting on the
         // video confirmation timeout with a dead screen.
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-        surface.configure(&device, &config);
+        let present_config = super::context::presentation_config(&config, surface_linear_present);
+        rverbose!(1, "Swapchain: {:?} view {:?} alpha {:?}", present_config.format, config.format, present_config.alpha_mode);
+        surface.configure(&device, &present_config);
         if let Some(error) = error_scope.pop().await {
             return Err(format!("Surface configuration failed: {error}"));
         }
@@ -502,6 +509,8 @@ impl Renderer {
                 texture_entry(29),
                 texture_entry(30),
                 sampler_entry(31),
+                uniform_entry(32, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                uniform_entry(33, wgpu::ShaderStages::VERTEX_FRAGMENT),
             ],
         });
         // Exact descriptor layouts used by the known-fast renderer. Advanced
@@ -540,7 +549,10 @@ impl Renderer {
                     texture_entry(9),
                     texture_entry(10),
                     sampler_entry(11),
-                    uniform_entry(
+                    sampler_entry(31),
+                    uniform_entry(32, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                    uniform_entry(33, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                            uniform_entry(
                         21,
                         wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ),
@@ -2362,6 +2374,8 @@ impl Renderer {
             fast_world_shader,
             wireframe_supported,
             wireframe_mask: 0,
+            shader_complexity_enabled: false,
+            shader_complexity_target: None,
             pvs_mode: PvsMode::Auto,
             wireframe_pipeline_layout,
             wireframe_shader,
@@ -2443,7 +2457,11 @@ impl Renderer {
             sky_sampler,
             texture_filter,
             picmip: 0,
+            texture_compression: 0,
             detail_textures_enabled: false,
+            map_has_snow_surfaces: false,
+            map_has_water: false,
+            model_wet_latched: false,
             jump_shade: JumpShadeState::Off,
             detail_texture_fade: false,
             detail_texture_fade_distance: 512.0,
@@ -2559,16 +2577,33 @@ impl Renderer {
             compact_group_scratch: Vec::new(),
             cpu_compact_indirect_scratch: Vec::new(),
             cpu_compact_count_scratch: Vec::new(),
+            cpu_compact_uploaded: None,
             reflection_compact_scratch: Vec::new(),
             reflection_compact_groups: Vec::new(),
             inline_visible_scratch: Vec::new(),
             post_ocean_transparent_scratch: Vec::new(),
             inline_pose_scratch: Vec::new(),
             inline_draw_scratch: InlineDrawScratch::default(),
+            deferred_world_bundles: DeferredWorldBundles::default(),
             gpu_driven_enabled: false,
+            draw_inline_models: true,
+            draw_bsp_model_surfaces: true,
+            world_stage_probe: 0,
+            fast_sky: 0,
+            sky_perf_probe: 0,
             hiz_occlusion_enabled: false,
             dynamic_lights_mode: DynamicLightsMode::Off,
             dynamic_light_debug: false,
+            fragment_shader_mode: 1,
+            ui_transient_tail_uploaded: None,
+            sky_box_pipelines: None,
+            sky_cloud_pipelines: HashMap::new(),
+            sky_cloud_world: None,
+            color_clear_mode: 1,
+            early_submit_enabled: false,
+            present_copy_enabled: false,
+            surface_linear_present,
+            early_present_target: None,
             tinted_glass_enabled: false,
             tinted_glass_debug: 0,
             rt_samples: 1,

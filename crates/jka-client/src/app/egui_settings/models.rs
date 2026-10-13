@@ -13,9 +13,29 @@ impl App {
         self.egui_toggle_row(
             ui,
             "Map models",
-            "Draws MD3 props the map's entities place in the world (misc_model_* and func_static models). Off removes them for a cleaner or faster view. Brush models such as doors and platforms, and any model geometry already compiled into the BSP by the map compiler, are always drawn.",
+            "Draws MD3 props the map's entities place in the world (misc_model_* and func_static models). Off removes them for a cleaner or faster view. Brush models such as doors and platforms are controlled by the separate Inline BSP models switch below; static BSP geometry is unaffected.",
             ui::VIDEO_ROW_DRAW_MAP_MODELS,
             self.video.draw_map_models,
+        );
+
+        theme::row(ui, "Inline BSP models",
+            "Render-only A/B switch for server-controlled BSP brush movers (fish, doors, platforms, rotating objects). Does not change collision, server gameplay or BSP static world geometry.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.draw_inline_models) {
+                    let _ = self.set_console_cvar("r_drawInlineModels", if enabled { "1" } else { "0" });
+                }
+            },
+        );
+
+        theme::row(ui, "Built-in model surfaces",
+            "Render-only shader-path filter for static BSP surfaces authored with models/* materials (e.g. compiled Costa del Sol trees). This is not true model provenance: map geometry sharing a models/* shader will also disappear. Does not affect collision or runtime MD3s.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.draw_bsp_model_surfaces) {
+                    let _ = self.set_console_cvar("r_drawBspModelSurfaces", if enabled { "1" } else { "0" });
+                }
+            },
         );
 
         const GHOUL2_SKINNING: [(Ghoul2SkinningMode, &str); 3] = [
@@ -71,7 +91,7 @@ impl App {
         theme::row(
             ui,
             "Model LOD scale",
-            "OpenJK r_lodscale for Ghoul2 model LODs (default 5). Larger keeps higher-detail GLM LODs at greater distances; smaller drops to cheaper LODs sooner. Model LOD bias is added afterward.",
+            "OpenJK/TaystJK r_lodscale for Ghoul2 and MD3 LODs (default 5). Larger keeps higher-detail meshes at greater distances; r_lodbias is added afterward.",
             theme::Reset::None,
             |ui| {
                 let mut scale = self.video.lod_scale;
@@ -91,7 +111,7 @@ impl App {
         if let Some(index) = quality_table_row(
             ui,
             "Model detail",
-            "r_lodbias. How early Ghoul2 models drop to their cheaper authored LODs. Highest (0) uses projected screen size normally and is the OpenJK default; lower settings bias toward cheaper GLM LODs. Model LOD scale is applied first.",
+            "r_lodbias. Higher values bias Ghoul2 and MD3 models toward cheaper LODs after projected-size selection, exactly like TaystJK. Highest (0) is the default.",
             theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_LOD_BIAS),
             self.video.ghoul2_lod_bias,
             &MODEL_DETAIL,
@@ -99,6 +119,19 @@ impl App {
         ) {
             let _ = self.set_console_cvar("r_lodbias", &MODEL_DETAIL[index].0.to_string());
         }
+
+        theme::row(
+            ui,
+            "Generate MD3 LODs",
+            "If authored _1/_2.md3 variants are missing, simplify on a background worker with meshoptimizer and cache by original MD3 content hash. Authored variants always take priority. Default off for A/B testing.",
+            theme::Reset::None,
+            |ui| {
+                let mut enabled = self.video.md3_auto_lod;
+                if ui.checkbox(&mut enabled, "Auto (cached)").changed() {
+                    let _ = self.set_console_cvar("r_md3AutoLod", if enabled { "1" } else { "0" });
+                }
+            },
+        );
 
         self.egui_toggle_row(
             ui,

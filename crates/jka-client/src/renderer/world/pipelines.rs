@@ -2,8 +2,9 @@
 use crate::renderer::{
     camera_depth_compare, create_cull_debug_pipeline, create_ssr_visibility_resources,
     create_surface_inspector_pipeline, create_taa_post_pipeline, create_targets,
-    create_world_pipeline, pipeline_hash, scene, thread, AlphaGen, BTreeMap, BTreeSet, BlendFactor,
-    BlendMode, CullDebugMode, CullMode, DrawBatch, DrawClass, GpuVertex, Instant, MaterialUniform,
+    create_world_pipeline, create_world_pipeline_specialized, gpu_blend_factor, pipeline_hash, scene, thread, AlphaGen, BTreeMap, BTreeSet, BlendFactor,
+    BlendMode, CullDebugMode, CullMode, DrawBatch, DrawClass, GpuVertex, Instant, MaterialFragmentKey,
+    MaterialUniform,
     OnceLock, Ordering, PipelineJobKey, PipelineKey, Renderer, RgbGen, TcGen, TcMod, Vec3,
     WorldBatch, WorldPipelineCompilePlan, WorldPipelineVariant, WorldShaderFamily,
     WorldShaderVariantKey, DEPTH_FORMAT, SHADOW_CASTER_CULL, VERTEX_ATTRIBUTES,
@@ -93,6 +94,7 @@ impl Renderer {
             fog_pass_pipelines,
             reflection_pipelines,
             reflection_fog_pass_pipelines,
+            specialized_pipelines,
         ) = {
             let Some(world) = self.world.as_ref() else {
                 return;
@@ -162,12 +164,22 @@ impl Renderer {
             } else {
                 BTreeMap::new()
             };
+            let specialized_pipelines = create_specialized_world_pipelines(
+                &self.device,
+                layout,
+                shader,
+                scene_format,
+                samples,
+                &material_specialization_jobs(world.all_world_batches()),
+                key,
+            );
             (
                 pipelines,
                 legacy_dlight_pipelines,
                 fog_pass_pipelines,
                 reflection_pipelines,
                 reflection_fog_pass_pipelines,
+                specialized_pipelines,
             )
         };
 
@@ -182,12 +194,15 @@ impl Renderer {
                     fog_pass_pipelines,
                     reflection_pipelines,
                     reflection_fog_pass_pipelines,
+                    specialized_pipelines,
                 },
             );
             world.active_pipeline_variant = key;
             // MSAA/scene-format changed: drop the fast set, it is recompiled on
             // demand the next time the frame plan selects FastBaseline.
             world.fast_pipelines.clear();
+            world.fast_complexity_pipelines.clear();
+            world.complexity_pipelines.clear();
         }
         rverbose!(1, "Synchronous world format/MSAA fallback compiled in {:.1} ms (RT requested: {rt_requested})",
             started.elapsed().as_secs_f64() * 1000.0);
@@ -675,8 +690,38 @@ pub(in crate::renderer) fn material_uniform(
     if matches!(source.rgb_gen, RgbGen::LightingDiffuse | RgbGen::LightingDiffuseEntity) {
         out.color[..3].fill(0.0);
     }
+    // The map loader can recover the specific GE128/127 depth-seed boundary
+    // without changing the shader script or globally forcing BSP vertex alpha.
+    if source.alpha_test_texture_only {
+        out.header[2] |= 1073741824; // MATERIAL_MASK_TEXTURE_ALPHA_ONLY
+    }
+    // Opaque world pipelines are compiled with ENABLE_ALPHA_TEST off.
+    debug_assert!(
+        source.pipeline.class != DrawClass::Opaque || source.alpha_cutoff == 0.0,
+        "Opaque batch with alpha cutoff {}",
+        source.alpha_cutoff
+    );
     out.params[0] = source.alpha_cutoff;
     out.params[1] = source.parallax_depth;
+    if source.pipeline.class != DrawClass::Sky {
+        // Relative *stage* complexity estimate, fixed at material preparation.
+        // This isn't driver ISA instruction count or measured GPU time. Separate
+        // stages produce separate diagnostic draws; fused additive stages get
+        // an explicit multiplier because the renderer draws them together.
+        let mut cost = 2.0f32;
+        cost += source.tc_mods.len().min(4) as f32 * 0.35;
+        if source.lightmap.is_some() || source.modulate_lightmap { cost += 1.2; }
+        if source.alpha_cutoff != 0.0 { cost += 0.8; }
+        if source.pipeline.blend != BlendMode::Opaque { cost += 2.5; }
+        if source.normal_texture.is_some() { cost += 2.0; }
+        if source.height_texture.is_some() { cost += 3.0; }
+        if source.roughness_texture.is_some() { cost += 0.6; }
+        if source.metallic_texture.is_some() { cost += 0.6; }
+        if source.specular_texture.is_some() { cost += 0.6; }
+        if source.emissive_texture.is_some() { cost += 0.6; }
+        if source.reflection_probe.is_some() { cost += 1.5; }
+        out.params[2] = cost * f32::from(source.pipeline.additive_fusion_count.max(1));
+    }
     // Tayst/OpenJK R_RemapShader's timeOffset is subtracted from shader time.
     // params.w was intentionally unused by world materials, so carrying it
     // here does not grow MaterialUniform or alter bind-group layouts.
@@ -762,6 +807,10 @@ pub(in crate::renderer) struct WorldPassPipelineIdentity {
     pub native_key: PipelineKey,
     pub target_format: wgpu::TextureFormat,
     pub samples: u32,
+    /// Narrowed material key of a specialized base-pass PSO; None for general ones.
+    pub material: Option<MaterialFragmentKey>,
+    /// The specialized PSO uses the minimal entry points (r_fragmentShaderMode 2).
+    pub minimal: bool,
 }
 
 impl WorldPassPipelineIdentity {
@@ -772,12 +821,291 @@ impl WorldPassPipelineIdentity {
         // Per-pass normalization is explicit and centralized. Other features
         // must NEVER be stripped unless their pipeline code actually disables
         // them; keeping an extra permutation is safer than aliasing wrong code.
-        let variant = match pass {
+        let mut variant = match pass {
             WorldPipelinePass::Base { .. } => variant.base_pass_key(),
             _ => variant,
         };
-        Self { variant, pass, native_key, target_format, samples }
+        // The flags only add specialized PSOs; the general ones are the same program
+        // in every mode, so switching r_fragmentShaderMode reuses them.
+        variant.material_specialization = false;
+        variant.minimal_entries = false;
+        Self { variant, pass, native_key, target_format, samples, material: None, minimal: false }
     }
+
+    pub(in crate::renderer) fn specialized(
+        variant: WorldShaderVariantKey, authored_fog: bool, native_key: PipelineKey,
+        material: MaterialFragmentKey, minimal: bool, target_format: wgpu::TextureFormat,
+        samples: u32,
+    ) -> Self {
+        Self {
+            material: Some(material),
+            minimal,
+            ..Self::new(variant, WorldPipelinePass::Base { authored_fog }, native_key,
+                target_format, samples)
+        }
+    }
+}
+
+/// TaystJK skybox_pipeline: one PSO per outer-box face (rt, bk, lf, ft, up, dn),
+/// each a single texture sample (`vs_sky_box_*` / `fs_sky_box_*`). Drawn after
+/// the opaque world at far depth with depth writes off, so only uncovered pixels
+/// are shaded.
+pub(in crate::renderer) fn create_sky_box_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    samples: u32,
+) -> [wgpu::RenderPipeline; 6] {
+    ["rt", "bk", "lf", "ft", "up", "dn"].map(|face| {
+        let vertex = format!("vs_sky_box_{face}");
+        let fragment = format!("fs_sky_box_{face}");
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("JKA sky box face pipeline"),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some(&vertex),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(camera_depth_compare()),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: samples,
+                ..Default::default()
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some(&fragment),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        })
+    })
+}
+
+/// One cloud-layer PSO (`vs_sky_cloud` / `fs_sky_cloud`) for an authored blend.
+pub(in crate::renderer) fn create_sky_cloud_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    blend: BlendMode,
+) -> wgpu::RenderPipeline {
+    let blend = match blend {
+        BlendMode::Opaque => None,
+        BlendMode::Custom(src, dst) => {
+            // Same glBlendFunc(src, dst) mapping as create_world_pipeline.
+            let component = wgpu::BlendComponent {
+                src_factor: gpu_blend_factor(src),
+                dst_factor: gpu_blend_factor(dst),
+                operation: wgpu::BlendOperation::Add,
+            };
+            Some(wgpu::BlendState { color: component, alpha: component })
+        }
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA sky cloud layer pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_sky_cloud"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_sky_cloud"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Sky stage that the box path draws as a cloud layer (tcGen sky cloud).
+pub(in crate::renderer) fn is_sky_cloud_stage(source: &DrawBatch) -> bool {
+    source.pipeline.class == DrawClass::Sky && matches!(source.tc_gen, TcGen::SkyCloud(_))
+}
+
+impl Renderer {
+    /// Builds the sky box face PSOs for the current scene format, sample count
+    /// and world shader family (six tiny pipelines), plus one cloud-layer PSO per
+    /// blend the loaded map's cloud stages use. Rebuilt only when one of those
+    /// changes or a different map is loaded.
+    pub(in crate::renderer) fn ensure_sky_box_pipelines(&mut self, enhanced: bool) {
+        let key = (self.scene_format(), self.msaa_samples, enhanced);
+        let (layout, shader) = if enhanced {
+            (&self.world_pipeline_layout, &self.world_shader)
+        } else {
+            (&self.world_pipeline_layout_lean, &self.world_shader_lean)
+        };
+        if !self.sky_box_pipelines.as_ref().is_some_and(|(built, _)| *built == key) {
+            let pipelines = create_sky_box_pipelines(&self.device, layout, shader, key.0, key.1);
+            self.sky_box_pipelines = Some((key, pipelines));
+            self.sky_cloud_pipelines.clear();
+            self.sky_cloud_world = None;
+        }
+        let Some(world) = self.world.as_ref() else { return };
+        if self.sky_cloud_world.as_ref() == Some(&world.index_buffer) {
+            return;
+        }
+        for batch in world.coarse_batches.iter().filter(|batch| is_sky_cloud_stage(&batch.source)) {
+            let blend = batch.source.pipeline.blend;
+            self.sky_cloud_pipelines.entry(blend).or_insert_with(|| {
+                create_sky_cloud_pipeline(&self.device, layout, shader, key.0, key.1, blend)
+            });
+        }
+        self.sky_cloud_world = Some(world.index_buffer.clone());
+    }
+}
+
+/// r_fragmentShaderMode 2: plain stages draw with `vs_world_minimal` /
+/// `fs_world_minimal` (default world vertex input, fs_main semantics) when the
+/// variant allows it. Fused additive, three-stage sRGB and autoSprite2 stages keep
+/// their own entry points.
+pub(in crate::renderer) fn material_minimal_entry(
+    variant: WorldShaderVariantKey,
+    key: &PipelineKey,
+) -> bool {
+    variant.minimal_entry_compatible()
+        && material_specialization_eligible(key)
+        && !key.legacy_srgb_three_stage
+        && !key.auto_sprite2
+}
+
+/// Base-pass pipelines that use the shared `shade_surface` material code. Sky and
+/// fused additive entry points keep the general program, and so does the key the
+/// ocean PSO takes over while the ocean is on. Every other stage is specialized,
+/// transparent ones included, as in TaystJK: with the classification key
+/// (`MaterialFragmentKey::for_variant`) blended stages collapse into a few PSOs.
+pub(in crate::renderer) fn material_specialization_eligible(key: &PipelineKey) -> bool {
+    key.class != DrawClass::Sky && key.additive_fusion_count < 2 && *key != ocean_pipeline_key()
+}
+
+pub(in crate::renderer) fn material_specialization_jobs<'a>(
+    batches: impl Iterator<Item = &'a WorldBatch>,
+) -> Vec<(PipelineKey, MaterialFragmentKey)> {
+    batches
+        .filter(|batch| material_specialization_eligible(&batch.source.pipeline))
+        .map(|batch| (batch.source.pipeline, batch.fragment_key))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+pub(in crate::renderer) type SpecializedWorldPipelines = std::collections::HashMap<
+    (PipelineKey, MaterialFragmentKey),
+    (MaterialFragmentKey, wgpu::RenderPipeline),
+>;
+
+/// Narrows each (pipeline, full material key) job for `variant` and returns the
+/// distinct PSOs to build plus, per job, the index of its PSO.
+fn specialized_pipeline_plan(
+    jobs: &[(PipelineKey, MaterialFragmentKey)],
+    variant: WorldShaderVariantKey,
+) -> (Vec<(PipelineKey, MaterialFragmentKey)>, Vec<usize>) {
+    let mut unique = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    let slots = jobs
+        .iter()
+        .map(|&(key, material)| {
+            let narrowed = material.for_variant(variant, key.class != DrawClass::Opaque);
+            *index.entry((key, narrowed)).or_insert_with(|| {
+                unique.push((key, narrowed));
+                unique.len() - 1
+            })
+        })
+        .collect();
+    (unique, slots)
+}
+
+fn specialized_pipeline_map(
+    jobs: &[(PipelineKey, MaterialFragmentKey)],
+    unique: &[(PipelineKey, MaterialFragmentKey)],
+    slots: &[usize],
+    pipelines: Vec<wgpu::RenderPipeline>,
+) -> SpecializedWorldPipelines {
+    jobs.iter()
+        .zip(slots)
+        .map(|(&job, &slot)| (job, (unique[slot].1, pipelines[slot].clone())))
+        .collect()
+}
+
+/// r_fragmentShaderMode 1 on the synchronous paths (map load, format/MSAA rebuild).
+/// Empty unless the variant asks for specialization.
+pub(in crate::renderer) fn create_specialized_world_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    msaa_samples: u32,
+    jobs: &[(PipelineKey, MaterialFragmentKey)],
+    variant: WorldShaderVariantKey,
+) -> SpecializedWorldPipelines {
+    if !variant.material_specialization {
+        return Default::default();
+    }
+    let started = Instant::now();
+    let base_variant = variant.base_pass_key();
+    let (unique, slots) = specialized_pipeline_plan(jobs, variant);
+    let pipelines = compile_pipeline_jobs("world-specialized", unique.clone(), |&(key, material)| {
+        create_world_pipeline_specialized(device, layout, shader, surface_format, key,
+            msaa_samples, variant.legacy_fog, false, Some(base_variant), false, None,
+            Some(material), material_minimal_entry(variant, &key))
+    });
+    log_material_specialization(jobs.len(), &unique, started);
+    specialized_pipeline_map(jobs, &unique, &slots, pipelines)
+}
+
+fn log_material_specialization(
+    jobs: usize,
+    pipelines: &[(PipelineKey, MaterialFragmentKey)],
+    started: Instant,
+) {
+    let count = |class| pipelines.iter().filter(|(key, _)| key.class == class).count();
+    rverbose!(1, "Fragment specialization: {jobs} material key(s) -> {} specialized PSO(s)         (opaque {}, mask {}, transparent {}) in {:.1} ms",
+        pipelines.len(), count(DrawClass::Opaque), count(DrawClass::Mask),
+        count(DrawClass::Transparent), started.elapsed().as_secs_f64() * 1000.0);
 }
 
 /// A cold-path snapshot of the compiled pass identities currently retained by
@@ -801,6 +1129,12 @@ impl WorldPipelineReuseCatalog {
                 catalog.insert(WorldPassPipelineIdentity::new(
                     variant, WorldPipelinePass::Base { authored_fog: fog },
                     key, format, samples,
+                ), pipeline);
+            }
+                    for (&(key, _), (material, pipeline)) in &set.specialized_pipelines {
+                catalog.insert(WorldPassPipelineIdentity::specialized(
+                    variant, variant.legacy_fog, key, *material,
+                    material_minimal_entry(variant, &key), format, samples,
                 ), pipeline);
             }
             for (&original, pipeline) in &set.legacy_dlight_pipelines {
@@ -923,7 +1257,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             key, surface_format, msaa_samples),
         |&(key, fog)| create_world_pipeline(
             device, layout, shader, surface_format, key, msaa_samples,
-            fog, false, Some(shader_variant.base_pass_key()), false))?
+            fog, false, Some(shader_variant.base_pass_key()), false, None))?
         .into_iter().zip(base_jobs).map(|(pipeline,(key,_))| (key,pipeline)).collect();
 
     let legacy_dlight_pipelines = if shader_variant.legacy_dlights {
@@ -941,7 +1275,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 key.depth_write = false;
                 key.depth_equal = true;
                 create_world_pipeline(device, layout, shader, surface_format,
-                    key, msaa_samples, false, false, Some(shader_variant), true)
+                    key, msaa_samples, false, false, Some(shader_variant), true, None)
             })?.into_iter().zip(originals.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
@@ -955,7 +1289,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             |&(original, writes_depth)| create_world_pipeline(
                 device, layout, shader, surface_format,
                 legacy_fog_pass_pipeline_key(original, writes_depth),
-                msaa_samples, true, true, Some(shader_variant), false))?
+                msaa_samples, true, true, Some(shader_variant), false, None))?
             .into_iter().zip(jobs.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
@@ -968,7 +1302,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 reflected_pipeline_key(original), surface_format, 1),
             |&original| create_world_pipeline(
                 device, layout, shader, surface_format, reflected_pipeline_key(original),
-                1, shader_variant.legacy_fog, false, Some(shader_variant), false))?
+                1, shader_variant.legacy_fog, false, Some(shader_variant), false, None))?
             .into_iter().zip(originals.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
@@ -984,10 +1318,28 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             |&(original, writes_depth)| create_world_pipeline(
                 device, layout, shader, surface_format,
                 reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
-                1, true, true, Some(shader_variant), false))?
+                1, true, true, Some(shader_variant), false, None))?
             .into_iter().zip(jobs.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
+
+    let specialized_pipelines = if shader_variant.material_specialization {
+        let started = Instant::now();
+        let base_variant = shader_variant.base_pass_key();
+        let (unique, slots) = specialized_pipeline_plan(&plan.material_jobs, shader_variant);
+        let compiled = compile_cached_world_pass("world-specialized-runtime", &unique, reusable, cancelled,
+            |&(key, material)| WorldPassPipelineIdentity::specialized(
+                shader_variant, shader_variant.legacy_fog, key, material,
+                material_minimal_entry(shader_variant, &key), surface_format, msaa_samples),
+            |&(key, material)| create_world_pipeline_specialized(
+                device, layout, shader, surface_format, key, msaa_samples,
+                shader_variant.legacy_fog, false, Some(base_variant), false, None, Some(material),
+                material_minimal_entry(shader_variant, &key)))?;
+        log_material_specialization(plan.material_jobs.len(), &unique, started);
+        specialized_pipeline_map(&plan.material_jobs, &unique, &slots, compiled)
+    } else {
+        Default::default()
+    };
 
     Some(WorldPipelineVariant {
         pipelines,
@@ -995,7 +1347,31 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
         fog_pass_pipelines,
         reflection_pipelines,
         reflection_fog_pass_pipelines,
+        specialized_pipelines,
     })
+}
+
+pub(in crate::renderer) fn create_shader_complexity_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    samples: u32,
+    keys: &[PipelineKey],
+    variant: Option<WorldShaderVariantKey>,
+) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
+    // This shader module and all diagnostic PSOs exist ONLY in the optional
+    // worker job. Normal BSP modules never see these declarations.
+    let complexity_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("BSP shader complexity (diagnostics only)"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../../bsp_complexity.wgsl").into()),
+    });
+    let jobs = keys.to_vec();
+    let pipelines = compile_pipeline_jobs("bsp-shader-complexity", jobs.clone(), |&key| {
+        create_world_pipeline(device, layout, shader, surface_format, key, samples,
+            false, false, variant.map(WorldShaderVariantKey::base_pass_key), false, Some(&complexity_fragment))
+    });
+    jobs.into_iter().zip(pipelines).collect()
 }
 
 pub(in crate::renderer) fn create_world_pipelines(
@@ -1037,6 +1413,7 @@ pub(in crate::renderer) fn create_world_pipelines(
             false,
             base_shader_variant,
             false,
+            None,
         )
     });
     keys.into_iter().zip(compiled).collect()
@@ -1197,6 +1574,7 @@ pub(in crate::renderer) fn create_legacy_dlight_pass_pipelines(
             false,
             Some(shader_variant),
             true,
+            None,
         )
     });
     originals.into_iter().zip(compiled).collect()
@@ -1235,7 +1613,9 @@ pub(in crate::renderer) fn legacy_fog_pass_pipeline_key(
 ) -> PipelineKey {
     PipelineKey {
         legacy_srgb_three_stage: false,
+        additive_fusion_count: 0,
         auto_sprite2: source.auto_sprite2,
+        sky_outer: source.sky_outer,
         class: source.class,
         blend: BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha),
         cull: source.cull,
@@ -1276,7 +1656,8 @@ pub(in crate::renderer) fn create_legacy_fog_pass_pipelines(
                 true,
                 shader_variant,
                 false,
-            )
+                None,
+        )
         },
     );
     jobs.into_iter().zip(compiled).collect()
@@ -1285,7 +1666,9 @@ pub(in crate::renderer) fn create_legacy_fog_pass_pipelines(
 pub(in crate::renderer) fn ocean_pipeline_key() -> PipelineKey {
     PipelineKey {
         legacy_srgb_three_stage: false,
+        additive_fusion_count: 0,
         auto_sprite2: false,
+        sky_outer: false,
         class: DrawClass::Transparent,
         blend: BlendMode::Opaque,
         cull: CullMode::None,
@@ -1328,6 +1711,7 @@ pub(in crate::renderer) fn create_reflection_pipelines(
             false,
             Some(shader_variant),
             false,
+            None,
         )
     });
     originals.into_iter().zip(compiled).collect()
@@ -1363,7 +1747,8 @@ pub(in crate::renderer) fn create_reflection_fog_pass_pipelines(
                 true,
                 Some(shader_variant),
                 false,
-            )
+                None,
+        )
         },
     );
     jobs.into_iter().zip(compiled).collect()

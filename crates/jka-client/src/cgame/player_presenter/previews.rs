@@ -193,7 +193,7 @@ impl PlayerPresenter {
         // The same cranium/cervical postmult conventions as OpenJK
         // BG_G2PlayerAngles (POSITIVE_X, NEGATIVE_Y, NEGATIVE_Z). Apply before
         // pose evaluation, so hats, sabers and the entire model stay coherent.
-        let pitch = (-head_look[1] * 15.0).clamp(-15.0, 15.0);
+        let pitch = (head_look[1] * 15.0).clamp(-15.0, 15.0);
         let yaw = (head_look[0] * 24.0).clamp(-24.0, 24.0);
         for (bone, weight) in [("cervical", 0.34), ("cranium", 0.66)] {
             if Ghoul2Animator::bone_index(&model.animation_gla, bone).is_some() {

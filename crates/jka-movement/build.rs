@@ -86,6 +86,11 @@ fn main() {
         .define("_CRT_SECURE_NO_WARNINGS", None)
         .define("Com_Error", "JKA_CM_Error")
         .define("Com_Printf", "JKA_CM_Printf")
+        // The STL since VS 2022 17.10 gives std::mutex a constexpr constructor that
+        // skips _Mtx_init_in_situ. Against a msvcp140.dll older than 14.40 (any PC
+        // without a recent VC++ redistributable) the first lock() then dereferences
+        // an uninitialised mutex and crashes in jka_lock. This keeps the old ABI.
+        .define("_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR", None)
         .warnings(false)
         .flag_if_supported("/fp:precise")
         .flag_if_supported("/EHsc")

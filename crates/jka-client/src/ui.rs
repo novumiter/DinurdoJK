@@ -121,7 +121,7 @@ pub use settings::rendering::{
     VIDEO_ROW_MODERN_SABERS, VIDEO_ROW_MOTION_BLUR, VIDEO_ROW_PBR, VIDEO_ROW_PERF_TRACE,
     VIDEO_ROW_PICMIP, VIDEO_ROW_PLANAR_REFLECTIONS,
     VIDEO_ROW_PLANAR_REFLECTION_DEBUG, VIDEO_ROW_PVS, VIDEO_ROW_QUALITY_PRESET,
-    VIDEO_ROW_RENDERER_VERBOSE, VIDEO_ROW_RENDER_BACKEND, VIDEO_ROW_RESOLUTION,
+    VIDEO_ROW_RENDERER_VERBOSE, VIDEO_ROW_RENDER_BACKEND, VIDEO_ROW_GPU_ADAPTER, VIDEO_ROW_RESOLUTION,
     VIDEO_ROW_SABER_FLARES, VIDEO_ROW_SABER_IMPACT_FX, VIDEO_ROW_SABER_MARKS, VIDEO_ROW_SSR, VIDEO_ROW_TEXTURE_FILTER,
     VIDEO_ROW_TONE_MAPPING, VIDEO_ROW_VERTEX_LIGHTING, VIDEO_ROW_VID_RESTART, VIDEO_ROW_VIGNETTE,
     VIDEO_ROW_CRT_SCOPE, VIDEO_ROW_CRT_STYLE, VIDEO_ROW_CRT_QUALITY, VIDEO_ROW_CRT_REFERENCE, VIDEO_ROW_CRT_MASK,
@@ -735,12 +735,14 @@ pub enum ConsoleSuggestKind {
     Cvar,
     Command,
     Server,
+    Map,
+    Argument,
 }
 
 /// One row of the console's live command/cvar filter popup.
 #[derive(Debug, Clone)]
 pub struct ConsoleSuggestion {
-    pub name: &'static str,
+    pub name: String,
     pub kind: ConsoleSuggestKind,
     /// Bit `i` set = byte `i` of `name` matched what was typed.
     pub mask: u64,

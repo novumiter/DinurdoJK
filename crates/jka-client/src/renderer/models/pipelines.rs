@@ -4,7 +4,7 @@ use crate::renderer::{
     gpu_blend_factor, pipeline_hash, polygon_offset_depth_bias, scene, BlendMode, CullMode,
     DrawClass, DynamicModelAlphaMode, DynamicModelRenderer, DynamicModelVertex,
     FxGpuSpriteInstance, Ghoul2GpuVertex, GpuVertex, PipelineJobKey, PipelineJobManager,
-    PipelineKey, Vec3, WorldShaderVariantKey, BLOB_MARK_PROJECTION, BLOB_MARK_SURFACE_LIFT,
+    MaterialFragmentKey, PipelineKey, Vec3, WorldShaderVariantKey, BLOB_MARK_PROJECTION, BLOB_MARK_SURFACE_LIFT,
     DEPTH_FORMAT, DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_ATTRIBUTES,
     FX_GPU_SPRITE_INSTANCE_ATTRIBUTES, GHOUL2_GPU_VERTEX_ATTRIBUTES,
     LEGACY_DLIGHT_SURFACE_ID_ATTRIBUTES, RT_RECEIVER_RAW_COLOR_ATTRIBUTES, VERTEX_ATTRIBUTES,
@@ -56,7 +56,7 @@ impl DynamicModelRenderer {
     ) {
         let surface_format = self.fx_sprite_surface_format;
         let samples = self.fx_sprite_samples;
-        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled));
+        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled, self.model_wet_compiled));
         let index = alpha_mode.index();
         if skin {
             let key = PipelineJobKey::new("ghoul2-model", index as u32, config);
@@ -64,6 +64,7 @@ impl DynamicModelRenderer {
             let layout = self.skin_pipeline_layout.clone();
             let shader = self.skin_shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
+            let model_wet = self.model_wet_compiled;
             jobs.request(key, "Ghoul2 alpha variant", move || {
                 create_ghoul2_skin_pipeline(
                     &device,
@@ -73,6 +74,7 @@ impl DynamicModelRenderer {
                     samples,
                     alpha_mode,
                     legacy_fog,
+                    model_wet,
                     false,
                     false,
                 )
@@ -83,6 +85,7 @@ impl DynamicModelRenderer {
             let layout = self.pipeline_layout.clone();
             let shader = self.shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
+            let model_wet = self.model_wet_compiled;
             jobs.request(key, "dynamic model alpha variant", move || {
                 create_dynamic_model_pipeline(
                     &device,
@@ -92,6 +95,7 @@ impl DynamicModelRenderer {
                     samples,
                     alpha_mode,
                     legacy_fog,
+                    model_wet,
                 )
             });
         }
@@ -108,12 +112,13 @@ impl DynamicModelRenderer {
     ) {
         let surface_format = self.fx_sprite_surface_format;
         let samples = self.fx_sprite_samples;
-        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled));
+        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled, self.model_wet_compiled));
         let key = PipelineJobKey::new("ghoul2-model-source", alpha_mode.index() as u32, config);
         let device = device.clone();
         let layout = self.skin_pipeline_layout.clone();
         let shader = self.skin_shader.clone();
         let legacy_fog = self.legacy_fog_compiled;
+        let model_wet = self.model_wet_compiled;
         jobs.request(key, "Ghoul2 Source 1 material variant", move || {
             create_ghoul2_skin_pipeline(
                 &device,
@@ -123,6 +128,7 @@ impl DynamicModelRenderer {
                 samples,
                 alpha_mode,
                 legacy_fog,
+                model_wet,
                 false,
                 true,
             )
@@ -138,7 +144,7 @@ impl DynamicModelRenderer {
     ) {
         let surface_format = self.fx_sprite_surface_format;
         let samples = self.fx_sprite_samples;
-        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled));
+        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled, self.model_wet_compiled));
         let index = alpha_mode.index();
         if skin {
             let key = PipelineJobKey::new("ghoul2-model-glow", index as u32, config);
@@ -146,6 +152,7 @@ impl DynamicModelRenderer {
             let layout = self.skin_pipeline_layout.clone();
             let shader = self.skin_shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
+            let model_wet = self.model_wet_compiled;
             jobs.request(key, "Ghoul2 authored glow alpha variant", move || {
                 create_ghoul2_skin_pipeline(
                     &device,
@@ -155,6 +162,7 @@ impl DynamicModelRenderer {
                     samples,
                     alpha_mode,
                     legacy_fog,
+                    model_wet,
                     true,
                     false,
                 )
@@ -165,6 +173,7 @@ impl DynamicModelRenderer {
             let layout = self.pipeline_layout.clone();
             let shader = self.shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
+            let model_wet = self.model_wet_compiled;
             jobs.request(key, "dynamic model authored glow alpha variant", move || {
                 create_dynamic_model_glow_pipeline(
                     &device,
@@ -174,6 +183,7 @@ impl DynamicModelRenderer {
                     samples,
                     alpha_mode,
                     legacy_fog,
+                    model_wet,
                 )
             });
         }
@@ -233,7 +243,7 @@ impl DynamicModelRenderer {
         }
         let surface_format = self.fx_sprite_surface_format;
         let samples = self.fx_sprite_samples;
-        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled));
+        let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled, self.model_wet_compiled));
         for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
             let index = alpha_mode.index();
             if model_mask & (1 << index) != 0 && self.model_pipelines[index].is_none() {
@@ -1051,6 +1061,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline(
     samples: u32,
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
+    model_wet: bool,
 ) -> wgpu::RenderPipeline {
     create_dynamic_model_pipeline_inner(
         device,
@@ -1060,6 +1071,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline(
         samples,
         alpha_mode,
         legacy_fog,
+        model_wet,
         false,
         false,
     )
@@ -1073,6 +1085,7 @@ pub(in crate::renderer) fn create_dynamic_model_glow_pipeline(
     samples: u32,
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
+    model_wet: bool,
 ) -> wgpu::RenderPipeline {
     create_dynamic_model_pipeline_inner(
         device,
@@ -1082,6 +1095,7 @@ pub(in crate::renderer) fn create_dynamic_model_glow_pipeline(
         samples,
         alpha_mode,
         legacy_fog,
+        model_wet,
         false,
         true,
     )
@@ -1095,9 +1109,18 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
     samples: u32,
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
+    // ENABLE_MODEL_WET; ignored for RT receivers, whose module keeps the default.
+    model_wet: bool,
     rt_receiver: bool,
     force_fog_black: bool,
 ) -> wgpu::RenderPipeline {
+    let mut fragment_constants = vec![
+        ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
+        ("FORCE_FOG_BLACK", f64::from(u8::from(force_fog_black))),
+    ];
+    if !rt_receiver {
+        fragment_constants.push(("ENABLE_MODEL_WET", f64::from(u8::from(model_wet))));
+    }
     let vertex_layouts = [
         Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<DynamicModelVertex>() as wgpu::BufferAddress,
@@ -1255,10 +1278,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
                 _ => "fs_main",
             }),
             compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[
-                    ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
-                    ("FORCE_FOG_BLACK", f64::from(u8::from(force_fog_black))),
-                ],
+                constants: &fragment_constants,
                 ..Default::default()
             },
             targets: &[Some(wgpu::ColorTargetState {
@@ -1280,6 +1300,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
     samples: u32,
     alpha_mode: DynamicModelAlphaMode,
     legacy_fog: bool,
+    model_wet: bool,
     force_fog_black: bool,
     source_material: bool,
 ) -> wgpu::RenderPipeline {
@@ -1446,6 +1467,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
                 constants: &[
                     ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),
                     ("FORCE_FOG_BLACK", f64::from(u8::from(force_fog_black))),
+                    ("ENABLE_MODEL_WET", f64::from(u8::from(model_wet))),
                     (
                         "ENABLE_SOURCE_MATERIAL",
                         f64::from(u8::from(source_material)),
@@ -1593,8 +1615,83 @@ pub(in crate::renderer) fn create_world_pipeline(
     fog_pass: bool,
     shader_variant: Option<WorldShaderVariantKey>,
     legacy_dlight_pass: bool,
+    complexity_fragment: Option<&wgpu::ShaderModule>,
 ) -> wgpu::RenderPipeline {
-    let blend = if legacy_dlight_pass {
+    create_world_pipeline_specialized(device, layout, shader, surface_format, key, msaa_samples,
+        legacy_fog, fog_pass, shader_variant, legacy_dlight_pass, complexity_fragment, None, false)
+}
+
+/// Fragment entry point of a base-pass world PSO.
+pub(in crate::renderer) fn world_base_fragment_entry(
+    key: PipelineKey,
+    legacy_fog: bool,
+    has_variant: bool,
+) -> &'static str {
+    if key.class == DrawClass::Sky {
+        if key.sky_outer && has_variant { "fs_sky_outer" } else { "fs_sky" }
+    } else if key.additive_fusion_count >= 2 {
+        match key.additive_fusion_count {
+            2 => "fs_additive_fused2",
+            _ => "fs_additive_fused3",
+        }
+    } else if key.legacy_srgb_three_stage {
+        // Separate WGSL entry: conversion math cannot leak into any unrelated PSO.
+        "fs_legacy_srgb_three_stage"
+    } else if legacy_fog {
+        "fs_main_legacy_fog"
+    } else {
+        "fs_main"
+    }
+}
+
+/// `create_world_pipeline` plus an optional per-material key (r_fragmentShaderMode 1),
+/// whose header bits become override constants of this PSO.
+pub(in crate::renderer) fn create_world_pipeline_specialized(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    surface_format: wgpu::TextureFormat,
+    key: PipelineKey,
+    msaa_samples: u32,
+    legacy_fog: bool,
+    fog_pass: bool,
+    shader_variant: Option<WorldShaderVariantKey>,
+    legacy_dlight_pass: bool,
+    complexity_fragment: Option<&wgpu::ShaderModule>,
+    material_key: Option<MaterialFragmentKey>,
+    // r_fragmentShaderMode 2: vs_world_minimal / fs_world_minimal (see
+    // material_minimal_entry); only for a plain base-pass stage.
+    minimal_entry: bool,
+) -> wgpu::RenderPipeline {
+    let shader_complexity = complexity_fragment.is_some();
+    let blend = if shader_complexity {
+        // Additive floating-point per-fragment accumulation, NOT alpha blending.
+        Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        })
+    } else if key.additive_fusion_count >= 2 && !legacy_dlight_pass {
+        Some(wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        })
+    } else if legacy_dlight_pass {
         Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -1632,7 +1729,20 @@ pub(in crate::renderer) fn create_world_pipeline(
         }
     };
     let color_write = wgpu::ColorWrites::ALL;
-    let shader_constants = shader_variant.map(WorldShaderVariantKey::compilation_constants);
+    // ENABLE_ALPHA_TEST is per pipeline rather than per variant: an Opaque stage
+    // never has an alpha cutoff, and leaving the discard out keeps early depth
+    // rejection for ordinary walls and floors.
+    let shader_constants = shader_variant.map(|variant| {
+        let mut constants = variant.compilation_constants();
+        constants.push((
+            "ENABLE_ALPHA_TEST",
+            f64::from(u8::from(key.class != DrawClass::Opaque)),
+        ));
+        if let Some(material) = material_key {
+            constants.extend(material.compilation_constants());
+        }
+        constants
+    });
     // wgpu validates specialization constants per entry point, not merely per
     // WGSL module. ENABLE_RAY_TRACED_SHADOWS is intentionally fragment-only, so
     // do not submit it while specializing vs_main. The remaining world overrides
@@ -1654,21 +1764,44 @@ pub(in crate::renderer) fn create_world_pipeline(
         },
         None => Default::default(),
     };
-    let fragment_compilation_options = match shader_constants.as_ref() {
-        Some(constants) => wgpu::PipelineCompilationOptions {
-            constants,
-            ..Default::default()
-        },
-        None => Default::default(),
+    let fragment_compilation_options = if shader_complexity {
+        Default::default()
+    } else {
+        match shader_constants.as_ref() {
+            Some(constants) => wgpu::PipelineCompilationOptions {
+                constants,
+                ..Default::default()
+            },
+            None => Default::default(),
+        }
     };
     let legacy_dlight_vertex_stream = shader_variant.is_some_and(|variant| variant.legacy_dlights);
-    let vertex_entry_point = match (key.class, legacy_dlight_vertex_stream, key.auto_sprite2) {
-        (_, true, true) => "vs_autosprite2_legacy",
-        (_, false, true) => "vs_autosprite2",
-        (DrawClass::Sky, true, false) => "vs_sky_legacy",
-        (DrawClass::Sky, false, false) => "vs_sky",
-        (_, true, false) => "vs_main_legacy",
-        (_, false, false) => "vs_main",
+    // Select the fused UV vertex interface only when paired with a fused
+    // fragment entry point. Legacy projected light and separate fog passes
+    // consume the ordinary VertexOut interface, even for fused source batches.
+    let vertex_entry_point = if minimal_entry {
+        "vs_world_minimal"
+    } else if key.additive_fusion_count >= 2
+        && !legacy_dlight_pass
+        && !fog_pass
+        && !key.auto_sprite2
+        && key.class != DrawClass::Sky
+    {
+        match (legacy_dlight_vertex_stream, key.additive_fusion_count) {
+            (true, 2) => "vs_additive_fused2_legacy",
+            (true, _) => "vs_additive_fused3_legacy",
+            (false, 2) => "vs_additive_fused2",
+            (false, _) => "vs_additive_fused3",
+        }
+    } else {
+        match (key.class, legacy_dlight_vertex_stream, key.auto_sprite2) {
+            (_, true, true) => "vs_autosprite2_legacy",
+            (_, false, true) => "vs_autosprite2",
+            (DrawClass::Sky, true, false) => "vs_sky_legacy",
+            (DrawClass::Sky, false, false) => "vs_sky",
+            (_, true, false) => "vs_main_legacy",
+            (_, false, false) => "vs_main",
+        }
     };
     let base_vertex_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
@@ -1685,26 +1818,24 @@ pub(in crate::renderer) fn create_world_pipeline(
     } else {
         vec![Some(base_vertex_layout)]
     };
-    let fragment_entry_point = if legacy_dlight_pass {
+    let fragment_entry_point = if shader_complexity {
+        "fs_cost"
+    } else if legacy_dlight_pass {
         "fs_legacy_dlight_pass"
     } else if fog_pass {
         "fs_legacy_fog_pass"
-    } else if key.class == DrawClass::Sky {
-        "fs_sky"
-    } else if key.legacy_srgb_three_stage {
-        // Separate WGSL entry: conversion math cannot leak into any unrelated PSO.
-        "fs_legacy_srgb_three_stage"
-    } else if legacy_fog {
-        "fs_main_legacy_fog"
+    } else if minimal_entry {
+        "fs_world_minimal"
     } else {
-        "fs_main"
+        world_base_fragment_entry(key, legacy_fog, shader_variant.is_some())
     };
     let is_rt = shader_variant.is_some_and(|variant| variant.ray_traced_shadows);
     let _compile_guard = rt_diagnostics::compile_guard(is_rt);
     let traced = crate::pipeline_jobs::pipeline_trace_enabled()
         || (is_rt && rt_diagnostics::config().trace);
     let fingerprint = pipeline_hash(&(key, shader_variant, surface_format, msaa_samples,
-        legacy_fog, fog_pass, legacy_dlight_pass, vertex_entry_point, fragment_entry_point));
+        legacy_fog, fog_pass, legacy_dlight_pass, vertex_entry_point, fragment_entry_point,
+        material_key));
     // This line is flushed by the logger BEFORE entering the native compiler.
     // BEGIN without a matching END identifies an in-flight compilation on crash.
     let compile_id = if traced {
@@ -1749,12 +1880,16 @@ pub(in crate::renderer) fn create_world_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: DEPTH_FORMAT,
-            depth_write_enabled: Some(if legacy_dlight_pass {
+            depth_write_enabled: Some(if shader_complexity || legacy_dlight_pass {
                 false
             } else {
                 key.depth_write
             }),
-            depth_compare: Some(if legacy_dlight_pass || key.depth_equal {
+            depth_compare: Some(if shader_complexity {
+                // Test against the finished scene depth; don't blindly
+                // inherit Equal from the original stage's depth-fill contract.
+                camera_depth_compare()
+            } else if legacy_dlight_pass || key.depth_equal {
                 wgpu::CompareFunction::Equal
             } else {
                 camera_depth_compare()
@@ -1771,11 +1906,11 @@ pub(in crate::renderer) fn create_world_pipeline(
             ..Default::default()
         },
         fragment: Some(wgpu::FragmentState {
-            module: shader,
+            module: complexity_fragment.unwrap_or(shader),
             entry_point: Some(fragment_entry_point),
             compilation_options: fragment_compilation_options,
             targets: &[Some(wgpu::ColorTargetState {
-                format: surface_format,
+                format: if shader_complexity { wgpu::TextureFormat::Rgba16Float } else { surface_format },
                 blend,
                 write_mask: color_write,
             })],

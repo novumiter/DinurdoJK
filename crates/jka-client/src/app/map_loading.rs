@@ -46,6 +46,8 @@ pub(in crate::app) struct PerfSample {
     pub(in crate::app) fps: Vec<f64>,
     pub(in crate::app) frame_ms: Vec<f64>,
     pub(in crate::app) gpu_ms: Vec<f64>,
+    /// Last window's main world program binds: specialized, general.
+    pub(in crate::app) world_program_binds: (u32, u32),
 }
 
 pub(in crate::app) struct MapLoadingState {
@@ -755,6 +757,11 @@ impl App {
         if self.video.stage_collapse_extra {
             scene::apply_reverse_lightmap_collapse_in_place(&mut map);
         }
+        if self.video.additive_stage_fusion {
+            scene::fuse_additive_stage_fusion_in_place(&mut map);
+        } else {
+            scene::expand_additive_stage_fusion_in_place(&mut map);
+        }
         map.load_timings = scene::MapLoadTimings::default();
 
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
@@ -864,6 +871,23 @@ impl App {
         }
     }
 
+    /// Display effective shader redirects (both local /remapShader and server
+    /// CS_SHADERSTATE), unlike the narrower server-only TaystJK listing.
+    pub(in crate::app) fn local_list_shader_remaps(&mut self) {
+        // Take owned names before writing console output, which borrows App mutably.
+        let remaps: Vec<(String, String)> = self.shader_remaps.redirects()
+            .map(|(from, to)| (from.to_owned(), to.to_owned()))
+            .collect();
+        if remaps.is_empty() {
+            self.push_console_line("^3listRemaps:^7 no active shader remaps".to_owned());
+            return;
+        }
+        self.push_console_line(format!("^3listRemaps:^7 {} active remap(s)", remaps.len()));
+        for (from, to) in remaps {
+            self.push_console_line(format!(" ^7{from} ^3->^7 {to}"));
+        }
+    }
+
     /// Consume only shader-remap renderer actions, preserving unrelated cgame
     /// side effects for their own consumers. Policy exactly follows TaystJK:
     /// CS_SHADERSTATE uses the models/players/* exception at cg_remaps=1,
@@ -940,6 +964,11 @@ impl App {
         )?;
         if self.video.stage_collapse_extra {
             scene::apply_reverse_lightmap_collapse_in_place(&mut map);
+        }
+        if self.video.additive_stage_fusion {
+            scene::fuse_additive_stage_fusion_in_place(&mut map);
+        } else {
+            scene::expand_additive_stage_fusion_in_place(&mut map);
         }
         map.load_timings = scene::MapLoadTimings::default();
 

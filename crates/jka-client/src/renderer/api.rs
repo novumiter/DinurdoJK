@@ -383,6 +383,12 @@ pub enum ModelGeometrySource {
 #[derive(Clone)]
 pub struct DynamicModelSurface {
     pub geometry_source: ModelGeometrySource,
+    /// Authored `rgbGen lightingDiffuse`: request TaystJK entity lightgrid
+    /// for this stage even when the generic ambient-mode shortcut is Off.
+    pub authored_lighting: bool,
+    /// Shared, immutable source-to-shader diagnostic for MD3 surfaces.
+    /// Kept separate from runtime material state; cloning is an Arc increment.
+    pub material_trace: Option<Arc<str>>,
     /// Presentation identity retained for diagnostics/culling work and dynamic
     /// RT BLAS ownership.
     pub entity_num: u16,
@@ -888,13 +894,18 @@ pub enum ScreenshotFormat {
 pub enum RenderCommand {
     /// Arm a bounded, off-by-default per-frame command-encoding capture.
     StartPerfCapture { stem: PathBuf, frames: usize },
+    /// One-command six-phase GPU sky sweep on the existing Unified renderer.
+    StartSkyPerfSweep { stem: PathBuf, frames: usize },
     Resize(PhysicalSize<u32>),
     SetVsync(VsyncMode),
     SetMaxFrameLatency(u32),
+    SetEarlySubmit(bool),
+    SetPresentCopy(bool),
     SetInputLateLatch(bool),
     SetMsaa(u32),
     SetTextureFilter(TextureFilter),
     SetPicmip(u32),
+    SetTextureCompression(u8),
     SetDetailTextures(bool),
     SetDetailTexture {
         path: String,
@@ -905,6 +916,7 @@ pub enum RenderCommand {
         distance: f32,
     },
     SetWireframeMask(u32),
+    SetShaderComplexity(bool),
     /// Trigger-volume / clip-brush debug overlays (session-only).
     SetDebugVolumes {
         triggers: bool,
@@ -925,6 +937,14 @@ pub enum RenderCommand {
     SetSunRayPreview(bool),
     SetPvsMode(PvsMode),
     SetWorldFlares(bool),
+    SetDrawInlineModels(bool),
+    /// r_fragmentShaderMode: 0 general world fragment program, 1 per-material specialized.
+    SetFragmentShaderMode(u8),
+    /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
+    SetColorClearMode(u8),
+    /// Render-only controls for compiled model-path world stages and GPU A/B stage isolation.
+    SetWorldStageDebug { draw_bsp_model_surfaces: bool, probe: u8 },
+    SetFastSky(u8),
     SetFpsCap(u32),
     SetGamma(f32),
     SetGammaMethod(crate::gamma::GammaMethod),
@@ -1123,16 +1143,24 @@ pub(in crate::renderer) struct PerfEncodeCallCounts {
     pub multi_draw_indexed_indirect_count: u32,
 }
 
-/// Opt-in main-camera BSP geometry counters, indexed by loaded material debug ID.
-/// The indexed counts include each authored shader stage (they are not unique
-/// map triangles). Kept out of the ordinary frame's hot path when not capturing.
+/// Opt-in main-camera BSP draw-batch candidates indexed by material debug ID.
+/// Indexed counts are prepared GPU batches, not unique map triangles or the
+/// number of authored stages inside an additive fused draw. Disabled capture
+/// leaves this allocation/counter work out of the normal frame hot path.
 #[derive(Clone, Copy, Default)]
 pub(in crate::renderer) struct WorldStagePerf {
     pub(in crate::renderer) stages: u64,
     pub(in crate::renderer) stage_indices: u64,
+    /// Authored/resolved stage equivalents represented by these submitted
+    /// world-batch candidates (fused batches still count as one draw).
+    pub(in crate::renderer) resolved_stage_equivalents: u64,
+    /// Real authored-glow draw_indexed calls recorded at the replay draw site.
+    pub(in crate::renderer) glow_replay_draws: u64,
     pub(in crate::renderer) distinct_surfaces: u64,
     pub(in crate::renderer) distinct_indices: u64,
     pub(in crate::renderer) inline_stages: u64,
+    pub(in crate::renderer) skipped_hidden_stages: u64,
+    pub(in crate::renderer) skipped_hidden_indices: u64,
 }
 
 #[derive(Default)]
@@ -1164,6 +1192,9 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) perf_followup_ms: f64,
     pub(in crate::renderer) perf_primary_command_buffers: u32,
     pub(in crate::renderer) perf_encode_calls: PerfEncodeCallCounts,
+    pub(in crate::renderer) perf_deferred_bundle_hit: u32,
+    pub(in crate::renderer) perf_deferred_bundle_build: u32,
+    pub(in crate::renderer) perf_deferred_bundle_draws: u32,
     /// Main-view CPU compaction audit; zero if that path was inactive.
     pub(in crate::renderer) world_cpu_compaction_active: bool,
     pub(in crate::renderer) world_cpu_compact_visible_members: u32,
@@ -1183,6 +1214,8 @@ pub(in crate::renderer) struct FrameInfo {
     /// True when the late-latch sample was intentionally taken after surface
     /// acquisition (fast baseline without camera-dependent early preparation).
     pub(in crate::renderer) late_latch_after_acquire: bool,
+    /// r_earlySubmit applied: recorded offscreen, submitted before acquire.
+    pub(in crate::renderer) early_submit: bool,
     pub(in crate::renderer) dynamic_model_prepare_ms: f64,
     pub(in crate::renderer) dynamic_model_surfaces: u32,
     pub(in crate::renderer) dynamic_model_vertices: u64,
@@ -1201,6 +1234,9 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) world_pvs_batches: u32,
     pub(in crate::renderer) world_frustum_rejected: u32,
     pub(in crate::renderer) world_encoded_batches: u32,
+    /// Main world pass base-program binds: specialized (r_fragmentShaderMode 1) vs general.
+    pub(in crate::renderer) world_specialized_binds: u32,
+    pub(in crate::renderer) world_general_binds: u32,
     pub(in crate::renderer) world_multidraw_groups: u32,
     pub(in crate::renderer) world_multidraw_batches: u32,
     /// Main-camera authored world stages surviving CPU area/frustum/optical
@@ -1210,6 +1246,14 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) perf_world_stage_indices: u64,
     pub(in crate::renderer) perf_world_distinct_surfaces: u64,
     pub(in crate::renderer) perf_world_distinct_indices: u64,
+    /// Authoritative inline mover state at main-camera submission.
+    pub(in crate::renderer) perf_inline_models_active: u64,
+    pub(in crate::renderer) perf_inline_models_hidden: u64,
+    pub(in crate::renderer) perf_inline_models_uninitialized: u64,
+    /// PVS-selected authored stage work suppressed because a particular
+    /// inline render instance is absent from the authoritative snapshot.
+    pub(in crate::renderer) perf_inline_hidden_stage_batches: u64,
+    pub(in crate::renderer) perf_inline_hidden_stage_indices: u64,
     pub(in crate::renderer) perf_world_inline_stages: u64,
     pub(in crate::renderer) perf_world_sky_stages: u64,
     pub(in crate::renderer) perf_world_largest_stage_indices: u64,
@@ -1228,9 +1272,18 @@ pub(in crate::renderer) struct FrameInfo {
 
 impl FrameInfo {
     #[inline]
+    pub(in crate::renderer) fn perf_count_hidden_world_stage(&mut self, material_index: u32, indices: u32) {
+        self.perf_inline_hidden_stage_batches += 1;
+        self.perf_inline_hidden_stage_indices += u64::from(indices);
+        if let Some(material) = self.perf_world_material_stages.get_mut(material_index as usize) {
+            material.skipped_hidden_stages += 1;
+            material.skipped_hidden_indices += u64::from(indices);
+        }
+    }
+
     pub(in crate::renderer) fn perf_count_world_stage(
         &mut self, material_index: u32, indices: u32, distinct: bool,
-        inline: bool, class: crate::scene::DrawClass,
+        inline: bool, class: crate::scene::DrawClass, resolved_stage_count: u8,
     ) {
         // An empty vector is the capture-disabled fast path.
         if self.perf_world_material_stages.is_empty() { return; }
@@ -1253,6 +1306,7 @@ impl FrameInfo {
         if let Some(mat) = self.perf_world_material_stages.get_mut(material_index as usize) {
             mat.stages += 1;
             mat.stage_indices += indices;
+            mat.resolved_stage_equivalents += u64::from(resolved_stage_count.max(1));
             mat.inline_stages += u64::from(inline);
             if distinct {
                 mat.distinct_surfaces += 1;

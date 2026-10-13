@@ -134,6 +134,15 @@ impl App {
             return false;
         }
 
+        // In the Dev wheel, physical gameplay keys must reach the raw
+        // dispatcher so held WASD/+movement keys remain live and can be
+        // released while the wheel is showing. Egui must not swallow them.
+        if self.overlay == OverlayMode::DevRadial
+            && matches!(event, WindowEvent::KeyboardInput { .. })
+        {
+            return false;
+        }
+
         // Ctrl+C in the Trace popup is an application shortcut: it exports the
         // complete selected diagnostic record, not just selectable egui text.
         // Keep it out of egui so its generic copy handling cannot swallow (or
@@ -157,8 +166,8 @@ impl App {
         let response = state.on_window_event(window, event);
         self.egui_repaint_requested |= response.repaint;
 
-        // The developer wheel is entirely pointer-driven. Never let a mouse
-        // press/release leak to an attack/bind when egui reports !consumed.
+        // Safety net: the wheel intercepts button events before this routing
+        // path, so no mouse button may leak into an attack or another bind.
         if self.overlay == OverlayMode::DevRadial
             && matches!(event, WindowEvent::MouseInput { .. })
         {
@@ -242,8 +251,6 @@ impl App {
                 return false;
             }
             if self.overlay == OverlayMode::DevRadial
-                && event.state == ElementState::Pressed
-                && !event.repeat
                 && self.key_bound_to_dev(code)
             {
                 return false;

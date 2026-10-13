@@ -8,6 +8,7 @@
 //! remaining entity kinds explicit instead of silently treating them as models.
 
 use super::{
+    md3_lod,
     item_presenter::{cg_item, item_cone_origin, ItemDraw, ItemInput, IT_WEAPON},
     weapon_fx::WeaponFx,
     player_presenter::{blend_for_alpha, openjk_vectoangles, Ghoul2PresentationView, PlayerPresenter},
@@ -25,11 +26,12 @@ use jka_assets::{
     bsp::StaticModel,
     md3::{self, Model as Md3Model},
     pk3::AssetSearchPath,
-    shader::Shader,
+    shader::{AlphaGen, RgbGen, Shader, Stage, TcGen, TcMod},
 };
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 const MAX_MD3_BYTES: usize = 64 * 1024 * 1024;
@@ -55,12 +57,43 @@ struct Md3SurfaceAsset {
     texture: Option<Arc<TextureData>>,
     alpha_mode: DynamicModelAlphaMode,
     authored_glow: bool,
+    material_trace: Arc<str>,
+    /// Current effective shader has no color/depth effect. This only gates
+    /// submission; the model and vertices remain cached for later remaps.
+    invisible_without_override: bool,
+    /// Extra authored passes, kept with the cached MD3 so remaps can replace
+    /// materials without ever discarding the source geometry.
+    extra_stages: Vec<Md3ExtraStage>,
+    two_sided_indices: Option<Arc<Vec<u32>>>,
+    authored_lighting: bool,
+}
+
+#[derive(Clone)]
+struct Md3ExtraStage {
+    index: usize,
+    texture: Option<Arc<TextureData>>,
+    alpha_mode: DynamicModelAlphaMode,
+    authored_glow: bool,
+    rgb_gen: RgbGen,
+    alpha_gen: AlphaGen,
+    rgb_const: [f32; 3],
+    alpha_const: f32,
+    tc_gen: TcGen,
+    tc_mods: Vec<TcMod>,
 }
 
 struct Md3Asset {
     key: Arc<str>,
+    content_hash: u64,
     model: Arc<Md3Model>,
     surfaces: Vec<Md3SurfaceAsset>,
+}
+
+struct Md3Chain {
+    lods: [Option<Arc<Md3Asset>>; 3],
+    generated: [bool; 3],
+    queued: bool,
+    processed: bool,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -102,6 +135,15 @@ pub struct EntityPresenter {
     texture_arcs: HashMap<usize, Arc<TextureData>>,
     missing_texture: Arc<TextureData>,
     md3_models: HashMap<String, Arc<Md3Asset>>,
+    md3_chains: HashMap<String, Md3Chain>,
+    md3_worker: md3_lod::Worker,
+    md3_lod_view: Option<Ghoul2PresentationView>,
+    md3_lod_scale: f32,
+    md3_lod_bias: i32,
+    md3_auto_lod: bool,
+    md3_lod_debug: bool,
+    md3_lod_reported: HashSet<(String, usize)>,
+    md3_static_report_at: Option<Instant>,
     md3_geometry_cache_enabled: bool,
     md3_geometry: HashMap<Md3GeometrySlot, CachedMd3Geometry>,
     md3_geometry_bytes: usize,
@@ -141,6 +183,11 @@ struct ShieldHit {
 /// One placed `misc_model_static` with its world-space surfaces already built.
 struct StaticProp {
     surfaces: Vec<DynamicModelSurface>,
+    /// Pretransformed on model registration, switched without re-transforming
+    /// thousands of misc_model_static surfaces on every camera move.
+    lods: [Option<Vec<DynamicModelSurface>>; 2],
+    lod_count: usize,
+    lod_radius: f32,
     origin: [f32; 3],
     /// Origin the cull tests use (jaPRO adds 1 + zoffset to z).
     cull_origin: [f32; 3],
@@ -171,6 +218,15 @@ impl EntityPresenter {
             texture_arcs: HashMap::new(),
             missing_texture: Arc::new(materials::missing_texture_data()),
             md3_models: HashMap::new(),
+            md3_chains: HashMap::new(),
+            md3_worker: md3_lod::Worker::new(),
+            md3_lod_view: None,
+            md3_lod_scale: 5.0,
+            md3_lod_bias: 0,
+            md3_auto_lod: false,
+            md3_lod_debug: false,
+            md3_lod_reported: HashSet::new(),
+            md3_static_report_at: None,
             md3_geometry_cache_enabled: true,
             md3_geometry: HashMap::new(),
             md3_geometry_bytes: 0,
@@ -302,10 +358,38 @@ impl EntityPresenter {
             return;
         }
         self.shader_remaps = remaps;
-        self.md3_models.clear();
-        self.md3_geometry.clear();
-        self.md3_geometry_bytes = 0;
+        // A server remap is reversible: keep the original MD3 models, vertex
+        // buffers and cached transforms. Only the material decisions change.
+        // The old implementation discarded all models here and reread them
+        // from the VFS, making a clear -> visible transition unnecessarily
+        // expensive (and losing any generated MD3 LODs).
+        let mut replaced = HashMap::new();
+        let old_models = std::mem::take(&mut self.md3_models);
+        for (key, old) in old_models {
+            let refreshed = Arc::new(self.refresh_md3_materials(&old));
+            replaced.insert(Arc::as_ptr(&old) as usize, Arc::clone(&refreshed));
+            self.md3_models.insert(key, refreshed);
+        }
+        let mut chains = std::mem::take(&mut self.md3_chains);
+        for chain in chains.values_mut() {
+            for slot in &mut chain.lods {
+                let Some(old) = slot.take() else { continue };
+                let id = Arc::as_ptr(&old) as usize;
+                let refreshed = if let Some(existing) = replaced.get(&id) {
+                    Arc::clone(existing)
+                } else {
+                    // Authored/generated LODs may exist only in the chain.
+                    let refreshed = Arc::new(self.refresh_md3_materials(&old));
+                    replaced.insert(id, Arc::clone(&refreshed));
+                    refreshed
+                };
+                *slot = Some(refreshed);
+            }
+        }
+        self.md3_chains = chains;
         self.fx_materials.clear();
+        // Pretransformed static props contain old material/visibility decisions.
+        // Rebuild once using the retained model and geometry caches.
         self.static_props = None;
     }
 
@@ -337,6 +421,7 @@ impl EntityPresenter {
             self.static_props = Some(props);
         }
         let mut draws = Vec::new();
+        let mut lod_counts = [0usize; 3];
         for prop in self.static_props.iter().flatten() {
             let culled = view.is_some_and(|view| {
                 let distance_cull = view.distance_cull();
@@ -344,14 +429,42 @@ impl EntityPresenter {
                     || (distance_cull > 0.0
                         && view.distance_to(prop.origin) - prop.radius > distance_cull)
             });
+            let lod = md3_lod_for_view(
+                view, prop.origin, prop.lod_radius, prop.lod_count,
+                self.md3_lod_scale, self.md3_lod_bias, false,
+            );
+            if !culled { lod_counts[lod] += 1; }
+            let chosen = if lod == 0 { &prop.surfaces } else {
+                prop.lods[lod - 1].as_ref().unwrap_or(&prop.surfaces)
+            };
             if !culled {
-                draws.extend(prop.surfaces.iter().cloned());
+                if self.rt_rigid_casters_enabled && lod != 0 {
+                    // Keep RT caster geometry at LOD0 so changing raster LOD
+                    // does not rebuild raytracing acceleration structures.
+                    draws.extend(chosen.iter().cloned().map(|mut surface| {
+                        surface.rt_rigid = None;
+                        surface
+                    }));
+                    draws.extend(prop.surfaces.iter().cloned().map(|mut surface| {
+                        surface.raster_visible = false;
+                        surface
+                    }));
+                } else {
+                    draws.extend(chosen.iter().cloned());
+                }
             } else if self.rt_rigid_casters_enabled {
+                // Offscreen casters likewise remain at stable authored LOD0.
                 draws.extend(prop.surfaces.iter().cloned().map(|mut surface| {
                     surface.raster_visible = false;
                     surface
                 }));
             }
+        }
+        if self.md3_lod_debug && self.md3_static_report_at
+            .is_none_or(|instant| instant.elapsed().as_secs_f32() >= 1.0) {
+            println!("MD3 STATIC LOD: visible LOD0={} LOD1={} LOD2={} (auto={})",
+                lod_counts[0], lod_counts[1], lod_counts[2], self.md3_auto_lod);
+            self.md3_static_report_at = Some(Instant::now());
         }
         draws
     }
@@ -385,6 +498,13 @@ impl EntityPresenter {
                 }
             };
             surfaces_total += surfaces.len();
+            let mut lods: [Option<Vec<DynamicModelSurface>>; 2] = [None, None];
+            let lod_count = self.md3_chain_count(&placement.model);
+            for level in 1..lod_count {
+                if let Ok(draws) = self.present_md3_ref_entity_lod(1023, &submission, Some(level)) {
+                    lods[level - 1] = Some(draws);
+                }
+            }
             let radius = self
                 .load_md3(&placement.model)
                 .ok()
@@ -399,9 +519,16 @@ impl EntityPresenter {
                     })
                 })
                 .unwrap_or(0.0);
+            let lod_radius = self.load_md3(&placement.model).ok()
+                .and_then(|asset| asset.model.frames.first().map(|frame| {
+                    let deltas = (0..3).map(|axis| {
+                        (frame.maxs[axis] - frame.mins[axis]) * placement.scale[axis]
+                    });
+                    deltas.map(|d| d*d).sum::<f32>().sqrt() * 0.5
+                })).unwrap_or(radius);
             let mut cull_origin = placement.origin;
             cull_origin[2] += 1.0 + placement.zoffset;
-            props.push(StaticProp { surfaces, origin: placement.origin, cull_origin, radius });
+            props.push(StaticProp { surfaces, lods, lod_count, lod_radius, origin: placement.origin, cull_origin, radius });
         }
         devprintln!(
             1,
@@ -621,6 +748,9 @@ impl EntityPresenter {
         shader_name: &str,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let asset = self.load_md3(qpath)?;
+        if self.is_noop_shader(shader_name) {
+            return Ok(Vec::new());
+        }
         let materials = self.fx_material_stages(shader_name);
         let mut draws = Vec::with_capacity(asset.surfaces.len() * materials.len().max(1));
         for surface_asset in &asset.surfaces {
@@ -641,6 +771,11 @@ impl EntityPresenter {
                     1.0, color, 0.0);
                 draws.push(DynamicModelSurface {
                     geometry_source: crate::renderer::ModelGeometrySource::Md3,
+                authored_lighting: false,
+                    material_trace: Some(Arc::from(format!(
+                        "CUSTOM SHADER OVERRIDE: {shader_name}\nCUSTOM STAGE: {stage} / {}\n{}",
+                        materials.len(), surface_asset.material_trace,
+                    ))),
                     entity_num,
                     wireframe_class: DynamicWireframeClass::Entity,
                     raster_visible: true,
@@ -923,6 +1058,59 @@ impl EntityPresenter {
         (vertices, indices)
     }
 
+    /// Additional authored MD3 shader stages. This is deliberately stage-driven:
+    /// no model/shader-name special cases, and source vertices survive remaps.
+    /// The first selected stage uses the existing primary material path.
+    #[allow(clippy::too_many_arguments)]
+    fn present_md3_extra_stages(
+        &mut self, draws: &mut Vec<DynamicModelSurface>,
+        asset: &Md3Asset, surface_asset: &Md3SurfaceAsset,
+        entity_num: u16, frame: usize, axis: [[f32; 3]; 3],
+        origin: [f32; 3], scale: f32, entity_color: [f32; 4], depth_hack: f32,
+    ) {
+        let camera = self.md3_lod_view.map(|view| view.camera_position());
+        for stage in &surface_asset.extra_stages {
+            let stage_color = md3_stage_color(stage, entity_color);
+            let (vertices, indices) = self.md3_geometry(
+                asset, surface_asset, entity_num, stage.index + 1, frame,
+                axis, origin, scale, stage_color, depth_hack,
+            );
+            let vertices = if matches!(stage.tc_gen, TcGen::Base) && stage.tc_mods.is_empty() {
+                vertices
+            } else {
+                Arc::new(vertices.iter().map(|vertex| {
+                    let mut transformed = *vertex;
+                    transformed.uv = md3_stage_uv(vertex, stage, camera);
+                    transformed
+                }).collect())
+            };
+            let indices = surface_asset.two_sided_indices.as_ref()
+                .map(Arc::clone).unwrap_or(indices);
+            draws.push(DynamicModelSurface {
+                geometry_source: crate::renderer::ModelGeometrySource::Md3,
+                authored_lighting: matches!(stage.rgb_gen, RgbGen::LightingDiffuse | RgbGen::LightingDiffuseEntity),
+                material_trace: Some(Arc::from(format!(
+                    "MD3 AUTHORED STAGE {} (of {})\n{}", stage.index,
+                    surface_asset.extra_stages.len() + 1, surface_asset.material_trace,
+                ))),
+                entity_num,
+                wireframe_class: DynamicWireframeClass::Entity,
+                raster_visible: true,
+                vertices, indices,
+                lighting_origin: Some(origin),
+                // Reflection, detail, translucency and other overlay stages do
+                // not create an additional rigid shadow caster.
+                rt_rigid: None,
+                rt_skinned_key: None,
+                ghoul2_gpu: None,
+                fx_gpu_sprites: None,
+                texture: stage.texture.clone(),
+                alpha_mode: stage.alpha_mode,
+                authored_glow: stage.authored_glow,
+            });
+        }
+    }
+
     /// An MD3 refEntity with an explicit transform (frame 0), shaderRGBA and
     /// optional customShader.
     fn present_md3_ref_entity(
@@ -930,7 +1118,19 @@ impl EntityPresenter {
         entity_num: u16,
         submission: &ItemDraw,
     ) -> Result<Vec<DynamicModelSurface>, String> {
-        let asset = self.load_md3(&submission.model)?;
+        self.present_md3_ref_entity_lod(entity_num, submission, None)
+    }
+
+    fn present_md3_ref_entity_lod(
+        &mut self,
+        entity_num: u16,
+        submission: &ItemDraw,
+        forced_lod: Option<usize>,
+    ) -> Result<Vec<DynamicModelSurface>, String> {
+        let asset = self.select_md3(&submission.model, submission.origin, 0, 1.0, forced_lod, false)?;
+        if submission.custom_shader.is_some_and(|shader| self.is_noop_shader(shader)) {
+            return Ok(Vec::new());
+        }
         let custom = submission.custom_shader.map(|shader| {
             let material = self.fx_material(shader);
             (
@@ -941,6 +1141,10 @@ impl EntityPresenter {
         });
         let mut draws = Vec::with_capacity(asset.surfaces.len());
         for surface_asset in &asset.surfaces {
+            // The explicit customShader overrides the MD3's surface shader.
+            if custom.is_none() && surface_asset.invisible_without_override {
+                continue;
+            }
             let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else { continue };
             let Some(vertices) = surface.frame_vertices(0) else { continue };
             if vertices.is_empty() || surface.indices.is_empty() {
@@ -958,11 +1162,18 @@ impl EntityPresenter {
             });
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
+                authored_lighting: submission.custom_shader.is_none() && surface_asset.authored_lighting,
+                material_trace: Some(if let Some(shader) = submission.custom_shader {
+                    Arc::from(format!("CUSTOM SHADER OVERRIDE: {shader}\n{}", surface_asset.material_trace))
+                } else {
+                    Arc::clone(&surface_asset.material_trace)
+                }),
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
                 vertices,
-                indices,
+                indices: surface_asset.two_sided_indices.as_ref()
+                    .map(Arc::clone).unwrap_or(indices),
                 lighting_origin: Some(submission.origin),
                 rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
                     Arc::clone(&asset.key),
@@ -981,6 +1192,12 @@ impl EntityPresenter {
 
                 authored_glow,
             });
+            if submission.custom_shader.is_none() {
+                self.present_md3_extra_stages(
+                    &mut draws, &asset, surface_asset, entity_num, 0, submission.axis,
+                    submission.origin, 1.0, submission.rgba, 0.0,
+                );
+            }
         }
         Ok(draws)
     }
@@ -1014,16 +1231,21 @@ impl EntityPresenter {
         entity: &PresentedEntity,
         qpath: &str,
     ) -> Result<Vec<DynamicModelSurface>, String> {
-        let asset = self.load_md3(qpath)?;
+        let base = self.load_md3(qpath)?;
         let frame = entity.state.field_i32("frame").unwrap_or(0).max(0) as usize;
-        let frame = frame.min(asset.model.frames.len().saturating_sub(1));
+        let frame = frame.min(base.model.frames.len().saturating_sub(1));
         let axis = angles_to_axis(entity.angles);
         let scale_int = entity.state.field_i32("iModelScale").unwrap_or(0);
         let scale = if scale_int == 0 { 1.0 } else { scale_int as f32 / 100.0 };
         let color = entity_color(entity);
+        let asset = self.select_md3(qpath, entity.origin, frame, scale.abs(), None, false)?;
+        let frame = frame.min(asset.model.frames.len().saturating_sub(1));
 
         let mut draws = Vec::with_capacity(asset.surfaces.len());
         for surface_asset in &asset.surfaces {
+            if surface_asset.invisible_without_override {
+                continue;
+            }
             let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else {
                 continue;
             };
@@ -1038,11 +1260,14 @@ impl EntityPresenter {
                 entity.origin, scale, color, 0.0);
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
+                authored_lighting: surface_asset.authored_lighting,
+                material_trace: Some(Arc::clone(&surface_asset.material_trace)),
                 entity_num: entity.number,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
                 vertices,
-                indices,
+                indices: surface_asset.two_sided_indices.as_ref()
+                    .map(Arc::clone).unwrap_or(indices),
                 lighting_origin: Some(entity.origin),
                 rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
                     Arc::clone(&asset.key),
@@ -1069,6 +1294,10 @@ impl EntityPresenter {
 
                 authored_glow: surface_asset.authored_glow,
             });
+            self.present_md3_extra_stages(
+                &mut draws, &asset, surface_asset, entity.number, frame, axis,
+                entity.origin, scale, color, 0.0,
+            );
         }
         Ok(draws)
     }
@@ -1208,6 +1437,9 @@ impl EntityPresenter {
         let asset = self.load_md3(qpath)?;
         let mut draws = Vec::with_capacity(asset.surfaces.len());
         for surface_asset in &asset.surfaces {
+            if surface_asset.invisible_without_override {
+                continue;
+            }
             let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else { continue };
             let Some(vertices) = surface.frame_vertices(0) else { continue };
             if vertices.is_empty() || surface.indices.is_empty() {
@@ -1218,11 +1450,14 @@ impl EntityPresenter {
                 1.0, [1.0; 4], 1.0);
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
+                authored_lighting: surface_asset.authored_lighting,
+                material_trace: Some(Arc::clone(&surface_asset.material_trace)),
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
                 vertices,
-                indices,
+                indices: surface_asset.two_sided_indices.as_ref()
+                    .map(Arc::clone).unwrap_or(indices),
                 lighting_origin: Some(origin),
                 // View weapons are camera-space presentation and must never be
                 // inserted into the world RT acceleration structure.
@@ -1235,6 +1470,10 @@ impl EntityPresenter {
 
                 authored_glow: surface_asset.authored_glow,
             });
+            self.present_md3_extra_stages(
+                &mut draws, &asset, surface_asset, entity_num, 0, axis,
+                origin, 1.0, [1.0; 4], 1.0,
+            );
         }
         Ok(draws)
     }
@@ -1255,6 +1494,9 @@ impl EntityPresenter {
         let frame = frame.min(asset.model.frames.len().saturating_sub(1));
         let mut draws = Vec::with_capacity(asset.surfaces.len());
         for surface_asset in &asset.surfaces {
+            if surface_asset.invisible_without_override {
+                continue;
+            }
             let Some(surface) = asset.model.surfaces.get(surface_asset.surface_index) else {
                 continue;
             };
@@ -1269,11 +1511,14 @@ impl EntityPresenter {
                 1.0, rgba, 0.0);
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Md3,
+                authored_lighting: surface_asset.authored_lighting,
+                material_trace: Some(Arc::clone(&surface_asset.material_trace)),
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Entity,
                 raster_visible: true,
                 vertices,
-                indices,
+                indices: surface_asset.two_sided_indices.as_ref()
+                    .map(Arc::clone).unwrap_or(indices),
                 lighting_origin: Some(origin),
                 rt_rigid: self.rt_rigid_casters_enabled.then(|| RayTracedRigidInstance::md3(
                     Arc::clone(&asset.key),
@@ -1300,8 +1545,278 @@ impl EntityPresenter {
 
                 authored_glow: surface_asset.authored_glow,
             });
+            self.present_md3_extra_stages(
+                &mut draws, &asset, surface_asset, entity_num, frame, axis,
+                origin, 1.0, rgba, 0.0,
+            );
         }
         Ok(draws)
+    }
+
+    /// Retain the original MD3 source and shader decision, not just the final
+    /// texture: a $whiteimage or a lost second stage must be traceable in game.
+    fn md3_material_trace(
+        &self,
+        model_qpath: &str,
+        surface: &md3::Surface,
+        texture: Option<&Arc<TextureData>>,
+        alpha_mode: DynamicModelAlphaMode,
+    ) -> Arc<str> {
+        let effective = self.shader_remaps.effective_name(&surface.shader);
+        let shader = jka_assets::shader::find_shader(&self.shaders, &effective);
+        let selected = shader.and_then(Shader::primary);
+        let mut lines = vec![
+            format!("MD3 MODEL: {model_qpath}"),
+            format!("MD3 SURFACE: {}", surface.name),
+            format!("EMBEDDED SHADER: {}", surface.shader),
+            format!("EFFECTIVE SHADER: {effective}"),
+            format!("RESOLVED ALPHA MODE: {alpha_mode:?}"),
+            format!("RESOLVED TEXTURE: {}", texture.map_or("<none>", |texture| texture.label.as_str())),
+        ];
+        match shader {
+            Some(shader) => {
+                lines.push(format!("AUTHORED SHADER STAGES: {}", shader.stages.len()));
+                for (index, stage) in shader.stages.iter().enumerate() {
+                    let is_selected = selected.is_some_and(|primary| std::ptr::eq(primary, stage));
+                    lines.push(format!(
+                        "STAGE {index}{}: map={} blend={:?} alphaFunc={:?} rgbGen={:?} alphaGen={:?} tcGen={:?} tcMods={:?}",
+                        if is_selected { " [MD3 RESOLVER SELECTED]" }
+                        else if md3_extra_stage_supported(stage) { " [ADDITIONAL DRAW]" }
+                        else { " [NOT SUPPORTED BY MD3 STAGE PATH]" },
+                        stage.image, stage.blend, stage.alpha_test, stage.rgb_gen, stage.alpha_gen,
+                        stage.tc_gen, stage.tc_mods,
+                    ));
+                }
+                if shader.stages.len() > 1 {
+                    lines.push("NOTICE: MD3 submits supported authored stages as separate material draws. Unsupported effects remain explicit in this trace.".into());
+                }
+                if selected.is_some_and(|stage| stage.image.eq_ignore_ascii_case("$whiteimage")) {
+                    lines.push("NOTICE: Selected $whiteimage maps to texture=None. Check subsequent stages before changing this.".into());
+                }
+                if let Some(text) = &shader.definition_text {
+                    lines.push("AUTHORED SHADER SCRIPT:".into());
+                    lines.extend(text.lines().map(str::to_owned));
+                }
+            }
+            None => lines.push("SHADER RESOLUTION: no authored shader; trying implicit image qpath".into()),
+        }
+        Arc::from(lines.join("\n"))
+    }
+
+    /// Classify a resolved *shader* based on TaystJK's blend/depth rules,
+    /// never on a model name, shader name, or use of $whiteimage by itself.
+    fn is_noop_shader(&self, source: &str) -> bool {
+        let effective = self.shader_remaps.effective_name(source);
+        jka_assets::shader::find_shader(&self.shaders, &effective)
+            .is_some_and(md3_shader_is_color_depth_noop)
+    }
+
+    fn md3_surface_material(&mut self, surface: &md3::Surface, key: &str,
+                            surface_index: usize, cached_indices: Arc<Vec<u32>>) -> Md3SurfaceAsset {
+        let invisible_without_override = self.is_noop_shader(&surface.shader);
+        let (texture, alpha_mode, authored_glow) = if invisible_without_override {
+            (None, DynamicModelAlphaMode::Opaque, false)
+        } else {
+            self.resolve_surface_material(&surface.shader)
+        };
+        let effective = self.shader_remaps.effective_name(&surface.shader).into_owned();
+        let definition = jka_assets::shader::find_shader(&self.shaders, &effective).cloned();
+        let authored_lighting = definition.as_ref()
+            .and_then(Shader::primary)
+            .is_some_and(|stage| matches!(stage.rgb_gen, RgbGen::LightingDiffuse | RgbGen::LightingDiffuseEntity));
+        let two_sided = definition.as_ref().is_some_and(|shader| {
+            matches!(shader.cull.trim().to_ascii_lowercase().as_str(), "none" | "twosided" | "two-sided" | "disable")
+        });
+        let two_sided_indices = two_sided.then(|| md3_two_sided_indices(&cached_indices, true));
+        let mut extra_stages = Vec::new();
+        if !invisible_without_override {
+            if let Some(shader) = definition.as_ref() {
+                let first = shader.primary().map(|stage| stage as *const Stage);
+                for (index, stage) in shader.stages.iter().enumerate() {
+                    if Some(stage as *const Stage) == first || stage.image.is_empty()
+                        || !md3_extra_stage_supported(stage)
+                    {
+                        continue;
+                    }
+                    // This is an authored raster stage, never an implicit model
+                    // texture. Unknown special images must not become white.
+                    if stage.image.starts_with('$') && !stage.image.eq_ignore_ascii_case("$whiteimage") {
+                        continue;
+                    }
+                    let texture = if stage.image.eq_ignore_ascii_case("$whiteimage") {
+                        None
+                    } else {
+                        Some(self.load_texture_arc_or_missing(&stage.image, stage.clamp, "MD3 STAGE"))
+                    };
+                    extra_stages.push(Md3ExtraStage {
+                        index, texture,
+                        alpha_mode: md3_stage_alpha_mode(stage),
+                        authored_glow: stage.glow,
+                        rgb_gen: stage.rgb_gen,
+                        alpha_gen: stage.alpha_gen,
+                        rgb_const: stage.color.unwrap_or([1.0; 3]),
+                        alpha_const: stage.alpha.unwrap_or(1.0),
+                        tc_gen: stage.tc_gen,
+                        tc_mods: stage.tc_mods.clone(),
+                    });
+                }
+            }
+        }
+        let material_trace = self.md3_material_trace(key, surface, texture.as_ref(), alpha_mode);
+        Md3SurfaceAsset { surface_index, cached_indices, texture, alpha_mode,
+            authored_glow, material_trace, invisible_without_override,
+            extra_stages, two_sided_indices, authored_lighting }
+    }
+
+    fn refresh_md3_materials(&mut self, old: &Md3Asset) -> Md3Asset {
+        let surfaces = old.surfaces.iter().map(|surface| {
+            self.md3_surface_material(&old.model.surfaces[surface.surface_index],
+                &old.key, surface.surface_index, Arc::clone(&surface.cached_indices))
+        }).collect();
+        Md3Asset { key: Arc::clone(&old.key), content_hash: old.content_hash,
+            model: Arc::clone(&old.model), surfaces }
+    }
+
+    fn make_md3_asset(&mut self, key: &str, model: Md3Model, hash: u64) -> Md3Asset {
+        let model = Arc::new(model);
+        let surfaces = model.surfaces.iter().enumerate().map(|(surface_index, surface)| {
+            self.md3_surface_material(surface, key, surface_index,
+                Arc::new(flipped_md3_indices(&surface.indices)))
+        }).collect();
+        Md3Asset { key: Arc::from(key), content_hash: hash, model, surfaces }
+    }
+
+    /// Only the main thread reads VFS and resolves materials. This registers
+    /// actual TaystJK-style _1/_2 variants before considering local fallbacks.
+    fn ensure_md3_chain(&mut self, base: &Arc<Md3Asset>) {
+        let key = base.key.to_string();
+        if !self.md3_chains.contains_key(&key) {
+            let mut chain = Md3Chain { lods: [Some(Arc::clone(base)), None, None],
+                generated: [false; 3], queued: false, processed: false };
+            for lod in 1..3 {
+                let path = replace_md3_suffix(&key, &format!("_{lod}.md3"));
+                if let Ok(Some(data)) = self.assets.read(&path, MAX_MD3_BYTES) {
+                    let hash = md3_lod::content_hash(&data.bytes);
+                    match md3::parse(&data.bytes) {
+                        Ok(model) => {
+                            if !model.frames.is_empty() && model.frames.len() == base.model.frames.len() {
+                                chain.lods[lod] = Some(Arc::new(self.make_md3_asset(&path, model, hash)));
+                            } else { println!("MD3 LOD: {path} incompatible frame count; skipping"); }
+                        }
+                        Err(error) => println!("MD3 LOD: {path}: {error}"),
+                    }
+                }
+            }
+            if self.md3_lod_debug {
+                println!("MD3 LOD REGISTER: {key}: authored _1={} _2={}", chain.lods[1].is_some(), chain.lods[2].is_some());
+            }
+            self.md3_chains.insert(key.clone(), chain);
+        }
+        if !self.md3_auto_lod { return; }
+        let Some(chain) = self.md3_chains.get_mut(&key) else { return; };
+        if chain.queued || chain.processed { return; }
+        let missing = [chain.lods[1].is_none(), chain.lods[2].is_none()];
+        if !missing.iter().any(|missing| *missing) { return; }
+        chain.queued = self.md3_worker.queue(md3_lod::Job {
+            key, hash: base.content_hash, model: Arc::clone(&base.model), missing,
+        });
+    }
+
+    fn md3_chain_count(&self, qpath: &str) -> usize {
+        let key = qpath.replace('\\', "/").to_ascii_lowercase();
+        let Some(chain) = self.md3_chains.get(&key) else { return 1; };
+        (1..3).rev().find(|&lod| chain.lods[lod].is_some()
+            && (self.md3_auto_lod || !chain.generated[lod]))
+            .map_or(1, |lod| lod + 1)
+    }
+
+    fn selected_md3_asset(&self, key: &str, wanted: usize) -> Option<Arc<Md3Asset>> {
+        let chain = self.md3_chains.get(key)?;
+        // Fill missing slots from the nearest MORE detailed LOD (never invent
+        // geometry by pointing to a less detailed source).
+        (0..=wanted.min(2)).rev().find_map(|lod| {
+            if chain.generated[lod] && !self.md3_auto_lod { None }
+            else { chain.lods[lod].clone() }
+        })
+    }
+
+    fn select_md3(
+        &mut self, qpath: &str, origin: [f32; 3], frame: usize,
+        scale: f32, forced_lod: Option<usize>, no_lod: bool,
+    ) -> Result<Arc<Md3Asset>, String> {
+        let base = self.load_md3(qpath)?;
+        self.ensure_md3_chain(&base);
+        let count = self.md3_chain_count(&base.key);
+        let bounds = base.model.frames.get(frame).or_else(|| base.model.frames.first());
+        // TaystJK RadiusFromBounds: 0.5 * length(maxs - mins).
+        let radius = bounds.map(|f| {
+            ((f.maxs[0] - f.mins[0]).powi(2)
+              + (f.maxs[1] - f.mins[1]).powi(2)
+              + (f.maxs[2] - f.mins[2]).powi(2)).sqrt() * 0.5 * scale
+        }).unwrap_or(0.0);
+        let wanted = forced_lod.unwrap_or_else(|| md3_lod_for_view(
+            self.md3_lod_view, origin, radius, count,
+            self.md3_lod_scale, self.md3_lod_bias, no_lod,
+        )).min(count - 1);
+        let key = base.key.to_string();
+        let asset = self.selected_md3_asset(&key, wanted).unwrap_or(base);
+        if self.md3_lod_debug && self.md3_lod_reported.insert((key.clone(), wanted)) {
+            println!("MD3 LOD SELECT: {key} -> {wanted} ({}) tris={} generated={}",
+                asset.key, asset.model.surfaces.iter().map(|s| s.indices.len()/3).sum::<usize>(),
+                self.md3_chains.get(&key).is_some_and(|c| c.generated[wanted]));
+        }
+        Ok(asset)
+    }
+
+    /// CGame may correct camera pose after prediction (and suppress it during
+    /// teleports). Use that same final view for MD3 and Ghoul2 LOD decisions.
+    pub fn update_md3_lod_view(&mut self, view: Option<Ghoul2PresentationView>) {
+        self.md3_lod_view = view;
+    }
+
+    /// Called once per frame before any static/snapshot MD3 submissions.
+    /// Polling never waits on the worker or performs disk I/O.
+    pub fn set_md3_lod_settings(
+        &mut self, view: Option<Ghoul2PresentationView>, scale: f32,
+        bias: i32, auto: bool, debug: bool,
+    ) {
+        self.md3_lod_view = view;
+        self.md3_lod_scale = scale.clamp(0.0, 20.0);
+        self.md3_lod_bias = bias;
+        self.md3_lod_debug = debug;
+        if self.md3_auto_lod != auto { self.static_props = None; }
+        self.md3_auto_lod = auto;
+        let mut updated = false;
+        while let Some(result) = self.md3_worker.pop() {
+            // If the same qpath was overridden or refreshed, an obsolete result
+            // cannot silently replace an authored asset.
+            let Some(mut chain) = self.md3_chains.remove(&result.key) else { continue; };
+            if chain.lods[0].as_ref().is_none_or(|a| a.content_hash != result.hash) {
+                self.md3_chains.insert(result.key, chain);
+                continue;
+            }
+            chain.queued = false;
+            chain.processed = true;
+            for (offset, generated) in result.lods.into_iter().enumerate() {
+                let lod = offset + 1;
+                if chain.lods[lod].is_some() { continue; }
+                if let Some(model) = generated {
+                    let key = format!("{}#generated_{lod}", result.key);
+                    let base_hash = chain.lods[0].as_ref().map_or(0, |a| a.content_hash);
+                    chain.lods[lod] = Some(Arc::new(self.make_md3_asset(&key, model, base_hash)));
+                    chain.generated[lod] = true;
+                    updated = true;
+                }
+            }
+            if debug { println!("MD3 LOD WORKER: {} ({}) lod1={} lod2={}", result.key, result.source,
+                chain.lods[1].is_some(), chain.lods[2].is_some()); }
+            self.md3_chains.insert(result.key, chain);
+        }
+        if updated {
+            self.static_props = None; // rebuild pretransformed static LODs once
+            self.md3_geometry.clear();
+            self.md3_geometry_bytes = 0;
+        }
     }
 
     fn load_md3(&mut self, qpath: &str) -> Result<Arc<Md3Asset>, String> {
@@ -1320,19 +1835,8 @@ impl EntityPresenter {
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| format!("missing {key}"))?
                 .bytes;
-            let model = Arc::new(md3::parse(&bytes)?);
-            let mut surfaces = Vec::with_capacity(model.surfaces.len());
-            for (surface_index, surface) in model.surfaces.iter().enumerate() {
-                let (texture, alpha_mode, authored_glow) =
-                    self.resolve_surface_material(&surface.shader);
-                surfaces.push(Md3SurfaceAsset {
-                    surface_index,
-                    cached_indices: Arc::new(flipped_md3_indices(&surface.indices)),
-                    texture,
-                    alpha_mode,
-                    authored_glow,
-                });
-            }
+            let hash = md3_lod::content_hash(&bytes);
+            let model = md3::parse(&bytes)?;
             devprintln!(
                 2,
                 "ENTITY MD3: {} frames={} tags/frame={} surfaces={}",
@@ -1341,7 +1845,7 @@ impl EntityPresenter {
                 model.tags.first().map_or(0, Vec::len),
                 model.surfaces.len(),
             );
-            Ok::<_, String>(Md3Asset { key: Arc::from(key.as_str()), model, surfaces })
+            Ok::<_, String>(self.make_md3_asset(&key, model, hash))
         })();
 
         match result {
@@ -1662,12 +2166,7 @@ impl EntityPresenter {
         let (image_name, clamp, alpha_mode, authored_glow) = jka_assets::shader::find_shader(&self.shaders, &effective)
             .and_then(Shader::primary)
             .map(|stage| {
-                let alpha_mode = if !stage.alpha_test.trim().is_empty() {
-                    DynamicModelAlphaMode::Mask
-                } else {
-                    crate::fx::draw::FxBlend::from_blend_func(&stage.blend)
-                        .custom_shader_alpha_mode()
-                };
+                let alpha_mode = md3_stage_alpha_mode(stage);
                 (stage.image.clone(), stage.clamp, alpha_mode, stage.glow)
             })
             .unwrap_or((
@@ -1696,6 +2195,137 @@ impl EntityPresenter {
             );
         }
     }
+}
+
+/// Only submit stage forms this MD3 path actually implements. Complex wave,
+/// animation and scroll stages still require the world shader evaluator; don't
+/// silently render incorrect approximation passes on unrelated models.
+fn md3_extra_stage_supported(stage: &Stage) -> bool {
+    matches!(stage.tc_gen, TcGen::Base | TcGen::Environment | TcGen::Vector(..))
+        && stage.tc_mods.iter().all(|op| matches!(op, TcMod::Scale(..) | TcMod::Transform(..)))
+        && matches!(stage.rgb_gen,
+            RgbGen::Identity | RgbGen::IdentityLighting | RgbGen::LightingDiffuse
+            | RgbGen::LightingDiffuseEntity | RgbGen::Vertex | RgbGen::ExactVertex
+            | RgbGen::OneMinusVertex | RgbGen::Const)
+        && matches!(stage.alpha_gen,
+            AlphaGen::Identity | AlphaGen::Const | AlphaGen::Vertex | AlphaGen::OneMinusVertex)
+        && stage.animation.is_none()
+        && !stage.depth_equal
+        && !stage.video
+        && stage.unsupported.is_empty()
+}
+
+/// Match authored stage lighting rather than inferring it from blend mode.
+/// In particular `rgbGen lightingDiffuse` + alpha blend is **lit**, whereas
+/// `rgbGen identity` + the same blend is unlit (TaystJK ComputeColors).
+fn md3_stage_alpha_mode(stage: &Stage) -> DynamicModelAlphaMode {
+    let mut mode = if !stage.alpha_test.trim().is_empty() {
+        DynamicModelAlphaMode::Mask
+    } else {
+        crate::fx::draw::FxBlend::from_blend_func(&stage.blend)
+            .custom_shader_alpha_mode()
+    };
+    if matches!(stage.rgb_gen, RgbGen::LightingDiffuse | RgbGen::LightingDiffuseEntity)
+        && matches!(mode, DynamicModelAlphaMode::BlendUnlit)
+    {
+        mode = DynamicModelAlphaMode::Blend;
+    }
+    if stage.depth_write {
+        mode = match mode {
+            DynamicModelAlphaMode::Blend => DynamicModelAlphaMode::BlendDepthWrite,
+            DynamicModelAlphaMode::BlendUnlit => DynamicModelAlphaMode::BlendUnlitDepthWrite,
+            other => other,
+        };
+    }
+    mode
+}
+
+fn md3_stage_color(stage: &Md3ExtraStage, entity: [f32; 4]) -> [f32; 4] {
+    let rgb = match stage.rgb_gen {
+        RgbGen::Vertex | RgbGen::ExactVertex | RgbGen::LightingDiffuseEntity => [entity[0], entity[1], entity[2]],
+        RgbGen::OneMinusVertex => [1.0 - entity[0], 1.0 - entity[1], 1.0 - entity[2]],
+        RgbGen::Const => stage.rgb_const,
+        _ => [1.0; 3],
+    };
+    let alpha = match stage.alpha_gen {
+        AlphaGen::Const => stage.alpha_const,
+        AlphaGen::Vertex => entity[3],
+        AlphaGen::OneMinusVertex => 1.0 - entity[3],
+        _ => 1.0,
+    };
+    [rgb[0], rgb[1], rgb[2], alpha]
+}
+
+/// TaystJK tr_shade_calc.cpp RB_CalcEnvironmentTexCoords, in JKA axes;
+/// world and view positions are stored in the renderer's Y-up axes.
+fn md3_stage_uv(
+    vertex: &DynamicModelVertex, stage: &Md3ExtraStage, camera: Option<[f32; 3]>,
+) -> [f32; 2] {
+    let mut uv = match stage.tc_gen {
+        TcGen::Environment => {
+            let Some(camera) = camera else { return vertex.uv; };
+            let view = scene::jka_position(std::array::from_fn(|i| camera[i] - vertex.position[i]));
+            let view_len = (view.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1.0e-6);
+            let view = view.map(|x| x / view_len);
+            let normal = scene::jka_position(vertex.normal);
+            let dot = (0..3).map(|i| normal[i] * view[i]).sum::<f32>();
+            let reflected: [f32; 3] = std::array::from_fn(|i| normal[i] * 2.0 * dot - view[i]);
+            [0.5 + reflected[1] * 0.5, 0.5 - reflected[2] * 0.5]
+        }
+        TcGen::Vector(s, t) => {
+            let pos = scene::jka_position(vertex.position);
+            [
+                (0..3).map(|i| s[i] * pos[i]).sum(),
+                (0..3).map(|i| t[i] * pos[i]).sum(),
+            ]
+        }
+        _ => vertex.uv,
+    };
+    for op in &stage.tc_mods {
+        match *op {
+            TcMod::Scale(s, t) => { uv[0] *= s; uv[1] *= t; }
+            TcMod::Transform([a,b,c,d,e,f]) => {
+                uv = [uv[0] * a + uv[1] * b + e, uv[0] * c + uv[1] * d + f];
+            }
+            _ => {} // time-dependent operations require shader time; not faked
+        }
+    }
+    uv
+}
+
+/// Registered once per MD3 surface and remap, never built per frame. A
+/// dedicated no-cull pipeline would save the extra triangles; until that is
+/// available, back-face culling of mirrored winding reproduces both faces.
+fn md3_two_sided_indices(source: &Arc<Vec<u32>>, two_sided: bool) -> Arc<Vec<u32>> {
+    if !two_sided { return Arc::clone(source); }
+    let mut indices = Vec::with_capacity(source.len() * 2);
+    indices.extend_from_slice(source);
+    for triangle in source.chunks_exact(3) {
+        indices.extend_from_slice(&[triangle[0], triangle[2], triangle[1]]);
+    }
+    Arc::new(indices)
+}
+
+/// A no-op blend means `source * GL_ZERO + destination * GL_ONE`.
+/// TaystJK tr_shader.cpp clears the depth mask for blended stages unless
+/// `depthWrite` is authored. Only suppress a shader if *every* stage
+/// preserves destination and none writes depth or has a surface sprite.
+/// The shader lookup must already have selected the effective remap target.
+fn md3_shader_is_color_depth_noop(shader: &Shader) -> bool {
+    !shader.stages.is_empty()
+        && !shader.portal
+        && !shader.sky
+        && !shader.fog
+        && shader.unsupported.is_empty()
+        && shader.stages.iter().all(|stage| {
+            let mut factors = stage.blend.split_ascii_whitespace();
+            matches!(factors.next(), Some(src) if src.eq_ignore_ascii_case("gl_zero"))
+                && matches!(factors.next(), Some(dst) if dst.eq_ignore_ascii_case("gl_one"))
+                && factors.next().is_none()
+                && !stage.depth_write
+                && stage.surface_sprite.is_none()
+                && stage.unsupported.is_empty()
+        })
 }
 
 fn entity_color(entity: &PresentedEntity) -> [f32; 4] {
@@ -1833,6 +2463,20 @@ fn invulnerability_sphere_transform(
     Some((origin, angles_to_axis(angles)))
 }
 
+/// TaystJK rd-vanilla/tr_mesh.cpp R_ComputeLOD: project bounding radius,
+/// scale 0..20, truncate projected level, clamp, apply r_lodbias, clamp again.
+fn md3_lod_for_view(
+    view: Option<Ghoul2PresentationView>, origin: [f32; 3], radius: f32,
+    num_lods: usize, scale: f32, bias: i32, no_lod: bool,
+) -> usize {
+    if num_lods < 2 || no_lod { return 0; }
+    let projected = view.map_or(0.0, |view| view.projected_radius(origin, radius));
+    let flod = if projected != 0.0 { 1.0 - projected * scale.clamp(0.0, 20.0) } else { 0.0 };
+    let limit = num_lods.saturating_sub(1) as isize;
+    let lod = ((flod * num_lods as f32) as isize).clamp(0, limit);
+    (lod + bias as isize).clamp(0, limit) as usize
+}
+
 fn flipped_md3_indices(source: &[u32]) -> Vec<u32> {
     let mut indices = source.to_vec();
     for triangle in indices.chunks_exact_mut(3) { triangle.swap(1, 2); }
@@ -1901,13 +2545,140 @@ mod tests {
         };
         presenter.md3_models.insert("synthetic.md3".into(), Arc::new(Md3Asset {
             key: "synthetic.md3".into(),
+            content_hash: 0,
             model: Arc::new(Md3Model { frames: vec![frame.clone(), frame], tags: vec![], surfaces: vec![surface] }),
             surfaces: vec![Md3SurfaceAsset {
                 surface_index: 0, cached_indices: Arc::new(vec![0, 2, 1]), texture: None,
                 alpha_mode: DynamicModelAlphaMode::Opaque, authored_glow: true,
+                material_trace: Arc::from("synthetic"), invisible_without_override: false,
+                extra_stages: Vec::new(), two_sided_indices: None, authored_lighting: false,
             }],
         }));
         (fixture, presenter)
+    }
+
+    fn shader_def(name: &str, stage: &str) -> String {
+        format!("{name}\n{{\n{{\n{stage}\n}}\n}}\n")
+    }
+
+    #[test]
+    fn md3_glass_two_stages_are_lit_then_subtle_environment_reflection() {
+        let script = r#"
+models/map_objects/factory/glass_b
+{
+  q3map_nolightmap
+  cull twosided
+  {
+    map models/map_objects/factory/glass
+    blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+    rgbGen lightingDiffuse
+  }
+  {
+    map models/map_objects/factory/glass_reflect
+    blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+    detail
+    alphaGen const 0.05
+    tcGen environment
+    tcMod scale 1.5 1.5
+  }
+}
+"#;
+        let library = jka_assets::shader::parse(script).unwrap();
+        let shader = &library["models/map_objects/factory/glass_b"];
+        assert_eq!(shader.stages.len(), 2);
+        assert_eq!(md3_stage_alpha_mode(&shader.stages[0]), DynamicModelAlphaMode::Blend);
+        assert_eq!(md3_stage_alpha_mode(&shader.stages[1]), DynamicModelAlphaMode::BlendUnlit);
+        assert!(md3_extra_stage_supported(&shader.stages[1]));
+        assert!(matches!(shader.stages[0].rgb_gen, RgbGen::LightingDiffuse));
+        let stage = Md3ExtraStage {
+            index: 1, texture: None,
+            alpha_mode: md3_stage_alpha_mode(&shader.stages[1]),
+            authored_glow: false,
+            rgb_gen: shader.stages[1].rgb_gen,
+            alpha_gen: shader.stages[1].alpha_gen,
+            rgb_const: shader.stages[1].color.unwrap_or([1.0; 3]),
+            alpha_const: shader.stages[1].alpha.unwrap_or(1.0),
+            tc_gen: shader.stages[1].tc_gen,
+            tc_mods: shader.stages[1].tc_mods.clone(),
+        };
+        let color = md3_stage_color(&stage, [0.3, 0.4, 0.5, 0.8]);
+        assert_eq!(&color[0..3], &[1.0, 1.0, 1.0]);
+        assert!((color[3] - 0.05).abs() < 1.0e-5);
+        let vertex = DynamicModelVertex {
+            position: [0.0, 0.0, 0.0], normal: [0.0, 1.0, 0.0],
+            uv: [0.7, 0.2], color: [1.0; 4], depth_hack: 0.0, water_wetness: 0.0,
+        };
+        let uv = md3_stage_uv(&vertex, &stage, Some([0.0, 10.0, 0.0]));
+        assert!(uv.iter().all(|value| value.is_finite()));
+        assert_ne!(uv, vertex.uv);
+    }
+
+    #[test]
+    fn md3_twosided_stage_keeps_original_geometry_unchanged() {
+        let source = Arc::new(vec![0, 1, 2]);
+        assert!(Arc::ptr_eq(&source, &md3_two_sided_indices(&source, false)));
+        assert_eq!(md3_two_sided_indices(&source, true).as_slice(), &[0, 1, 2, 0, 2, 1]);
+        assert_eq!(source.as_slice(), &[0, 1, 2]);
+    }
+
+    #[test]
+    fn clear_blend_is_noop_but_whiteimage_alone_is_not() {
+        for texture in ["$whiteimage", "textures/test/not_white"] {
+            let shaders = jka_assets::shader::parse(&shader_def("clear", &format!(
+                "map {texture}\nblendFunc GL_ZERO GL_ONE"))).unwrap();
+            assert!(md3_shader_is_color_depth_noop(&shaders["clear"]));
+        }
+        for shader in [
+            shader_def("bright", "map $whiteimage\nblendFunc GL_ONE GL_ONE"),
+            shader_def("bright", "map $whiteimage\nblendFunc GL_ZERO GL_ONE\ndepthWrite"),
+            format!("bright\n{{\n{{\nmap $whiteimage\nblendFunc GL_ZERO GL_ONE\n}}\n{{\nmap textures/a\nblendFunc GL_ONE GL_ONE\n}}\n}}\n"),
+        ] {
+            let shaders = jka_assets::shader::parse(&shader).unwrap();
+            assert!(!md3_shader_is_color_depth_noop(&shaders["bright"]));
+        }
+    }
+
+    #[test]
+    fn server_remap_clear_then_visible_restores_original_md3_without_reload() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        let clear = jka_assets::shader::parse(&shader_def("clear",
+            "map $whiteimage\nblendFunc GL_ZERO GL_ONE")).unwrap();
+        let visible = jka_assets::shader::parse(&shader_def("visible",
+            "map $whiteimage\nblendFunc GL_ONE GL_ONE")).unwrap();
+        presenter.shaders.extend(clear);
+        presenter.shaders.extend(visible);
+        let original = Arc::clone(&presenter.md3_models["synthetic.md3"].model);
+        let origin = [0.0; 3];
+        let axis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let normal = ItemDraw { model: "synthetic.md3".into(), origin, axis,
+            rgba: [1.0; 4], custom_shader: None };
+        let mut remaps = scene::ShaderRemapState::default();
+        assert!(remaps.apply("test", "clear", Some(0.0)));
+        presenter.set_shader_remaps(remaps.clone());
+        assert!(presenter.md3_models["synthetic.md3"].surfaces[0].invisible_without_override);
+        assert!(presenter.present_md3_ref_entity(1023, &normal).unwrap().is_empty());
+        assert!(presenter.present_static_md3(1023, "synthetic.md3", origin, axis,
+            [1.0; 4], 0).unwrap().is_empty());
+        let with_override = ItemDraw { model: "synthetic.md3".into(), origin, axis,
+            rgba: [1.0; 4], custom_shader: Some("visible") };
+        assert_eq!(presenter.present_md3_ref_entity(1023, &with_override).unwrap().len(), 1);
+        // The custom override itself can also become a no-op.
+        let hidden_override = ItemDraw { model: "synthetic.md3".into(), origin, axis,
+            rgba: [1.0; 4], custom_shader: Some("clear") };
+        assert!(presenter.present_md3_ref_entity(1023, &hidden_override).unwrap().is_empty());
+        assert!(remaps.apply("test", "visible", Some(0.0)));
+        presenter.set_shader_remaps(remaps.clone());
+        assert!(!presenter.md3_models["synthetic.md3"].surfaces[0].invisible_without_override);
+        assert!(Arc::ptr_eq(&original, &presenter.md3_models["synthetic.md3"].model));
+        assert_eq!(presenter.present_md3_ref_entity(1023, &normal).unwrap().len(), 1);
+        assert_eq!(presenter.present_static_md3(1023, "synthetic.md3", origin, axis,
+            [1.0; 4], 0).unwrap().len(), 1);
+        // Remap source to itself -> original surface material, not clear.
+        assert!(remaps.apply("test", "test", None));
+        presenter.set_shader_remaps(remaps);
+        assert!(!presenter.md3_models["synthetic.md3"].surfaces[0].invisible_without_override);
+        assert!(Arc::ptr_eq(&original, &presenter.md3_models["synthetic.md3"].model));
+        assert_eq!(presenter.present_md3_ref_entity(1023, &normal).unwrap().len(), 1);
     }
 
     #[test]
@@ -2369,5 +3140,23 @@ mod tests {
             },
         };
         assert_eq!(entity_color(&entity), [1.0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod md3_lod_tests {
+    use super::*;
+    #[test]
+    fn taystjk_bias_applies_after_projected_lod() {
+        // With no view ProjectRadius=0, so the authored path starts at LOD 0.
+        assert_eq!(md3_lod_for_view(None, [0.0;3], 32.0, 3, 5.0, 0, false), 0);
+        assert_eq!(md3_lod_for_view(None, [0.0;3], 32.0, 3, 5.0, 1, false), 1);
+        assert_eq!(md3_lod_for_view(None, [0.0;3], 32.0, 3, 5.0, 5, false), 2);
+        assert_eq!(md3_lod_for_view(None, [0.0;3], 32.0, 3, 5.0, 5, true), 0);
+        assert_eq!(md3_lod_for_view(None, [0.0;3], 32.0, 1, 5.0, 1, false), 0);
+    }
+    #[test]
+    fn md3_lod_filenames_match_taystjk() {
+        assert_eq!(replace_md3_suffix("models/map/rock.md3", "_2.md3"), "models/map/rock_2.md3");
     }
 }

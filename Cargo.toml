@@ -35,3 +35,5 @@ incremental = true
 # 2500 fps). See vendor/README.md. Drop this once upstream fixes it.
 [patch.crates-io]
 wgpu-core = { path = "vendor/wgpu-core-30.0.1" }
+wgpu-hal = { path = "vendor/wgpu-hal-30.0.1" }
+winit = { path = "vendor/winit-0.30.13" }

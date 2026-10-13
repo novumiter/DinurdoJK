@@ -274,7 +274,9 @@ pub(crate) fn append_authored_ocean_planes(
         b.alpha_cutoff = 0.0;
         b.pipeline = PipelineKey {
             legacy_srgb_three_stage: false,
+        additive_fusion_count: 0,
             auto_sprite2: false,
+            sky_outer: false,
             class: DrawClass::Transparent,
             blend: BlendMode::Opaque,
             cull: CullMode::None,

@@ -646,6 +646,15 @@ impl LocalPlayer {
         })
     }
 
+    /// Sub-millisecond version of the presentation timeline. Camera
+    /// damping needs the fractional sample (TaystJK predictedTimeFrac) at
+    /// hundreds or thousands of rendered frames per second.
+    pub fn presentation_time_precise(&self) -> f64 {
+        let span = self.current_command_time.saturating_sub(self.previous_command_time).max(0);
+        f64::from(self.previous_command_time)
+            + f64::from(self.presentation_alpha()) * f64::from(span)
+    }
+
     /// Millisecond presentation clock aligned with `presentation_origin`. This
     /// is the OpenJK-style render/cgame time between the previous and current
     /// pmove samples, rather than the stepped playerState commandTime.

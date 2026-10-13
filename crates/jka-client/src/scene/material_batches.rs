@@ -3,7 +3,7 @@ use crate::scene::{
     bsp_fog_params, material_legacy2_in_stage_safe, materials, stage_fog_color_override, AlphaGen,
     AssetSearchPath, BTreeMap, BlendFactor, BlendMode, Bsp, CullMode, DrawBatch, DrawClass, MaterialDebugEntry,
     MaterialDebugInfo, MaterialStage, PipelineKey, Range, RgbGen, Shader, StageTexture,
-    SurfaceMaterial, TcGen, Textures,
+    SurfaceMaterial, TcGen, TcMod, Textures, GpuVertex,
 };
 
 pub(in crate::scene) fn stage_is_opaque_replacement(stage: &MaterialStage) -> bool {
@@ -127,6 +127,12 @@ const LIT_OVERLAY_BLEND: BlendMode =
 pub(in crate::scene) fn class_for(material: &SurfaceMaterial) -> DrawClass {
     if material.sky {
         DrawClass::Sky
+    } else if material.sort.is_some_and(|sort| sort >= 5.0) {
+        // This is the geometry/PVS *ordering* class, not a per-stage GPU
+        // pipeline class. TaystJK sorts the whole shader at SS_SEE_THROUGH
+        // or later, even when its first stage is an alpha-tested depth seed.
+        // Keep that stage's Mask pipeline unchanged for GE128/depthWrite.
+        DrawClass::Transparent
     } else {
         material
             .stages
@@ -239,7 +245,10 @@ pub(in crate::scene) fn stage_pipeline(
 ) -> PipelineKey {
     PipelineKey {
         legacy_srgb_three_stage: false,
+        additive_fusion_count: 0,
         auto_sprite2: material.auto_sprite2,
+        sky_outer: material.sky && material.skybox.is_some()
+            && !matches!(stage.tc_gen, TcGen::SkyCloud(_)),
         class: if material.sky {
             DrawClass::Sky
         } else {
@@ -350,8 +359,10 @@ pub(in crate::scene) fn stage_batch(
         material_debug_index: material_debug_index.map_or(u32::MAX, |index| index as u32),
         surface_material: material.surface_material,
         opaque_composite_before_clouds: opaque_composite_before_clouds(material),
+        late_sorted_material: material.sort.is_some_and(|sort| sort >= 5.0),
         texture,
         legacy_srgb_overlay: None,
+        additive_companions: Vec::new(),
         animation: stage.animation.clone(),
         texture_is_lightmap,
         texture_is_white,
@@ -387,6 +398,7 @@ pub(in crate::scene) fn stage_batch(
             stage.opacity,
         ],
         alpha_cutoff: stage.alpha_cutoff,
+        alpha_test_texture_only: false,
         shader_time_offset: 0.0,
         shader_clamp_time: material.clamp_time,
         no_picmip: material.no_picmip,
@@ -972,7 +984,7 @@ pub(in crate::scene) fn can_fold_jka_lightmap_pair(
 /// glow (separate bloom extraction), secondary depth writes, PBR companion maps,
 /// or dynamically transformed texcoords. Caller also rules out BSP fog, water
 /// and special reflections so this opt-in cannot silently change those paths.
-/// Conservatively recognize the exact, commonplace TaystJK three-stage idiom:
+/// Conservatively recognize a prefix of the commonplace TaystJK idiom:
 /// opaque $lightmap; DST_COLOR/ZERO diffuse; SRC_ALPHA/ONE_MINUS_SRC_ALPHA
 /// vertex-alpha overlay. Its blending occurs in encoded RGB in the original
 /// framebuffer. The separate WGPU draws instead blend in linear light.
@@ -986,7 +998,7 @@ pub(in crate::scene) fn legacy_srgb_three_stage_overlay(
     stages: &[MaterialStage],
     fog: [f32; 4],
 ) -> Option<usize> {
-    if stages.len() != 3
+    if stages.len() < 3
         || !material.explicit
         || material.sky || material.water || material.planar_reflection
         || material.offset || material.auto_sprite2 || material.water_deformed
@@ -994,7 +1006,9 @@ pub(in crate::scene) fn legacy_srgb_three_stage_overlay(
         || material.authored_detail || material.sort.is_some()
         || fog[3] > 0.001
         || !can_fold_jka_lightmap_pair(&stages[0], &stages[1])
-        || stages.iter().any(|stage| stage.animation.is_some()
+        // Only the first three passes are fused. Later authored stages remain
+        // independent, retaining their original animation, blending and glow.
+        || stages[..3].iter().any(|stage| stage.animation.is_some()
             || stage.glow || has_stage_enhancements(stage)
             || !stage.tc_mods.is_empty() || stage.depth_equal
             || stage.alpha_cutoff != 0.0)
@@ -1116,6 +1130,155 @@ pub(crate) fn append_sky_batches(
     }
 }
 
+
+/// Recovery for BSPs whose *entire* masked base is one 8-bit color step below
+/// GE128, yet whose later authored stages require depthFunc equal. Without a
+/// depth seed, the complete material is guaranteed invisible, regardless of
+/// its valid texture alpha. Keep vertex RGB and all subsequent stage alphas.
+///
+/// This is deliberately NOT an alphaGen parser override. Explicit alphaGen
+/// vertex and all ordinary vertex-alpha blends remain intact; this path is
+/// selected for a whole BSP draw group only when the masked base otherwise
+/// cannot pass, and only with dependent depth-equal stages.
+pub(in crate::scene) fn recover_impossible_masked_depth_seed(
+    batches: &mut [DrawBatch], geometry: &[GpuVertex],
+) {
+    if geometry.is_empty() || !batches.iter().any(|batch| batch.pipeline.depth_equal) {
+        return;
+    }
+    for (index, stage) in batches.iter_mut().enumerate() {
+        // All authored stages in this group share the same BSP geometry. Only
+        // the depth-writing base can require rescue, never its blended siblings.
+        if index != 0 || !stage.pipeline.depth_write
+            || stage.pipeline.class != DrawClass::Mask
+            || stage.alpha_cutoff != 0.5
+            || stage.rgb_gen != RgbGen::Vertex
+            || !matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::Identity)
+            || stage.color[3] < 0.999
+        {
+            continue;
+        }
+        // 127/255 versus GE128 is the characteristic 8-bit boundary case.
+        // Do not 'fix' meaningful fades (0.0, 0.25, etc.) or mixed alpha draws.
+        let near_boundary = geometry.iter().all(|vertex| {
+            let alpha = vertex.color[3];
+            alpha >= (127.0 / 255.0) - 1e-5 && alpha < 0.5
+        });
+        if near_boundary {
+            stage.alpha_test_texture_only = true;
+        }
+    }
+}
+
+
+fn additive_affine_tcmods(batch: &DrawBatch) -> bool {
+    batch.tc_mods.len() <= 4 && batch.tc_mods.iter().all(|m| match *m {
+        TcMod::Scroll(x, y) => x.is_finite() && y.is_finite(),
+        TcMod::Scale(x, y) => x.is_finite() && y.is_finite() && x.abs() > 0.00001 && y.abs() > 0.00001,
+        TcMod::Rotate(x) => x.is_finite(),
+        TcMod::Transform(v) => v.iter().all(|x| x.is_finite())
+            && (v[0] * v[3] - v[1] * v[2]).abs() > 0.00001,
+        _ => false,
+    })
+}
+
+fn additive_same_tcgen(a: &DrawBatch, b: &DrawBatch) -> bool {
+    match (a.tc_gen, b.tc_gen) {
+        (TcGen::Base, TcGen::Base) => true,
+        (TcGen::Vector(sa, ta), TcGen::Vector(sb, tb)) => sa == sb && ta == tb,
+        _ => false,
+    }
+}
+
+fn additive_candidate(b: &DrawBatch) -> bool {
+    b.pipeline.blend == BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::One)
+        && b.pipeline.class == DrawClass::Transparent
+        && !b.pipeline.depth_write && !b.pipeline.offset && !b.pipeline.auto_sprite2
+        && !b.pipeline.legacy_srgb_three_stage
+        // Never re-fuse an already fused primary: that would overwrite its
+        // companions rather than extend the authored stage sequence.
+        && b.pipeline.additive_fusion_count == 0 && b.additive_companions.is_empty()
+        && b.alpha_cutoff == 0.0 && b.animation.is_none()
+        && b.texture.is_some() && !b.texture_is_white && !b.texture_is_lightmap
+        // Automatic Rend2 companion-map discovery does not change transparent
+        // JKA stages: material_uniform() emits the PBR map flags only for
+        // opaque, unblended surfaces. In this SRC_ALPHA/ONE path the companion
+        // textures are NOT sampled. Their mere presence must not veto fusion.
+        // Preserve all actually-used state tests below.
+        && b.legacy_srgb_overlay.is_none()
+        && b.fog[3] <= 0.001 && !b.planar_reflection
+        && !b.planar_environment_candidate && !b.modulate_lightmap
+        && !b.dlight_in_lightmap_stage && !b.detail_texture_eligible
+        && additive_affine_tcmods(b)
+}
+
+/// Exact eligibility explanation shared by preparation and Trace Inspector.
+/// None means the pair is eligible; a separate max-three-stage limit may still
+/// split an eligible run. Keep this in one place to avoid misleading diagnostics.
+pub(crate) fn additive_fusion_rejection_reason(a: &DrawBatch, b: &DrawBatch) -> Option<&'static str> {
+    if !additive_candidate(a) || !additive_candidate(b) {
+        return Some("non-additive blend, depth/alpha state, texture animation, fog, PBR or non-affine tcMod");
+    }
+    if a.authored_glow != b.authored_glow {
+        return Some("authored glow boundary (glow-only framebuffer replay)");
+    }
+    if a.vertices != b.vertices || a.bsp_shader_index != b.bsp_shader_index {
+        return Some("different BSP surface geometry or shader");
+    }
+    if a.pipeline.cull != b.pipeline.cull || a.pipeline.depth_equal != b.pipeline.depth_equal {
+        return Some("different culling or depth-test state");
+    }
+    if a.fog_color_override != b.fog_color_override
+        || a.shader_time_offset != b.shader_time_offset
+        || a.shader_clamp_time != b.shader_clamp_time
+        || a.water != b.water || a.vertex_lit != b.vertex_lit
+    {
+        return Some("different fog, shader time, water or vertex-lighting state");
+    }
+    if !additive_same_tcgen(a, b) {
+        return Some("incompatible texture coordinate generators");
+    }
+    None
+}
+
+fn additive_compatible(a: &DrawBatch, b: &DrawBatch) -> bool {
+    additive_fusion_rejection_reason(a, b).is_none()
+}
+
+fn fuse_adjacent_additive_batches(out: &mut Vec<DrawBatch>, start: usize) {
+    let mut i = start;
+    while i + 1 < out.len() {
+        if !additive_compatible(&out[i], &out[i + 1]) {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 2;
+        while end < out.len() && end - i < 3 && additive_compatible(&out[i], &out[end]) {
+            end += 1;
+        }
+        let companions: Vec<_> = out.drain(i + 1..end).collect();
+        out[i].pipeline.additive_fusion_count = (companions.len() + 1) as u8;
+        out[i].additive_companions = companions;
+        i += 1;
+    }
+}
+
+/// A cheap cold-path gate: ordinary prepared maps are already fused, and
+/// must not clone their huge PVS batch vectors merely to rediscover that.
+pub(in crate::scene) fn has_unfused_additive_batches(source: &[DrawBatch]) -> bool {
+    source.windows(2).any(|pair| additive_compatible(&pair[0], &pair[1]))
+}
+
+/// Cold-path recovery for maps or remap caches holding unfused stages even
+/// though the live setting asks for fusion. Do not modify already fused draws.
+/// No shader-name cases and no work in the renderer's frame loop.
+pub(in crate::scene) fn fuse_prepared_additive_batches(source: &[DrawBatch]) -> (Vec<DrawBatch>, usize) {
+    let mut draws = source.to_vec();
+    fuse_adjacent_additive_batches(&mut draws, 0);
+    let saved = source.len() - draws.len();
+    (draws, saved)
+}
+
 pub(in crate::scene) fn append_material_batches(
     out: &mut Vec<DrawBatch>,
     material: &SurfaceMaterial,
@@ -1143,6 +1306,12 @@ pub(in crate::scene) fn append_material_batches(
         fog,
         fog_is_global,
     );
+    // Fold only strictly equivalent adjacent SRC_ALPHA/ONE passes: no depth writes,
+    // no alpha discard, identical depth/glow/fog and affine texture generators.
+    // This is material-agnostic: ocean, fish caustics and terrain overlays all
+    // use the same eligibility test. The world fragment shader evaluates every
+    // member in original order in one draw, preserving independent tcMods.
+    fuse_adjacent_additive_batches(out, start);
     // `dlight_in_lightmap_stage` is derived from the authored stages, but the
     // `$lightmap` stage can be folded into the diffuse pass (GL_DST_COLOR pair)
     // or replaced by vertex color. With no lightmap-stage batch left, the
@@ -1295,10 +1464,11 @@ pub(in crate::scene) fn append_material_batches_unflagged(
         let fused = batch.pipeline.legacy_srgb_three_stage;
         out.push(batch);
 
-        if fused {
-            return;
-        }
-        for stage in stages.iter().skip(2) {
+        // The prefix (lightmap + diffuse + vertex-alpha overlay) is now one
+        // draw, but an arbitrary fourth or later stage must still execute.
+        // This generalizes the existing three-stage fast path without changing
+        // any unsupported additive/animated/depth-equal/glow passes.
+        for stage in stages.iter().skip(if fused { 3 } else { 2 }) {
             out.push(stage_batch(
                 material,
                 stage,
@@ -1379,6 +1549,191 @@ mod cloud_composite_order_tests {
     }
 
     #[test]
+    fn ge128_vertex_127_depth_equal_material_recovers_only_mask() {
+        let mut base = base_stage();
+        base.alpha_cutoff = 0.5;
+        base.rgb_gen = RgbGen::Vertex;
+        base.blend = Some(materials::BlendFunc {
+            src: BlendFactor::One, dst: BlendFactor::Zero,
+        });
+        let mut caustic = base_stage();
+        caustic.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+        });
+        caustic.depth_equal = true;
+        let material = SurfaceMaterial {
+            stages: vec![base.clone(), caustic.clone()],
+            sort: Some(15.0), explicit: true,
+            ..Default::default()
+        };
+        let make_batch = |stage: &MaterialStage, first: bool| {
+            stage_batch(&material, stage, first, false, 0..3,
+                Some(114), None, None, &[], [0; 4], [0.0; 4], false)
+        };
+        let mut batches = vec![make_batch(&base, true), make_batch(&caustic, false)];
+        let vertex = GpuVertex {
+            position: [0.0; 3], uv: [0.0; 2], lightmap_uv: [0.0; 2],
+            normal: [0.0, 1.0, 0.0], color: [1.0, 1.0, 1.0, 127.0 / 255.0],
+            alpha_cutoff: 1.0,
+        };
+        recover_impossible_masked_depth_seed(&mut batches, &[vertex; 3]);
+        assert!(batches[0].alpha_test_texture_only);
+        assert!(!batches[1].alpha_test_texture_only);
+
+        // Normal/intentional fades must retain their authored vertex alpha.
+        batches[0].alpha_test_texture_only = false;
+        let mut intentional_fade = vertex;
+        intentional_fade.color[3] = 0.25;
+        recover_impossible_masked_depth_seed(&mut batches, &[intentional_fade; 3]);
+        assert!(!batches[0].alpha_test_texture_only);
+
+        // The recovery is not applied when there is no dependent depth-equal pass.
+        recover_impossible_masked_depth_seed(&mut batches[0..1], &[vertex; 3]);
+        assert!(!batches[0].alpha_test_texture_only);
+    }
+
+    #[test]
+    fn two_additive_wave_layers_with_one_minus_vertex_alpha_fuse() {
+        // Models seph_surf without depending on the material name. Keep the
+        // per-stage waveform, opposite scrolling, and vertex inverse alpha.
+        let mut first = base_stage();
+        first.texture = StageTexture::Image(14);
+        first.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+        });
+        first.alpha_gen = AlphaGen::OneMinusVertex;
+        first.rgb_gen = RgbGen::Wave(jka_assets::shader::Wave {
+            func: jka_assets::shader::WaveFunc::Sin,
+            base: 0.0, amplitude: 0.6, phase: 0.5, frequency: 0.09,
+        });
+        first.tc_mods = vec![TcMod::Scale(3.0, 1.0), TcMod::Scroll(1.0, 0.0)];
+        let mut second = first.clone();
+        second.rgb_gen = RgbGen::Wave(jka_assets::shader::Wave {
+            func: jka_assets::shader::WaveFunc::Sin,
+            base: 0.0, amplitude: 0.3, phase: 0.0, frequency: 0.09,
+        });
+        second.tc_mods = vec![TcMod::Scale(3.0, 1.0), TcMod::Scroll(-0.6, 0.0)];
+        let material = SurfaceMaterial {
+            explicit: true, water: true, stages: vec![first, second],
+            ..Default::default()
+        };
+        let mut draws = Vec::new();
+        append_material_batches(&mut draws, &material, 10, None, false,
+            0..48, None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].pipeline.additive_fusion_count, 2);
+        assert_eq!(draws[0].additive_companions.len(), 1);
+        assert_eq!(draws[0].additive_companions[0].alpha_gen, AlphaGen::OneMinusVertex);
+        assert_ne!(draws[0].rgb_gen, draws[0].additive_companions[0].rgb_gen);
+        assert_ne!(draws[0].tc_mods, draws[0].additive_companions[0].tc_mods);
+    }
+
+    #[test]
+    fn additive_ocean_fuses_two_regular_and_three_glow_layers() {
+        let mut stages = (0..5).map(|i| {
+            let mut stage = base_stage();
+            stage.texture = StageTexture::Image(i);
+            stage.blend = Some(materials::BlendFunc {
+                src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+            });
+            stage.tc_mods = vec![TcMod::Scroll(0.01 * (i as f32 + 1.0), 0.025)];
+            stage.glow = i >= 2;
+            stage
+        }).collect::<Vec<_>>();
+        stages[3].tc_mods.push(TcMod::Scale(0.4, 0.4));
+        stages[3].tc_mods.push(TcMod::Rotate(4.5));
+        // This is loaded automatically for seph_water2.jpg, but transparent
+        // material_uniform never samples it. It must not prevent fusion.
+        stages[0].enhancements.emissive_texture = Some(77);
+        let material = SurfaceMaterial {
+            explicit: true, water: true, stages,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        append_material_batches(&mut out, &material, 8, None, false, 0..6,
+            None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].pipeline.additive_fusion_count, 2);
+        assert_eq!(out[1].pipeline.additive_fusion_count, 3);
+        assert!(!out[0].authored_glow);
+        assert!(out[1].authored_glow);
+        assert_eq!(
+            additive_fusion_rejection_reason(&out[0].additive_companions[0], &out[1]),
+            Some("authored glow boundary (glow-only framebuffer replay)"),
+        );
+        let restored = super::super::shader_remap::expand_additive_batches(&out);
+        assert_eq!(restored.len(), 5);
+        assert!(restored.iter().all(|b| b.pipeline.additive_fusion_count == 0));
+        assert_eq!(restored.iter().map(|b| b.texture).collect::<Vec<_>>(),
+            (0..5).map(Some).collect::<Vec<_>>());
+        assert!(!restored[0].authored_glow && !restored[1].authored_glow);
+        assert!(restored[2].authored_glow && restored[3].authored_glow && restored[4].authored_glow);
+        // The cold-path re-fuser restores an expanded cached map, then becomes
+        // a no-op on an already-fused copy (idempotent / no stage loss).
+        assert!(has_unfused_additive_batches(&restored));
+        let (refused, saved) = fuse_prepared_additive_batches(&restored);
+        assert!(!has_unfused_additive_batches(&refused));
+        assert_eq!(saved, 3);
+        assert_eq!(refused.len(), 2);
+        assert_eq!(refused[0].pipeline.additive_fusion_count, 2);
+        assert_eq!(refused[1].pipeline.additive_fusion_count, 3);
+        let (unchanged, saved_again) = fuse_prepared_additive_batches(&refused);
+        assert_eq!(saved_again, 0);
+        assert_eq!(unchanged.len(), 2);
+        assert_eq!(unchanged[0].additive_companions.len(), 1);
+        assert_eq!(unchanged[1].additive_companions.len(), 2);
+    }
+
+    #[test]
+    fn additive_fish_respects_depth_and_glow_boundaries() {
+        let mut base = base_stage();
+        base.texture = StageTexture::Image(1);
+        base.alpha_cutoff = 0.5;
+        base.depth_write = true;
+        let mut caustic = base_stage();
+        caustic.texture = StageTexture::Image(2);
+        caustic.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+        });
+        caustic.depth_equal = true;
+        caustic.tc_gen = TcGen::Vector([0.00390625, 0.0, 0.0], [0.0, 0.00390625, 0.0]);
+        caustic.tc_mods = vec![TcMod::Scroll(-0.0075, 0.005)];
+        let mut caustic2 = caustic.clone();
+        caustic2.texture = StageTexture::Image(3);
+        caustic2.tc_mods = vec![TcMod::Scroll(-0.0175, 0.025)];
+        let mut caustic_glow = caustic.clone();
+        caustic_glow.texture = StageTexture::Image(4);
+        caustic_glow.glow = true;
+        let mut fade = base_stage();
+        fade.texture = StageTexture::Image(5);
+        fade.depth_equal = true;
+        fade.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::OneMinusSrcAlpha,
+        });
+        let material = SurfaceMaterial {
+            explicit: true, stages: vec![base, caustic, caustic2, caustic_glow, fade],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        append_material_batches(&mut out, &material, 12, None, false, 0..6,
+            None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[1].pipeline.additive_fusion_count, 2);
+        assert!(out[1].pipeline.depth_equal);
+        assert_eq!(out[2].pipeline.additive_fusion_count, 0);
+        assert!(out[2].authored_glow);
+        let restored = super::super::shader_remap::expand_additive_batches(&out);
+        assert_eq!(restored.len(), 5);
+        assert_eq!(restored[0].pipeline.depth_write, true);
+        assert_eq!(restored[1].texture, Some(2));
+        assert_eq!(restored[2].texture, Some(3));
+        assert_eq!(restored[3].texture, Some(4));
+        assert_eq!(restored[4].texture, Some(5));
+        assert!(restored[1].pipeline.depth_equal && restored[2].pipeline.depth_equal);
+        assert!(restored[3].authored_glow && !restored[2].authored_glow);
+    }
+
+    #[test]
     fn authored_opaque_terrain_stays_together_but_water_does_not() {
         let base = base_stage();
         let mut wet_sand = base.clone();
@@ -1410,6 +1765,29 @@ mod cloud_composite_order_tests {
         assert!(!opaque_composite_before_clouds(&sorted));
         let fully_blended = SurfaceMaterial { stages: vec![caustics], ..terrain };
         assert!(!opaque_composite_before_clouds(&fully_blended));
+    }
+
+    #[test]
+    fn explicit_late_sort_controls_surface_order_not_stage_alpha_mask() {
+        let mut base = base_stage();
+        base.alpha_cutoff = 0.5;
+        base.blend = Some(materials::BlendFunc {
+            src: BlendFactor::One, dst: BlendFactor::Zero,
+        });
+        let sorted = SurfaceMaterial {
+            stages: vec![base.clone()],
+            sort: Some(15.0),
+            ..Default::default()
+        };
+        assert_eq!(class_for(&sorted), DrawClass::Transparent);
+        // Per-stage pipeline still alpha-tests, writes depth and preserves
+        // the authored GL_ONE GL_ZERO replacement blend.
+        let pipeline = stage_pipeline(&sorted, &base, true);
+        assert_eq!(pipeline.class, DrawClass::Mask);
+        assert!(pipeline.depth_write);
+        assert_eq!(pipeline.blend, BlendMode::Opaque);
+        let unsorted = SurfaceMaterial { sort: None, ..sorted };
+        assert_eq!(class_for(&unsorted), DrawClass::Mask);
     }
 
     #[test]

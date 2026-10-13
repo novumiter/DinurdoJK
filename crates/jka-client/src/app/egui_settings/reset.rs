@@ -519,6 +519,10 @@ impl App {
                 self.video.ghoul2_early_cull = defaults.ghoul2_early_cull;
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_GPU_ADAPTER => {
+                self.video.gpu_adapter = defaults.gpu_adapter;
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_RENDER_BACKEND => {
                 self.video.renderer_backend = defaults.renderer_backend;
                 self.mark_config_dirty();

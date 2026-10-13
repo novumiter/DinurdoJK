@@ -136,7 +136,9 @@ impl Instance {
                     .push((A::VARIANT, Box::new(instance)));
             }
             Err(err) => {
-                log::debug!(
+                // DinurdoJK patch: warn, not debug, so the reason a backend (e.g. DX12 without
+                // dxcompiler.dll) is unavailable reaches latest.log.
+                log::warn!(
                     "Instance::new: failed to create {:?} backend: {:?}",
                     A::VARIANT,
                     err

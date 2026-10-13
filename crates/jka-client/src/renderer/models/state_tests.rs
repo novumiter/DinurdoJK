@@ -181,6 +181,8 @@ fn fx_survives_raster_rt_and_back_preparation() {
         let mut jobs = PipelineJobManager::new();
         let surface = DynamicModelSurface {
             geometry_source: crate::renderer::ModelGeometrySource::Fx,
+            authored_lighting: false,
+            material_trace: None,
             entity_num: 7,
             wireframe_class: DynamicWireframeClass::Entity,
             raster_visible: true,

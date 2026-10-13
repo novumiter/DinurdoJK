@@ -140,6 +140,17 @@ fn stage_collapse_extra_is_live_and_archived() {
     assert!(!crate::ui::VideoSettings::default().stage_collapse_extra);
 }
 
+#[test]
+fn additive_stage_fusion_is_live_and_archived() {
+    use crate::console::{cvars::CvarFlags, LatchScope};
+    let definition = crate::app::cvar_registry()
+        .find("r_additiveStageFusion")
+        .expect("additive-stage fusion cvar registered");
+    assert_eq!(definition.entry.latch, LatchScope::None);
+    assert!(definition.flags.contains(CvarFlags::ARCHIVE));
+    assert!(crate::ui::VideoSettings::default().additive_stage_fusion);
+}
+
 fn assert_command_encoding_ab_controls(app: &mut App) {
     use crate::console::{cvars::CvarFlags, LatchScope};
     app.config_dirty = false;

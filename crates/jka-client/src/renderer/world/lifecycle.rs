@@ -1,8 +1,8 @@
 //! World lifecycle.
 use crate::renderer::{
     build_auto_detail_by_base_texture, build_world, create_gpu_cull_bind_group,
-    create_world_froxel_bind_group, Arc, EntityLegacyFog, GrassMapGpu, Instant,
-    Mat4, PreparedMap, Renderer, WorldShaderFamily, WorldUploadTimings, WorldVideoPlayer,
+    create_world_froxel_bind_group, Arc, DrawClass, EntityLegacyFog, GrassMapGpu, Instant,
+    Mat4, PreparedMap, MATERIAL_SNOW, Renderer, WorldShaderFamily, WorldUploadTimings, WorldVideoPlayer,
     PBR_PROFILE_COMPANION_COMPRESSION, WORLD_VIDEO_MAX_CATCH_UP,
 };
 
@@ -75,6 +75,24 @@ impl Renderer {
             self.request_scene_rebuild();
         }
         let source_map = map.map_file_stats.is_some();
+        // Same selection as create_snow_shell_gpu's source scan plus non-up-facing
+        // snow, which the 2D footprint stamps can still shade.
+        self.map_has_snow_surfaces = map
+            .batches
+            .iter()
+            .chain(map.pvs_batches.iter())
+            .chain(map.inline_batches.iter())
+            .any(|batch| {
+                u32::from(batch.surface_material) == MATERIAL_SNOW
+                    && batch.pipeline.class != DrawClass::Sky
+            });
+        self.map_has_water = map
+            .batches
+            .iter()
+            .chain(map.pvs_batches.iter())
+            .chain(map.inline_batches.iter())
+            .any(|batch| batch.water);
+        self.model_wet_latched = false;
         let videos = std::mem::take(&mut map.videos);
         // The BLAS needs the uploaded world buffers, so map upload always creates
         // a normal raster variant first.  If RT Shadows is selected we build the
@@ -138,6 +156,7 @@ impl Renderer {
             self.ocean_enabled,
             self.pbr_enabled && PBR_PROFILE_COMPANION_COMPRESSION && self.bc_compression_supported,
             self.picmip,
+            if self.bc_compression_supported { self.texture_compression } else { 0 },
             map,
         );
         upload_timings.pre_build_ms = pre_build_ms;

@@ -30,6 +30,7 @@ pub(super) struct DecodedImage {
 
 pub(super) enum CatalogRequest {
     AssetViewer,
+    ConsoleFiles,
     DemoGames { token: u64 },
     Demos { token: u64 },
     ChatLogs,
@@ -49,6 +50,7 @@ type ProfileCatalog = (Vec<ProfileModelEntry>, Vec<ProfileSaberEntry>);
 
 pub(super) enum CatalogPayload {
     AssetViewer(Result<Vec<AssetEntry>, String>),
+    ConsoleFiles(Result<frontend::ConsoleFileCatalog, String>),
     DemoGames { token: u64, games: Result<Vec<String>, String> },
     Demos { token: u64, game: Option<PathBuf>, demos: Result<Vec<frontend::DemoEntry>, String> },
     ChatLogs(Result<Vec<ChatLogIndexEntry>, String>),
@@ -79,6 +81,7 @@ struct Job {
 #[derive(Default, Clone, Copy)]
 pub(super) struct PendingCatalogs {
     pub asset_viewer: bool,
+    pub console_files: bool,
     pub chat_logs: bool,
     pub chat_log_detail: bool,
     pub profile: bool,
@@ -254,7 +257,8 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                 Err(error) => {
                     let error = error.to_string();
                     let payload = match job.request {
-                        CatalogRequest::AssetViewer => Some(CatalogPayload::AssetViewer(Err(error))),
+                        CatalogRequest::AssetViewer => Some(CatalogPayload::AssetViewer(Err(error.clone()))),
+                        CatalogRequest::ConsoleFiles => Some(CatalogPayload::ConsoleFiles(Err(error))),
                         CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } => unreachable!("demo requests handled before VFS"),
                         // Handled before VFS open above.
                         CatalogRequest::ChatLogs | CatalogRequest::ChatLogDetail { .. } => None,
@@ -285,6 +289,10 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
         let scan_started = Instant::now();
         let (label, payload) = match job.request {
             CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } => unreachable!("demo requests handled before VFS"),
+            CatalogRequest::ConsoleFiles => (
+                "console files",
+                CatalogPayload::ConsoleFiles(Ok(frontend::scan_console_files(assets))),
+            ),
             CatalogRequest::AssetViewer => (
                 "asset viewer",
                 CatalogPayload::AssetViewer(frontend::scan_asset_viewer_assets(assets)),

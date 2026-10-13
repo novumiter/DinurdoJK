@@ -434,7 +434,7 @@ pub(in crate::renderer) struct AutoExposureState {
 pub(in crate::renderer) struct GpuCullRecord {
     pub(in crate::renderer) minimum: [f32; 4],
     pub(in crate::renderer) maximum: [f32; 4],
-    pub(in crate::renderer) draw: [u32; 4], // index_count, first_index, sky flag, reserved
+    pub(in crate::renderer) draw: [u32; 4], // index_count, first_index, sky flag, bits: 1=inline, 2=hidden, 4=models/ shader, 8=transparent
     pub(in crate::renderer) compact: [u32; 4], // group index, output base, compactable, reserved
 }
 

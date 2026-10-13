@@ -206,8 +206,9 @@ impl DynamicModelRenderer {
                 &mut fx_sprite_instances) {
                 continue;
             }
-            let classic_light = if self.entity_ambient_lighting
+            let classic_light = if (self.entity_ambient_lighting
                 == EntityAmbientLightingMode::BspLightgridClassic
+                || (surface.authored_lighting && self.entity_ambient_lighting == EntityAmbientLightingMode::Off))
                 && !matches!(
                     surface.alpha_mode,
                     DynamicModelAlphaMode::AdditiveOne

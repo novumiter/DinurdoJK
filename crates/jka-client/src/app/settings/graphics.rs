@@ -1497,6 +1497,10 @@ impl App {
                 );
             }
             ui::VIDEO_ROW_RENDER_BACKEND => self.cycle_renderer_backend(direction),
+            ui::VIDEO_ROW_GPU_ADAPTER => {
+                self.video.gpu_adapter = (i32::from(self.video.gpu_adapter) + direction).rem_euclid(4) as u8;
+                self.mark_config_dirty();
+            },
             ui::VIDEO_ROW_BAKED_AO_SAMPLES => {
                 const VALUES: [u32; 5] = [8, 16, 32, 64, 128];
                 let current = VALUES

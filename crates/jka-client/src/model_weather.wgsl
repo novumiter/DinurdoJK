@@ -14,10 +14,12 @@
 // right whenever the camera and the model share shelter and covers the case a
 // player actually notices - walking indoors and drying off.
 //
-// There is deliberately no override constant. The whole path sits behind one
-// uniform test with the same answer for every fragment in the frame, so the
-// branch is perfectly coherent; specializing it would buy nothing and cost a
-// variant of every model pipeline.
+// ENABLE_MODEL_WET compiles the whole path out on maps with no rain, no wetness
+// and no water (DynamicModelRenderer::model_wet_compiled). The runtime test below
+// is not free: the water term is a per-vertex varying, so the compiler keeps the
+// wet code in every model pixel (Ghoul2 fs_main 343 -> 124 DXIL instructions
+// without it). Defaults on so any other module including this file is unchanged.
+override ENABLE_MODEL_WET: bool = true;
 
 const MODEL_WET_LUMA: vec3<f32> = vec3<f32>(0.2126, 0.7152, 0.0722);
 
@@ -48,6 +50,9 @@ fn model_wet_albedo(dry: vec3<f32>, wet: f32) -> vec3<f32> {
 // model samples an environment, so the sheen borrows the light the surface is
 // already standing in rather than inventing a colour of its own.
 fn model_wet_color_with_water(dry: vec4<f32>, world_normal: vec3<f32>, world_position: vec3<f32>, water_wet: f32) -> vec4<f32> {
+    if (!ENABLE_MODEL_WET) {
+        return dry;
+    }
     // Submersion wets undersides too, unlike directional falling rain.
     // MAX avoids double darkening where the two sources overlap.
     let wet = max(model_wetness(world_normal), clamp(water_wet, 0.0, 1.0));

@@ -1,14 +1,26 @@
 //! World inline models.
 use crate::renderer::{
-    posed_inline_vertices, same_world_surface, weather, DrawClass, DrawIndexedIndirectArgs,
-    GpuCullRecord, GpuVertex, InlineModelInstance, Renderer, WorldBatch, WorldGpu,
+    posed_inline_vertices, same_world_surface, weather, world_blend_probe_bucket,
+    DrawClass, DrawIndexedIndirectArgs,
+    GpuCullRecord, GpuVertex, InlineModelGpu, InlineModelInstance, Renderer, WorldBatch, WorldGpu,
 };
+
+/// True only for an authoritative snapshot that explicitly omitted this
+/// particular renderer instance. Never infer absence from a missing initial
+/// pose: `uploaded == None` still contains the compiled model geometry.
+#[inline]
+pub(in crate::renderer) fn hidden_inline_batch(batch: &WorldBatch, models: &[InlineModelGpu]) -> bool {
+    if batch.inline_model_slot == u32::MAX { return false; }
+    models.get(batch.inline_model_slot as usize)
+        .is_some_and(|model| matches!(model.uploaded, Some(None)))
+}
 
 impl Renderer {
     /// Apply this frame's CG_Mover inline-model poses: rewrite each moved
     /// model's private vertex region and its batches' CPU and GPU cull bounds.
-    /// Models absent from an authoritative list collapse to zero-area
-    /// triangles, so no draw list has to change.
+    /// Authoritative mover presence is an explicit cull-record flag in BOTH
+    /// CPU and GPU paths. Absent models retain their last valid vertex data;
+    /// reactivation uploads a newly posed copy without reallocating buffers.
     pub(in crate::renderer) fn update_inline_models(
         &mut self,
         instances: Option<&[InlineModelInstance]>,
@@ -45,9 +57,51 @@ impl Renderer {
             if model.uploaded == Some(target) {
                 continue;
             }
+            let was_hidden = matches!(model.uploaded, Some(None));
             model.uploaded = Some(target);
             glass_poses_changed |= model.rt_mask_sources.iter().any(|source| source.material.glass);
-            let (vertices, minimum, maximum) = posed_inline_vertices(&model.base, target);
+            // Mark the individual instance invisible in the EXISTING cull
+            // record (draw.w bit 1). GPU culling and its early Hi-Z phase
+            // both reject it, including compacted indirect draws. Never
+            // relocate or collapse its vertices just to hide the model.
+            let hidden = target.is_none();
+            // Preserve material flags when an inline mover changes presence.
+            const CULL_DRAW_FLAGS_OFFSET: u64 = std::mem::offset_of!(GpuCullRecord, draw) as u64
+                + 3 * std::mem::size_of::<u32>() as u64;
+            // Moving fish update their pose every frame. Do not issue a tiny
+            // queue.write_buffer for every stage every frame unless presence
+            // actually changes (initial records are already marked inline).
+            if was_hidden != hidden {
+                for slot in 0..local_shadows.cache_entries.len() {
+                    if local_shadows.cache_entries[slot].light_index.is_some()
+                        && !local_shadows.pending_slots.contains(&slot) {
+                        local_shadows.pending_slots.push(slot);
+                    }
+                }
+                for (set, indices) in [
+                    (&mut *coarse_batches, &model.coarse_batches),
+                    (&mut *full_batches, &model.full_batches),
+                ] {
+                    for &index in indices {
+                        let Some(batch) = set.get(index) else { continue; };
+                        let flags: u32 = 1 | (u32::from(hidden) << 1)
+                            | (u32::from(batch.source.pipeline.class == DrawClass::Transparent) << 3)
+                            | (world_blend_probe_bucket(batch.source.pipeline) << 5)
+                            | (u32::from(batch.source.water) << 8);
+                        self.queue.write_buffer(
+                            cull_records_buffer,
+                            u64::from(batch.cull_index) * record_stride + CULL_DRAW_FLAGS_OFFSET,
+                            bytemuck::bytes_of(&flags),
+                        );
+                    }
+                }
+            }
+            let Some(pose) = target else {
+                // No geometry upload, CPU bounds mutation or collapsed triangles.
+                // Preserve compiled/last-active vertices for instant reappearance.
+                continue;
+            };
+            let (vertices, minimum, maximum) = posed_inline_vertices(&model.base, pose);
             self.queue.write_buffer(
                 vertex_buffer,
                 u64::from(model.gpu_vertex_start) * stride,
@@ -61,9 +115,7 @@ impl Renderer {
                 (&mut *full_batches, &model.full_batches),
             ] {
                 for &index in indices {
-                    let Some(batch) = set.get_mut(index) else {
-                        continue;
-                    };
+                    let Some(batch) = set.get_mut(index) else { continue; };
                     batch.bounds_min = minimum;
                     batch.bounds_max = maximum;
                     self.queue.write_buffer(
@@ -73,13 +125,10 @@ impl Renderer {
                     );
                 }
             }
-            // AUTO 4 keeps static portal-plan geometry first and appends one
-            // shallow copy of the FULL inline-model tail. The cull record itself
-            // is shared with FULL; keep only the CPU bounds alias in sync here.
+            // AUTO 4 is a shallow alias of FULL: the GPU cull-record flag
+            // and bounds are shared; only the CPU batch bounds need syncing.
             for &full_index in &model.full_batches {
-                let Some(relative) = full_index.checked_sub(*auto4_inline_full_start) else {
-                    continue;
-                };
+                let Some(relative) = full_index.checked_sub(*auto4_inline_full_start) else { continue; };
                 let auto4_index = (*auto4_inline_start).saturating_add(relative);
                 if let Some(batch) = auto4_batches.get_mut(auto4_index) {
                     batch.bounds_min = minimum;
@@ -154,6 +203,19 @@ fn collect_inline_poses(
                 slot.push(InlineModelInstance::compiled(model));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hidden_state_tests {
+    use super::*;
+
+    #[test]
+    fn authoritative_absence_is_distinct_from_the_uninitialized_pose() {
+        let active = Some(Some(InlineModelInstance::compiled(9)));
+        assert!(!matches!(None::<Option<InlineModelInstance>>, Some(None)));
+        assert!(!matches!(active, Some(None)));
+        assert!(matches!(Some(None::<InlineModelInstance>), Some(None)));
     }
 }
 

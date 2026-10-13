@@ -315,7 +315,7 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    println!("DinurdoJK renderer: winit + wgpu, no Bevy");
+    println!("DinurdoJK renderer: winit + wgpu");
     logging::write_line_with_path(
         logging::Level::Info,
         format_args!("Base directory: {}", options.base.display()),

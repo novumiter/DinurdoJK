@@ -3,7 +3,7 @@ use crate::renderer::{
     auto_detail_fallback_index, create_fast_world_wireframe_pipeline, create_wireframe_pipeline,
     create_world_pipeline_variant_from_plan, create_world_wireframe_pipeline, pipeline_hash,
     required_auto_detail_indices, try_load_texture_asset_from_search_path, ui, upload_texture,
-    AssetSearchPath, CullDebugMode, DynamicLightsMode, DynamicShadowsMode,
+    AssetSearchPath, CullDebugMode, DrawClass, DynamicLightsMode, DynamicShadowsMode, FootprintMode,
     GrassPreparedDraw, HashMap, Instant, JumpShadeState, Path, PipelineJobKey,
     PlanarReflectionDebugMode, PreparedSurfaceSpriteEffects, PvsMode, Renderer,
     WorldPipelineCompilePlan, WorldPipelineReuseCatalog, WorldPipelineVariant,
@@ -204,6 +204,77 @@ impl Renderer {
             if enabled { "ON" } else { "OFF" },
             distance,
         );
+    }
+
+    pub(in crate::renderer) fn ensure_shader_complexity_target(&mut self) {
+        if !self.shader_complexity_enabled || self.world.is_none() { return; }
+        let width = self.config.width;
+        let height = self.config.height;
+        let samples = self.msaa_samples;
+        let scene_format = self.scene_format();
+        if self.shader_complexity_target.as_ref().is_some_and(|target| {
+            target.width == width && target.height == height
+                && target.samples == samples && target.scene_format == scene_format
+        }) { return; }
+        self.shader_complexity_target = Some(
+            crate::renderer::diagnostics::shader_complexity::ShaderComplexityTarget::new(
+                &self.device, width, height, samples, scene_format,
+            ),
+        );
+    }
+
+    pub(in crate::renderer) fn ensure_shader_complexity_pipelines(&mut self) {
+        if !self.shader_complexity_enabled { return; }
+        let Some(world) = self.world.as_ref() else { return; };
+        let format = self.scene_format();
+        let samples = self.msaa_samples;
+        // Do not compile debug PSOs for sky or promoted ocean surfaces: the
+        // diagnostic draw pass intentionally excludes them anyway.
+        let keys = world.coarse_batches.iter()
+            .filter(|b| b.source.pipeline.class != DrawClass::Sky && b.ocean_clipmap.is_none())
+            .map(|b| b.source.pipeline)
+            .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        if self.frame_plan.world_path == WorldRenderPath::FastBaseline {
+            if !world.fast_complexity_pipelines.is_empty() || keys.is_empty() { return; }
+            let job = PipelineJobKey::new("fast-shader-complexity", 0,
+                pipeline_hash(&(format, samples, &keys)));
+            if let Some(pipelines) = self.pipeline_jobs.take_ready(job) {
+                if let Some(world) = self.world.as_mut() { world.fast_complexity_pipelines = pipelines; }
+            } else {
+                let device = self.device.clone();
+                let layout = self.fast_world_pipeline_layout.clone();
+                let shader = self.fast_world_shader.clone();
+                self.pipeline_jobs.request(job, "fast BSP shader heatmap", move || {
+                    crate::renderer::create_shader_complexity_pipelines(&device, &layout, &shader,
+                        format, samples, &keys, None)
+                });
+            }
+        } else {
+            let variant = world.active_pipeline_variant;
+            if world.complexity_pipelines.contains_key(&variant) || keys.is_empty() { return; }
+            let job = PipelineJobKey::new("shader-complexity", pipeline_hash(&variant) as u32,
+                pipeline_hash(&(format, samples, variant, &keys)));
+            if let Some(pipelines) = self.pipeline_jobs.take_ready(job) {
+                if let Some(world) = self.world.as_mut() { world.complexity_pipelines.insert(variant, pipelines); }
+            } else {
+                let device = self.device.clone();
+                let selected = if variant.ray_traced_shadows {
+                    self.ray_traced_shadows.as_ref().map(|rt| match variant.family() {
+                        WorldShaderFamily::Lean => (rt.world_pipeline_layout_lean.clone(), rt.world_shader_for_variant(variant).clone()),
+                        WorldShaderFamily::Enhanced => (rt.world_pipeline_layout.clone(), rt.world_shader_for_variant(variant).clone()),
+                    })
+                } else { Some(match variant.family() {
+                    WorldShaderFamily::Lean => (self.world_pipeline_layout_lean.clone(), self.world_shader_lean.clone()),
+                    WorldShaderFamily::Enhanced => (self.world_pipeline_layout.clone(), self.world_shader.clone()),
+                }) };
+                if let Some((layout, shader)) = selected {
+                    self.pipeline_jobs.request(job, "BSP shader heatmap", move || {
+                        crate::renderer::create_shader_complexity_pipelines(&device, &layout,
+                            &shader, format, samples, &keys, Some(variant))
+                    });
+                }
+            }
+        }
     }
 
     pub(in crate::renderer) fn set_wireframe_mask(&mut self, mask: u32) {
@@ -527,7 +598,22 @@ impl Renderer {
             deluxe: self.deluxe_shader_enabled(),
             deluxe_specular: self.deluxe_shader_enabled() && self.deluxe_specular > 0.0,
             detail_textures_enabled: self.detail_textures_enabled,
+            surface_deformation: self.surface_deformation_shader_needed(),
+            dynamic_light_debug: self.dynamic_light_debug,
+            material_specialization: self.fragment_shader_mode >= 1,
+            minimal_entries: self.fragment_shader_mode == 2,
+            sky_debug: self.sky_debug_shader_needed(),
         }
+    }
+
+    pub(in crate::renderer) fn sky_debug_shader_needed(&self) -> bool {
+        self.sky_perf_probe != 0 || self.sky_fractal_override
+    }
+
+    /// Snow shell, Snowflow and footprint shading only ever touch authored snow
+    /// surfaces, so a map without any keeps all of it compiled out.
+    pub(in crate::renderer) fn surface_deformation_shader_needed(&self) -> bool {
+        self.map_has_snow_surfaces && self.surface_deformation.mode() != FootprintMode::Off
     }
 
     /// Deluxe needs the PBR material path; the shader override is what removes its
@@ -551,11 +637,34 @@ impl Renderer {
     /// without a pipeline-aware setter: wetness accumulating or drying out, classic
     /// lighting toggles, cached-AO availability and planar debug views. One compare
     /// of a few bools per frame; the pipeline is only touched when one flips.
+    /// ENABLE_MODEL_WET: rain or wetness, a map with water, or any entity in
+    /// water. Latched per map (see `model_wet_latched`).
+    fn sync_model_wet(&mut self) {
+        if self.weather_surface_needed()
+            || self.map_has_water
+            || !self.dynamic_model_renderer.entity_water.is_empty()
+        {
+            self.model_wet_latched = true;
+        }
+        let wet = self.model_wet_latched;
+        if wet != self.dynamic_model_renderer.model_wet_compiled {
+            let scene_format = self.scene_format();
+            let samples = self.msaa_samples;
+            self.dynamic_model_renderer.set_model_wet(
+                &mut self.pipeline_jobs, &self.device, scene_format, samples, wet,
+            );
+        }
+    }
+
     pub(in crate::renderer) fn sync_runtime_variant_flags(&mut self) {
+        self.sync_model_wet();
         let needed = self.weather_surface_needed();
         let classic = self.classic_world_render_flags() != 0;
         let static_ao = self.static_bsp_ao_enabled;
         let planar_debug = self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off;
+        let surface_deformation = self.surface_deformation_shader_needed();
+        let dynamic_light_debug = self.dynamic_light_debug;
+        let sky_debug = self.sky_debug_shader_needed();
         if self.world_variant_pending.is_some()
             || self.world.as_ref().is_some_and(|world| {
                 let key = &world.active_pipeline_variant;
@@ -563,8 +672,24 @@ impl Renderer {
                     || key.classic_render_flags != classic
                     || key.static_bsp_ao != static_ao
                     || key.planar_debug != planar_debug
+                    || key.surface_deformation != surface_deformation
+                    || key.dynamic_light_debug != dynamic_light_debug
+                    || key.sky_debug != sky_debug
             })
         {
+            self.activate_world_pipeline_variant();
+        }
+    }
+
+    /// r_fragmentShaderMode. The specialized programs are compiled in the
+    /// background like any other variant; the switch happens once they are ready.
+    pub(in crate::renderer) fn set_fragment_shader_mode(&mut self, mode: u8) {
+        let mode = mode.min(2);
+        if self.fragment_shader_mode == mode {
+            return;
+        }
+        self.fragment_shader_mode = mode;
+        if self.world.is_some() {
             self.activate_world_pipeline_variant();
         }
     }

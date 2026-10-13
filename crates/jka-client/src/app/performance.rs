@@ -24,6 +24,7 @@ impl App {
             fps: Vec::new(),
             frame_ms: Vec::new(),
             gpu_ms: Vec::new(),
+            world_program_binds: (0, 0),
         });
     }
 
@@ -41,6 +42,7 @@ impl App {
         if let Some(gpu) = stats.gpu_ms {
             sample.gpu_ms.push(gpu);
         }
+        sample.world_program_binds = stats.world_program_binds;
         if sample.started.elapsed() < sample.duration {
             return;
         }
@@ -52,7 +54,7 @@ impl App {
         let max = sample.fps.iter().copied().fold(0.0, f64::max);
         let position = self.camera.position;
         let line = format!(
-            "[JKA PERF SAMPLE] label={} fps_avg={:.1} fps_min={:.1} fps_max={:.1} cpu_frame_avg={:.3}ms gpu_frame_avg={} windows={} view=({:.0} {:.0} {:.0}) yaw={:.1} pitch={:.1}",
+            "[JKA PERF SAMPLE] label={} fps_avg={:.1} fps_min={:.1} fps_max={:.1} cpu_frame_avg={:.3}ms gpu_frame_avg={} windows={} view=({:.0} {:.0} {:.0}) yaw={:.1} pitch={:.1} world_programs={}spec/{}gen",
             sample.label,
             mean(&sample.fps).unwrap_or(0.0),
             min,
@@ -65,6 +67,8 @@ impl App {
             position.y,
             self.camera.yaw.to_degrees().rem_euclid(360.0),
             -self.camera.pitch.to_degrees(),
+            sample.world_program_binds.0,
+            sample.world_program_binds.1,
         );
         self.push_console_line(line);
     }

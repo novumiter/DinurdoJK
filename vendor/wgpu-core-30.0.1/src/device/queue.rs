@@ -47,6 +47,72 @@ use crate::{
 };
 use crate::{device::resource::CommandIndices, resource::RawResourceAccess};
 
+/// DinurdoJK diagnostic (not upstream): `JKA_QUEUE_STATS=1` prints, once per
+/// second, the queue traffic that never appears in the client's GPU pass timers:
+/// write_buffer/write_texture bytes by label and queue submits.
+pub mod jka_queue_stats {
+    use alloc::string::String;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use std::{collections::HashMap, sync::Mutex, sync::OnceLock, time::Instant};
+
+    static SUBMITS: AtomicU64 = AtomicU64::new(0);
+    static COMMAND_BUFFERS: AtomicU64 = AtomicU64::new(0);
+
+    struct State {
+        started: Instant,
+        writes: HashMap<String, (u64, u64)>,
+    }
+
+    fn state() -> Option<&'static Mutex<State>> {
+        static STATE: OnceLock<Option<Mutex<State>>> = OnceLock::new();
+        STATE
+            .get_or_init(|| {
+                (std::env::var_os("JKA_QUEUE_STATS").is_some_and(|v| v == "1")).then(|| {
+                    Mutex::new(State { started: Instant::now(), writes: HashMap::new() })
+                })
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn record_write(kind: &str, label: &str, bytes: u64) {
+        let Some(state) = state() else { return };
+        let mut state = state.lock().unwrap();
+        let entry = state.writes.entry(alloc::format!("{kind} {label}")).or_insert((0, 0));
+        entry.0 += bytes;
+        entry.1 += 1;
+    }
+
+    pub(crate) fn record_submit(command_buffers: usize) {
+        let Some(state) = state() else { return };
+        SUBMITS.fetch_add(1, Ordering::Relaxed);
+        COMMAND_BUFFERS.fetch_add(command_buffers as u64, Ordering::Relaxed);
+        let mut state = state.lock().unwrap();
+        let elapsed = state.started.elapsed().as_secs_f64();
+        if elapsed < 1.0 {
+            return;
+        }
+        let submits = SUBMITS.swap(0, Ordering::Relaxed);
+        let buffers = COMMAND_BUFFERS.swap(0, Ordering::Relaxed);
+        let mut writes: alloc::vec::Vec<_> = state.writes.drain().collect();
+        writes.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let total: u64 = writes.iter().map(|(_, (bytes, _))| bytes).sum();
+        std::println!(
+            "[JKA QUEUE STATS] {:.0} submits/s, {:.0} cmdbufs/s, {:.1} KiB/s written",
+            submits as f64 / elapsed,
+            buffers as f64 / elapsed,
+            total as f64 / elapsed / 1024.0
+        );
+        for (label, (bytes, calls)) in writes.iter().take(12) {
+            std::println!(
+                "[JKA QUEUE STATS]   {:>10.1} KiB/s {:>7.0} calls/s  {label}",
+                *bytes as f64 / elapsed / 1024.0,
+                *calls as f64 / elapsed
+            );
+        }
+        state.started = Instant::now();
+    }
+}
+
 pub struct Queue {
     raw: Box<dyn hal::DynQueue>,
     pub(crate) pending_writes: Mutex<PendingWrites>,
@@ -649,6 +715,7 @@ impl Queue {
         self.device.check_is_valid()?;
 
         let data_size = data.len() as wgt::BufferAddress;
+        jka_queue_stats::record_write("buffer", buffer.label(), data_size);
 
         self.same_device_as(buffer.as_ref())?;
 
@@ -872,6 +939,7 @@ impl Queue {
         self.device.check_is_valid()?;
 
         let dst = destination.texture;
+        jka_queue_stats::record_write("texture", dst.label(), data.len() as u64);
         let destination = wgt::TexelCopyTextureInfo {
             texture: (),
             mip_level: destination.mip_level,
@@ -1360,6 +1428,7 @@ impl Queue {
     ) -> Result<SubmissionIndex, (SubmissionIndex, QueueSubmitError)> {
         profiling::scope!("Queue::submit");
         api_log!("Queue::submit");
+        jka_queue_stats::record_submit(command_buffers.len());
 
         let snatch_guard = self.device.snatchable_lock.read();
         let mut submission = self

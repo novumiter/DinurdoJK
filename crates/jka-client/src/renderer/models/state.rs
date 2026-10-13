@@ -279,6 +279,7 @@ impl DynamicModelRenderer {
             entity_water: Arc::new(std::collections::HashMap::new()),
             cloud_shadow_sun: [0.0; 4],
             legacy_fog_compiled: false,
+            model_wet_compiled: true,
             pipeline_layout,
             shader,
             wireframe_pipeline: None,
@@ -357,7 +358,7 @@ impl DynamicModelRenderer {
             perf_bundles: Default::default(),
             md3_geometry_cache: true,
             md3_stream_cache: Default::default(),
-            model_index_upload_cache: false,
+            model_index_upload_cache: true,
             index_upload_cache: super::prepare::IndexUploadCache::default(),
             ghoul2_batch_key_cache: false,
             next_texture_binding_id: 1,
@@ -709,6 +710,24 @@ impl DynamicModelRenderer {
     ) {
         self.entity_ambient_lighting = mode;
         self.write_entity_lighting(queue);
+    }
+
+    /// Compiles the rain/water wetness path in or out of the model pipelines.
+    /// Decided per map (rain, wetness, water surfaces, any entity in water), so
+    /// pipelines are respecialized at map load, not while playing.
+    pub(in crate::renderer) fn set_model_wet(
+        &mut self,
+        jobs: &mut PipelineJobManager,
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        samples: u32,
+        wet: bool,
+    ) {
+        if wet != self.model_wet_compiled {
+            self.model_wet_compiled = wet;
+            self.rebuild_pipelines(device, surface_format, samples);
+            self.prewarm_core_model_pipelines(jobs, device);
+        }
     }
 
     /// Applies FogSystem::legacy_self_fog. Called only when fog settings or the

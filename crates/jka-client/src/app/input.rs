@@ -1,7 +1,7 @@
 //! Input.
 use crate::app::{
     keybinds, App, Arc, BindKey, CursorGrabMode, DemoViewMode, ElementState, FrontendPage, HashSet,
-    Instant, KeyCode, KeyEvent, OverlayMode, RenderCommand,
+    Instant, KeyCode, KeyEvent, MouseButton, OverlayMode, RenderCommand,
 };
 
 impl App {
@@ -20,7 +20,8 @@ impl App {
         // A focus regain, left click, or set_overlay(None) must not re-lock the
         // cursor while a map/download modal is open over live gameplay.
         let captured = captured
-            && self.overlay == OverlayMode::None
+            && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial)
+            && self.window_focused
             && !self.connection_modal_active();
         if !captured {
             self.noclip_primary_down = false;
@@ -44,6 +45,12 @@ impl App {
                 window.set_cursor_visible(false);
                 self.captured = true;
                 self.mouse_grab_mode = grab_mode;
+            } else if self.overlay == OverlayMode::DevRadial {
+                // No cursor even if the platform cannot lock/confine it; raw
+                // motion still drives the wheel while the window has focus.
+                window.set_cursor_visible(false);
+                self.captured = true;
+                self.mouse_grab_mode = "none";
             } else {
                 self.captured = false;
                 self.mouse_grab_mode = "none";
@@ -107,6 +114,7 @@ impl App {
     }
 
     pub(in crate::app) fn set_overlay(&mut self, overlay: OverlayMode) {
+        let previous_overlay = self.overlay;
         let leaving_console =
             self.overlay == OverlayMode::Console && overlay != OverlayMode::Console;
         let toggling_console = self.overlay != overlay
@@ -137,10 +145,28 @@ impl App {
             self.console_search_open = false;
         }
         self.last_mouse_motion_at = None;
-        if let Some(player) = &mut self.local_server {
-            player.pause();
+        // The wheel is a non-modal overlay over gameplay: opening/closing it
+        // must not clear physical keys, release +movement sources, reset the
+        // solo command clock, or interrupt a locally held movement key.
+        let wheel_gameplay_transition = matches!(
+            (previous_overlay, overlay),
+            (OverlayMode::None, OverlayMode::DevRadial)
+                | (OverlayMode::DevRadial, OverlayMode::None)
+        );
+        if !wheel_gameplay_transition {
+            if let Some(player) = &mut self.local_server {
+                player.pause();
+            }
         }
-        if overlay != OverlayMode::None {
+        if wheel_gameplay_transition {
+            if overlay == OverlayMode::DevRadial {
+                self.set_capture(true);
+            } else if self.demo_playback_active() {
+                self.sync_demo_camera_capture();
+            } else {
+                self.set_capture(true);
+            }
+        } else if overlay != OverlayMode::None {
             // Equivalent to TaystJK Key_ClearStates: menus/console must not
             // leave a gameplay kbutton latched if its physical release is
             // consumed by UI input routing.
@@ -167,12 +193,29 @@ impl App {
             self.close_dev_radial();
             return;
         }
+        // The Dev bind acts as a Back key while either inspection screen is
+        // open. It dismisses that screen without opening a wheel underneath.
+        match self.overlay {
+            OverlayMode::Trace => {
+                self.close_trace_overlay();
+                return;
+            }
+            OverlayMode::EntityGraph => {
+                self.set_overlay(OverlayMode::None);
+                return;
+            }
+            _ => {}
+        }
         self.dev_radial_return_overlay = if self.overlay == OverlayMode::Console {
             self.overlay_after_console()
         } else {
             self.overlay
         };
+        self.dev_radial_offset = [0.0; 2];
         self.set_overlay(OverlayMode::DevRadial);
+        // Also capture when invoked from the console/menu, where a normal
+        // overlay transition intentionally released gameplay input.
+        self.set_capture(true);
     }
 
     pub(in crate::app) fn close_dev_radial(&mut self) {
@@ -413,6 +456,60 @@ impl App {
                 self.spectator_binding_context(),
             )
             .is_some_and(|binding| keybinds::binding_contains_command(binding, "dev"))
+    }
+
+    /// Dev can also be bound to a mouse button; its *release* must not
+    /// disappear into egui's normal button swallowing path.
+    pub(in crate::app) fn mouse_button_bound_to_dev(&self, button: MouseButton) -> bool {
+        let number = match button {
+            MouseButton::Left => 1,
+            MouseButton::Right => 2,
+            MouseButton::Middle => 3,
+            MouseButton::Back => 4,
+            MouseButton::Forward => 5,
+            _ => return false,
+        };
+        self.bindings
+            .get_resolved(BindKey::Mouse(number), self.spectator_binding_context())
+            .is_some_and(|binding| keybinds::binding_contains_command(binding, "dev"))
+    }
+
+    /// Keep held gameplay buttons responsive while the wheel is up. Unlike
+    /// ordinary key dispatch, only '+' commands are allowed here: typing a
+    /// non-button command while inspecting a wheel must not open another UI
+    /// or activate an unintended tool.
+    pub(in crate::app) fn handle_dev_wheel_gameplay_key(
+        &mut self,
+        code: KeyCode,
+        state: ElementState,
+        repeat: bool,
+    ) {
+        let key = keybinds::bind_key_for_code(code);
+        if state == ElementState::Released {
+            self.keys.remove(&code);
+            self.execute_binding_release_from(key, BindKey::Keyboard(code));
+            return;
+        }
+        self.keys.insert(code);
+        if repeat {
+            return;
+        }
+        let Some(binding) = self
+            .bindings
+            .get_resolved(key, self.spectator_binding_context())
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let source = format!("@bind:key:{code:?}");
+        let presses = keybinds::split_binding_commands(&binding)
+            .into_iter()
+            .filter(|command| {
+                command.split_whitespace().next().is_some_and(|verb| verb.starts_with('+'))
+            })
+            .map(|command| format!("{command} {source}"))
+            .collect();
+        self.append_console_commands(presses);
     }
 
     pub(in crate::app) fn execute_binding_press(&mut self, key: BindKey) {

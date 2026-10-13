@@ -303,6 +303,7 @@ impl GameSession {
         } else {
             ghoul2_view
         };
+        self.entity_presenter.update_md3_lod_view(ghoul2_view);
         let audio_started = Instant::now();
         if !self.suppress_audio {
             if let Some(sound) = &mut self.sound_presenter {

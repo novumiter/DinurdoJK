@@ -71,7 +71,7 @@ fn outside_frustum(record: CullRecord) -> bool {
 // the box is hidden when even its nearest point is farther than the farthest
 // occluder anywhere in its footprint.
 fn occluded_by_hiz(record: CullRecord) -> bool {
-    if (record.draw.z != 0u || settings.viewport_mips_flags.w == 0u) {
+    if (record.draw.z != 0u || (settings.viewport_mips_flags.w & 1u) == 0u) {
         return false;
     }
 
@@ -123,6 +123,28 @@ fn occluded_by_hiz(record: CullRecord) -> bool {
     return nearest_depth < occluder_depth * 0.9998;
 }
 
+// draw.w bits: 0 inline mover, 1 explicitly absent, 2 static models/ shader,
+// 3 transparent stage, bits 5..7 = resolved blend bucket (0 none,
+// 1 multiply, 2 additive, 3 alpha composite, 4 other), bit 8 = water.
+// Viewport flags: bit1 hide inline, bit2 hide static models/ shaders,
+// bit3 omit transparent, bit4 omit opaque/masked, bit5 fast sky,
+// bits 8..11 probe 0..8.
+fn excluded_inline(record: CullRecord) -> bool {
+    let flags = settings.viewport_mips_flags.w;
+    return (record.draw.w & 2u) != 0u ||
+        (((flags & 2u) != 0u) && ((record.draw.w & 1u) != 0u)) ||
+        (((flags & 4u) != 0u) && ((record.draw.w & 4u) != 0u)) ||
+        (((flags & 8u) != 0u) && ((record.draw.w & 8u) != 0u)) ||
+        (((flags & 16u) != 0u) && ((record.draw.w & 8u) == 0u) && record.draw.z == 0u) ||
+        (((flags & 32u) != 0u) && record.draw.z != 0u) ||
+        (((flags >> 8u) >= 3u) && ((flags >> 8u) <= 6u) &&
+         (((record.draw.w >> 5u) & 7u) == ((flags >> 8u) - 2u))) ||
+        (((flags >> 8u) == 7u) && ((record.draw.w & 256u) != 0u) &&
+         (((record.draw.w >> 5u) & 7u) == 2u)) ||
+        (((flags >> 8u) == 8u) && ((record.draw.w & 256u) == 0u) &&
+         (((record.draw.w >> 5u) & 7u) == 2u));
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let active_index = gid.x;
@@ -142,7 +164,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // sky vertex path renders them at far depth. Match the CPU submission path
     // by exempting sky from geometric frustum rejection; otherwise GPU-driven
     // culling can zero instance_count before the sky vertex shader ever runs.
-    if (record.draw.z == 0u && outside_frustum(record)) {
+    if (excluded_inline(record)) {
+        visible = false;
+        reason = 3u;
+    } else if (record.draw.z == 0u && outside_frustum(record)) {
         visible = false;
         reason = 1u;
     } else if (occluded_by_hiz(record)) {
@@ -207,7 +232,8 @@ fn cs_early(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let record = records[index];
-    let draw_it = draws[index].instance_count != 0u
+    let draw_it = !excluded_inline(record)
+        && draws[index].instance_count != 0u
         && record.draw.z == 0u
         && !outside_frustum(record);
     early_draws[index].index_count = select(0u, record.draw.x, draw_it);

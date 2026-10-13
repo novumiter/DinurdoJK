@@ -1,5 +1,6 @@
 //! Thread.
 use crate::renderer::diagnostics::perf_capture::PerfCapture;
+use crate::renderer::diagnostics::sky_sweep::SkyPerfSweep;
 use crate::renderer::{
     block_on, mpsc, sample_view_rotation, scene, thread, Arc, CompanionId, CompanionRenderThread,
     Duration, DynamicLightsMode, EventLoopProxy, FrameInfo, GpuPass, HashMap, InputLatencySample,
@@ -93,6 +94,11 @@ impl RenderThread {
         // for a single diagnostic run: WGPU_VALIDATION=1, plus
         // WGPU_GPU_BASED_VALIDATION=1 (shader-side bounds checks) and
         // WGPU_VALIDATION_INDIRECT_CALL=1 (indirect draw/dispatch arguments).
+        // wgpu's release default keeps VALIDATION_INDIRECT_CALL, which adds a
+        // compute pass, buffer copies and barriers to every frame with an indirect
+        // draw (measured on an Intel UHD 630). Our indirect arguments are built by
+        // the renderer itself; WGPU_VALIDATION_INDIRECT_CALL=1 turns it back on.
+        instance_desc.flags.remove(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL);
         instance_desc.flags = instance_desc.flags.with_env();
         if instance_desc.flags.contains(wgpu::InstanceFlags::VALIDATION) {
             eprintln!("[GPU] backend validation layers enabled: {:?}", instance_desc.flags);
@@ -101,18 +107,51 @@ impl RenderThread {
             RendererBackend::Vulkan => wgpu::Backends::VULKAN,
             RendererBackend::Dx12 => wgpu::Backends::DX12,
         };
+        // DX12 prefers the DXC runtime shipped beside DinurdoJK.exe (loaded by
+        // absolute path so no other dxcompiler.dll on the system can shadow it).
+        // If it is missing or fails to initialise (seen: LoadLibrary error 1114
+        // on an Intel iGPU PC), wgpu drops the whole DX12 backend and surface
+        // creation fails with "any enabled backend: {}". Fall back to the FXC
+        // compiler built into Windows instead of losing DX12.
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+        let dxc_path = exe_dir
+            .as_ref()
+            .map(|dir| dir.join("dxcompiler.dll"))
+            .filter(|path| path.is_file() && path.with_file_name("dxil.dll").is_file());
         if backend == RendererBackend::Dx12 {
-            // Use the shipped dynamic DXC runtime explicitly. This avoids linking
-            // static DXC (and its ATL build dependency) while also avoiding an
-            // automatic fallback to legacy FXC when DXC is expected to be present.
-            // Ship dxcompiler.dll (and its matching dxil.dll) beside DinurdoJK.exe.
-            instance_desc.backend_options.dx12.shader_compiler =
-                wgpu::Dx12Compiler::default_dynamic_dxc();
+            instance_desc.backend_options.dx12.shader_compiler = match &dxc_path {
+                Some(path) => wgpu::Dx12Compiler::DynamicDxc {
+                    dxc_path: path.to_string_lossy().into_owned(),
+                },
+                None => {
+                    eprintln!(
+                        "[GPU] DX12: dxcompiler.dll/dxil.dll not beside DinurdoJK.exe; using the Windows FXC shader compiler"
+                    );
+                    wgpu::Dx12Compiler::Fxc
+                }
+            };
         }
         let instance = wgpu::Instance::new(instance_desc);
-        let surface = instance
-            .create_surface(window.clone())
-            .map_err(|error| format!("Could not create WGPU surface: {error}"))?;
+        let (instance, surface) = match instance.create_surface(window.clone()) {
+            Ok(surface) => (instance, surface),
+            Err(error) if backend == RendererBackend::Dx12 && dxc_path.is_some() => {
+                eprintln!(
+                    "[GPU] DX12 with the DXC runtime failed ({error}); retrying with the Windows FXC shader compiler"
+                );
+                let mut fxc_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+                fxc_desc.flags = fxc_desc.flags.with_env();
+                fxc_desc.backends = wgpu::Backends::DX12;
+                fxc_desc.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
+                let instance = wgpu::Instance::new(fxc_desc);
+                let surface = instance
+                    .create_surface(window.clone())
+                    .map_err(|error| format!("Could not create WGPU surface: {error}"))?;
+                (instance, surface)
+            }
+            Err(error) => return Err(format!("Could not create WGPU surface: {error}")),
+        };
         // Winit's Win32 window handles are thread-affine. Keep one cheap WGPU
         // Instance handle here so future native surfaces can be created by App
         // on the Winit thread, then moved to their dedicated render workers.
@@ -212,6 +251,11 @@ impl RenderThread {
     /// Request a bounded renderer CPU recording after map/shader warmup.
     pub fn start_render_perf_capture(&self, stem: PathBuf, frames: usize) -> Result<(), &'static str> {
         self.command_tx.send(RenderCommand::StartPerfCapture { stem, frames })
+            .map_err(|_| "renderer command channel closed")
+    }
+
+    pub fn start_sky_perf_sweep(&self, stem: PathBuf, frames: usize) -> Result<(), &'static str> {
+        self.command_tx.send(RenderCommand::StartSkyPerfSweep { stem, frames })
             .map_err(|_| "renderer command channel closed")
     }
 
@@ -334,6 +378,7 @@ pub(in crate::renderer) fn render_thread_main(
         initial_ui.video.max_frame_latency,
         initial_ui.video.hdr_output,
         &detail_texture_path,
+        initial_ui.video.gpu_adapter,
     )) {
         Ok(renderer) => renderer,
         Err(error) => {
@@ -375,6 +420,7 @@ pub(in crate::renderer) fn render_thread_main(
         initial_ui.video.detail_texture_fade_distance,
     );
     renderer.set_wireframe_mask(initial_ui.video.wireframe_mask);
+    renderer.shader_complexity_enabled = initial_ui.video.shader_complexity;
     renderer.debug_volumes.triggers_enabled = initial_ui.video.draw_triggers;
     renderer.debug_volumes.clips_enabled = initial_ui.video.draw_clip_brushes;
     renderer.set_pvs_mode(initial_ui.video.pvs_mode);
@@ -526,6 +572,14 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.dynamic_model_renderer.set_model_index_upload_cache(initial_ui.video.model_index_upload_cache);
     renderer.dynamic_model_renderer.ghoul2_batch_key_cache = initial_ui.video.ghoul2_batch_key_cache;
     renderer.set_gpu_visibility(initial_ui.video.gpu_driven, initial_ui.video.hiz_occlusion);
+    renderer.early_submit_enabled = initial_ui.video.early_submit;
+    renderer.present_copy_enabled = initial_ui.video.present_copy;
+    renderer.texture_compression = initial_ui.video.texture_compression.min(2);
+    renderer.set_draw_inline_models(initial_ui.video.draw_inline_models);
+    renderer.set_fragment_shader_mode(initial_ui.video.fragment_shader_mode);
+    renderer.color_clear_mode = initial_ui.video.color_clear_mode.min(1);
+    renderer.set_world_stage_debug(initial_ui.video.draw_bsp_model_surfaces, initial_ui.video.world_stage_probe);
+    renderer.set_fast_sky(initial_ui.video.fast_sky);
     renderer.set_dynamic_lighting(initial_ui.video.dynamic_lights);
     renderer.set_rt_samples(initial_ui.video.rt_samples);
     renderer.set_dynamic_light_falloff(initial_ui.video.dynamic_light_falloff);
@@ -579,6 +633,8 @@ pub(in crate::renderer) fn render_thread_main(
         wireframe_supported: renderer.wireframe_supported,
         hdr_output_status: renderer.hdr_output.as_ref().map_or_else(|| "SDR".to_owned(), |o| o.status()),
         hdr_output_active: renderer.hdr_output.as_ref().is_some_and(|o| matches!(o.selection.encoding, 1 | 2)),
+        adapter_name: renderer.adapter.get_info().name,
+        adapter_type: format!("{:?}", renderer.adapter.get_info().device_type),
     });
     let mut companion_renderers: HashMap<CompanionId, CompanionRenderThread> = HashMap::new();
 
@@ -622,6 +678,7 @@ pub(in crate::renderer) fn render_thread_main(
     // Owned exclusively by this thread. There is no shared collection state,
     // and each successful frame adds one small, allocation-free PerfRow.
     let mut perf_capture: Option<PerfCapture> = None;
+    let mut sky_sweep: Option<SkyPerfSweep> = None;
 
     // Opt-in console diagnostics. Keep the normal maximum-FPS path free of
     // per-frame formatting/printing, and only aggregate when explicitly asked.
@@ -722,12 +779,24 @@ pub(in crate::renderer) fn render_thread_main(
                 let command_started = Instant::now();
                 match received {
                     Ok(RenderCommand::StartPerfCapture { stem, frames }) => {
+                        if let Some(mut sweep) = sky_sweep.take() {
+                            sweep.restore(&mut renderer);
+                            renderer.set_gpu_timings(user_gpu_timings || diag_forced_gpu_timings);
+                            eprintln!("[SKY SWEEP] cancelled by render_perf_capture");
+                        }
                         // Re-arming discards an incomplete run. Drop clears the
                         // global hook flag before the new capture enables it.
                         drop(perf_capture.take());
                         eprintln!("[RENDER PERF] armed {} samples -> {} (2s delay + 120 warmup frames)",
                             frames.clamp(30, 6_000), stem.display());
                         perf_capture = Some(PerfCapture::arm(stem, frames, &renderer));
+                    }
+                    Ok(RenderCommand::StartSkyPerfSweep { stem, frames }) => {
+                        if let Some(mut sweep) = sky_sweep.take() { sweep.restore(&mut renderer); }
+                        drop(perf_capture.take());
+                        renderer.set_gpu_timings(true);
+                        eprintln!("[SKY SWEEP] starting six-phase Unified sky experiment -> {}", stem.display());
+                        sky_sweep = Some(SkyPerfSweep::new(stem, frames, &mut renderer));
                     }
                     Ok(RenderCommand::BatchBegin(title)) => {
                         renderer.begin_settings_batch();
@@ -752,6 +821,12 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetMaxFrameLatency(latency)) => {
                         renderer.set_max_frame_latency(latency)
                     }
+                    Ok(RenderCommand::SetEarlySubmit(enabled)) => {
+                        renderer.early_submit_enabled = enabled;
+                    }
+                    Ok(RenderCommand::SetPresentCopy(enabled)) => {
+                        renderer.present_copy_enabled = enabled;
+                    }
                     Ok(RenderCommand::SetInputLateLatch(enabled)) => {
                         input_latelatch = enabled;
                     }
@@ -760,6 +835,9 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.set_texture_filter(filter)
                     }
                     Ok(RenderCommand::SetPicmip(picmip)) => renderer.set_picmip(picmip),
+                    Ok(RenderCommand::SetTextureCompression(level)) => {
+                        renderer.texture_compression = level.min(2);
+                    }
                     Ok(RenderCommand::SetDetailTextures(mode)) => {
                         renderer.set_detail_textures(mode)
                     }
@@ -770,6 +848,7 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.set_detail_texture_fade(enabled, distance)
                     }
                     Ok(RenderCommand::SetWireframeMask(mask)) => renderer.set_wireframe_mask(mask),
+                    Ok(RenderCommand::SetShaderComplexity(enabled)) => renderer.shader_complexity_enabled = enabled,
                     Ok(RenderCommand::SetDebugVolumes { triggers, clips }) => {
                         renderer.debug_volumes.triggers_enabled = triggers;
                         renderer.debug_volumes.clips_enabled = clips;
@@ -789,6 +868,13 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.debug_volumes.sun_ray_enabled = enabled;
                     }
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
+                    Ok(RenderCommand::SetDrawInlineModels(enabled)) => renderer.set_draw_inline_models(enabled),
+                    Ok(RenderCommand::SetFragmentShaderMode(mode)) => renderer.set_fragment_shader_mode(mode),
+                    Ok(RenderCommand::SetColorClearMode(mode)) => renderer.color_clear_mode = mode.min(1),
+                    Ok(RenderCommand::SetWorldStageDebug { draw_bsp_model_surfaces, probe }) => {
+                        renderer.set_world_stage_debug(draw_bsp_model_surfaces, probe);
+                    },
+                    Ok(RenderCommand::SetFastSky(mode)) => renderer.set_fast_sky(mode),
                     Ok(RenderCommand::SetWorldFlares(enabled)) => {
                         if renderer.world_flares_enabled != enabled {
                             renderer.world_flares.invalidate_history();
@@ -899,7 +985,7 @@ pub(in crate::renderer) fn render_thread_main(
                         user_gpu_timings = enabled;
                         // A capture owns the profiler until it finishes; the new
                         // preference is applied when it restores.
-                        if !diag_forced_gpu_timings {
+                        if !diag_forced_gpu_timings && sky_sweep.is_none() {
                             renderer.set_gpu_timings(enabled);
                         }
                     }
@@ -1449,6 +1535,14 @@ pub(in crate::renderer) fn render_thread_main(
                         completed.finish();
                     }
                 }
+                if let Some(sweep) = sky_sweep.as_mut() {
+                    if sweep.record(&info, &mut renderer) {
+                        if let Some(completed) = sky_sweep.take() {
+                            completed.finish();
+                        }
+                        renderer.set_gpu_timings(user_gpu_timings || diag_forced_gpu_timings);
+                    }
+                }
                 for scene_frame in renderer.take_companion_scene_ready() {
                     if let Some(worker) = companion_renderers.get(&scene_frame.id) {
                         worker.publish_scene(scene_frame);
@@ -1664,6 +1758,10 @@ pub(in crate::renderer) fn render_thread_main(
                     cull_hiz_rejected: last_info.cull_hiz_rejected,
                     cull_pvs_rejected: last_info.cull_pvs_rejected,
                     cull_area_rejected: last_info.cull_area_rejected,
+                    world_program_binds: (
+                        last_info.world_specialized_binds,
+                        last_info.world_general_binds,
+                    ),
                     input_event_to_sim_ms: (input_latency_samples != 0)
                         .then(|| input_event_to_sim_sum_ms / input_latency_samples as f64),
                     input_sim_to_render_ms: (input_latency_samples != 0)

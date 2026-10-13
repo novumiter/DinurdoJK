@@ -868,6 +868,7 @@ impl App {
             view_angles,
             presentation_origin,
             presentation_time,
+            camera_time_precise,
         )) = self.local_server.as_ref().map(|player| {
             player.camera_subframe(&mut first_person_camera);
             let player_view = player.view();
@@ -879,6 +880,7 @@ impl App {
                 view_angles,
                 player.presentation_origin(),
                 player.presentation_time(),
+                player.presentation_time_precise(),
             )
         })
         else {
@@ -915,7 +917,7 @@ impl App {
                         health: entity_view.health,
                         dead_yaw: entity_view.dead_yaw as f32,
                         client_num: entity_view.client_num,
-                        time: f64::from(presentation_time),
+                        time: camera_time_precise,
                         teleported: false,
                     },
                 );

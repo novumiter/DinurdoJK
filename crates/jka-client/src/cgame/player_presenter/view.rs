@@ -147,6 +147,11 @@ impl Ghoul2PresentationView {
         }
     }
 
+    /// Renderer-coordinate camera position, for stage-aware MD3 tcGen environment.
+    pub fn camera_position(self) -> [f32; 3] {
+        self.position.to_array()
+    }
+
     pub fn with_pose(self, position: [f32; 3], forward: [f32; 3]) -> Self {
         let forward = Vec3::from_array(forward).normalize_or_zero();
         let mut right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -198,7 +203,7 @@ impl Ghoul2PresentationView {
         Vec3::from_array(scene::render_position(jka_origin)).distance(self.position)
     }
 
-    pub(in crate::cgame::player_presenter) fn projected_radius(
+    pub(crate) fn projected_radius(
         self,
         jka_origin: [f32; 3],
         radius: f32,

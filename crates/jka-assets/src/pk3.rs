@@ -452,9 +452,39 @@ impl AssetSearchPath {
                     return Err(format!("{name} exceeds asset size limit").into());
                 }
                 let mut bytes = Vec::new();
-                (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes)?;
+                let read_result = (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes);
+                // Release the first ZipFile before reopening the same entry on
+                // the same archive handle. Ordinary reads keep CRC validation.
+                drop(file);
+                let ignored_crc = match read_result {
+                    Ok(_) => false,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::InvalidData
+                            && error.to_string() == "Invalid checksum" =>
+                    {
+                        // zip 8.6.0 rejects mismatched ZIP CRCs at the end of
+                        // an otherwise successful read. TaystJK/MiniZip keeps
+                        // those decompressed bytes. Retry only this specific
+                        // error without CRC validation; decompression errors
+                        // and expanded-size checks still fail as normal.
+                        bytes.clear();
+                        let mut retry = handle.by_index_with_options(
+                            entry,
+                            zip::read::ZipReadOptions::new().ignore_crc32(true),
+                        )?;
+                        (&mut retry).take(limit as u64 + 1).read_to_end(&mut bytes)?;
+                        true
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 if bytes.len() > limit || bytes.len() as u64 != declared {
                     return Err("invalid expanded asset size".into());
+                }
+                if ignored_crc {
+                    log::warn!(
+                        "PK3 CRC mismatch ignored: {name} in {} (decompression and size OK)",
+                        shared.archive_paths[archive].display()
+                    );
                 }
                 Ok(Asset {
                     bytes,
@@ -955,6 +985,51 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ))
+    }
+
+    /// Simulate a PK3 whose ZIP CRC metadata is wrong but whose compressed
+    /// bytes are intact. Change both local and central header values so the
+    /// archive itself is still structurally consistent.
+    fn break_first_entry_crc(path: &Path) {
+        let mut contents = fs::read(path).unwrap();
+        let local = contents.windows(4).position(|s| s == b"PK\x03\x04").unwrap();
+        let central = contents.windows(4).position(|s| s == b"PK\x01\x02").unwrap();
+        let actual = u32::from_le_bytes(contents[central + 16..central + 20].try_into().unwrap());
+        let wrong = (actual ^ 0xffff_ffff).to_le_bytes();
+        contents[local + 14..local + 18].copy_from_slice(&wrong);
+        contents[central + 16..central + 20].copy_from_slice(&wrong);
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn bad_zip_crc_with_valid_compressed_data_is_readable() {
+        let root = test_root("bad-entry-crc");
+        let base = root.join("base");
+        fs::create_dir_all(&base).unwrap();
+        let package = base.join("bad_crc.pk3");
+        let qpath = "textures/test/crc.jpg";
+        let image_bytes = b"intact texture payload in a PK3 with a bad CRC";
+        write_package(&package, qpath, image_bytes);
+        break_first_entry_crc(&package);
+
+        // The ZIP crate must still reject the checksum on its normal path.
+        let mut plain_zip = zip::ZipArchive::new(File::open(&package).unwrap()).unwrap();
+        let mut plain_file = plain_zip.by_index(0).unwrap();
+        let mut plain_bytes = Vec::new();
+        let err = plain_file.read_to_end(&mut plain_bytes).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "Invalid checksum");
+        drop(plain_file);
+        drop(plain_zip);
+
+        // Our VFS retries CRC-only failures, keeping the actual image bytes.
+        let mut assets = AssetSearchPath::open(&base).unwrap();
+        let loaded = assets.read(qpath, 1024).unwrap().unwrap();
+        assert_eq!(loaded.bytes, image_bytes);
+        assert_eq!(loaded.source, package);
+        // Even CRC-tolerant reads still enforce the expanded-size limit.
+        assert!(assets.read(qpath, image_bytes.len() - 1).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

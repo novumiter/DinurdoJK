@@ -119,6 +119,7 @@ fn pending_video_reset(key: &str) -> Option<theme::Reset> {
     Some(match key {
         "hdr_output" | "cvar:r_hdroutput" => theme::Reset::Color("r_hdrOutput"),
         "render_backend" => theme::Reset::Video(ui::VIDEO_ROW_RENDER_BACKEND),
+        "gpu_adapter" => theme::Reset::Video(ui::VIDEO_ROW_GPU_ADAPTER),
         "display_mode" => theme::Reset::Video(ui::VIDEO_ROW_FULLSCREEN),
         "resolution" => theme::Reset::Video(ui::VIDEO_ROW_RESOLUTION),
         "voxel_probe_gi" => theme::Reset::Video(ui::VIDEO_ROW_VOXEL_PROBE_GI),

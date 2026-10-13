@@ -22,6 +22,7 @@ pub mod sound_presenter;
 pub(crate) mod sound_tables;
 pub(crate) mod ambient_sets;
 pub mod stringed;
+mod md3_lod;
 pub mod entity_presenter;
 pub mod event_debug;
 pub mod event_presenter;

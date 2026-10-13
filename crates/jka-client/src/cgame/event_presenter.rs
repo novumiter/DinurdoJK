@@ -455,6 +455,8 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
     }
     Some(DynamicModelSurface {
         geometry_source: crate::renderer::ModelGeometrySource::Fx,
+        authored_lighting: false,
+        material_trace: None,
         entity_num: flash.entity_num,
         wireframe_class: DynamicWireframeClass::Effect,
         raster_visible: true,

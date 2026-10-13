@@ -388,6 +388,26 @@ impl Renderer {
                     )
                 ));
             }
+            if let Some(trace) = &surface.material_trace {
+                lines.extend(trace.lines().map(str::to_owned));
+            }
+            let mut sections = vec![SurfaceInspectorSection {
+                title: "RENDER GEOMETRY".into(),
+                lines: vec![
+                    format!(
+                        "Hit triangle {triangle_index} at {:.1}, {:.1}, {:.1}",
+                        hit.x, hit.y, hit.z
+                    ),
+                    format!("Blend/alpha: {:?}", surface.alpha_mode),
+                    format!("Texture: {texture_name}"),
+                ],
+            }];
+            if let Some(trace) = &surface.material_trace {
+                sections.push(SurfaceInspectorSection {
+                    title: "MD3 SHADER SOURCE / RESOLUTION".into(),
+                    lines: trace.lines().map(str::to_owned).collect(),
+                });
+            }
             return Some(SurfaceInspectorInfo {
                 kind: entity_kind.into(),
                 title: format!("ENTITY #{}", surface.entity_num),
@@ -407,17 +427,7 @@ impl Renderer {
                         ),
                     ),
                 ],
-                sections: vec![SurfaceInspectorSection {
-                    title: "RENDER GEOMETRY".into(),
-                    lines: vec![
-                        format!(
-                            "Hit triangle {triangle_index} at {:.1}, {:.1}, {:.1}",
-                            hit.x, hit.y, hit.z
-                        ),
-                        format!("Blend/alpha: {:?}", surface.alpha_mode),
-                        format!("Texture: {texture_name}"),
-                    ],
-                }],
+                sections,
                 lines,
                 hit_entity_num: (surface.entity_num < 1022).then_some(surface.entity_num),
                 hit_inline_model: None,
@@ -591,6 +601,66 @@ impl Renderer {
                 source.modulate_lightmap, source.texture_is_lightmap, source.texture_is_white
             ),
         ];
+        // Count uploaded draw batches for *this exact traced BSP face*, not
+        // parsed shader stages. The prepared world can have fewer batches than
+        // the authored stage list because additive stages are already fused.
+        // These are upload/preparation facts, not a claim that every batch
+        // survived the current frame's PVS, frustum or ocean replacement.
+        let same_face = |other: &&crate::renderer::WorldBatch| {
+            other.source.vertices == source.vertices
+                && other.source.bsp_shader_index == source.bsp_shader_index
+                && other.source.material_debug_index == source.material_debug_index
+                && other.is_inline_entity == batch.is_inline_entity
+        };
+        let prepared: Vec<_> = world.coarse_batches.iter().filter(same_face).collect();
+        let prepared_stages: usize = prepared.iter()
+            .map(|b| if b.source.pipeline.legacy_srgb_three_stage { 3 }
+                else { 1 + b.source.additive_companions.len() }).sum();
+        if let Some(entry) = debug_entry {
+            lines.push(format!("AUTHORED STAGES: {}    RESOLVED STAGES: {}",
+                entry.authored_stage_count, entry.resolved_stage_count));
+        }
+        lines.push(format!(
+            "GPU DRAW BATCHES PREPARED (TRACED FACE): {}    RESOLVED STAGES REPRESENTED: {}",
+            prepared.len(), prepared_stages,
+        ));
+        lines.push(format!("STAGE FUSION (PREPARED): {} -> {}",
+            prepared_stages, prepared.len()));
+        for (i, draw) in prepared.iter().enumerate() {
+            let stages = if draw.source.pipeline.legacy_srgb_three_stage { 3 }
+                else { 1 + draw.source.additive_companions.len() };
+            let entry = match draw.source.pipeline.additive_fusion_count {
+                2 => "fs_additive_fused2",
+                3 => "fs_additive_fused3",
+                _ if draw.source.pipeline.legacy_srgb_three_stage => "fs_legacy_srgb_three_stage",
+                _ => "ordinary stage pipeline",
+            };
+            lines.push(format!(
+                "PREPARED DRAW {}: stages={} pipeline={} authored_glow={}",
+                i + 1, stages, entry, draw.source.authored_glow,
+            ));
+        }
+        for pair in prepared.windows(2) {
+            let last = pair[0].source.additive_companions.last().unwrap_or(&pair[0].source);
+            let next = &pair[1].source;
+            let reason = scene::additive_fusion_rejection_reason(last, next)
+                .unwrap_or_else(|| {
+                    if pair[0].source.pipeline.additive_fusion_count >= 3 {
+                        "maximum three additive stages per draw"
+                    } else {
+                        "ELIGIBLE BUT NOT FUSED (check cvar/uploaded map vs cache)"
+                    }
+                });
+            lines.push(format!("FUSION BOUNDARY: {reason}"));
+        }
+        let glow_batches = prepared.iter().filter(|b| b.source.authored_glow).count();
+        if glow_batches > 0 {
+            lines.push(format!(
+                "AUTHORED GLOW REPLAY: {} additional prepared draw(s) if glow enabled and face visible",
+                glow_batches,
+            ));
+        }
+        lines.push("DRAW COUNT SCOPE: map-prepared coarse world batches; not executed-frame draw calls. PVS/frustum, ocean promotion and other passes can change submissions. See renderperf capture for frame totals.".into());
         if let Some(overlay_index) = source.legacy_srgb_overlay {
             lines.push(format!(
                 "AUTHORED STAGES: 3 -> 1 GPU draw; exact-sRGB legacy composition; overlay image index={overlay_index} (alphaGen vertex; not a shader tint override)"
@@ -628,6 +698,14 @@ impl Renderer {
             }
         }
         lines.push(format!("GPU VERTEX ALPHA OVERRIDE: {}", if self.debug_world_vertex_alpha_one { "FORCED 1.000" } else { "AUTHORED" }));
+        lines.push(format!(
+            "ALPHA TEST INPUT: {}",
+            if source.alpha_test_texture_only {
+                "TEXTURE ONLY (GE128/127 depth-seed recovery; BSP RGBA remains authored)"
+            } else {
+                "AUTHORED TEXEL * ALPHAGEN"
+            }
+        ));
         if let Some(color) = hit_vertex_color {
             lines.push(format!(
                 "BSP VERTEX RGBA AT HIT: {:.3}, {:.3}, {:.3}, {:.3} (interpolated)",
@@ -1090,6 +1168,18 @@ impl Renderer {
                 ],
             },
         ];
+        sections.push(SurfaceInspectorSection {
+            title: "STAGE FUSION / DRAW PREPARATION".into(),
+            lines: lines.iter()
+                .filter(|line| line.starts_with("AUTHORED STAGES:")
+                    || line.starts_with("GPU DRAW BATCHES PREPARED")
+                    || line.starts_with("STAGE FUSION (PREPARED)")
+                    || line.starts_with("PREPARED DRAW ")
+                    || line.starts_with("FUSION BOUNDARY:")
+                    || line.starts_with("AUTHORED GLOW REPLAY:")
+                    || line.starts_with("DRAW COUNT SCOPE:"))
+                .cloned().collect(),
+        });
         if let Some(entry) = debug_entry {
             let mut resolution = entry.resolution_lines.clone();
             resolution.push(format!(

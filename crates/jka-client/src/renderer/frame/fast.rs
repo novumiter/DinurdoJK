@@ -1,7 +1,7 @@
 //! Frame fast.
 use crate::renderer::{
-    aabb_intersects_clip_frustum, active_batch_selection, batch_area_visible, camera_depth_clear,
-    draw_snow_shell_fast, draw_world_batch, effective_area_mask, inspector_index_range,
+    world_stage_probe_excludes, aabb_intersects_clip_frustum, active_batch_selection, batch_area_visible, camera_depth_clear,
+    draw_snow_shell_fast, draw_world_batch, effective_area_mask, hidden_inline_batch, inspector_index_range,
     ocean_suppresses_batch, refresh_auto4_lazy_collapse, sample_view_rotation,
     snow_shell_draw_near_center, ui, update_visibility, Camera, CameraUniform, CompanionSceneView,
     CullDebugMode, DrawClass, DynamicModelSurface, FootprintMode, FrameInfo, GpuPass, Instant,
@@ -64,6 +64,8 @@ impl Renderer {
                 .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         }
         self.ensure_wireframe_pipelines();
+        self.ensure_shader_complexity_target();
+        self.ensure_shader_complexity_pipelines();
         self.update_sun_ray_preview(&render_camera, player_position);
         if self.weather.wind_visuals.active() {
             // Wind visuals are deliberately compatible with FastBaseline: they
@@ -202,7 +204,7 @@ impl Renderer {
             wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Validation),
         };
         info.cpu_acquire_ms = acquire_started.elapsed().as_secs_f64() * 1000.0;
-        let surface_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let surface_view = self.surface_texture_view(&frame);
         let frame_view = self.hdr_output.as_ref().map_or_else(|| surface_view.clone(), |output| output.view.clone());
         let mut screenshot_readback = self.prepare_screenshot_readback();
 
@@ -320,6 +322,15 @@ impl Renderer {
             let active = active_batch_selection(world, self.pvs_mode);
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
+            if capture_api_calls {
+                for mover in &world.inline_models {
+                    match mover.uploaded {
+                        Some(Some(_)) => info.perf_inline_models_active += 1,
+                        Some(None) => info.perf_inline_models_hidden += 1,
+                        None => info.perf_inline_models_uninitialized += 1,
+                    }
+                }
+            }
 
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::World, false);
@@ -366,6 +377,28 @@ impl Renderer {
             let mut transparency_order = super::plan::WorldTransparencyOrder::default();
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
+                if !self.draw_bsp_model_surfaces && !batch.is_inline_entity
+                    && world.material_debug.entries
+                        .get(batch.source.material_debug_index as usize)
+                        .is_some_and(|entry| entry.name.starts_with("models/"))
+                {
+                    continue;
+                }
+                if world_stage_probe_excludes(self.world_stage_probe, batch.source.pipeline, batch.source.water) {
+                    continue;
+                }
+                if !self.draw_inline_models && batch.is_inline_entity {
+                    continue;
+                }
+                if hidden_inline_batch(batch, &world.inline_models) {
+                    if capture_api_calls {
+                        info.perf_count_hidden_world_stage(
+                            batch.source.material_debug_index,
+                            batch.indexed_range.end.saturating_sub(batch.indexed_range.start),
+                        );
+                    }
+                    continue;
+                }
                 if !batch_area_visible(batch, effective_area_mask) {
                     continue;
                 }
@@ -441,6 +474,7 @@ impl Renderer {
                     batch.source.bsp_shader_index,
                     batch.source.pipeline.class,
                     batch.source.opaque_composite_before_clouds,
+                    batch.source.late_sorted_material,
                 ) {
                     deferred_transparent.push(active_pos);
                     continue;
@@ -586,6 +620,11 @@ impl Renderer {
                                 mask & ui::wireframe::MAP != 0
                             };
                             if category_enabled
+                                // World wireframe must follow the resolved remap, not
+                                // resurrect framebuffer/depth no-op shaders (e.g. clear).
+                                && batch.source.contributes_to_world_wireframe()
+                                && (!batch.is_inline_entity || self.draw_inline_models)
+                                && !hidden_inline_batch(batch, &world.inline_models)
                                 && (!self.ocean_enabled || batch.ocean_clipmap.is_none())
                                 && batch.source.pipeline.class != DrawClass::Sky
                                 && aabb_intersects_clip_frustum(
@@ -706,6 +745,63 @@ impl Renderer {
                     pass.set_bind_group(0, &self.camera_bind_group, &[]);
                     if capture_api_calls { info.perf_encode_calls.draw_indexed = info.perf_encode_calls.draw_indexed.saturating_add(1); }
                     pass.draw_indexed(indices, 0, 0..1);
+                }
+            }
+            // The main render pass must end before opening the cost target pass.
+            drop(pass);
+
+            // BSP shader complexity: separate float accumulation and compositing.
+            // Runs only when enabled and diagnostic pipelines are ready.
+            if self.shader_complexity_enabled {
+                if let (Some(target), false) = (
+                    self.shader_complexity_target.as_ref(),
+                    world.fast_complexity_pipelines.is_empty(),
+                ) {
+                    {
+                        let color = target.multisampled_view.as_ref().unwrap_or(&target.resolved_view);
+                        let resolve = target.multisampled_view.as_ref().map(|_| &target.resolved_view);
+                        let mut cost_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("BSP cost accumulation (fast)"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: color, depth_slice: None, resolve_target: resolve,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                            })],
+                            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                                view: &self.targets.depth_view,
+                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                                stencil_ops: None,
+                            }),
+                            timestamp_writes: None, occlusion_query_set: None, multiview_mask: None,
+                        });
+                        cost_pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                        cost_pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
+                        cost_pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                        cost_pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        let mut last_key = None;
+                        for &batch_index in active.indices {
+                            let batch = &active.batches[batch_index];
+                            if !self.draw_bsp_model_surfaces && !batch.is_inline_entity
+                                && world.material_debug.entries.get(batch.source.material_debug_index as usize)
+                                    .is_some_and(|entry| entry.name.starts_with("models/")) { continue; }
+                            if ocean_suppresses_batch(self.ocean_enabled, batch)
+                                || world_stage_probe_excludes(self.world_stage_probe, batch.source.pipeline, batch.source.water)
+                                || batch.source.pipeline.class == DrawClass::Sky
+                                || batch.ocean_clipmap.is_some()
+                                || (!self.draw_inline_models && batch.is_inline_entity)
+                                || hidden_inline_batch(batch, &world.inline_models)
+                                || !batch_area_visible(batch, effective_area_mask)
+                                || !aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, view_proj)
+                            { continue; }
+                            if last_key != Some(batch.source.pipeline) {
+                                let Some(pipeline) = world.fast_complexity_pipelines.get(&batch.source.pipeline) else { continue; };
+                                cost_pass.set_pipeline(pipeline);
+                                last_key = Some(batch.source.pipeline);
+                            }
+                            cost_pass.set_bind_group(1, &batch.fast_bind_group, &[]);
+                            draw_world_batch(&mut cost_pass, batch, 0..1, None);
+                        }
+                    }
+                    target.composite(&mut encoder, self.targets.msaa_view.as_ref(), scene_output);
                 }
             }
         } else {

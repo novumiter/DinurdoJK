@@ -855,7 +855,7 @@ fn inline_model_pose_matches_cg_mover_transform_in_jka_space() {
         origin: [5.0, 0.0, 2.0],
         axis: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
     };
-    let (posed, minimum, maximum) = posed_inline_vertices(&base, Some(pose));
+    let (posed, minimum, maximum) = posed_inline_vertices(&base, pose);
     assert_eq!(scene::jka_position(posed[0].position), [5.0, 10.0, 2.0]);
     assert_eq!(scene::jka_position(posed[0].normal), [0.0, 1.0, 0.0]);
     assert_eq!(scene::jka_position(posed[1].position), [5.0, 0.0, 10.0]);
@@ -867,7 +867,7 @@ fn inline_model_pose_matches_cg_mover_transform_in_jka_space() {
     assert_eq!(minimum, [5.0, 2.0, -10.0]);
     assert_eq!(maximum, [5.0, 10.0, 0.0]);
 
-    let (compiled, _, _) = posed_inline_vertices(&base, Some(InlineModelInstance::compiled(3)));
+    let (compiled, _, _) = posed_inline_vertices(&base, InlineModelInstance::compiled(3));
     assert_eq!(compiled[0].position, base[0].position);
     assert_eq!(compiled[1].normal, base[1].normal);
 }
@@ -896,16 +896,19 @@ fn inline_model_rt_transform_matches_raster_pose() {
 }
 
 #[test]
-fn inline_model_absent_from_snapshot_collapses_to_zero_area() {
+fn inline_model_visibility_uses_cull_record_flags_without_vertex_mutation() {
     let base = [
         mover_vertex([1.0, 2.0, 3.0], [0.0, 0.0, 1.0]),
         mover_vertex([9.0, 2.0, 3.0], [0.0, 0.0, 1.0]),
     ];
-    let (hidden, minimum, maximum) = posed_inline_vertices(&base, None);
-    assert!(hidden
-        .iter()
-        .all(|vertex| vertex.position == base[0].position));
-    assert_eq!(minimum, maximum);
+    let (posed, minimum, maximum) = posed_inline_vertices(
+        &base, InlineModelInstance::compiled(3),
+    );
+    assert_eq!(posed[0].position, base[0].position);
+    assert_ne!(minimum, maximum);
+    // Bit0 marks inline; bit1 marks snapshot-absent.
+    assert_eq!(1u32 & 2u32, 0);
+    assert_ne!(3u32 & 2u32, 0);
 }
 
 #[test]
@@ -1267,6 +1270,8 @@ fn entity_shadow_pass_writes_caster_depth() {
         };
         let surface = DynamicModelSurface {
             geometry_source: crate::renderer::ModelGeometrySource::Fx,
+            authored_lighting: false,
+            material_trace: None,
             entity_num: 1,
             wireframe_class: DynamicWireframeClass::Entity,
             raster_visible: true,

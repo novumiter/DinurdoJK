@@ -120,7 +120,13 @@ impl App {
                 camera_number!("Vertical offset", "cg_thirdPersonVertOffset: target height above the player origin.", vert_offset, "cg_thirdPersonVertOffset", 0.5);
                 camera_number!("Horizontal offset", "cg_thirdPersonHorzOffset: left/right camera offset.", horz_offset, "cg_thirdPersonHorzOffset", 0.5);
                 camera_number!("Pitch offset", "cg_thirdPersonPitchOffset: camera pitch offset in degrees.", pitch_offset, "cg_thirdPersonPitchOffset", 0.5);
-                camera_number!("Camera damping", "cg_thirdPersonCameraDamp: OpenJK camera-position smoothing factor.", camera_damp, "cg_thirdPersonCameraDamp", 0.01);
+                theme::row(ui, "Emulated camera FPS", "cg_cameraFPS: 0-14 = original frame-dependent damping; 15+ = TaystJK frame-independent damping emulating the selected FPS (default 125).", theme::Reset::None, |ui| {
+                    let mut fps = self.third_person.camera_fps;
+                    if ui.add(egui::DragValue::new(&mut fps).speed(1.0).update_while_editing(false)).changed() {
+                        let _ = self.set_console_cvar("cg_cameraFPS", &fps.to_string());
+                    }
+                });
+                camera_number!("Camera damping", "cg_thirdPersonCameraDamp: TaystJK camera-position smoothing factor.", camera_damp, "cg_thirdPersonCameraDamp", 0.01);
                 camera_number!("Target damping", "cg_thirdPersonTargetDamp: OpenJK camera-target smoothing factor.", target_damp, "cg_thirdPersonTargetDamp", 0.01);
                 camera_number!("Player alpha", "cg_thirdPersonAlpha stock cvar. Preserved for the OpenJK player-rendering path.", alpha, "cg_thirdPersonAlpha", 0.01);
                 theme::row(

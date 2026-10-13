@@ -1,5 +1,6 @@
 //! frame implementation modules.
 pub(in crate::renderer) mod draw;
+pub(in crate::renderer) mod early_submit;
 pub(in crate::renderer) mod finish;
 pub(in crate::renderer) mod fast;
 pub(in crate::renderer) mod late_latch;

@@ -4,7 +4,7 @@ use crate::app::egui_menu::{
 };
 
 impl App {
-    pub(in crate::app::egui_menu) fn ensure_source_map_catalog(&mut self) {
+    pub(in crate::app) fn ensure_source_map_catalog(&mut self) {
         if self.source_map_catalog_loaded {
             return;
         }

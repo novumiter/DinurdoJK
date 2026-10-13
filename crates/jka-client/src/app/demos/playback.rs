@@ -1393,6 +1393,10 @@ impl App {
                 .entity_presenter
                 .set_draw_map_models(self.video.draw_map_models);
             playback.entity_presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
+            playback.entity_presenter.set_md3_lod_settings(
+                ghoul2_view, self.video.lod_scale, self.video.ghoul2_lod_bias,
+                self.video.md3_auto_lod, self.video.md3_lod_debug,
+            );
             playback
                 .player_presenter
                 .set_lod_bias(self.video.ghoul2_lod_bias);

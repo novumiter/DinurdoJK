@@ -307,13 +307,20 @@ pub fn find(name: &str) -> Option<&'static Entry> {
         .find(|entry| entry.name.eq_ignore_ascii_case(name))
 }
 
+/// Execution ignores optional leading console `/` or `\`. Completion must
+/// normalize those too, so `/remapShader` appears before Enter is pressed.
+fn completion_query(name: &str) -> &str {
+    name.trim_start_matches(['/', '\\'])
+}
+
 /// Exact lookup for completion, including server commands while connected.
 pub fn find_command(name: &str, connected: bool) -> Option<&'static Entry> {
+    let name = completion_query(name);
     registry(connected).find(|entry| entry.name.eq_ignore_ascii_case(name))
 }
 
 pub fn prefix(prefix: &str, connected: bool) -> impl Iterator<Item = &'static Entry> {
-    let prefix = prefix.to_ascii_lowercase();
+    let prefix = completion_query(prefix).to_ascii_lowercase();
     registry(connected).filter(move |entry| entry.name.to_ascii_lowercase().starts_with(&prefix))
 }
 
@@ -384,18 +391,23 @@ fn name_mask(start: usize, len: usize) -> u64 {
     (start..start + len).filter(|bit| *bit < 64).fold(0, |mask, bit| mask | 1u64 << bit)
 }
 
-fn classify(entry: &'static Entry, query: &str) -> Option<Suggestion> {
-    let name = entry.name.as_bytes();
+/// Shared name matcher for registered commands/cvars and argument completion.
+/// The mask highlights matched bytes in the console popup (up to 64 bytes).
+/// Argument completion intentionally does not match command descriptions.
+pub(crate) fn rank_name_match(name: &str, query: &str) -> Option<(MatchTier, u64)> {
+    if query.is_empty() {
+        return None;
+    }
+    let name = name.as_bytes();
     let q = query.as_bytes();
-    let hit = |tier, mask| Some(Suggestion { entry, tier, mask });
     if name.eq_ignore_ascii_case(q) {
-        return hit(MatchTier::Exact, name_mask(0, name.len()));
+        return Some((MatchTier::Exact, name_mask(0, name.len())));
     }
     if name.len() >= q.len() && name[..q.len()].eq_ignore_ascii_case(q) {
-        return hit(MatchTier::Prefix, name_mask(0, q.len()));
+        return Some((MatchTier::Prefix, name_mask(0, q.len())));
     }
     if let Some(start) = name.windows(q.len()).position(|w| w.eq_ignore_ascii_case(q)) {
-        return hit(MatchTier::Substring, name_mask(start, q.len()));
+        return Some((MatchTier::Substring, name_mask(start, q.len())));
     }
     let mut mask = 0u64;
     let mut wanted = q.iter().map(u8::to_ascii_lowercase);
@@ -406,11 +418,15 @@ fn classify(entry: &'static Entry, query: &str) -> Option<Suggestion> {
             next = wanted.next();
         }
     }
-    if next.is_none() && q.len() >= 2 {
-        return hit(MatchTier::Subsequence, mask);
+    (next.is_none() && q.len() >= 2).then_some((MatchTier::Subsequence, mask))
+}
+
+fn classify(entry: &'static Entry, query: &str) -> Option<Suggestion> {
+    if let Some((tier, mask)) = rank_name_match(entry.name, query) {
+        return Some(Suggestion { entry, tier, mask });
     }
-    (q.len() >= 3 && contains_ignore_case(entry.description, query))
-        .then(|| Suggestion { entry, tier: MatchTier::Description, mask: 0 })
+    (query.len() >= 3 && contains_ignore_case(entry.description, query))
+        .then_some(Suggestion { entry, tier: MatchTier::Description, mask: 0 })
 }
 
 /// Live-filter the registry for the console popup: best matches first (exact,
@@ -418,7 +434,7 @@ fn classify(entry: &'static Entry, query: &str) -> Option<Suggestion> {
 /// ahead of longer ones inside a tier. Returns at most `limit` rows plus the
 /// total number of matches.
 pub fn suggest(query: &str, connected: bool, limit: usize) -> (Vec<Suggestion>, usize) {
-    let query = query.trim();
+    let query = completion_query(query.trim());
     if query.is_empty() {
         return (Vec::new(), 0);
     }
@@ -587,6 +603,15 @@ mod tests {
     }
 
     #[test]
+    fn map_name_ranking_matches_console_substrings_and_subsequences() {
+        assert_eq!(rank_name_match("mp/ffa3", "mp/ffa3").unwrap().0, MatchTier::Exact);
+        assert_eq!(rank_name_match("mp/ffa3", "mp/f").unwrap().0, MatchTier::Prefix);
+        assert_eq!(rank_name_match("mp/ffa3", "ffa").unwrap().0, MatchTier::Substring);
+        assert_eq!(rank_name_match("mp/ffa3", "mfa").unwrap().0, MatchTier::Subsequence);
+        assert_eq!(rank_name_match("mp/ffa3", "zzz"), None);
+    }
+
+    #[test]
     fn suggestions_rank_exact_prefix_substring_then_fuzzy() {
         let (hits, total) = suggest("cg_fov", false, 8);
         assert_eq!(hits[0].entry.name, "cg_fov");
@@ -609,6 +634,18 @@ mod tests {
         assert!(suggest("   ", false, 8).0.is_empty());
         assert!(suggest("callvot", false, 8).0.is_empty());
         assert_eq!(suggest("callvot", true, 8).0[0].entry.name, "callvote");
+    }
+
+    #[test]
+    fn local_shader_remap_commands_complete_with_or_without_console_slash() {
+        for cmd in ["remapShader", "listRemaps"] {
+            assert_eq!(find_command(cmd, false).map(|e| e.name), Some(cmd));
+            assert_eq!(find_command(&format!("/{cmd}"), false).map(|e| e.name), Some(cmd));
+            assert_eq!(find_command(&format!("\\{cmd}"), false).map(|e| e.name), Some(cmd));
+            assert!(prefix(&format!("/{cmd}"), false).any(|e| e.name == cmd));
+            assert_eq!(suggest(&format!("/{cmd}"), false, 10).0[0].entry.name, cmd);
+        }
+        assert_eq!(unique_prefix("/remapS", false).map(|e| e.name), Some("remapShader"));
     }
 
     #[test]

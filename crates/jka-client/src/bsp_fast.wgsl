@@ -54,6 +54,14 @@ struct Material {
 @group(1) @binding(9) var sky_up: texture_2d<f32>;
 @group(1) @binding(10) var sky_dn: texture_2d<f32>;
 @group(1) @binding(11) var sky_sampler: sampler;
+// Fused additive siblings share the base draw geometry, but NOT material state.
+// These are the same MaterialUniform blocks as their original separate passes.
+@group(1) @binding(32) var<uniform> additive_stage1: Material;
+@group(1) @binding(33) var<uniform> additive_stage2: Material;
+@group(1) @binding(24) var additive_clamp_sampler: sampler;
+
+@group(1) @binding(31) var additive_repeat_sampler: sampler;
+
 
 const CLASSIC_FULLBRIGHT: u32 = 1u;
 const CLASSIC_VERTEX_LIGHT: u32 = 2u;
@@ -83,6 +91,23 @@ struct VertexOut {
     @location(6) @interpolate(flat) shell_kind: u32,
     @location(7) shell_coverage: f32,
 };
+
+// Fused additive stages only. Reuse locations unused by this shader family;
+// ordinary world vertex/fragment entry points keep their original varyings.
+// Affine tcMods commute with perspective-correct interpolation, so calculate
+// each stage's coordinates per vertex as the original JKA stage path did.
+struct AdditiveVertexOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) additive_uv1: vec2<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) additive_uv2: vec2<f32>,
+    @location(4) world_position: vec3<f32>,
+    @location(5) world_normal: vec3<f32>,
+    @location(6) @interpolate(flat) shell_kind: u32,
+    @location(7) shell_coverage: f32,
+};
+
 
 // Waveform generators (rgbGen wave / alphaGen wave). Same functions as id Tech 3's
 // tables: value = base + func(phase + time * frequency) * amplitude.
@@ -338,6 +363,174 @@ fn classic_three_stage_rgb(input: VertexOut) -> vec4<f32> {
     return classic_three_stage_rgb(input);
 }
 
+
+// Source additive draws previously computed each of these transformations in
+// its own vertex shader. Reversing the primary affine tcMods gives the exact
+// common pre-modified coordinates; applying each sibling's own tcMods then
+// evaluates the same independent animated UV in one fragment shader.
+fn additive_time(m: Material) -> f32 {
+    let elapsed = camera.camera_pos_time.w - m.params.w;
+    return select(elapsed, min(elapsed, m.vector_t.w), m.vector_t.w > 0.0);
+}
+fn additive_transform_uv(raw: vec2<f32>, m: Material) -> vec2<f32> {
+    var uv = raw;
+    let time = additive_time(m);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        if (i >= m.header.y) { break; }
+        let a = m.mods[i * 2u];
+        let b = m.mods[i * 2u + 1u];
+        let kind = u32(a.x + 0.5);
+        if (kind == 1u) {
+            let scroll = a.yz * time;
+            uv += scroll - floor(scroll);
+        } else if (kind == 2u) {
+            uv *= a.yz;
+        } else if (kind == 3u) {
+            let radians = -a.y * time * 0.017453292519943295;
+            let c = cos(radians);
+            let sn = sin(radians);
+            let p = uv - vec2<f32>(0.5);
+            uv = vec2<f32>(p.x * c - p.y * sn, p.x * sn + p.y * c) + vec2<f32>(0.5);
+        } else if (kind == 4u) {
+            uv = vec2<f32>(uv.x * a.y + uv.y * a.z + a.w,
+                           uv.x * b.x + uv.y * b.y + b.z);
+        }
+    }
+    return uv;
+}
+fn additive_untransform_uv(modified: vec2<f32>, m: Material) -> vec2<f32> {
+    var uv = modified;
+    let time = additive_time(m);
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        if (j >= m.header.y) { break; }
+        let i = m.header.y - 1u - j;
+        let a = m.mods[i * 2u];
+        let b = m.mods[i * 2u + 1u];
+        let kind = u32(a.x + 0.5);
+        if (kind == 1u) {
+            let scroll = a.yz * time;
+            uv -= scroll - floor(scroll);
+        } else if (kind == 2u) {
+            uv /= a.yz;
+        } else if (kind == 3u) {
+            let radians = a.y * time * 0.017453292519943295;
+            let c = cos(radians);
+            let sn = sin(radians);
+            let p = uv - vec2<f32>(0.5);
+            uv = vec2<f32>(p.x * c - p.y * sn, p.x * sn + p.y * c) + vec2<f32>(0.5);
+        } else if (kind == 4u) {
+            let determinant = a.y * b.y - a.z * b.x;
+            let p = uv - vec2<f32>(a.w, b.z);
+            uv = vec2<f32>((p.x * b.y - p.y * a.z) / determinant,
+                           (p.y * a.y - p.x * b.x) / determinant);
+        }
+    }
+    return uv;
+}
+// The source stage tcMods run on vertices in JKA. A fused fragment can use
+// interpolated UVs for its companions instead of rebuilding/inverting tcMods
+// for each covered pixel (especially expensive on screen-filling water).
+fn additive_vertex_output(base: VertexOut, count: u32) -> AdditiveVertexOut {
+    var out: AdditiveVertexOut;
+    out.clip_position = base.clip_position;
+    out.uv = base.uv;
+    out.color = base.color;
+    out.world_position = base.world_position;
+    out.world_normal = base.world_normal;
+    out.shell_kind = base.shell_kind;
+    out.shell_coverage = base.shell_coverage;
+    let raw_uv = additive_untransform_uv(base.uv, material);
+    out.additive_uv1 = additive_transform_uv(raw_uv, additive_stage1);
+    out.additive_uv2 = vec2<f32>(0.0);
+    if (count == 3u) {
+        out.additive_uv2 = additive_transform_uv(raw_uv, additive_stage2);
+    }
+    return out;
+}
+
+@vertex fn vs_additive_fused2(input: VertexIn, @builtin(instance_index) instance_index: u32) -> AdditiveVertexOut {
+    return additive_vertex_output(fast_world_vertex(input, instance_index), 2u);
+}
+@vertex fn vs_additive_fused3(input: VertexIn, @builtin(instance_index) instance_index: u32) -> AdditiveVertexOut {
+    return additive_vertex_output(fast_world_vertex(input, instance_index), 3u);
+}
+
+fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
+    var color = m.color;
+    if ((m.header.z & 1u) != 0u) {
+        color = vec4<f32>(color.rgb * vertex_color.rgb, color.a);
+    } else if ((m.header.z & 524288u) != 0u) {
+        color = vec4<f32>(color.rgb * (vec3<f32>(1.0) - vertex_color.rgb), color.a);
+    }
+    if ((m.header.z & 1048576u) != 0u) {
+        color.a *= vertex_color.a;
+    } else if ((m.header.z & 2097152u) != 0u) {
+        color.a *= (1.0 - vertex_color.a);
+    }
+    if ((m.header.z & 134217728u) != 0u) {
+        let wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+        color = vec4<f32>(vec3<f32>(wave), color.a);
+    }
+    if ((m.header.z & 268435456u) != 0u) {
+        color.a = clamp(wave_value(m.wave_funcs.y, m.wave_alpha, additive_time(m)), 0.0, 1.0);
+    }
+    return color;
+}
+fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
+    var sample = texel * additive_stage_tint(m, vertex_color);
+    // Same material flag as the source stages (1u << 29u). Keep this
+    // fusion-only check independent of optional legacy helper declarations.
+    if ((m.header.z & 536870912u) != 0u) {
+        // Inline the exact sRGB transfer function used by the legacy stage
+        // path. Fused entry points must not depend on the optional three-stage
+        // compositing helper being present in a specialized BSP module.
+        let v = max(sample.rgb, vec3<f32>(0.0));
+        let encoded = select(
+            1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
+            12.92 * v,
+            v <= vec3<f32>(0.0031308),
+        );
+        sample = vec4<f32>(encoded, sample.a);
+    }
+    // GL_SRC_ALPHA GL_ONE applies source alpha to both RGB and alpha. The
+    // fused pipeline uses GL_ONE GL_ONE with already-weighted contributions.
+    return vec4<f32>(sample.rgb * sample.a, sample.a * sample.a);
+}
+fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
+    let base = textureSample(base_texture, base_sampler, input.uv);
+    var total = additive_weighted_sample(base, material, input.color);
+    // Every companion shares the same primary inverse tcMods. Evaluate that
+    // inverse once per fragment, then apply independent authored sibling tcMods.
+    // Three-stage fusion previously recomputed the inverse twice; no sampling,
+    // stage ordering, blending or shader permutation changes.
+    let uv1 = input.additive_uv1;
+    if ((additive_stage1.header.w & 65536u) != 0u) {
+        total += additive_weighted_sample(textureSample(sky_rt, additive_clamp_sampler, uv1), additive_stage1, input.color);
+    } else {
+        total += additive_weighted_sample(textureSample(sky_rt, additive_repeat_sampler, uv1), additive_stage1, input.color);
+    }
+    if (count >= 3u) {
+        let uv2 = input.additive_uv2;
+        if ((additive_stage2.header.w & 65536u) != 0u) {
+            total += additive_weighted_sample(textureSample(sky_bk, additive_clamp_sampler, uv2), additive_stage2, input.color);
+        } else {
+            total += additive_weighted_sample(textureSample(sky_bk, additive_repeat_sampler, uv2), additive_stage2, input.color);
+        }
+    }
+    return total;
+}
+
+
+@fragment fn fs_additive_fused2(input: AdditiveVertexOut) -> @location(0) vec4<f32> {
+    if (surface_deformation_should_discard(input.world_position, material.header.w,
+        input.world_normal, input.shell_kind & 1u, input.shell_coverage, input.clip_position.xy,
+        true)) { discard; }
+    return additive_fused_contributions(input, 2u);
+}
+@fragment fn fs_additive_fused3(input: AdditiveVertexOut) -> @location(0) vec4<f32> {
+    if (surface_deformation_should_discard(input.world_position, material.header.w, input.world_normal, input.shell_kind & 1u, input.shell_coverage, input.clip_position.xy, true)) { discard; }
+    return additive_fused_contributions(input, 3u);
+}
 @fragment fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let shell_kind = input.shell_kind & 1u;
     let classic_flags = input.shell_kind >> 1u;
@@ -391,7 +584,13 @@ fn classic_three_stage_rgb(input: VertexOut) -> vec4<f32> {
     }
 
     var base = source_sample * stage_color;
-    if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
+    // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot
+    // seed depth. For the narrowly identified multi-stage depth-equal case,
+    // test the source texture's alpha while retaining the vertex alpha for
+    // the actual stage output and for all sibling shaders.
+    let mask_alpha = select(base.a, source_sample.a * material.color.a,
+        (material.header.z & 1073741824u) != 0u);
+    if ((material.params.x > 0.0 && mask_alpha < material.params.x || material.params.x < 0.0 && mask_alpha >= -material.params.x)) {
         discard;
     }
 

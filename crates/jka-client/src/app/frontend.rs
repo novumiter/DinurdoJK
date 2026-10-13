@@ -923,6 +923,39 @@ pub(super) fn scan_demo_game_directories(base: &Path) -> Result<Vec<String>, Str
     Ok(games)
 }
 
+/// A single VFS index pass for file-backed console argument providers. Kept
+/// separate from the demo browser because that browser can select another mod.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ConsoleFileCatalog {
+    pub demos: Vec<String>,
+    pub configs: Vec<String>,
+    pub trails: Vec<String>,
+}
+
+pub(super) fn scan_console_files(assets: &AssetSearchPath) -> ConsoleFileCatalog {
+    let mut catalog = ConsoleFileCatalog::default();
+    for name in assets.names() {
+        let lower = name.to_ascii_lowercase();
+        if let Some(name) = lower.strip_prefix("demos/").and_then(|s| s.strip_suffix(".dm_26")) {
+            if !name.is_empty() { catalog.demos.push(name.to_owned()); }
+        }
+        if let Some(name) = lower.strip_suffix(".cfg") {
+            if !name.is_empty() {
+                // exec expects the actual VFS path, except for its .cfg suffix.
+                catalog.configs.push(name.to_owned());
+                if let Some(trail) = name.strip_prefix("strafetrails/") {
+                    if !trail.is_empty() { catalog.trails.push(trail.to_owned()); }
+                }
+            }
+        }
+    }
+    for names in [&mut catalog.demos, &mut catalog.configs, &mut catalog.trails] {
+        names.sort_unstable();
+        names.dedup();
+    }
+    catalog
+}
+
 /// Scan demos physically owned by one selected game directory. A mod selection
 /// must not inherit base/demos into its browser list, even though normal JKA
 /// gameplay mounts `fs_game` over base after the demo has been opened.

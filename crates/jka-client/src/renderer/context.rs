@@ -4,7 +4,39 @@ use crate::renderer::{
     Renderer, TextureFilter, VsyncMode, DEPTH_FORMAT,
 };
 
+/// The configuration actually handed to `Surface::configure`.
+///
+/// DXGI flip-model swapchains do not accept sRGB formats, and Intel's Windows
+/// Vulkan driver presents through DXGI: with an sRGB swapchain it falls back to
+/// "Composed: Copy with GPU GDI" (PresentMon), an extra GPU copy plus a blocking
+/// GDI hand-off every frame. TaystJK's Vulkan renderer uses B8G8R8A8_UNORM. Keep
+/// `Renderer::config.format` as the sRGB render format (all pipelines and views
+/// use it) but present a UNORM swapchain that allows that sRGB view.
+/// `JKA_SURFACE_SRGB_DIRECT=1` restores the sRGB swapchain for A/B tests.
+pub(in crate::renderer) fn presentation_config(
+    config: &wgpu::SurfaceConfiguration,
+    linear_present_supported: bool,
+) -> wgpu::SurfaceConfiguration {
+    let mut config = config.clone();
+    let linear = config.format.remove_srgb_suffix();
+    let srgb_direct = std::env::var_os("JKA_SURFACE_SRGB_DIRECT").is_some_and(|v| v == "1");
+    if linear != config.format && linear_present_supported && !srgb_direct {
+        config.view_formats = vec![config.format];
+        config.format = linear;
+    }
+    config
+}
+
 impl Renderer {
+    /// View of an acquired swapchain image in the render format (sRGB view of
+    /// the UNORM presentation image; see `presentation_config`).
+    pub(in crate::renderer) fn surface_texture_view(&self, frame: &wgpu::SurfaceTexture) -> wgpu::TextureView {
+        frame.texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.config.format),
+            ..Default::default()
+        })
+    }
+
     #[inline]
     pub(in crate::renderer) fn note_surface_configured(&mut self, reason: &'static str) {
         self.surface_config_generation = self.surface_config_generation.saturating_add(1);

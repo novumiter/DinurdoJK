@@ -38,6 +38,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", model_state_cache: false, dynamic_batch_draws: false, world_compact_min_draws: 1", "")
         .replace(", md3_geometry_cache: false", "")
         .replace(", md3_geometry_cache: true", "")
+        .replace(", md3_auto_lod: false, md3_lod_debug: false", "")
         .replace(", model_render_bundles: false", "")
         .replace(", encoder_finish_threads: 2", "")
         .replace(", model_prepare_threads: 0, model_index_upload_cache: false, ghoul2_batch_key_cache: false", "")
@@ -50,6 +51,7 @@ pub(crate) fn digest(text: &str) -> String {
         // The prediction backend/rounding cvars were deleted. Preserve the old
         // NetworkSettings Debug-layout for unrelated frozen compatibility hashes.
         .replace(", prediction_miss_threshold: ", ", snap_mode: -1, predict_backend: -1, prediction_miss_threshold: ")
+        .replace(", camera_fps: 125", "")
         .replace(", third_person_flag_alpha: 1.0", "")
         .replace(", console_notify_lines: 3", "")
         .replace(", score_spectator_guess: true", "")
@@ -109,6 +111,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
         projected_archive = actual
             .lines()
             .filter(|line| {
+                !line.starts_with("seta cg_cameraFPS ") &&
                 !line.starts_with("seta r_rtTaa ") &&
                 !line.starts_with("seta con_notifylines ")
                     && !line.starts_with("seta cg_thirdPersonFlagAlpha ")

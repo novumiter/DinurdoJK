@@ -42,6 +42,7 @@ impl App {
         let mut settings = self.video;
         settings.fullscreen = stable.fullscreen;
         settings.renderer_backend = stable.renderer_backend;
+        settings.gpu_adapter = stable.gpu_adapter;
         settings.resolution = stable.resolution;
         // Grass can be disabled live. Preserve a pending enable as latched
         // until the renderer has actually been restarted with the required map

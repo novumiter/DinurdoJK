@@ -259,6 +259,8 @@ impl PlayerPresenter {
                     if !vertices.is_empty() {
                         draws.push(DynamicModelSurface {
                             geometry_source: crate::renderer::ModelGeometrySource::Ghoul2,
+                            authored_lighting: false,
+                            material_trace: None,
                             entity_num,
                             wireframe_class: DynamicWireframeClass::Player,
                             raster_visible: true,
@@ -299,6 +301,8 @@ impl PlayerPresenter {
                     .saturating_add(draw_vertices.len() as u64);
                 draws.push(DynamicModelSurface {
                     geometry_source: crate::renderer::ModelGeometrySource::Ghoul2,
+                    authored_lighting: false,
+                    material_trace: None,
                     entity_num,
                     wireframe_class: DynamicWireframeClass::Player,
                     raster_visible: true,
@@ -445,6 +449,8 @@ impl PlayerPresenter {
             let overlay_at = draws.len() + 1;
             draws.push(DynamicModelSurface {
                 geometry_source: crate::renderer::ModelGeometrySource::Ghoul2,
+                authored_lighting: false,
+                material_trace: None,
                 entity_num,
                 wireframe_class: DynamicWireframeClass::Player,
                 raster_visible: true,
@@ -680,6 +686,8 @@ impl PlayerPresenter {
         };
         DynamicModelSurface {
             geometry_source: surface.geometry_source,
+            authored_lighting: false,
+            material_trace: None,
             entity_num: surface.entity_num,
             wireframe_class: DynamicWireframeClass::Player,
             raster_visible: surface.raster_visible,
