@@ -210,6 +210,7 @@ impl App {
             threads: self.threads.clone(),
             surface_inspector,
             startup_splash: !self.startup_first_frame_seen,
+            startup_splash_art: !self.front_end,
             loading: self.loading.as_ref().map(MapLoadingState::ui),
             shader_compile_progress: None, // Render thread owns worker progress.
             shader_compile_stage: None,

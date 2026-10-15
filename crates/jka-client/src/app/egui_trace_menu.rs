@@ -17,6 +17,7 @@ enum TraceAction {
     Select(usize),
     TeleportTo(u16),
     Use(u16),
+    Remap(String),
 }
 
 impl App {
@@ -84,12 +85,23 @@ impl App {
 
         let can_act = self.local_server.is_some();
         let entity_num = entry.hit_entity_num;
+        let traced_shader = entry.summary.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("MATERIAL") || key.eq_ignore_ascii_case("SHADER"))
+            .map(|(_, name)| crate::scene::canonical_shader_name(name))
+            .or_else(|| (entry.kind == "WORLD SURFACE")
+                .then(|| crate::scene::canonical_shader_name(&entry.title)))
+            .filter(|name| !name.is_empty());
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             let enabled = can_act && entity_num.is_some();
             let teleport = ui.add_enabled_ui(enabled, |ui| theme::primary_button(ui, "TELEPORT TO"));
             if teleport.inner.clicked() {
                 actions.push(TraceAction::TeleportTo(entity_num.expect("gated by enabled")));
+            }
+            let remap = ui.add_enabled_ui(traced_shader.is_some(), |ui|
+                theme::primary_button(ui, "REMAP SELECTED"));
+            if remap.inner.clicked() {
+                actions.push(TraceAction::Remap(traced_shader.clone().expect("gated")));
             }
             let use_toggle = ui.add_enabled_ui(enabled, |ui| theme::ghost_button(ui, "USE / TOGGLE"));
             if use_toggle.inner.clicked() {
@@ -148,6 +160,7 @@ impl App {
             }
             TraceAction::TeleportTo(entity_num) => self.teleport_to_traced_entity(entity_num),
             TraceAction::Use(entity_num) => self.use_traced_entity(entity_num),
+            TraceAction::Remap(shader) => self.open_shader_remap(Some(shader)),
         }
     }
 

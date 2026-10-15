@@ -164,6 +164,8 @@ impl Renderer {
         if ray_tracing_supported {
             required_features |= ray_query_feature;
         }
+        // Vulkan only (DX12/GL adapters never report it): persisted pipeline cache.
+        required_features |= adapter_features & wgpu::Features::PIPELINE_CACHE;
         rverbose!(
             1,
             "Wireframe polygon mode: {}",
@@ -239,6 +241,7 @@ impl Renderer {
             "[RENDER INIT] device request {:.1} ms",
             device_started.elapsed().as_secs_f64() * 1000.0
         );
+        crate::pipeline_cache::install(&device, &info, base);
         init_mark!("adapter+device");
 
         // A lost device (TDR, driver reset, removed adapter) otherwise shows up
@@ -293,7 +296,8 @@ impl Renderer {
         let surface_linear_present = caps.formats.contains(&surface_format.remove_srgb_suffix());
         config.present_mode = no_vsync_mode(&caps.present_modes);
         config.desired_maximum_frame_latency = desired_maximum_frame_latency.clamp(1, 3);
-        let screenshot_supported = hdr_output_mode != 0 || caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+        let native_hdr_selected = super::hdr_output::requires_compositor(output_selection);
+        let screenshot_supported = native_hdr_selected || caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
         if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
         }
@@ -315,9 +319,9 @@ impl Renderer {
             return Err(format!("Surface configuration failed: {error}"));
         }
         let surface_configured_at = Instant::now();
-        let hdr_output = if hdr_output_mode != 0 {
-            // Keep the entire compositor in FP16 even on SDR fallback, so an OS
-            // HDR toggle only changes the final output pipeline/surface.
+        let hdr_output = if native_hdr_selected {
+            // No FP16 compositor, extra output submission or native-HDR UI
+            // target when the actual presentation surface is SDR.
             config.format = wgpu::TextureFormat::Rgba16Float;
             let mut output = super::hdr_output::HdrOutput::new(&device, output_selection, hdr_output_mode, config.width, config.height);
             output.detected_peak = display_info.luminance.and_then(|l| l.max_nits);
@@ -898,7 +902,7 @@ impl Renderer {
                 module: &cluster_shader,
                 entry_point: Some("cs_main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             });
         let lighting_settings_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1228,6 +1232,10 @@ impl Renderer {
         // separate late overlay so the game/world renderer and legacy HUD/menu
         // remain untouched, and it costs nothing when the Video panel is closed.
         init_mark!("UI buffers");
+        super::EGUI_LINEAR_FRAMEBUFFER.store(
+            hdr_output.is_none() && config.format.is_srgb(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
             if hdr_output.is_some() { wgpu::TextureFormat::Rgba8Unorm } else { config.format },
@@ -1304,6 +1312,7 @@ impl Renderer {
             &device,
             &queue,
             &camera_layout,
+            &cloud_shadow_layout,
             config.format,
             msaa_samples,
             &white,
@@ -1694,6 +1703,7 @@ impl Renderer {
                     time: 0.0,
                     exposure: 0.0,
                 },
+                exposure_controls: [0.0; 4],
                 camera_fx: PostCameraFxSettings {
                     motion_blur_scale: 0.0,
                     depth_of_field: 0.0,
@@ -1794,7 +1804,7 @@ impl Renderer {
                 module: &auto_exposure_shader,
                 entry_point: Some("cs_main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             });
         let auto_exposure_state_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2104,7 +2114,7 @@ impl Renderer {
             module: &hiz_build_shader,
             entry_point: Some("cs_main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
         let hiz_build_bind_group =
             create_hiz_build_bind_group(&device, &hiz_build_layout, &targets);
@@ -2154,7 +2164,7 @@ impl Renderer {
                 module: &hiz_reduce_shader,
                 entry_point: Some("cs_main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             });
         let hiz_reduce_bind_groups =
             create_hiz_reduce_bind_groups(&device, &hiz_reduce_layout, &targets);
@@ -2203,7 +2213,7 @@ impl Renderer {
             module: &gpu_cull_shader,
             entry_point: Some("cs_main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
         let gpu_cull_early_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -2212,7 +2222,7 @@ impl Renderer {
                 module: &gpu_cull_shader,
                 entry_point: Some("cs_early"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             });
         let gpu_cull_settings_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2346,6 +2356,7 @@ impl Renderer {
             ocean_interaction,
             ocean_optics_layout: cloud_shadow_layout,
             ocean_optics,
+            glass_world: None,
             ocean_inert_bind_group,
             ocean_spray_albedo,
             detail_texture,
@@ -2359,6 +2370,7 @@ impl Renderer {
             water_boxes: Vec::new(),
             camera_water_surface: NO_WATER_SURFACE,
             ocean_enabled: false,
+            ocean_sky_extend: true,
             coastal_enabled: false,
             coastal_pool: 0,
             coastal_atlas: None,
@@ -2374,9 +2386,17 @@ impl Renderer {
             fast_world_shader,
             wireframe_supported,
             wireframe_mask: 0,
+            patch_curve_error: 250.0,
+            bsp_model_lod_scale: 5.0,
+            bsp_model_lod_bias: 0,
+            bsp_model_lod_debug: false,
+            bsp_model_lod_enabled: true,
+            patch_no_curves: false,
+            patch_speeds: 0,
             shader_complexity_enabled: false,
             shader_complexity_target: None,
             pvs_mode: PvsMode::Auto,
+            face_plane_cull: false,
             wireframe_pipeline_layout,
             wireframe_shader,
             wireframe_pipeline,
@@ -2436,6 +2456,7 @@ impl Renderer {
             egui_paint_jobs: Vec::new(),
             egui_pixels_per_point: 1.0,
             egui_active: false,
+            egui_present_token: None,
             egui_pending_free: Vec::new(),
             asset_preview_mode: false,
             asset_preview_viewport: None,
@@ -2470,7 +2491,9 @@ impl Renderer {
             gamma_method: crate::gamma::GammaMethod::Shader,
             hdr_enabled: false,
             tone_mapping_enabled: false,
+            tone_mapping_strength: 0.0,
             auto_exposure_enabled: false,
+            auto_exposure_strength: 0.0,
             glow_mode: GlowMode::Off,
             halation_enabled: false,
             ssao_enabled: false,
@@ -2575,6 +2598,7 @@ impl Renderer {
             gpu_compaction_supported,
             world_compact_min_draws: 1,
             compact_group_scratch: Vec::new(),
+            face_plane_cull_scratch: Vec::new(),
             cpu_compact_indirect_scratch: Vec::new(),
             cpu_compact_count_scratch: Vec::new(),
             cpu_compact_uploaded: None,
@@ -2582,6 +2606,7 @@ impl Renderer {
             reflection_compact_groups: Vec::new(),
             inline_visible_scratch: Vec::new(),
             post_ocean_transparent_scratch: Vec::new(),
+            pre_optics_overlay_scratch: Vec::new(),
             inline_pose_scratch: Vec::new(),
             inline_draw_scratch: InlineDrawScratch::default(),
             deferred_world_bundles: DeferredWorldBundles::default(),
@@ -2595,6 +2620,7 @@ impl Renderer {
             dynamic_lights_mode: DynamicLightsMode::Off,
             dynamic_light_debug: false,
             fragment_shader_mode: 1,
+            world_sort_mode: 0,
             ui_transient_tail_uploaded: None,
             sky_box_pipelines: None,
             sky_cloud_pipelines: HashMap::new(),

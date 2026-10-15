@@ -67,7 +67,7 @@ const GUTTER: f32 = 24.0;
 /// Keep the renderer hidden until the frontend BSP is actually ready, then
 /// reveal it gently behind the menu. This also replaces the renderer's empty
 /// world/fog clear color with intentional black during startup.
-const FRONTEND_SCENE_FADE_IN_SECS: f32 = 4.0;
+pub(in crate::app) const FRONTEND_SCENE_FADE_IN_SECS: f32 = 0.55;
 
 // The Studio nav retains these indices for Force-preview behavior.
 const PROFILE_MODEL: usize = 1;
@@ -324,6 +324,7 @@ pub(super) enum VideoSection {
     Weather,
     Surface,
     Water,
+    Glass,
 }
 
 impl VideoSection {
@@ -337,12 +338,13 @@ impl VideoSection {
         (Self::PostProcessing, "Post processing"),
         (Self::Physics, "Physics"),
     ];
-    const ENVIRONMENT: [(Self, &'static str); 5] = [
+    const ENVIRONMENT: [(Self, &'static str); 6] = [
         (Self::Sun, "Sun"),
         (Self::Clouds, "Clouds"),
         (Self::Weather, "Weather"),
         (Self::Surface, "Surface"),
         (Self::Water, "Water"),
+        (Self::Glass, "Glass"),
     ];
     const TOOLS: [(Self, &'static str); 1] = [(Self::DebugTools, "Debug & tools")];
 }

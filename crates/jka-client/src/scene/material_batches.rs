@@ -32,6 +32,14 @@ pub(in crate::scene) fn authored_environment_composite(
     if !material.explicit || material.planar_reflection || material.water {
         return false;
     }
+    // Explicit glass may consist of this environment contribution alone.
+    // Keep its authored framebuffer blend when glass promotion is disabled;
+    // the separate reflection-quality resolver must not replace it either.
+    if material.surface_material == jka_assets::bsp::MATERIAL_GLASS as u8
+        && matches!(stage.tc_gen, TcGen::Environment)
+    {
+        return true;
+    }
     // Share the exact classification with parsed-shader preparation. Off must
     // not delete a stage that the Ultra guard considers part of the material.
     materials::authored_environment_composite_stage(
@@ -71,6 +79,30 @@ pub(in crate::scene) fn stage_class(stage: &MaterialStage) -> DrawClass {
     }
 }
 
+/// A `surfaceparm water` material whose authored colour or alpha generator can
+/// reach zero (e.g. costadelsol's shore-surf sheet `seph_surf`, `rgbGen wave sin
+/// 0 0.6 0.5 0.09`, additive) is an overlay that fades itself out, not a body of
+/// water. Promoting it into the FFT ocean multiplies the sea body colour by that
+/// wave, so the sheet turned into an opaque black water patch for roughly half of
+/// every 11 s cycle. Such materials keep their authored draw.
+pub(in crate::scene) fn water_fades_to_nothing(material: &SurfaceMaterial) -> bool {
+    use jka_assets::shader::{AlphaGen, RgbGen, WaveFunc};
+    let reaches_zero = |wave: jka_assets::shader::Wave| {
+        let low = match wave.func {
+            WaveFunc::Sin | WaveFunc::Triangle | WaveFunc::Square | WaveFunc::Noise => {
+                wave.base - wave.amplitude.abs()
+            }
+            WaveFunc::Sawtooth | WaveFunc::InverseSawtooth => wave.base.min(wave.base + wave.amplitude),
+        };
+        low <= 0.05
+    };
+    material.water
+        && material.stages.iter().any(|stage| {
+            matches!(stage.rgb_gen, RgbGen::Wave(wave) if reaches_zero(wave))
+                || matches!(stage.alpha_gen, AlphaGen::Wave(wave) if reaches_zero(wave))
+        })
+}
+
 /// Computed during map/shader preparation, not in the per-frame render loop.
 /// TaystJK framebuffer blendFunc is stage-local: an opaque material may use
 /// alpha/additive blending for later stages (lightmaps, terrain splats,
@@ -84,6 +116,26 @@ pub(in crate::scene) fn opaque_composite_before_clouds(material: &SurfaceMateria
         || material.auto_sprite2
         // Explicit translucent sort classes start above the opaque/decal range.
         || material.sort.is_some_and(|sort| !sort.is_finite() || sort >= 5.0)
+    {
+        return false;
+    }
+    material.stages.first().is_some_and(|base| {
+        let first = stage_pipeline(material, base, true);
+        first.depth_write && matches!(first.class, DrawClass::Opaque | DrawClass::Mask)
+    })
+}
+
+/// A late-sorted shader (`sort additive`) that nevertheless starts with an
+/// alpha-tested, depth-writing stage, so its geometry is a cutout that
+/// occupies the scene like an opaque surface. Seaweed and fish: they draw after
+/// the water by sort, yet sit underneath it and must be absorbed with the rest.
+fn late_sorted_depth_seed(material: &SurfaceMaterial) -> bool {
+    if material.sky
+        || material.water
+        || material.planar_reflection
+        || material.auto_sprite2
+        || material.glass_promotion
+        || !material.sort.is_some_and(|sort| sort.is_finite() && sort >= 5.0)
     {
         return false;
     }
@@ -123,6 +175,17 @@ fn lit_overlay_trailing_stages(material: &SurfaceMaterial) -> Option<usize> {
 
 const LIT_OVERLAY_BLEND: BlendMode =
     BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha);
+
+/// Stable fixed-point JKA material sort bucket.  Deliberately store it on each
+/// authored stage: runtime submission cannot infer this from the stage's
+/// pipeline class (e.g. a late-sorted alpha-tested depth seed).
+pub(in crate::scene) fn effective_material_sort(material: &SurfaceMaterial) -> i32 {
+    // Match FinishShader: polygonOffset defaults to SS_DECAL, even when its
+    // single stage uses destination-color blending (e.g. mp_imperial_symbol).
+    let default = if material.sky { 2.0 } else if material.offset { 4.0 }
+        else if class_for(material) == DrawClass::Transparent { 14.0 } else { 3.0 };
+    (material.sort.unwrap_or(default) * 1024.0) as i32
+}
 
 pub(in crate::scene) fn class_for(material: &SurfaceMaterial) -> DrawClass {
     if material.sky {
@@ -358,8 +421,14 @@ pub(in crate::scene) fn stage_batch(
         bsp_shader_index: bsp_shader_index.map_or(u32::MAX, |index| index as u32),
         material_debug_index: material_debug_index.map_or(u32::MAX, |index| index as u32),
         surface_material: material.surface_material,
+        glass_primary: material.glass_promotion && first,
+        glass_tint: material.glass_tint,
+        glass_reflectance: material.glass_reflectance,
         opaque_composite_before_clouds: opaque_composite_before_clouds(material),
+        lit_overlay: false,
+        late_depth_seed: late_sorted_depth_seed(material),
         late_sorted_material: material.sort.is_some_and(|sort| sort >= 5.0),
+        authored_sort_priority: effective_material_sort(material),
         texture,
         legacy_srgb_overlay: None,
         additive_companions: Vec::new(),
@@ -427,7 +496,8 @@ pub(in crate::scene) fn stage_batch(
         water_deformed: material.water_deformed,
         alpha_shadow: material.alpha_shadow,
         light_filter: material.light_filter,
-        water_primary: material.water && first,
+        water_primary: material.water && first && !water_fades_to_nothing(material),
+        water_overlay: material.water && water_fades_to_nothing(material),
         authored_ocean: None,
         planar_environment_candidate: matches!(stage.tc_gen, TcGen::Environment)
             && !authored_environment_composite,
@@ -451,6 +521,29 @@ pub(in crate::scene) fn prepared_stages(
     vertex_lit: bool,
 ) -> Vec<MaterialStage> {
     let mut stages = material.stages.clone();
+    if material.glass_promotion {
+        let Some(mut stage) = stages.into_iter().next() else { return Vec::new(); };
+        // The source image only informs the tint. Its low-resolution reflection
+        // pattern and framebuffer blend no longer appear in the promoted pass.
+        stage.texture = StageTexture::White;
+        stage.animation = None;
+        stage.enhancements = Default::default();
+        stage.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha,
+            dst: BlendFactor::OneMinusSrcAlpha,
+        });
+        stage.alpha_cutoff = 0.0;
+        stage.opacity = 1.0;
+        stage.color = [1.0; 3];
+        stage.rgb_gen = RgbGen::Identity;
+        stage.alpha_gen = AlphaGen::Identity;
+        stage.tc_gen = TcGen::Base;
+        stage.tc_mods.clear();
+        stage.depth_write = false;
+        stage.depth_equal = false;
+        stage.glow = false;
+        return vec![stage];
+    }
     if !vertex_lit {
         return stages;
     }
@@ -1332,6 +1425,7 @@ pub(in crate::scene) fn append_material_batches(
             if emitted[tail].pipeline.blend == LIT_OVERLAY_BLEND {
                 for batch in &mut emitted[tail..] {
                     batch.opaque_composite_before_clouds = false;
+                    batch.lit_overlay = true;
                 }
             }
         }
@@ -1546,6 +1640,39 @@ mod cloud_composite_order_tests {
             depth_equal: false,
             glow: false,
         }
+    }
+
+    #[test]
+    fn shore_surf_sheet_is_not_an_ocean_body_but_the_sea_is() {
+        use jka_assets::shader::{Wave, WaveFunc};
+        let wave = |base, amplitude| Wave {
+            func: WaveFunc::Sin, base, amplitude, phase: 0.0, frequency: 0.09,
+        };
+        let stage = |rgb: RgbGen| MaterialStage { rgb_gen: rgb, ..base_stage() };
+        // textures/sephtestmap/seph_surf: rgbGen wave sin 0 0.6 0.5 0.09
+        let surf = SurfaceMaterial {
+            water: true,
+            stages: vec![stage(RgbGen::Wave(wave(0.0, 0.6))), stage(RgbGen::Wave(wave(0.0, 0.3)))],
+            ..Default::default()
+        };
+        assert!(water_fades_to_nothing(&surf));
+        let batch = stage_batch(&surf, &surf.stages[0], true, false, 0..3,
+            Some(1), None, None, &[], [0; 4], [0.0; 4], false);
+        assert!(!batch.water_primary, "overlay sheets keep their authored draw");
+        // textures/sephtestmap/oceanwater: rgbGen wave sin 1 0.05 (never near zero),
+        // and plain sea shaders with no generator at all.
+        let sea = SurfaceMaterial {
+            water: true,
+            stages: vec![stage(RgbGen::Wave(wave(1.0, 0.05))), stage(RgbGen::Identity)],
+            ..Default::default()
+        };
+        assert!(!water_fades_to_nothing(&sea));
+        let batch = stage_batch(&sea, &sea.stages[0], true, false, 0..3,
+            Some(2), None, None, &[], [0; 4], [0.0; 4], false);
+        assert!(batch.water_primary);
+        // Non-water materials are never reclassified.
+        let wall = SurfaceMaterial { stages: surf.stages.clone(), ..Default::default() };
+        assert!(!water_fades_to_nothing(&wall));
     }
 
     #[test]
@@ -1780,6 +1907,7 @@ mod cloud_composite_order_tests {
             ..Default::default()
         };
         assert_eq!(class_for(&sorted), DrawClass::Transparent);
+        assert_eq!(effective_material_sort(&sorted), 15 * 1024);
         // Per-stage pipeline still alpha-tests, writes depth and preserves
         // the authored GL_ONE GL_ZERO replacement blend.
         let pipeline = stage_pipeline(&sorted, &base, true);
@@ -1788,6 +1916,29 @@ mod cloud_composite_order_tests {
         assert_eq!(pipeline.blend, BlendMode::Opaque);
         let unsorted = SurfaceMaterial { sort: None, ..sorted };
         assert_eq!(class_for(&unsorted), DrawClass::Mask);
+        assert_eq!(effective_material_sort(&unsorted), 3 * 1024);
+    }
+
+    #[test]
+    fn late_sorted_cutouts_are_surfaces_but_late_blends_are_not() {
+        // costadelsol seaweed/fish: `sort additive`, GE128 depthWrite base.
+        let mut cutout = base_stage();
+        cutout.alpha_cutoff = 0.5;
+        cutout.depth_write = true;
+        let seaweed = SurfaceMaterial {
+            sort: Some(15.0), stages: vec![cutout.clone()], ..Default::default()
+        };
+        assert!(late_sorted_depth_seed(&seaweed));
+        let unsorted = SurfaceMaterial { sort: None, ..seaweed.clone() };
+        assert!(!late_sorted_depth_seed(&unsorted));
+        let additive_fx = MaterialStage {
+            blend: Some(materials::BlendFunc { src: BlendFactor::SrcAlpha, dst: BlendFactor::One }),
+            alpha_cutoff: 0.0,
+            depth_write: false,
+            ..cutout
+        };
+        let glow = SurfaceMaterial { sort: Some(15.0), stages: vec![additive_fx], ..Default::default() };
+        assert!(!late_sorted_depth_seed(&glow));
     }
 
     #[test]
@@ -1821,6 +1972,15 @@ mod cloud_composite_order_tests {
             ..Default::default()
         };
         assert_eq!(lit_overlay_trailing_stages(&terrain), Some(1));
+        // Only the haze batch is flagged: it follows the cloud multiplier but
+        // must still draw before the ocean optics capture with its surface.
+        let mut out = Vec::new();
+        let explicit_terrain = SurfaceMaterial { explicit: true, ..terrain.clone() };
+        append_material_batches(&mut out, &explicit_terrain, 12, None, false, 0..6,
+            None, &[], [0; 4], [0.0; 4], false);
+        let last = out.len() - 1;
+        assert!(out[last].lit_overlay && !out[last].opaque_composite_before_clouds);
+        assert!(out[..last].iter().all(|b| !b.lit_overlay && b.opaque_composite_before_clouds));
         // The pre-lightmap wet-sand splat is albedo and must stay in front.
         let splat_only = SurfaceMaterial {
             stages: vec![base_stage(), wet_sand, lightmap],

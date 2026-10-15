@@ -31,6 +31,9 @@ macro_rules! rverbose {
 mod app;
 mod asset_jobs;
 mod audio;
+mod eal;
+mod eal_openal;
+mod eal_worker;
 mod camera;
 mod cgame;
 mod global_cosmetics;
@@ -68,6 +71,7 @@ mod emote_net;
 mod emote_net_codec;
 mod ocean;
 mod player;
+mod pipeline_cache;
 mod pipeline_jobs;
 mod pure;
 mod renderer;
@@ -81,10 +85,13 @@ mod steam_audio;
 mod strafehelper;
 mod strafe_trail;
 mod thread_activity;
+mod startup_timeline;
+mod startup_console;
 mod ui;
 mod vgs;
 mod vote;
 mod weather;
+mod glass;
 mod water_wetness;
 mod windows_timer;
 mod world_effects;
@@ -214,6 +221,7 @@ impl Options {
                 }
                 "--game" => options.game = Some(args.next().ok_or("--game needs a directory name")?),
                 "--validate-map" => options.validate = true,
+                "--console" => {}, // Kept as a harmless compatibility flag; native console stays enabled.
                 command if command.starts_with('+') && command.len() > 1 => {
                     options.startup_commands.push(command[1..].to_owned());
                 }
@@ -241,7 +249,7 @@ impl Options {
                 }
                 _ => {
                     return Err(
-                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [screenshot.jpg] [+command args ...]"
+                        "Usage: DinurdoJK [--base path/to/base] [--game modname] [--map mp/ffa3[.bsp|.map] | --map-file path/to/map.map] [--validate-map] [--console] [screenshot.jpg] [+command args ...]"
                             .into(),
                     )
                 }
@@ -279,9 +287,13 @@ fn is_screenshot_path(path: &std::path::Path) -> bool {
 }
 
 fn main() -> std::process::ExitCode {
+    crate::startup_timeline::start();
     if let Some(code) = display_gamma::helper_entry() {
         return std::process::ExitCode::from(code as u8);
     }
+
+    crate::startup_console::prepare_own_console();
+    let _console_reveal_on_exit = crate::startup_console::RevealOnExit;
 
     let disabled_legacy_amd_vulkan_layer = apply_windows_vulkan_loader_compat();
     match logging::init() {
@@ -297,6 +309,8 @@ fn main() -> std::process::ExitCode {
         Err(error) => std::eprintln!("Logging initialization failed: {error}"),
     }
 
+    crate::startup_timeline::mark(crate::startup_timeline::Milestone::LoggingReady);
+
     if disabled_legacy_amd_vulkan_layer {
         println!(
             "[GPU] Vulkan compatibility: disabled legacy AMD switchable-graphics implicit layer for this process"
@@ -307,6 +321,8 @@ fn main() -> std::process::ExitCode {
         eprintln!("Display gamma recovery: {error}");
     }
 
+    crate::startup_timeline::mark(crate::startup_timeline::Milestone::GammaReady);
+
     let options = match Options::parse() {
         Ok(options) => options,
         Err(error) => {
@@ -314,6 +330,8 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    crate::startup_timeline::mark(crate::startup_timeline::Milestone::OptionsReady);
 
     println!("DinurdoJK renderer: winit + wgpu");
     logging::write_line_with_path(
@@ -494,11 +512,13 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    crate::startup_timeline::mark(crate::startup_timeline::Milestone::EventLoopReady);
     let proxy = event_loop.create_proxy();
     let terminal_proxy = proxy.clone();
     let startup_commands = options.startup_commands;
     let startup_screenshot_path = options.screenshot_path.clone();
     let startup_screenshot_metadata = options.screenshot_metadata.clone();
+    crate::startup_timeline::mark(crate::startup_timeline::Milestone::AppBegin);
     let mut application = match app::App::new(
         options.base,
         game_dir,
@@ -518,6 +538,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    crate::startup_timeline::mark(crate::startup_timeline::Milestone::AppReady);
     spawn_terminal_command_reader(terminal_proxy);
 
     match event_loop.run_app(&mut application) {

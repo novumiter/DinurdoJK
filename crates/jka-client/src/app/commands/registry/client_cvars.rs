@@ -896,41 +896,6 @@ app_cvars! {
         ]
     }
 
-    APP_CG_CAMERAFPS {
-        runtime: CvarDef::new(
-                "cg_cameraFPS", "125", "<15 legacy | >=15 emulated FPS",
-                "TaystJK: 0..14 original frame-dependent camera damping; 15+ FPS-independent damping emulating this frame rate (default 125).",
-                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-                |app: &App| CvarValue::String(app.third_person.camera_fps.to_string()),
-                |app, value| App::cvar_set_cg_camerafps(app, "cg_cameraFPS", &value.to_string()),
-            ).with_text_setter(App::cvar_set_cg_camerafps, None),
-        config: CvarBinding {
-            load_presentation: Some(|settings, _name, value| {
-                if let Ok(fps) = value.trim().parse::<i32>() {
-                    settings.third_person.camera_fps = fps;
-                }
-            }),
-            archive: Some((502, |state| state.presentation.third_person.camera_fps.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: [
-            impl App {
-                fn cvar_set_cg_camerafps(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let fps = value.trim().parse::<i32>()
-                        .map_err(|_| format!("{name}: expected integer FPS"))?;
-                    if self.third_person.camera_fps != fps {
-                        self.third_person.camera_fps = fps;
-                        // TaystJK cg_cameraFPS uses CG_ClearThirdPersonDamp on change.
-                        // The next camera sample will reinitialize using collision.
-                        self.third_person_camera.reset();
-                        self.mark_config_dirty();
-                    }
-                    Ok(())
-                }
-            }
-        ]
-    }
-
     APP_CG_THIRDPERSONALPHA {
         runtime: CvarDef::new(
                 "cg_thirdPersonAlpha",

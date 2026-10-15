@@ -23,6 +23,7 @@ pub(in crate::renderer) struct DeferredResources {
 #[derive(Clone, PartialEq, Eq)]
 pub(in crate::renderer) struct DeferredCommand {
     pub pipeline: wgpu::RenderPipeline,
+    pub binding: crate::renderer::WorldPipelineBinding,
     pub surface: wgpu::BindGroup,
     pub ocean: Option<wgpu::BindGroup>,
     pub indices: Range<u32>,
@@ -34,6 +35,7 @@ pub(in crate::renderer) struct DeferredWorldBundles {
     commands: Vec<DeferredCommand>,
     pub scratch: Vec<DeferredCommand>,
     bundle: Option<wgpu::RenderBundle>,
+    program_binds: [u32; 5],
 }
 
 #[derive(Default, Clone, Copy)]
@@ -41,6 +43,7 @@ pub(in crate::renderer) struct DeferredBundleResult {
     pub reused: bool,
     pub built: bool,
     pub represented_draws: u32,
+    pub program_binds: [u32; 5],
 }
 
 impl DeferredWorldBundles {
@@ -56,6 +59,7 @@ impl DeferredWorldBundles {
             self.commands.clear();
             self.scratch.clear();
             self.bundle = None;
+            self.program_binds = [0; 5];
             return DeferredBundleResult::default();
         }
         if self.resources.as_ref() != Some(&resources) || self.commands != self.scratch {
@@ -63,11 +67,12 @@ impl DeferredWorldBundles {
             std::mem::swap(&mut self.commands, &mut self.scratch);
             self.scratch.clear();
             self.bundle = None;
+            self.program_binds = [0; 5];
             return DeferredBundleResult::default();
         }
         self.scratch.clear();
         if self.bundle.is_some() {
-            return DeferredBundleResult { reused: true, represented_draws: count as u32, ..Default::default() };
+            return DeferredBundleResult { reused: true, represented_draws: count as u32, program_binds: self.program_binds, ..Default::default() };
         }
         let colors = [Some(resources.color_format)];
         let mut encoder = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
@@ -97,6 +102,15 @@ impl DeferredWorldBundles {
         for command in &self.commands {
             if pipeline != Some(&command.pipeline) {
                 encoder.set_pipeline(&command.pipeline);
+                use super::programs::StageProgram;
+                let kind = match command.binding.1.map(|key| key.program) {
+                    None => 0,
+                    Some(StageProgram::Specialized) => 1,
+                    Some(StageProgram::Minimal) => 2,
+                    Some(StageProgram::SharedBasic | StageProgram::SharedEnhanced) => 3,
+                    Some(StageProgram::GeneratedBasic | StageProgram::GeneratedEnhanced) => 4,
+                };
+                self.program_binds[kind] += 1;
                 pipeline = Some(&command.pipeline);
                 // Bind-group layouts can change with pipeline variants.
                 surface = None;
@@ -117,7 +131,7 @@ impl DeferredWorldBundles {
         self.bundle = Some(encoder.finish(&wgpu::RenderBundleDescriptor {
             label: Some("JKA cached ordered transparent BSP"),
         }));
-        DeferredBundleResult { built: true, represented_draws: count as u32, ..Default::default() }
+        DeferredBundleResult { built: true, represented_draws: count as u32, program_binds: self.program_binds, ..Default::default() }
     }
 
     pub fn bundle(&self) -> Option<&wgpu::RenderBundle> { self.bundle.as_ref() }

@@ -1,6 +1,10 @@
 //! Renderer cvars: declarative runtime and config bindings.
 use super::cvar_prelude::*;
 
+// All runtime definitions in this registry are App cvars. Fix the state type
+// before closure inference for setters and dynamic cvar bindings.
+type CvarDef = crate::console::cvars::CvarDef<App>;
+
 app_cvars! {
     APP_R_DEBUGWORLDVERTEXALPHAONE {
         runtime: CvarDef::new("r_debugWorldVertexAlphaOne", "", "0..1", "A/B shader test: force BSP world vertex alpha to 1. Original vertex data is restored by setting 0. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_debugworldvertexalphaone(app)), |app, value| App::cvar_set_r_debugworldvertexalphaone(app, APP_R_DEBUGWORLDVERTEXALPHAONE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_debugworldvertexalphaone, None),
@@ -846,15 +850,36 @@ app_cvars! {
         ]
     }
 
+    APP_R_WORLDSORTMODE {
+        runtime: CvarDef::new("r_worldSortMode", "", "0|1", "Session A/B: 0 authored-sort baseline; 1 additionally group independent opaque/masked stages by their ACTUAL compiled pipeline inside the same authored shader sort bucket. Never reorders blended, sky, depth-equal, multi-stage, mover, water, mirror or ocean stages. Sort estimates appear in renderperf captures and JKA PERF logs.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.world_sort_mode.to_string()),
+            |app, value| App::cvar_set_r_worldsortmode(app, APP_R_WORLDSORTMODE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_worldsortmode, None),
+        config: CvarBinding::NONE,
+        implementations: [
+            impl App {
+                fn cvar_set_r_worldsortmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode = value.trim().parse::<u8>()
+                        .ok().filter(|&mode| mode <= 1)
+                        .ok_or_else(|| format!("{name}: expected 0 or 1"))?;
+                    self.video.world_sort_mode = mode;
+                    self.render_command(RenderCommand::SetWorldSortMode(mode));
+                    self.console_status = format!("WORLD SORT: {}", if mode == 0 { "AUTHORED SORT" } else { "AUTHORED + SAFE PIPELINE" });
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_FRAGMENTSHADERMODE {
-        runtime: CvarDef::new("r_fragmentShaderMode", "", "0..2", "World pixel shader: 0 one general program for every material; 1 TaystJK-style, a specialized program per kind of stage (texture/lightmap, colour source, alpha test); 2 like 1, plus dedicated minimal vertex/pixel entry points for plain stages. Same image in every mode. Switches without a map reload once its shaders have compiled.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_fragmentShaderMode", "", "0..4", "World shaders: 0 general; 1 material specialization; 2 specialization plus minimal entries; 3 shared basic/enhanced families; 4 generated minimal vertex/fragment pairs per encountered stage recipe. Modes 3/4 target Minimal Unified, Low and Medium, with reported fallbacks for other features. Switches after background compilation; quality settings are preserved.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.fragment_shader_mode.to_string()),
             |app, value| App::cvar_set_r_fragmentshadermode(app, APP_R_FRAGMENTSHADERMODE.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_r_fragmentshadermode, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(mode) = value.trim().parse::<u8>() {
-                    settings.fragment_shader_mode = mode.min(2);
+                    settings.fragment_shader_mode = mode.min(4);
                 }
             }),
             archive: Some((428, |state| format!("{}", state.video.fragment_shader_mode))),
@@ -867,8 +892,8 @@ app_cvars! {
                         .trim()
                         .parse::<u8>()
                         .ok()
-                        .filter(|mode| *mode <= 2)
-                        .ok_or_else(|| format!("{name}: expected 0, 1 or 2"))?;
+                        .filter(|mode| *mode <= 4)
+                        .ok_or_else(|| format!("{name}: expected 0..4"))?;
                     if self.video.fragment_shader_mode != mode {
                         self.video.fragment_shader_mode = mode;
                         self.render_command(RenderCommand::SetFragmentShaderMode(mode));
@@ -878,6 +903,8 @@ app_cvars! {
                     self.console_status = format!("FRAGMENT SHADERS: {}", match mode {
                         1 => "TAYSTJK SPECIALIZED",
                         2 => "SPECIALIZED + MINIMAL ENTRIES",
+                        3 => "SHARED FAMILIES",
+                        4 => "GENERATED STAGE PROGRAMS",
                         _ => "GENERAL",
                     });
                     Ok(())
@@ -1533,9 +1560,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -2315,22 +2341,54 @@ app_cvars! {
     }
 
     APP_R_MD3AUTOLOD {
-        runtime: CvarDef::new("r_md3AutoLod", "", "0..1", "Background-generate and disk-cache missing MD3 LOD levels with meshoptimizer. Authored _1/_2 always take priority. 0 authored only (default), 1 generate missing LODs.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_md3AutoLod", "", "0..1", "Shared automatic LOD switch: 0 authored MD3 LODs only and full-detail baked BSP models; 1 (default) generate/use missing MD3 LODs and simplify eligible baked BSP models. Authored MD3 LODs always take priority.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.md3_auto_lod)),
             |app, value| App::cvar_set_r_md3autolod(app, APP_R_MD3AUTOLOD.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_md3autolod, None),
-        config: CvarBinding { default: Some(|state| bool_value(state.video.md3_auto_lod)), ..CvarBinding::NONE },
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.md3_auto_lod = parse_bool(value).unwrap_or(settings.md3_auto_lod);
+            }),
+            archive: Some((430, |state| bool_value(state.video.md3_auto_lod))),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_set_r_md3autolod(&mut self, name: &str, value: &str) -> Result<(), String> {
                 self.video.md3_auto_lod = Self::parse_cvar_bool(name, value)?;
-                self.console_status = format!("MD3 AUTO LOD: {}", if self.video.md3_auto_lod { "THREADED + CACHED" } else { "AUTHORED ONLY" });
+                self.render_command(RenderCommand::SetBspModelLod {
+                    scale: self.video.lod_scale, bias: self.video.ghoul2_lod_bias,
+                    debug: self.video.md3_lod_debug,
+                    enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
+                });
+                self.console_status = format!("AUTOMATIC MODEL LODS: {}", if self.video.md3_auto_lod { "ON (ENTITY MD3 + BSP)" } else { "OFF (AUTHORED MD3 ONLY)" });
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BSPMODELLOD {
+        runtime: CvarDef::new("r_bspModelLod", "", "0..1", "Session-only A/B override for baked BSP model LOD. 0 forces baked geometry to full detail; 1 allows it when r_md3AutoLod is also on. Never affects MD3 entities.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.bsp_model_lod)),
+            |app, value| App::cvar_set_r_bspmodellod(app, APP_R_BSPMODELLOD.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_r_bspmodellod, None),
+        config: CvarBinding { default: Some(|state| bool_value(state.video.bsp_model_lod)), ..CvarBinding::NONE },
+        implementations: [impl App {
+            fn cvar_set_r_bspmodellod(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.bsp_model_lod = Self::parse_cvar_bool(name, value)?;
+                self.render_command(RenderCommand::SetBspModelLod {
+                    scale: self.video.lod_scale, bias: self.video.ghoul2_lod_bias,
+                    debug: self.video.md3_lod_debug,
+                    enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
+                });
+                self.console_status = format!("BSP MODEL LOD: {}", if self.video.bsp_model_lod { "ALLOWED BY SHARED GATE" } else { "FORCED FULL DETAIL" });
                 self.publish_ui();
                 Ok(())
             }
         }]
     }
     APP_R_MD3LODDEBUG {
-        runtime: CvarDef::new("r_md3LodDebug", "", "0..1", "Log MD3 LOD selection changes and generated/cache LOD job completions. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_md3LodDebug", "", "0..1", "Log MD3 and compiled BSP-model LOD selection changes and generated/cache LOD job completions. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.md3_lod_debug)),
             |app, value| App::cvar_set_r_md3loddebug(app, APP_R_MD3LODDEBUG.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_md3loddebug, None),
@@ -2338,6 +2396,10 @@ app_cvars! {
         implementations: [impl App {
             fn cvar_set_r_md3loddebug(&mut self, name: &str, value: &str) -> Result<(), String> {
                 self.video.md3_lod_debug = Self::parse_cvar_bool(name, value)?;
+                self.render_command(RenderCommand::SetBspModelLod {
+                    scale: self.video.lod_scale, bias: self.video.ghoul2_lod_bias, debug: self.video.md3_lod_debug,
+                    enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
+                });
                 self.publish_ui();
                 Ok(())
             }
@@ -2380,7 +2442,7 @@ app_cvars! {
     }
 
     APP_R_GHOUL2BATCHKEYCACHE {
-        runtime: CvarDef::new("r_ghoul2BatchKeyCache", "", "0..1", "A/B cached Ghoul2 preparation hashes with identical grouping and ordering. Session-only; default 0.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_ghoul2BatchKeyCache", "", "0..1", "A/B Ghoul2 cached group IDs + linear visible bucketing (1), or legacy full-frame hash/sort (0). Session-only; default 1.", CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.ghoul2_batch_key_cache)),
             |app, value| App::cvar_set_r_ghoul2batchkeycache(app, APP_R_GHOUL2BATCHKEYCACHE.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_ghoul2batchkeycache, None),
@@ -2717,6 +2779,533 @@ app_cvars! {
         ]
     }
 
+    APP_R_GLASSPROMOTION {
+        runtime: CvarDef::new(
+            "r_glassPromotion", "", "0..1",
+            "Promote q3map_material Glass shaders (BSP, MD3, Ghoul2) to a transmissive draw over the opaque scene. 0 keeps the authored shader stages. Applies on next map load.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart,
+            |_app: &App| CvarValue::String(bool_value(crate::materials::glass_promotion_enabled())),
+            |app, value| App::cvar_set_r_glasspromotion(app, APP_R_GLASSPROMOTION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_glasspromotion, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| {
+                if let Some(enabled) = parse_bool(value) {
+                    crate::materials::set_glass_promotion_enabled(enabled);
+                }
+            }),
+            archive: Some((26004, |_state| format!("{}", u8::from(crate::materials::glass_promotion_enabled())))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_glasspromotion(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if enabled != crate::materials::glass_promotion_enabled() {
+                        crate::materials::set_glass_promotion_enabled(enabled);
+                        // Glass is resolved while materials compile. The cached
+                        // prepared map (reused by vid_restart and same-map reloads)
+                        // still holds the old resolution, so drop it.
+                        self.prepared_map_cache = None;
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GLASSSTYLE {
+        runtime: CvarDef::new(
+            "r_glassStyle", "", "bevy|frosted|liquid|ocean",
+            "Live glass style. Applies a preset and resets glass tuning controls: bevy=physical transmission, frosted=blur, liquid=static distortion/color separation, ocean=animated water-like distortion.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::settings().style.name().to_owned()),
+            |app, value| App::cvar_set_glass_style(app, APP_R_GLASSSTYLE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_style, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| {
+                if let Some(style) = crate::glass::Style::parse(value) { crate::glass::set_style(style); }
+            }),
+            archive: Some((26005, |_state| crate::glass::settings().style.name().to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_glass_style(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let style = crate::glass::Style::parse(value).ok_or_else(|| "r_glassStyle: bevy, frosted, liquid, or ocean".to_owned())?;
+                    crate::glass::set_style(style);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+                fn cvar_set_glass_control(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    crate::glass::set_value(name, value)?;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+                fn cvar_set_glass_tint(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    crate::glass::set_tint(value)?;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_GLASSBLUR {
+        runtime: CvarDef::new(
+            "r_glassBlur", "", "0..64", "Additional transmission blur radius in screen pixels. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassBlur").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSBLUR.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassBlur", value); }),
+            archive: Some((26006, |_state| crate::glass::value("r_glassBlur").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSDISTORTION {
+        runtime: CvarDef::new(
+            "r_glassDistortion", "", "0..8", "Refraction displacement multiplier; 0 disables distortion. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassDistortion").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSDISTORTION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassDistortion", value); }),
+            archive: Some((26007, |_state| crate::glass::value("r_glassDistortion").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSDISPERSION {
+        runtime: CvarDef::new(
+            "r_glassDispersion", "", "0..0.25", "Red/blue separation as a fraction of refraction displacement. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassDispersion").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSDISPERSION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassDispersion", value); }),
+            archive: Some((26008, |_state| crate::glass::value("r_glassDispersion").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSROUGHNESS {
+        runtime: CvarDef::new(
+            "r_glassRoughness", "", "0..1", "Surface roughness controls Bevy-style transmission blur. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassRoughness").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSROUGHNESS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassRoughness", value); }),
+            archive: Some((26009, |_state| crate::glass::value("r_glassRoughness").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSTHICKNESS {
+        runtime: CvarDef::new(
+            "r_glassThickness", "", "0.1..128", "Approximate glass thickness in map units; increases refraction. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassThickness").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSTHICKNESS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassThickness", value); }),
+            archive: Some((26010, |_state| crate::glass::value("r_glassThickness").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSIOR {
+        runtime: CvarDef::new(
+            "r_glassIOR", "", "1..2.5", "Index of refraction; 1.5 is ordinary glass. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassIOR").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSIOR.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassIOR", value); }),
+            archive: Some((26011, |_state| crate::glass::value("r_glassIOR").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSTINTSTRENGTH {
+        runtime: CvarDef::new(
+            "r_glassTintStrength", "", "0..1", "Amount of authored chromatic tint and r_glassTint applied to transmission. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassTintStrength").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSTINTSTRENGTH.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassTintStrength", value); }),
+            archive: Some((26012, |_state| crate::glass::value("r_glassTintStrength").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSREFLECTION {
+        runtime: CvarDef::new(
+            "r_glassReflection", "", "0..1", "Fresnel environment contribution; 0 disables it. Live for all promoted glass styles.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassReflection").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSREFLECTION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassReflection", value); }),
+            archive: Some((26013, |_state| crate::glass::value("r_glassReflection").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSTINT {
+        runtime: CvarDef::new(
+            "r_glassTint", "", "R G B (0..1)", "Live linear RGB transmission tint. Strength is r_glassTintStrength.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| { let c = crate::glass::settings().tint; CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_glass_tint(app, APP_R_GLASSTINT.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_tint, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_tint(value); }),
+            archive: Some((26014, |_state| { let c = crate::glass::settings().tint; format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSFROST {
+        runtime: CvarDef::new(
+            "r_glassFrost", "", "0..1", "Blurred-versus-sharp transmission mix; 0 keeps sharp refraction. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassFrost").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSFROST.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassFrost", value); }),
+            archive: Some((26015, |_state| crate::glass::value("r_glassFrost").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSOPACITY {
+        runtime: CvarDef::new(
+            "r_glassOpacity", "", "0..1", "Solid haze/tint fill; 0 adds no haze, 1 fills with r_glassTint. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassOpacity").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSOPACITY.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassOpacity", value); }),
+            archive: Some((26016, |_state| crate::glass::value("r_glassOpacity").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSEFFECTSTRENGTH {
+        runtime: CvarDef::new(
+            "r_glassEffectStrength", "", "0..1", "Overall glass effect strength; 0 shows the undistorted scene. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassEffectStrength").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSEFFECTSTRENGTH.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassEffectStrength", value); }),
+            archive: Some((26017, |_state| crate::glass::value("r_glassEffectStrength").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSEDGEWIDTH {
+        runtime: CvarDef::new(
+            "r_glassEdgeWidth", "", "0..128", "Width of the refractive bevel in screen pixels. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassEdgeWidth").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSEDGEWIDTH.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassEdgeWidth", value); }),
+            archive: Some((26018, |_state| crate::glass::value("r_glassEdgeWidth").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSEDGESTRENGTH {
+        runtime: CvarDef::new(
+            "r_glassEdgeStrength", "", "0..8", "Bevel refraction strength along actual visible glass boundaries. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassEdgeStrength").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSEDGESTRENGTH.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassEdgeStrength", value); }),
+            archive: Some((26019, |_state| crate::glass::value("r_glassEdgeStrength").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSMAXDISPLACEMENT {
+        runtime: CvarDef::new(
+            "r_glassMaxDisplacement", "", "0..128", "Maximum refraction displacement in screen pixels. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassMaxDisplacement").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSMAXDISPLACEMENT.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassMaxDisplacement", value); }),
+            archive: Some((26020, |_state| crate::glass::value("r_glassMaxDisplacement").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSMAGNIFICATION {
+        runtime: CvarDef::new(
+            "r_glassMagnification", "", "-1..1", "Zoom the transmitted scene around the visible pane center; 0 disables. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassMagnification").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSMAGNIFICATION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassMagnification", value); }),
+            archive: Some((26021, |_state| crate::glass::value("r_glassMagnification").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSRIMSTRENGTH {
+        runtime: CvarDef::new(
+            "r_glassRimStrength", "", "0..2", "Directional rim highlight strength. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassRimStrength").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSRIMSTRENGTH.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassRimStrength", value); }),
+            archive: Some((26022, |_state| crate::glass::value("r_glassRimStrength").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSRIMWIDTH {
+        runtime: CvarDef::new(
+            "r_glassRimWidth", "", "0..32", "Rim highlight width in screen pixels. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassRimWidth").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSRIMWIDTH.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassRimWidth", value); }),
+            archive: Some((26023, |_state| crate::glass::value("r_glassRimWidth").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSRIMSOFTNESS {
+        runtime: CvarDef::new(
+            "r_glassRimSoftness", "", "0.1..32", "Rim highlight feather width in screen pixels. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassRimSoftness").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSRIMSOFTNESS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassRimSoftness", value); }),
+            archive: Some((26024, |_state| crate::glass::value("r_glassRimSoftness").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSRIMANGLE {
+        runtime: CvarDef::new(
+            "r_glassRimAngle", "", "0..360", "Rim highlight direction in screen degrees. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassRimAngle").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSRIMANGLE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassRimAngle", value); }),
+            archive: Some((26025, |_state| crate::glass::value("r_glassRimAngle").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSEDGEBLUR {
+        runtime: CvarDef::new(
+            "r_glassEdgeBlur", "", "0..64", "Additional progressive blur radius near glass boundaries. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassEdgeBlur").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSEDGEBLUR.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassEdgeBlur", value); }),
+            archive: Some((26026, |_state| crate::glass::value("r_glassEdgeBlur").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSEDGEBLURMODE {
+        runtime: CvarDef::new(
+            "r_glassEdgeBlurMode", "", "0..1", "Progressive blur distribution: 0 all boundaries, 1 top/bottom boundaries. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassEdgeBlurMode").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSEDGEBLURMODE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassEdgeBlurMode", value); }),
+            archive: Some((26027, |_state| crate::glass::value("r_glassEdgeBlurMode").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSWAVINESS {
+        runtime: CvarDef::new(
+            "r_glassWaviness", "", "0..4", "Procedural surface waves; 0 keeps the flat center clear. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassWaviness").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSWAVINESS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassWaviness", value); }),
+            archive: Some((26028, |_state| crate::glass::value("r_glassWaviness").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSANIMATIONSPEED {
+        runtime: CvarDef::new(
+            "r_glassAnimationSpeed", "", "0..4", "Surface wave animation rate; 0 freezes waves. Live for promoted glass.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassAnimationSpeed").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSANIMATIONSPEED.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassAnimationSpeed", value); }),
+            archive: Some((26029, |_state| crate::glass::value("r_glassAnimationSpeed").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSEDGEPROFILE {
+        runtime: CvarDef::new(
+            "r_glassEdgeProfile", "", "convex|squircle|concave|lip", "Shape of the refractive glass bevel. Applies live.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::settings().edge_profile.name().to_owned()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSEDGEPROFILE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassEdgeProfile", value); }),
+            archive: Some((26030, |_state| crate::glass::settings().edge_profile.name().to_owned())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSFOREGROUNDGUARD {
+        runtime: CvarDef::new(
+            "r_glassForegroundGuard", "", "0..1", "Suppress refraction offsets near foreground actors to prevent silhouette halos. Applies live.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassForegroundGuard").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSFOREGROUNDGUARD.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassForegroundGuard", value); }),
+            archive: Some((26031, |_state| crate::glass::value("r_glassForegroundGuard").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSRIMSATURATION {
+        runtime: CvarDef::new(
+            "r_glassRimSaturation", "", "0..4", "Color saturation at the rim when r_glassRimType is 0.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassRimSaturation").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSRIMSATURATION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassRimSaturation", value); }),
+            archive: Some((26032, |_state| crate::glass::value("r_glassRimSaturation").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSRIMTYPE {
+        runtime: CvarDef::new(
+            "r_glassRimType", "", "0|1", "0 color-enhanced rim, 1 white rim. Applies live.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassRimType").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSRIMTYPE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassRimType", value); }),
+            archive: Some((26033, |_state| crate::glass::value("r_glassRimType").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_GLASSDISPERSIONBASE {
+        runtime: CvarDef::new(
+            "r_glassDispersionBase", "", "0..4", "Base multiplier for chromatic separation; multiplies r_glassDispersion.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassDispersionBase").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSDISPERSIONBASE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassDispersionBase", value); }),
+            archive: Some((26034, |_state| crate::glass::value("r_glassDispersionBase").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+
+    APP_R_GLASSBACKGROUNDRECOVERY {
+        runtime: CvarDef::new(
+            "r_glassBackgroundRecovery", "", "0|1", "Save the world before opaque models to fill foreground refraction/blur holes. Adds one fullscreen capture when needed; 0 disables it.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |_app: &App| CvarValue::String(crate::glass::value("r_glassBackgroundRecovery").to_string()),
+            |app, value| App::cvar_set_glass_control(app, APP_R_GLASSBACKGROUNDRECOVERY.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_glass_control, None),
+        config: CvarBinding {
+            load_video: Some(|_settings, _name, value, _context| { let _ = crate::glass::set_value("r_glassBackgroundRecovery", value); }),
+            archive: Some((26035, |_state| crate::glass::value("r_glassBackgroundRecovery").to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_R_TINTEDGLASS {
         runtime: CvarDef::new(
             "r_tintedGlass", "", "0..1",
@@ -2830,7 +3419,7 @@ app_cvars! {
                 "r_lodbias",
                 "",
                 "0..8",
-                "TaystJK Ghoul2/MD3 LOD bias; higher values select cheaper authored or generated geometry.",
+                "TaystJK Ghoul2/MD3/BSP-model LOD bias; higher values select cheaper authored or generated geometry.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2864,6 +3453,10 @@ app_cvars! {
                             .parse::<i32>()
                             .map_err(|_| format!("{name}: expected a non-negative integer"))?;
                         self.video.ghoul2_lod_bias = bias.max(0);
+                        self.render_command(RenderCommand::SetBspModelLod {
+                            scale: self.video.lod_scale, bias: self.video.ghoul2_lod_bias, debug: self.video.md3_lod_debug,
+                    enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
+                        });
                         self.mark_config_dirty();
                         self.publish_ui();
                         self.console_status = format!("MODEL LOD BIAS: {}", self.video.ghoul2_lod_bias);
@@ -2875,7 +3468,7 @@ app_cvars! {
     }
 
     APP_R_LODSCALE {
-        runtime: CvarDef::new("r_lodScale", "", "0.1..100", "TaystJK Ghoul2 and MD3 projected-radius LOD scale (default 5). Larger keeps higher-detail models farther away; r_lodbias is added afterward.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_lodscale(app)), |app, value| App::cvar_set_r_lodscale(app, APP_R_LODSCALE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lodscale, None),
+        runtime: CvarDef::new("r_lodScale", "", "0.1..100", "TaystJK Ghoul2, MD3 and compiled BSP-model projected-radius LOD scale (default 5). Larger keeps higher-detail models farther away; r_lodbias is added afterward.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_lodscale(app)), |app, value| App::cvar_set_r_lodscale(app, APP_R_LODSCALE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lodscale, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.lod_scale = normalize_lod_scale(value, settings.lod_scale);
@@ -2898,6 +3491,10 @@ app_cvars! {
                             .parse::<f32>()
                             .map_err(|_| "r_lodScale expects a number".to_owned())?;
                         self.video.lod_scale = config::normalize_lod_scale(value, self.video.lod_scale);
+                        self.render_command(RenderCommand::SetBspModelLod {
+                            scale: self.video.lod_scale, bias: self.video.ghoul2_lod_bias, debug: self.video.md3_lod_debug,
+                    enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
+                        });
                         self.mark_config_dirty();
                         self.publish_ui();
                         self.console_status = format!("MODEL LOD SCALE: {}", self.video.lod_scale);
@@ -3468,6 +4065,42 @@ app_cvars! {
         ]
     }
 
+    APP_R_FACEPLANECULL {
+        runtime: CvarDef::new(
+            "r_facePlaneCull", "", "0..1",
+            "BSP plane culling: packed-batch rejection plus CPU subrange rejection of planar faces (GPU-driven uses batch-only fallback).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_faceplanecull(app)),
+            |app, value| App::cvar_set_r_faceplanecull(app, APP_R_FACEPLANECULL.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_faceplanecull, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(enabled) = parse_bool(value) {
+                    settings.face_plane_cull = enabled;
+                }
+            }),
+            archive: Some((31, |state| format!("{}", u8::from(state.video.face_plane_cull)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_faceplanecull(&self) -> String {
+                    bool_value(self.video.face_plane_cull)
+                }
+                fn cvar_set_r_faceplanecull(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    if self.video.face_plane_cull != enabled {
+                        self.video.face_plane_cull = enabled;
+                        self.render_command(RenderCommand::SetFacePlaneCull(enabled));
+                        self.mark_config_dirty();
+                        self.publish_ui();
+                    }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_PVSMODE {
         runtime: CvarDef::new("r_pvsMode", "", "off|minimal|full|auto", "Potentially-visible-set culling mode; Auto uses map-load portal/cluster draw plans with shared compatible merged batches.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_pvsmode(app)), |app, value| App::cvar_set_r_pvsmode(app, APP_R_PVSMODE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_pvsmode, None),
         config: CvarBinding {
@@ -3537,9 +4170,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -4065,9 +4697,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;

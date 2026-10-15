@@ -93,6 +93,109 @@ pub(in crate::renderer) fn encode_textures(
         .collect()
 }
 
+fn encode_companion_texture(data: &TextureData, picmip: u32) -> Option<EncodedTexture> {
+    if data.rgba16f.is_some() {
+        return None;
+    }
+    let (width, height, mip_level_count, mut offset) = mip_upload_window(data, picmip, 4);
+    let (aligned_width, aligned_height) = (width.div_ceil(4) * 4, height.div_ceil(4) * 4);
+    let bytes = if (width, height) == (aligned_width, aligned_height) {
+        super::textures::encode_bc3_mip_chain(data, picmip)
+    } else {
+        // BC requires an aligned base extent. Resample the whole UV domain,
+        // rather than adding a border which would move features and repeat seams.
+        // Resize each existing mip independently to retain its normal/height
+        // filtering, and match the dimensions derived from the new base extent.
+        let mut resized = TextureData {
+            label: data.label.clone(),
+            source: data.source.clone(),
+            width: aligned_width,
+            height: aligned_height,
+            rgba: Vec::new(),
+            rgba16f: None,
+            mip_level_count,
+            clamp: data.clamp,
+            srgb: false,
+        };
+        let (mut source_width, mut source_height) = (width, height);
+        let (mut target_width, mut target_height) = (aligned_width, aligned_height);
+        for _ in 0..mip_level_count {
+            let len = source_width as usize * source_height as usize * 4;
+            let source = data.rgba.get(offset..offset + len)?;
+            if (source_width, source_height) == (target_width, target_height) {
+                resized.rgba.extend_from_slice(source);
+            } else {
+                let image = image::RgbaImage::from_raw(source_width, source_height, source.to_vec())?;
+                let mip = image::imageops::resize(
+                    &image, target_width, target_height, image::imageops::FilterType::Triangle,
+                );
+                resized.rgba.extend_from_slice(mip.as_raw());
+            }
+            offset += len;
+            source_width = (source_width / 2).max(1);
+            source_height = (source_height / 2).max(1);
+            target_width = (target_width / 2).max(1);
+            target_height = (target_height / 2).max(1);
+        }
+        super::textures::encode_bc3_mip_chain(&resized, 0)
+    };
+    Some(EncodedTexture {
+        format: wgpu::TextureFormat::Bc3RgbaUnorm,
+        width: aligned_width,
+        height: aligned_height,
+        mip_level_count,
+        bytes,
+    })
+}
+
+/// CPU-only encoders for map colour and optional PBR companion images. The
+/// caller supplies per-map usage bits: companion=1, colour=2, no-picmip=4.
+/// Called on a worker while the render thread builds indexed world geometry.
+pub(in crate::renderer) fn encode_world_textures(
+    textures: &[TextureData],
+    usage: &[u8],
+    picmip: u32,
+    compress_color: bool,
+    compress_companions: bool,
+) -> Vec<Option<EncodedTexture>> {
+    encode_world_textures_skipping(textures, usage, picmip, compress_color, compress_companions, &[])
+}
+
+/// Remap-only optimization: already resident images need no BC encoding.
+pub(in crate::renderer) fn encode_world_textures_skipping(
+    textures: &[TextureData],
+    usage: &[u8],
+    picmip: u32,
+    compress_color: bool,
+    compress_companions: bool,
+    skip: &[bool],
+) -> Vec<Option<EncodedTexture>> {
+    textures.par_iter().enumerate().map(|(index, data)| {
+        if skip.get(index).copied().unwrap_or(false) {
+            return None;
+        }
+
+        let use_bits = usage.get(index).copied().unwrap_or_default();
+        let selected_picmip = if use_bits & 4 == 0 && data.label
+            .get(..9)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("textures/"))
+        {
+            picmip
+        } else {
+            0
+        };
+        // Keep the original companion decision and byte-for-byte BC3 encoder.
+        if compress_companions && !data.srgb && use_bits == 1 {
+            return encode_companion_texture(data, selected_picmip);
+        }
+        if compress_color && use_bits & 2 != 0 {
+            encode_texture(data, selected_picmip)
+        } else {
+            None
+        }
+    }).collect()
+}
+
 pub(in crate::renderer) fn upload_encoded_texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -370,4 +473,163 @@ mod tests {
         };
         assert!(encode_texture(&data, 0).is_none());
     }
+
+    #[test]
+    fn world_colour_encoder_preserves_old_bc_bytes_and_smart_picmip() {
+        let image = TextureData {
+            label: "textures/world/brick".into(),
+            source: None,
+            width: 8,
+            height: 8,
+            rgba: [180, 90, 70, 255].repeat(64 + 16),
+            rgba16f: None,
+            mip_level_count: 2,
+            clamp: false,
+            srgb: true,
+        };
+        let encoded = encode_world_textures(&[image.clone()], &[2], 1, true, false);
+        let original = encode_texture(&image, 1).unwrap();
+        let actual = encoded[0].as_ref().unwrap();
+        assert_eq!(actual.bytes, original.bytes);
+        assert_eq!(actual.width, 4);
+        let no_picmip = encode_world_textures(&[image], &[2 | 4], 1, true, false);
+        assert_eq!(no_picmip[0].as_ref().unwrap().width, 8);
+    }
+
+    #[test]
+    fn remap_encoder_skips_resident_textures_without_altering_others() {
+        let image = TextureData {
+            label: "textures/remap_test".into(),
+            source: None,
+            width: 8,
+            height: 8,
+            rgba: vec![255; 8 * 8 * 4],
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: false,
+            srgb: true,
+        };
+        let images = [image.clone(), image];
+        let old = encode_world_textures(&images, &[2, 2], 0, true, false);
+        let new = encode_world_textures_skipping(&images, &[2, 2], 0, true, false, &[true, false]);
+        assert!(new[0].is_none());
+        assert_eq!(new[1].as_ref().unwrap().bytes, old[1].as_ref().unwrap().bytes);
+    }
+
+    #[test]
+    fn world_companion_encoder_uses_identical_legacy_bc3_blocks() {
+        let image = TextureData {
+            label: "textures/world/normal".into(),
+            source: None,
+            width: 8,
+            height: 8,
+            rgba: [40, 127, 200, 255].repeat(64),
+            rgba16f: None,
+            mip_level_count: 1,
+            clamp: false,
+            srgb: false,
+        };
+        let encoded = encode_world_textures(&[image.clone()], &[1], 0, false, true);
+        let actual = encoded[0].as_ref().unwrap();
+        assert_eq!(actual.format, wgpu::TextureFormat::Bc3RgbaUnorm);
+        assert_eq!(actual.bytes, crate::renderer::textures::encode_bc3_mip_chain(&image, 0));
+        let mixed = encode_world_textures(&[image], &[1 | 2], 0, false, true);
+        assert!(mixed[0].is_none());
+    }
+
+    #[test]
+    fn world_companion_encoder_compresses_unaligned_selected_mips() {
+        for (width, height, picmip, expected_size) in [
+            (1254, 4, 0, (1256, 4)), // Reported generated-normal crash.
+            (4, 1254, 0, (4, 1256)),
+            (12, 8, 1, (8, 4)), // Aligned source, but selected base mip is 6x4.
+            (8, 12, 1, (4, 8)),
+            (8, 8, 2, (4, 4)), // Small selected base mip is 2x2.
+        ] {
+            let mut rgba = Vec::new();
+            let (mut w, mut h) = (width, height);
+            for _ in 0..3 {
+                rgba.extend([127, 127, 255, 255].repeat((w * h) as usize));
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+            }
+            let image = TextureData {
+                label: "textures/oot/zora.png [Rend2 generated normal]".into(),
+                source: None,
+                width,
+                height,
+                rgba,
+                rgba16f: None,
+                mip_level_count: 3,
+                clamp: false,
+                srgb: false,
+            };
+            let encoded = encode_world_textures(&[image], &[1], picmip, true, true);
+            let actual = encoded[0].as_ref().expect("unaligned companions still compress");
+            assert_eq!((actual.width, actual.height), expected_size);
+            assert_eq!(actual.format, wgpu::TextureFormat::Bc3RgbaUnorm);
+            assert_eq!(actual.mip_level_count, 3 - picmip);
+            let (mut w, mut h) = expected_size;
+            let mut expected_bytes = 0;
+            for _ in 0..actual.mip_level_count {
+                expected_bytes += (w.div_ceil(4) * h.div_ceil(4) * 16) as usize;
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+            }
+            assert_eq!(actual.bytes.len(), expected_bytes);
+        }
+    }
+
+    #[test]
+    fn world_companion_encoder_checks_selected_mip_and_preserves_float_images() {
+        let mut image = TextureData {
+            label: "textures/world/normal".into(),
+            source: None,
+            width: 18,
+            height: 16,
+            rgba: [127, 127, 255, 255].repeat(18 * 16 + 9 * 8 + 4 * 4),
+            rgba16f: None,
+            mip_level_count: 3,
+            clamp: false,
+            srgb: false,
+        };
+        let encoded = encode_world_textures(&[image.clone()], &[1], 2, false, true);
+        let actual = encoded[0].as_ref().expect("selected 4x4 mip is BC3-eligible");
+        assert_eq!((actual.width, actual.height), (4, 4));
+        assert_eq!(actual.bytes, crate::renderer::textures::encode_bc3_mip_chain(&image, 2));
+        image.rgba16f = Some(vec![0; image.rgba.len()]);
+        assert!(encode_world_textures(&[image], &[1], 2, false, true)[0].is_none());
+    }
+
+    #[test]
+    fn resized_companions_preserve_source_mip_colours_and_height() {
+        let pixels = [[40, 127, 200, 23], [200, 80, 40, 199], [80, 200, 40, 83]];
+        let image = TextureData {
+            label: "textures/world/normalHeight".into(),
+            source: None,
+            width: 6,
+            height: 5,
+            rgba: [pixels[0].repeat(30), pixels[1].repeat(6), pixels[2].repeat(1)].concat(),
+            rgba16f: None,
+            mip_level_count: 3,
+            clamp: false,
+            srgb: false,
+        };
+        let encoded = encode_companion_texture(&image, 0).unwrap();
+        assert_eq!((encoded.width, encoded.height), (8, 8));
+        // Resizing must retain the supplied mips (6x5, 3x2, 1x1), including
+        // their height channel, instead of regenerating them from level zero.
+        let mut offset = 0;
+        for (pixel, blocks) in pixels.into_iter().zip([4, 1, 1]) {
+            for _ in 0..blocks {
+                let block = &encoded.bytes[offset..offset + 16];
+                assert_eq!(&block[..2], &[pixel[3], pixel[3]]);
+                let expected = rgb565_expand(rgb565([pixel[0], pixel[1], pixel[2]]));
+                assert_eq!(decode_bc1_color(&block[8..]), [expected; 16]);
+                offset += 16;
+            }
+        }
+        assert_eq!(offset, encoded.bytes.len());
+    }
+
 }

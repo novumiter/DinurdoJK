@@ -163,7 +163,7 @@ fn assert_command_encoding_ab_controls(app: &mut App) {
         ("r_modelRenderBundles", "0", "1"),
         ("r_encoderFinishThreads", "2", "0"),
         ("r_modelIndexUploadCache", "0", "1"),
-        ("r_ghoul2BatchKeyCache", "0", "1"),
+        ("r_ghoul2BatchKeyCache", "1", "0"),
     ] {
         let definition = crate::app::cvar_registry().find(name).unwrap();
         assert_eq!(definition.entry.latch, LatchScope::None);

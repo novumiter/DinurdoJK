@@ -1138,7 +1138,7 @@ fn create_rain_haze_resources(device: &wgpu::Device) -> RainHazeResources {
         module: &shader,
         entry_point: Some("cs_main"),
         compilation_options: Default::default(),
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
     RainHazeResources { layout, bind_group: None, pipeline }
 }
@@ -1508,7 +1508,7 @@ fn create_rain_gpu_resources(
         module: &sim_shader,
         entry_point: Some("cs_main"),
         compilation_options: Default::default(),
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
 
     let render_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1623,7 +1623,7 @@ fn create_rain_drop_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1664,7 +1664,7 @@ fn create_rain_splash_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 

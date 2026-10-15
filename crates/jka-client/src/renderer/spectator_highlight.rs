@@ -140,7 +140,7 @@ impl SpectatorHighlightResources {
                         })],
                     }),
                     multiview_mask: None,
-                    cache: None,
+                    cache: crate::pipeline_cache::get().as_ref(),
                 },
             ));
         }
@@ -591,7 +591,7 @@ fn create_mask_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 

@@ -235,11 +235,26 @@ impl Renderer {
         let no_masks = crate::ocean::OceanMasks::default();
         let masks = self.world.as_ref().map_or(&no_masks, |world| &*world.ocean_masks);
         let eye_point = [eye.x, eye.y, eye.z];
-        let surface = boxes
+        let mut surface = boxes
             .iter()
             .filter(|volume| volume.contains(eye_point, masks))
             .map(|volume| volume.maximum[1])
             .fold(NO_WATER_SURFACE, f32::max);
+        // A camera beyond a sky-connected water edge is still inside the
+        // *rendered* ocean's underwater medium. Keep the original volume boxes
+        // untouched; this is an independent rendering/optics classification.
+        if self.ocean_sky_extend {
+            if let Some(world) = self.world.as_ref() {
+                for (slot, region) in world.ocean_sky_regions.iter().enumerate() {
+                    let (Some(region), Some(ocean)) = (region.as_ref(), world.ocean_surfaces.get(slot)) else {
+                        continue;
+                    };
+                    if eye.y <= ocean.plane_height && region.contains([eye.x, eye.z]) {
+                        surface = surface.max(ocean.plane_height);
+                    }
+                }
+            }
+        }
         self.camera_water_surface = surface;
         self.water_boxes = boxes;
     }

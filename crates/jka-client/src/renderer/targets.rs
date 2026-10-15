@@ -186,7 +186,7 @@ pub(in crate::renderer) fn create_menu_backdrop_resources(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA lazy menu backdrop bind group"),

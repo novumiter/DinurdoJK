@@ -1,5 +1,6 @@
 //! World variants.
 use crate::renderer::Hash;
+use super::programs::{StageProgram, VertexRecipe, WorldProgramMode};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::renderer) enum WorldRenderPath {
@@ -21,7 +22,7 @@ pub(in crate::renderer) enum WorldShaderFamily {
 /// settings uniforms, these flags are supplied as WGSL `override` constants at
 /// pipeline creation time.  A setting change selects an existing cached variant
 /// or creates it once; steady-state frames never compile pipelines.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(in crate::renderer) struct WorldShaderVariantKey {
     pub(in crate::renderer) pbr: bool,
     pub(in crate::renderer) pom: bool,
@@ -77,6 +78,7 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     /// r_fragmentShaderMode 2: eligible specialized PSOs use the dedicated
     /// minimal entry points (`vs_world_minimal` / `fs_world_minimal`).
     pub(in crate::renderer) minimal_entries: bool,
+    pub(in crate::renderer) program_mode: WorldProgramMode,
 }
 
 // MaterialUniform header.z bits that are never read by the world WGSL (CPU,
@@ -100,6 +102,9 @@ const MATERIAL_TC_GEN_DYNAMIC: u32 = u32::MAX;
 const MATERIAL_FLAGS_W_DETAIL: u32 = 2;
 const MATERIAL_FLAGS_W_PLANAR: u32 = 4;
 const MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP: u32 = 65536;
+/// Promoted glass primary stage. Only `fs_main` / `fs_main_legacy_fog` shade it,
+/// so it is carried in the raw key for program selection; `for_variant` drops it.
+pub(in crate::renderer) const MATERIAL_FLAGS_W_GLASS: u32 = 1 << 17;
 
 /// TaystJK-style per-material fragment specialization (r_fragmentShaderMode 1).
 ///
@@ -120,6 +125,9 @@ pub(in crate::renderer) struct MaterialFragmentKey {
     pub(in crate::renderer) tc_gen: u32,
     /// 1 none, 2 discard below params.x, 3 discard at/above -params.x.
     pub(in crate::renderer) alpha_func: u32,
+    /// Structural vertex operations; numeric parameters remain uniforms.
+    pub(in crate::renderer) vertex_recipe: VertexRecipe,
+    pub(in crate::renderer) program: StageProgram,
 }
 
 impl MaterialFragmentKey {
@@ -128,8 +136,8 @@ impl MaterialFragmentKey {
         Self {
             flags: header[2] & !MATERIAL_FLAGS_UNREAD,
             flags_mask: !MATERIAL_FLAGS_UNREAD,
-            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP),
-            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP,
+            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS),
+            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS,
             tc_gen: header[0],
             alpha_func: if alpha_cutoff > 0.0 {
                 2
@@ -138,7 +146,15 @@ impl MaterialFragmentKey {
             } else {
                 1
             },
+            vertex_recipe: VertexRecipe::default(),
+            program: StageProgram::Specialized,
         }
+    }
+
+    pub(in crate::renderer) fn from_uniform(material: &crate::renderer::MaterialUniform) -> Self {
+        let mut key = Self::from_material(material.header, material.params[0]);
+        key.vertex_recipe = VertexRecipe::from_uniform(material);
+        key
     }
 
     /// TaystJK-style classification (r_fragmentShaderMode 1): keep only the
@@ -154,6 +170,8 @@ impl MaterialFragmentKey {
         alpha_test: bool,
     ) -> Self {
         let (keep, keep_w, fix_tc_gen) = Self::relevant_bits(variant, alpha_test);
+        self.vertex_recipe = VertexRecipe::default();
+        self.program = StageProgram::Specialized;
         self.flags &= keep;
         self.flags_mask &= keep;
         self.flags_w &= keep_w;
@@ -512,7 +530,12 @@ impl WorldShaderVariantKey {
             enabled.push("dlight-debug");
         }
         if self.material_specialization {
-            enabled.push(if self.minimal_entries { "mat-spec+minimal" } else { "mat-spec" });
+            enabled.push(match self.program_mode {
+                WorldProgramMode::Shared => "shared-families",
+                WorldProgramMode::Generated => "generated-stages",
+                WorldProgramMode::Specialized if self.minimal_entries => "mat-spec+minimal",
+                WorldProgramMode::Specialized => "mat-spec",
+            });
         }
         if self.sky_debug {
             enabled.push("sky-debug");

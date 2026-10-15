@@ -40,13 +40,19 @@ fn fs_output(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     var color = max(textureLoad(image, vec2<i32>(position.xy), 0).rgb, vec3<f32>(0.0));
     let encoding = u32(settings.values.x);
     if (encoding == 0u || encoding == 3u) {
-        color = sdr_tonemap(color);
+        let strength = clamp(settings.values.w, 0.0, 1.0);
+        if (strength > 0.0) {
+            color = mix(color, sdr_tonemap(color), strength);
+        }
         if (encoding == 3u) { color = srgb(color); }
         return vec4<f32>(color, 1.0);
     }
     let white = max(settings.values.y, 80.0);
     let peak = max(settings.values.z, white);
-    if (settings.values.w > 0.5) { color = hdr_rolloff(color, peak / white); }
+    let rolloff = clamp(settings.values.w, 0.0, 1.0);
+    if (rolloff > 0.0) {
+        color = mix(color, hdr_rolloff(color, peak / white), rolloff);
+    }
     color = min(color * white, vec3<f32>(peak));
     if (encoding == 1u) {
         // Windows scRGB defines linear 1.0 as 80 cd/m^2.

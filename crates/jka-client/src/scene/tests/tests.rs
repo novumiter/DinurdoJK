@@ -75,6 +75,22 @@ fn order_pvs_pieces_reference<T>(
 }
 
 #[test]
+fn destination_blended_polygon_offset_decal_uses_authored_decal_sort() {
+    let [_, mut stage] = legacy_lightmap_modulate_pair(false);
+    stage.blend = Some(materials::BlendFunc { src: BlendFactor::DstColor, dst: BlendFactor::SrcColor });
+    stage.alpha_cutoff = 0.5;
+    let mut material = SurfaceMaterial { stages: vec![stage], offset: true, explicit: true, ..Default::default() };
+    assert_eq!(super::material_batches::effective_material_sort(&material), 4*1024);
+    assert_eq!(stage_class(&material.stages[0]), DrawClass::Transparent);
+    let pipeline=stage_pipeline(&material, &material.stages[0], true);
+    assert!(pipeline.offset);
+    assert!(!pipeline.depth_write, "decal keeps its authored framebuffer blend without becoming a depth seed");
+    material.sort=Some(14.0);
+    assert_eq!(super::material_batches::effective_material_sort(&material),14*1024,
+        "explicit late authoring must win over the default decal sort");
+}
+
+#[test]
 fn piece_ordering_matches_the_reference() {
     let mut state = 0x1234_5678_u32;
     let mut next = move || {
@@ -1721,6 +1737,30 @@ fn composed_glass_environment_keeps_authored_stage_at_ultra() {
     let mut different_images = material.clone();
     different_images.stages[0].texture = StageTexture::Image(42);
     assert!(authored_environment_composite(&different_images, &env));
+}
+
+#[test]
+fn glass_promotion_off_keeps_single_environment_stage_authored_at_ultra() {
+    let env = reflection_test_stage(7, TcGen::Environment, Some(materials::BlendFunc {
+        src: BlendFactor::One, dst: BlendFactor::One,
+    }));
+    let material = SurfaceMaterial {
+        explicit: true,
+        surface_material: jka_assets::bsp::MATERIAL_GLASS as u8,
+        glass_promotion: false,
+        stages: vec![env.clone()],
+        ..Default::default()
+    };
+    assert!(!material_has_promotable_environment_stage(&material));
+    let stages = prepared_stages(&material, false);
+    assert_eq!(stages.len(), 1);
+    let batch = stage_batch(&material, &stages[0], true, false, 0..6, None,
+        None, None, &[], [0; 4], [0.0; 4], false);
+    assert!(!batch.glass_primary);
+    assert_eq!(batch.tc_gen, TcGen::Environment);
+    assert_eq!(batch.pipeline.blend, BlendMode::Custom(BlendFactor::One, BlendFactor::One));
+    assert!(batch.authored_environment_composite);
+    assert!(!batch.planar_environment_candidate);
 }
 
 #[test]

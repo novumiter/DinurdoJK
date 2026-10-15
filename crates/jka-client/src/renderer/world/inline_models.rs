@@ -15,6 +15,33 @@ pub(in crate::renderer) fn hidden_inline_batch(batch: &WorldBatch, models: &[Inl
         .is_some_and(|model| matches!(model.uploaded, Some(None)))
 }
 
+/// TaystJK CG_AddPacketEntities(qtrue) selects *entity instances* by the
+/// authoritative snapshot's isPortalEnt bit. No initial/hidden model can
+/// enter the sky pass, even if the BSP itself has skyportal geometry.
+#[inline]
+pub(in crate::renderer) fn sky_portal_inline_eligible(
+    pose: Option<Option<InlineModelInstance>>,
+) -> bool {
+    matches!(pose, Some(Some(instance)) if instance.is_portal_entity)
+}
+
+/// The server can change isPortalEnt independently of origin or angles.
+/// Such a change is a draw-selection update, never a vertex upload.
+#[inline]
+fn same_inline_geometry(
+    uploaded: Option<Option<InlineModelInstance>>,
+    target: Option<InlineModelInstance>,
+) -> bool {
+    match (uploaded, target) {
+        (Some(Some(previous)), Some(next)) =>
+            previous.model == next.model
+                && previous.origin == next.origin
+                && previous.axis == next.axis,
+        (Some(None), None) => true,
+        _ => false,
+    }
+}
+
 impl Renderer {
     /// Apply this frame's CG_Mover inline-model poses: rewrite each moved
     /// model's private vertex region and its batches' CPU and GPU cull bounds.
@@ -54,7 +81,11 @@ impl Renderer {
         let mut glass_poses_changed = false;
         for model in inline_models.iter_mut() {
             let target = poses.get_mut(model.model as usize).and_then(Vec::pop);
-            if model.uploaded == Some(target) {
+            // Portal membership can change without a pose change. Retain its
+            // current per-instance flag, but avoid a needless vertex upload or
+            // shadow invalidation when only isPortalEnt changed.
+            if same_inline_geometry(model.uploaded, target) {
+                model.uploaded = Some(target);
                 continue;
             }
             let was_hidden = matches!(model.uploaded, Some(None));
@@ -400,6 +431,7 @@ pub(in crate::renderer) fn pack_inline_draws(
     buffer: &wgpu::Buffer,
     region_base: u32,
     region_capacity: u32,
+    secondary: bool,
 ) -> bool {
     if visible.len() > region_capacity as usize {
         return false;
@@ -417,13 +449,11 @@ pub(in crate::renderer) fn pack_inline_draws(
     args.clear();
     args.extend(scratch.order.iter().map(|&position| {
         let batch = &batches[visible[position as usize]];
+        let range=if secondary {crate::renderer::secondary_batch_range(batch)} else {&batch.indexed_range};
         DrawIndexedIndirectArgs {
-            index_count: batch
-                .indexed_range
-                .end
-                .saturating_sub(batch.indexed_range.start),
+            index_count: range.end-range.start,
             instance_count: 1,
-            first_index: batch.indexed_range.start,
+            first_index: range.start,
             base_vertex: 0,
             first_instance: 0,
         }
@@ -437,4 +467,33 @@ pub(in crate::renderer) fn pack_inline_draws(
     }
     scratch.args = args;
     true
+}
+
+#[cfg(test)]
+mod portal_entity_tests {
+    use super::*;
+
+    #[test]
+    fn portal_membership_is_per_instance_not_per_bsp_handle() {
+        let mut portal_mover = InlineModelInstance::compiled(12);
+        portal_mover.is_portal_entity = true;
+        let ordinary_mover = InlineModelInstance::compiled(12);
+        assert!(sky_portal_inline_eligible(Some(Some(portal_mover))));
+        assert!(!sky_portal_inline_eligible(Some(Some(ordinary_mover))));
+        assert!(!sky_portal_inline_eligible(Some(None)));
+        assert!(!sky_portal_inline_eligible(None));
+    }
+
+    #[test]
+    fn portal_flag_only_transition_does_not_change_uploaded_geometry() {
+        let old = InlineModelInstance::compiled(12);
+        let mut marked = old;
+        marked.is_portal_entity = true;
+        assert!(same_inline_geometry(Some(Some(old)), Some(marked)));
+        assert!(same_inline_geometry(Some(Some(marked)), Some(old)));
+        assert!(!same_inline_geometry(None, Some(marked)));
+        marked.origin[0] = 128.0;
+        assert!(!same_inline_geometry(Some(Some(old)), Some(marked)));
+        assert!(!same_inline_geometry(Some(Some(old)), None));
+    }
 }

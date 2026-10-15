@@ -400,7 +400,7 @@ impl GrassRenderer {
             module: &prepare_shader,
             entry_point: Some("cs_main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
 
         let (high_vertices, high_indices) = high_blade_mesh();
@@ -2244,7 +2244,7 @@ fn create_grass_shadow_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: None,
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -2289,7 +2289,7 @@ fn create_prepared_grass_wireframe_pipeline(
             module: shader, entry_point: Some("fs_wireframe"), compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState { format: surface_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
         }),
-        multiview_mask: None, cache: None,
+        multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -2325,7 +2325,7 @@ fn create_grass_wireframe_pipeline(
             module: shader, entry_point: Some("fs_wireframe"), compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState { format: surface_format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
         }),
-        multiview_mask: None, cache: None,
+        multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -2384,7 +2384,7 @@ fn create_prepared_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -2450,6 +2450,6 @@ fn create_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }

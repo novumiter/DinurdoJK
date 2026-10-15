@@ -17,6 +17,7 @@ mod gamma;
 mod filesystem;
 mod frame;
 mod frontend_previews;
+mod frontend_scene_cache;
 mod hud;
 mod initialize;
 mod input;
@@ -80,6 +81,10 @@ use session::types::{
 mod background_jobs;
 mod companion;
 mod egui_dev_radial;
+mod egui_model_placement;
+mod map_mod_ent;
+mod egui_emote_radial;
+mod egui_shader_remap;
 mod egui_entity_graph;
 mod egui_menu;
 mod egui_pages;
@@ -99,6 +104,7 @@ mod session_tools;
 mod ui_catalog;
 
 use egui_entity_graph::EntityGraphUi;
+use egui_shader_remap::ShaderRemapUi;
 use egui_menu::VideoSection;
 use frontend::{
     build_demo_index, AssetDetail, AssetEntry, AssetFilter, AssetKind, ChatLogRangeFilter,
@@ -530,6 +536,15 @@ pub struct App {
     /// It deliberately does not become a game session or local player.
     frontend_background_request_id: Option<u64>,
     frontend_cinematic: Option<FrontendCinematic>,
+    /// Filename of the currently selected menu scene's snapshot, not a fixed map.
+    frontend_scene_cache_path: Option<PathBuf>,
+    frontend_scene_texture: Option<egui::TextureHandle>,
+    frontend_scene_cache_generation: u64,
+    /// Single presentation-driven clock for the menu stage fade.
+    frontend_stage: frontend_scene_cache::FrontendStage,
+    /// A speculative frontend result is held until a real egui frame presents.
+    deferred_frontend_map: Option<UserEvent>,
+    startup_first_menu_frame_seen: bool,
     proxy: EventLoopProxy<UserEvent>,
     loader_tx: Sender<MapLoadRequest>,
     window: Option<Arc<Window>>,
@@ -650,10 +665,12 @@ pub struct App {
     previous_tick: Instant,
     overlay: OverlayMode,
     overlay_before_console: OverlayMode,
-    /// UI to restore when `/dev` is canceled (including when invoked from console).
+    /// Shared by the mutually exclusive `/dev` and `/emote` wheels.
     dev_radial_return_overlay: OverlayMode,
-    /// Accumulated raw mouse delta normalized to the Dev wheel's outer radius.
+    /// Virtual relative mouse stick for both wheels (not gameplay sensitivity).
     dev_radial_offset: [f32; 2],
+    model_placement: egui_model_placement::ModelPlacementUi,
+    emote_radial_category: Option<egui_emote_radial::EmoteCategory>,
     console_input: String,
     /// UTF-8 byte offset of the editable console caret inside `console_input`.
     console_cursor: usize,
@@ -782,6 +799,8 @@ pub struct App {
     ocean_settings_target: i32, // -1 shared, >=0 promoted slot, <=-2 authored index
     promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     promoted_ocean_overrides: Vec<(usize, crate::ocean::OceanSettings)>,
+    /// Independent session-only toggle for sky-wall water clipmap continuation.
+    ocean_sky_extend: bool,
     /// Session-only Phase 2.5 overlay: 0 off, 1 treatment, 2 boundaries,
     /// 3 bathymetry cells.
     coastal_debug_mode: u8,
@@ -812,6 +831,8 @@ pub struct App {
     applied_hdr_output: u32,
     hdr_output_status: String,
     hdr_output_active: bool,
+    hdr_available_modes: u8,
+    hdr_modes_known: bool,
     applied_resolution: [u32; 2],
     applied_grass: bool,
     applied_ocean: bool,
@@ -901,6 +922,8 @@ pub struct App {
     /// A remap changed while another map upload was in flight. Coalesce any
     /// number of such changes into one rebuild when that upload completes.
     shader_remap_dirty: bool,
+    /// Persistent edit drafts / offscreen thumbnail handles for the remap menu.
+    shader_remap_ui: ShaderRemapUi,
     /// Map label whose Rapier world mesh is present or being built by a worker.
     /// Stops repeated toggles from queueing duplicate builds.
     physics_mesh_label: Option<String>,

@@ -570,7 +570,7 @@ impl App {
             != 0
     }
 
-    fn japro_do_race_restricted(&self) -> bool {
+    pub(in crate::app) fn japro_do_race_restricted(&self) -> bool {
         self.cgame_server_mod() == crate::net::mod_support::ServerMod::Japro
             && self
                 .current_player_state()
@@ -672,6 +672,15 @@ impl App {
         // vmCvar_t.integer truncates the cg_zoomFov string to an integer in the
         // TaystJK code paths below. Rust's cast has the same truncation toward 0.
         self.japro_zoom_fov as i32
+    }
+
+    /// Zoom the chase-camera range relative to the same `cg_fov` reference
+    /// used by the first-person projection. TaystJK's original range^2 / zoom
+    /// makes equal cg_fov / cg_zoomFov values change camera distance whenever
+    /// cg_thirdPersonRange differs from cg_fov (the reported regression).
+    pub(in crate::app) fn japro_zoom_third_person_range(&self, range: f32) -> f32 {
+        let zoom = self.japro_zoom_fov_integer().clamp(1, 176) as f32;
+        range * (self.camera.cg_fov() / zoom)
     }
 
     /// Port of TaystJK CG_CalcFov's held +zoom interpolation. TaystJK uses

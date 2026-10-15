@@ -247,6 +247,6 @@ fn create_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }

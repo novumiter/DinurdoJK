@@ -163,6 +163,20 @@ impl App {
         self.publish_ui();
     }
 
+    pub(in crate::app) fn set_tone_mapping_strength(&mut self, strength: f32) {
+        self.video.tone_mapping = strength.clamp(0.0, 1.0);
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_auto_exposure_strength(&mut self, strength: f32) {
+        self.video.auto_exposure = strength.clamp(0.0, 1.0);
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
     pub(in crate::app) fn set_motion_blur_strength(&mut self, strength: f32) {
         self.video.motion_blur_strength = strength.clamp(0.0, 1.0);
         self.sync_post_effects();
@@ -1180,9 +1194,8 @@ impl App {
                 self.sync_planar_reflection_debug();
             }
             ui::VIDEO_ROW_HDR => {
-                self.video.hdr = !self.video.hdr;
-                self.sync_post_effects();
-                self.mark_config_dirty();
+                let next = if self.video.hdr_mode() == 0 { "1" } else { "0" };
+                let _ = self.cvar_set_r_hdr("r_hdr", next);
                 if self.map_prepare_restart_required() {
                     self.console_status =
                         "HDR / FLOAT LIGHTMAP FORMAT: PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART".into();
@@ -1196,16 +1209,12 @@ impl App {
                         "FLOAT LIGHTMAPS: PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART".into();
                 }
             }
-            ui::VIDEO_ROW_TONE_MAPPING => {
-                self.video.tone_mapping = !self.video.tone_mapping;
-                self.sync_post_effects();
-                self.mark_config_dirty();
-            }
-            ui::VIDEO_ROW_AUTO_EXPOSURE => {
-                self.video.auto_exposure = !self.video.auto_exposure;
-                self.sync_post_effects();
-                self.mark_config_dirty();
-            }
+            ui::VIDEO_ROW_TONE_MAPPING => self.set_tone_mapping_strength(
+                self.video.tone_mapping + direction as f32 * 0.05,
+            ),
+            ui::VIDEO_ROW_AUTO_EXPOSURE => self.set_auto_exposure_strength(
+                self.video.auto_exposure + direction as f32 * 0.05,
+            ),
             ui::VIDEO_ROW_GLOW => {
                 let current = GlowMode::ALL
                     .iter()
@@ -1464,6 +1473,10 @@ impl App {
             }
             ui::VIDEO_ROW_GHOUL2_LOD_BIAS => {
                 self.video.ghoul2_lod_bias = (self.video.ghoul2_lod_bias + direction).clamp(0, 8);
+                self.render_command(RenderCommand::SetBspModelLod {
+                    scale: self.video.lod_scale, bias: self.video.ghoul2_lod_bias, debug: self.video.md3_lod_debug,
+                    enabled: self.video.md3_auto_lod && self.video.bsp_model_lod,
+                });
                 self.mark_config_dirty();
                 self.console_status = format!("MODEL LOD BIAS: {}", self.video.ghoul2_lod_bias);
             }
@@ -1605,13 +1618,25 @@ impl App {
         settings
     }
 
+    /// Brings loaded or edited ocean settings to their effective form: shared
+    /// wind, linked swell controls derived from the amplitude, sanitized ranges.
+    /// Archived values predate the links, so this must also run before the
+    /// first upload, not only after an edit.
+    pub(in crate::app) fn normalize_ocean_settings(&mut self) {
+        self.video.ocean_settings.wind = self.video.weather_wind;
+        // A previewed map-authored ocean keeps the map's own values.
+        if self.ocean_settings_target > -2 {
+            self.video.ocean_settings.apply_links(false);
+        }
+        self.video.ocean_settings = self.video.ocean_settings.sanitize();
+    }
+
     pub(in crate::app) fn commit_ocean_settings(&mut self) {
         if let Some(session) = self.game_session.as_mut() {
             session.ocean_interaction_enabled = self.video.ocean
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         }
-        self.video.ocean_settings.wind = self.video.weather_wind;
-        self.video.ocean_settings = self.video.ocean_settings.sanitize();
+        self.normalize_ocean_settings();
         self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
         self.publish_authored_oceans();
         self.mark_config_dirty();

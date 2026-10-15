@@ -600,6 +600,23 @@ pub(in crate::cgame::player_presenter) fn material_layers<'a>(
     let Some(primary) = shader.primary() else {
         return unresolved();
     };
+    if shader.is_glass() && crate::materials::glass_promotion_enabled() {
+        return MaterialLayers {
+            base: StageMaterial {
+                image: primary.image.as_str(),
+                clamp: primary.clamp,
+                alpha_mode: DynamicModelAlphaMode::Glass,
+                authored_glow: false,
+            },
+            entity_tint: false,
+            overlay: None,
+            stages: Vec::new(),
+            two_sided: matches!(
+                shader.cull.trim().to_ascii_lowercase().as_str(),
+                "none" | "twosided" | "two-sided" | "disable"
+            ),
+        };
+    }
     let overlay = primary
         .entity_rgb
         .then(|| {
@@ -1054,6 +1071,7 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
         .first()
         .ok_or_else(|| format!("{model_qpath} has no GLM LODs"))?;
     let mut surfaces = Vec::with_capacity(lod.surfaces.len());
+    let mut missing_images = std::collections::HashSet::new();
     for surface in &lod.surfaces {
         let hierarchy = glm.hierarchy.get(surface.surface_index).ok_or_else(|| {
             format!(
@@ -1089,6 +1107,17 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
             shader_name
         };
         let material = source.resolve_material(shader_name);
+        // Report the exact unresolved GLM shader on the asset-loading worker.
+        // A missing image can otherwise look like a solid bright material;
+        // never paper over it with a model-specific shader or color override.
+        if material.texture.is_none()
+            && !shader_name.eq_ignore_ascii_case("$whiteimage")
+            && missing_images.insert(shader_name.to_ascii_lowercase())
+        {
+            log::warn!(
+                "GLM MATERIAL MISSING: model={} surface={} shader={} (check its image in the active PK3/VFS)",
+                model_qpath, hierarchy.name, shader_name);
+        }
         let fallback_gray = preview_fallback
             && (missing_shader
                 || (!shader_name.eq_ignore_ascii_case("$whiteimage")

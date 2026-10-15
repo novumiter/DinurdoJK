@@ -8,3 +8,4 @@ pub(in crate::renderer) mod skinning;
 pub(in crate::renderer) mod state;
 pub(in crate::renderer) mod submission;
 pub(in crate::renderer) mod types;
+pub(in crate::renderer) mod resident_fx;

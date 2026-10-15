@@ -42,6 +42,48 @@ commands! {
         }
     }
 
+    // TaystJK cg_consolecmds.c / cg_weapons.c; all remain cgame-local.
+    cmd_weaplast ["weaplast", ] ("weaplast", "Switch back to the previous selected weapon.", CommandScope::Always, game = GameCommand::WeaponLast) |self, command| {
+        if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
+    }
+    cmd_weaponclean ["weaponclean", ] ("weaponclean <raw_weapon_id>", "Choose a weapon by raw WP_* ID (without /weapon slot remapping).", CommandScope::Always, game = GameCommand::WeaponClean) |self, command| {
+        if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
+    }
+    cmd_selectfiremode ["selectfiremode", ] ("selectfiremode", "TaystJK: toggle singlefire primary/alternate firing mode.", CommandScope::Always, game = GameCommand::ToggleFireMode) |self, command| {
+        if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
+    }
+    cmd_tell_target ["tell_target", ] ("tell_target <message>", "Send private text to the crosshair target (TaystJK CG_TellTarget_f).", CommandScope::Always) |self, command| {
+        self.tell_selected_player(command, false);
+        CommandResult::Handled
+    }
+    cmd_tell_attacker ["tell_attacker", ] ("tell_attacker <message>", "Send private text to the last player who damaged you (TaystJK CG_TellAttacker_f).", CommandScope::Always) |self, command| {
+        self.tell_selected_player(command, true);
+        CommandResult::Handled
+    }
+    // +singlefire / +duck / +grapple are holdable commands: release companions
+    // are registered and exposed to the keybind release generator.
+    cmd_singlefire_down ["+singlefire", ] ("+singlefire", "Fire with selected primary/alternate fire mode.", CommandScope::Always) |self, command| {
+        self.tayst_special_button(command); CommandResult::Handled
+    }
+    cmd_singlefire_up ["-singlefire", ] ("-singlefire", "Release singlefire.", CommandScope::Always) |self, command| {
+        self.tayst_special_button(command); CommandResult::Handled
+    }
+    cmd_duck_down ["+duck", ] ("+duck", "TaystJK no-roll duck sequence.", CommandScope::Always) |self, command| {
+        self.tayst_special_button(command); CommandResult::Handled
+    }
+    cmd_duck_up ["-duck", ] ("-duck", "Release TaystJK no-roll duck.", CommandScope::Always) |self, command| {
+        self.tayst_special_button(command); CommandResult::Handled
+    }
+    cmd_grapple_down ["+grapple", ] ("+grapple", "TaystJK grapple button12.", CommandScope::Always) |self, command| {
+        self.tayst_special_button(command); CommandResult::Handled
+    }
+    cmd_grapple_up ["-grapple", ] ("-grapple", "Release TaystJK grapple; JA+ performs use pulse.", CommandScope::Always) |self, command| {
+        self.tayst_special_button(command); CommandResult::Handled
+    }
+    cmd_lowjump ["lowjump", ] ("lowjump", "TaystJK brief jump tap.", CommandScope::Always) |self, command| {
+        self.tayst_lowjump(); CommandResult::Handled
+    }
+
     cmd_follownext ["follownext", ] ("follownext", "Spectate the next player.", CommandScope::Connected) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         if self.execute_game_command(command) {
@@ -281,6 +323,20 @@ commands! {
         }
     }
 
+    // TaystJK cg_consolecmds.c / cg_main.c: these operate on the local
+    // holdable selector, never forward as unknown server commands.
+    cmd_game_invnext ["invnext", ] ("invnext", "Select the next owned, selectable inventory item.", CommandScope::Always, game = GameCommand::InventoryNext) |self, command| {
+        if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
+    }
+
+    cmd_game_invprev ["invprev", ] ("invprev", "Select the previous owned, selectable inventory item.", CommandScope::Always, game = GameCommand::InventoryPrev) |self, command| {
+        if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
+    }
+
+    cmd_game_invfree ["invfree", ] ("invfree", "TaystJK: use the first owned holdable other than jetpack.", CommandScope::Always, game = GameCommand::InventoryFree) |self, command| {
+        if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
+    }
+
     cmd_game_flipkick ["flipkick", ] ("flipkick", "TaystJK jaPRO flipkick bind sequence.", CommandScope::Always, game = GameCommand::Flipkick) |self, command| {
         if self.execute_game_command(command) {
             CommandResult::Handled
@@ -500,6 +556,16 @@ commands! {
             CommandResult::Handled
         } else {
             CommandResult::Unhandled
+        }
+    }
+
+    cmd_emote ["emote", ] ("emote", "Hold bound key/button for the tiered Emote wheel. Left click enters a category or plays an emote; release the bind to cancel.", CommandScope::Always) |self, command| {
+        match command.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [_verb] => {
+                self.toggle_emote_radial();
+                CommandResult::Handled
+            }
+            _ => CommandResult::Unhandled,
         }
     }
 

@@ -303,6 +303,9 @@ pub struct Shader {
     /// fields. Comments/spacing are normalized, but directive order and stage
     /// braces are preserved.
     pub definition_text: Option<String>,
+    /// Explicit `material` / `q3map_material` name, also used by model shaders
+    /// that have no compiled BSP surface flags.
+    pub material_name: Option<String>,
     pub cull: String,
     /// Classic id Tech 3 portal/mirror surface. The renderer can use this as
     /// an authored planar-reflection mask instead of guessing from gloss.
@@ -535,6 +538,10 @@ fn apply_ja_collision_surfaceparm(shader: &mut Shader, parm: &str) {
 }
 
 impl Shader {
+    pub fn is_glass(&self) -> bool {
+        self.material_name.as_deref().is_some_and(|name| name.eq_ignore_ascii_case("glass"))
+    }
+
     pub fn primary(&self) -> Option<&Stage> {
         self.stages
             .iter()
@@ -1169,7 +1176,15 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
             } else {
                 match key.as_str() {
                     "cull" => shader.cull = first,
-                    "portal" => shader.portal = true,
+                    "material" | "q3map_material" if !first.is_empty() => {
+                        shader.material_name = Some(first);
+                    }
+                    // tr_shader.cpp: `portal` sets shader.sort = SS_PORTAL (a later
+                    // `sort` keyword still overrides it).
+                    "portal" => {
+                        shader.portal = true;
+                        shader.sort = Some(1.0);
+                    }
                     "sun" | "q3map_sun" => shader.suns.push(parse_sun(args, false)?),
                     "sunext" | "q3map_sunext" => shader.suns.push(parse_sun(args, true)?),
                     "surfaceparm" => {
@@ -1515,6 +1530,17 @@ mod tests {
     }
 
     #[test]
+    fn glass_material_survives_shader_parsing() {
+        let shaders = parse("textures/common/env_glass {\nqer_editorimage textures/common/etest4\nqer_trans 0.6\nsurfaceparm nonopaque\nsurfaceparm forcefield\nsurfaceparm trans\nq3map_material Glass\nsurfaceparm nolightmap\n{\nmap textures/common/etest4\nblendFunc GL_ONE GL_ONE\ntcGen environment\n}\n}").unwrap();
+        let glass = &shaders["textures/common/env_glass"];
+        assert!(glass.is_glass());
+        assert!(glass.translucent);
+        assert_eq!(glass.stages.len(), 1);
+        assert_eq!(glass.stages[0].tc_gen, TcGen::Environment);
+        assert_eq!(glass.material_name.as_deref(), Some("glass"));
+    }
+
+    #[test]
     fn shader_numbers_read_like_atof() {
         assert_eq!(numbers(&["0.01ce".to_owned()]).unwrap(), [0.01]);
         assert_eq!(numbers(&["-0.5".to_owned(), "1E".to_owned()]).unwrap(), [-0.5, 1.0]);
@@ -1656,6 +1682,9 @@ mod tests {
         .unwrap();
         assert!(shaders["textures/test/mirror_a"].portal);
         assert!(shaders["textures/test/mirror_b"].portal);
+        // Both forms sort at SS_PORTAL, before opaque surfaces.
+        assert_eq!(shaders["textures/test/mirror_a"].sort, Some(1.0));
+        assert_eq!(shaders["textures/test/mirror_b"].sort, Some(1.0));
     }
 
     #[test]

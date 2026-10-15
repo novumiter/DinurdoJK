@@ -345,6 +345,7 @@ pub(in crate::renderer) struct PostUniform {
     pub(in crate::renderer) scene: PostSceneSettings,
     pub(in crate::renderer) film: PostFilmSettings,
     pub(in crate::renderer) grain: PostGrainSettings,
+    pub(in crate::renderer) exposure_controls: [f32; 4], // x: auto exposure correction strength
     pub(in crate::renderer) camera_fx: PostCameraFxSettings,
     // rgb: authored OpenJK global fog color in legacy framebuffer/display space;
     // w: depthForOpaque. taa_params.w carries the authored strength scale.
@@ -436,6 +437,7 @@ pub(in crate::renderer) struct GpuCullRecord {
     pub(in crate::renderer) maximum: [f32; 4],
     pub(in crate::renderer) draw: [u32; 4], // index_count, first_index, sky flag, bits: 1=inline, 2=hidden, 4=models/ shader, 8=transparent
     pub(in crate::renderer) compact: [u32; 4], // group index, output base, compactable, reserved
+    pub(in crate::renderer) face_plane: [f32; 4], // normal toward visible side + plane distance; zero disables
 }
 
 #[repr(C)]

@@ -43,6 +43,68 @@ impl OceanAuthoring {
     }
 }
 
+/// Which swell controls follow the master amplitude. Locked controls are
+/// recomputed from `derive`; unlocked ones keep their own value.
+pub mod links {
+    pub const WAVELENGTH: u8 = 1;
+    pub const SPEED: u8 = 1 << 1;
+    pub const STEEPNESS: u8 = 1 << 2;
+    pub const WIND_CHOP: u8 = 1 << 3;
+    pub const FOAM: u8 = 1 << 4;
+    pub const SPRAY: u8 = 1 << 5;
+    pub const ROUGHNESS: u8 = 1 << 6;
+    pub const ALL: u8 = 0x7f;
+}
+
+/// Everything that follows the swell amplitude. At the default amplitude (128u)
+/// every value equals its GodotOceanWaves default, so the default sea is the
+/// upstream sea (roughness excepted, see below); smaller seas get shorter,
+/// slower, gentler, less foamy and glossier waves, larger seas the opposite.
+///
+/// Roughness deliberately does NOT use upstream's 0.65. That value only works
+/// in the demo because its normals fade out with distance; here it spreads the
+/// sun's specular lobe into a whitish veil over the whole sea and starves
+/// reflections (the Fresnel curve also depends on it). A resolved sea needs
+/// little roughness: 0.2 at 128u, glassy for ponds, a little rougher for storms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DerivedWaves {
+    pub wavelength: f32,
+    pub speed: f32,
+    pub steepness: f32,
+    pub wind_chop: f32,
+    pub foam: f32,
+    pub spray: f32,
+    pub roughness: f32,
+}
+
+pub fn derive_from_amplitude(amplitude: f32) -> DerivedWaves {
+    let amplitude = if amplitude.is_finite() { amplitude.clamp(0.0, 16384.0) } else { 128.0 };
+    let r = amplitude / 128.0;
+    // Wavelength grows slower than height, so small seas are also steeper
+    // relative to their size, as real chop is.
+    let wavelength = (1400.0 * r.powf(0.7)).clamp(256.0, 32768.0);
+    // Deep-water dispersion: phase speed grows with the square root of length.
+    let speed = 180.0 * (wavelength / 1400.0).sqrt();
+    let steepness = (0.65 * r.max(1.0e-3).powf(0.25)).clamp(0.2, 1.0);
+    let wind_chop = r.max(1.0e-3).powf(0.25).clamp(0.3, 2.0);
+    let foam = (0.05 + 0.95 * (amplitude / 64.0).min(1.0)).clamp(0.0, 4.0);
+    let roughness = 0.05 + 0.15 * r.clamp(0.0, 1.0) + 0.1 * ((r - 1.0) / 3.0).clamp(0.0, 1.0);
+    DerivedWaves { wavelength, speed, steepness, wind_chop, foam, spray: foam, roughness }
+}
+
+impl OceanAuthoring {
+    /// Overwrites the linked controls with their amplitude-derived values.
+    pub fn apply_links(&mut self, mask: u8) {
+        let d = derive_from_amplitude(self.amplitude);
+        if mask & links::WAVELENGTH != 0 { self.wavelength = d.wavelength; }
+        if mask & links::SPEED != 0 { self.speed = d.speed; }
+        if mask & links::STEEPNESS != 0 { self.steepness = d.steepness; }
+        if mask & links::WIND_CHOP != 0 { self.wind_chop = d.wind_chop; }
+        if mask & links::FOAM != 0 { self.foam = d.foam; }
+        if mask & links::SPRAY != 0 { self.spray = d.spray; }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AtmosphericWind {
     pub speed: f32,

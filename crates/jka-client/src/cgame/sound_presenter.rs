@@ -202,6 +202,9 @@ pub(crate) fn prepare_sound_event(
 pub struct SoundPresenter {
     assets: SoundAssets,
     backend: Option<AudioBackend>,
+    eal_map: Option<Arc<crate::eal::EalMap>>,
+    eal_file: Option<String>,
+    eal_enabled: bool,
     /// Physical-device backend parked while deterministic demo export owns an
     /// offline software mixer. None during ordinary gameplay.
     offline_restore_backend: Option<AudioBackend>,
@@ -274,6 +277,9 @@ impl SoundPresenter {
         Self {
             assets,
             backend,
+            eal_map: None,
+            eal_file: None,
+            eal_enabled: false,
             offline_restore_backend: None,
             offline_capture_active: false,
             warnings: HashSet::new(),
@@ -871,6 +877,33 @@ impl SoundPresenter {
             backend.set_steam_audio_environmental_enabled(enabled);
         }
     }
+    pub fn set_eal_enabled(&mut self, enabled: bool) {
+        self.eal_enabled = enabled;
+        if let Some(backend) = &mut self.backend {
+            backend.set_eal_enabled(enabled);
+        }
+    }
+
+    /// Load authored EAGLE map zones and configure the optional wet renderer.
+    pub fn set_eal_map(&mut self, name: &str) {
+        self.eal_file = None;
+        self.eal_map = None;
+        match self.assets.read_eal_map(name) {
+            Ok(Some((path, map))) => {
+                devprintln!(1, "EAL ZONES: {path}: {} environment presets, {} geometry sets",
+                    map.environments.len(), map.geometry_sets.len());
+                self.eal_file = Some(path);
+                self.eal_map = Some(map);
+            }
+            Ok(None) => (),
+            Err(error) => eprintln!("EAL ZONES: {error}; disabled for this map"),
+        }
+        if let Some(backend) = &mut self.backend {
+            backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
+            backend.set_eal_enabled(self.eal_enabled);
+        }
+    }
+
     pub fn set_steam_audio_map(
         &mut self,
         mesh: Option<Arc<AcousticMesh>>,
@@ -918,6 +951,8 @@ impl SoundPresenter {
         backend.set_music_level((music_volume * self.music_mult).clamp(0.0, 1.0));
         backend.set_rate(rate);
         backend.set_steam_audio_map(acoustic_mesh, bake);
+        backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
+        backend.set_eal_enabled(self.eal_enabled);
         let info = backend.info();
         self.backend = Some(backend);
         self.music_base = music_volume;

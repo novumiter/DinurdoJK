@@ -160,7 +160,8 @@ impl App {
              which removes ghosting behind moving geometry.",
             theme::Reset::CloudTuning(ui::CLOUD_ROW_TEMPORAL_DEPTH_FIX),
             |ui| {
-                if theme::switch(ui, self.video.cloud_temporal_depth_fix).is_some() {
+                let preview = theme::preview_toggle_value(ui.ctx(), theme::Reset::CloudTuning(ui::CLOUD_ROW_TEMPORAL_DEPTH_FIX), self.video.cloud_temporal_depth_fix);
+                if theme::switch(ui, preview).is_some() {
                     self.apply_cloud_tuning(ui::CLOUD_ROW_TEMPORAL_DEPTH_FIX, true, None);
                 }
             },

@@ -138,44 +138,47 @@ pub(in crate::renderer) fn legacy_dlight_surface_mask(
         return 0;
     }
 
+    let mut bits = 0u32;
+    for (light_index, light) in lights.iter().take(transient_count).enumerate() {
+        if legacy_dlight_touches_surface(
+            surface,
+            Vec3::from_array(light.position),
+            light.radius.max(0.0),
+        ) {
+            bits |= 1u32 << light_index;
+        }
+    }
+    bits
+}
+
+/// One light against one surface (`cull_kind != 0`).
+pub(in crate::renderer) fn legacy_dlight_touches_surface(
+    surface: &scene::LegacyDlightSurface,
+    position: Vec3,
+    radius: f32,
+) -> bool {
     let minimum = Vec3::from_array(surface.bounds_min);
     let maximum = Vec3::from_array(surface.bounds_max);
-    let normal = Vec3::new(surface.plane[0], surface.plane[1], surface.plane[2]);
-    let planar = surface.cull_kind == 1 && normal.length_squared() > 1.0e-10;
-    let mut bits = 0u32;
-
-    for (light_index, light) in lights.iter().take(transient_count).enumerate() {
-        let position = Vec3::from_array(light.position);
-        let radius = light.radius.max(0.0);
-
-        // OpenJK reaches R_DlightSurface with dlightBits already reduced by BSP
-        // traversal. Preserve that early spatial rejection in the batched WGPU
-        // path with a conservative surface-bounds test. Like R_DlightGrid, this
-        // is radius-box overlap rather than a tighter sphere/AABB distance test.
-        if position.x - radius > maximum.x
-            || position.x + radius < minimum.x
-            || position.y - radius > maximum.y
-            || position.y + radius < minimum.y
-            || position.z - radius > maximum.z
-            || position.z + radius < minimum.z
-        {
-            continue;
-        }
-
-        // OpenJK R_DlightFace then rejects planar faces whose plane lies wholly
-        // outside the light radius. Patch/triangle surfaces remain conservative
-        // after the bounds test, matching the source renderer's intent.
-        if planar {
-            let distance = (normal.dot(position) - surface.plane[3]).abs();
-            if distance > radius {
-                continue;
-            }
-        }
-
-        bits |= 1u32 << light_index;
+    // OpenJK reaches R_DlightSurface with dlightBits already reduced by BSP
+    // traversal. Like R_DlightGrid, this is radius-box overlap rather than a
+    // tighter sphere/AABB distance test.
+    if position.x - radius > maximum.x
+        || position.x + radius < minimum.x
+        || position.y - radius > maximum.y
+        || position.y + radius < minimum.y
+        || position.z - radius > maximum.z
+        || position.z + radius < minimum.z
+    {
+        return false;
     }
-
-    bits
+    // OpenJK R_DlightFace then rejects planar faces whose plane lies wholly
+    // outside the light radius. Patch/triangle surfaces remain conservative
+    // after the bounds test, matching the source renderer's intent.
+    let normal = Vec3::new(surface.plane[0], surface.plane[1], surface.plane[2]);
+    if surface.cull_kind == 1 && normal.length_squared() > 1.0e-10 {
+        return (normal.dot(position) - surface.plane[3]).abs() <= radius;
+    }
+    true
 }
 
 #[derive(Debug, Clone, Copy)]

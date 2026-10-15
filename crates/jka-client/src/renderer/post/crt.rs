@@ -166,7 +166,7 @@ impl CrtResources {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             })
         };
         let fast_pipeline = make_pipeline("fs_fast", "JKA CRT Lottes fast 2-tap pipeline");
@@ -194,7 +194,7 @@ impl CrtResources {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
         Self {
             width,

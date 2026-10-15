@@ -7,10 +7,10 @@
 use super::{
     material_batches::{append_material_batches, fuse_prepared_additive_batches, has_unfused_additive_batches},
     materials, AssetSearchPath, BTreeMap, DrawBatch,
-    InlineModelGeometry, PreparedMap, SurfaceMaterial, Textures,
+    InlineModelGeometry, PreparedMap, PreparedRemapPlan, SurfaceMaterial, Textures,
 };
 use crate::materials::StageTexture;
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 /// Canonical renderer shader name. `R_RemapShader` compares the old shader
 /// after `COM_StripExtension`, while `R_FindShader` is slash/case insensitive.
@@ -341,20 +341,13 @@ pub(crate) fn expand_additive_stage_fusion_in_place(map: &mut PreparedMap) -> us
     fused_count
 }
 
-/// Re-resolve all currently active redirects into an already-prepared map.
-/// The caller must supply an unremapped map: stage flattening is rebuilt from
-/// its original batches so `old -> old` restores the authored material exactly.
-pub(crate) fn apply_shader_remaps_in_place(
-    map: &mut PreparedMap,
+fn resolve_remap_targets(
+    map: &PreparedMap,
     root: &Path,
     game: Option<&Path>,
     options: super::MapPrepareOptions,
     state: &ShaderRemapState,
-) -> Result<(), String> {
-    if state.is_empty() {
-        return Ok(());
-    }
-
+) -> Result<(BTreeMap<String, SurfaceMaterial>, Textures), String> {
     let mut assets = AssetSearchPath::open_game(root, game).map_err(|error| error.to_string())?;
     assets.set_allow_asset_overrides(options.allow_asset_overrides);
     let mut textures = Textures::new();
@@ -389,14 +382,34 @@ pub(crate) fn apply_shader_remaps_in_place(
             || textures.images.len() != image_count_before
             || textures.videos.len() != video_count_before;
         if !target_exists {
-            map.warnings.push(format!(
-                "shader remap: target {target} was not found; keeping the original shader"
+            textures.warnings.push(format!(
+                "target {target} was not found; keeping the original shader"
             ));
             continue;
         }
         offset_material_textures(&mut material, texture_base);
         replacements.insert(target.clone(), material);
     }
+
+    Ok((replacements, textures))
+}
+
+/// Re-resolve all currently active redirects into an already-prepared map.
+/// The caller must supply an unremapped map: stage flattening is rebuilt from
+/// its original batches so `old -> old` restores the authored material exactly.
+pub(crate) fn apply_shader_remaps_in_place(
+    map: &mut PreparedMap,
+    root: &Path,
+    game: Option<&Path>,
+    options: super::MapPrepareOptions,
+    state: &ShaderRemapState,
+) -> Result<(), String> {
+    if state.is_empty() {
+        return Ok(());
+    }
+
+    let (replacements, mut textures) = resolve_remap_targets(map, root, game, options, state)?;
+    let texture_base = map.textures.len();
 
     // Only these comparatively small flattened stage lists must be copied.
     // Geometry, collision, lightmaps and already-decoded textures stay in the
@@ -455,6 +468,106 @@ pub(crate) fn apply_shader_remaps(
     let mut map = base_map.clone();
     apply_shader_remaps_in_place(&mut map, root, game, options, state)?;
     Ok(map)
+}
+
+/// An ordinary material/texture substitution does not change the mapping
+/// from FULL pieces to prepared AUTO4 geometry recipes. Keep those plans when
+/// their existing merged members still share one new draw state; rebuilding
+/// hundreds of camera-cluster plans just to change a texture is unnecessary.
+fn can_reuse_portal_geometry(base: &PreparedMap, coarse: &[DrawBatch], full: &[DrawBatch]) -> bool {
+    if base.batches.len() != coarse.len() || base.pvs_batches.len() != full.len() {
+        return false;
+    }
+    if !base.batches.iter().zip(coarse).chain(base.pvs_batches.iter().zip(full))
+        .all(|(old, next)| old.vertices == next.vertices
+            && old.bsp_shader_index == next.bsp_shader_index
+            && old.pipeline == next.pipeline
+            && old.pvs_signature == next.pvs_signature
+            && old.area_signature == next.area_signature)
+    {
+        return false;
+    }
+    base.portal_draw_plan.variants.iter().all(|variant| {
+        full.get(variant.representative).is_some_and(|first|
+            variant.members.iter().all(|&member|
+                full.get(member).is_some_and(|piece|
+                    super::draw_batches_share_state(first, piece))))
+    })
+}
+
+/// Compile a cold-path remap into a *material-only* payload. The map's
+/// collision, vertices, lightmaps, effects, ocean and PVS allocations stay in
+/// the Arc-backed pristine cache and are never cloned for shader replacement.
+/// The drawing hot path receives already-resolved pipeline/stage batches.
+pub(crate) fn prepare_remap_plan(
+    base: Arc<PreparedMap>,
+    root: &Path,
+    game: Option<&Path>,
+    options: super::MapPrepareOptions,
+    state: &ShaderRemapState,
+    reverse_lightmap: bool,
+    additive_fusion: bool,
+) -> Result<PreparedRemapPlan, String> {
+    let started = std::time::Instant::now();
+    let (replacements, mut textures) = if state.is_empty() {
+        (BTreeMap::new(), Textures::new())
+    } else {
+        resolve_remap_targets(&base, root, game, options, state)?
+    };
+    let mut coarse = rebuild_batches(&base, &base.batches, state, &replacements);
+    let mut full = rebuild_batches(&base, &base.pvs_batches, state, &replacements);
+    let (mut inline, mut models) = rewrite_inline_model_batches(
+        &base.inline_batches, &base.inline_models,
+        |batches| rebuild_batches(&base, batches, state, &replacements),
+    );
+    if reverse_lightmap {
+        coarse = fold_reverse_lightmap_batches(&coarse).0;
+        full = fold_reverse_lightmap_batches(&full).0;
+        let rewritten = rewrite_inline_model_batches(&inline, &models,
+            |batches| fold_reverse_lightmap_batches(batches).0);
+        inline = rewritten.0;
+        models = rewritten.1;
+    }
+    if additive_fusion {
+        coarse = fuse_prepared_additive_batches(&coarse).0;
+        full = fuse_prepared_additive_batches(&full).0;
+        let rewritten = rewrite_inline_model_batches(&inline, &models,
+            |batches| fuse_prepared_additive_batches(batches).0);
+        inline = rewritten.0;
+        models = rewritten.1;
+    } else {
+        coarse = expand_additive_batches(&coarse);
+        full = expand_additive_batches(&full);
+        let rewritten = rewrite_inline_model_batches(&inline, &models, expand_additive_batches);
+        inline = rewritten.0;
+        models = rewritten.1;
+    }
+    let reuse_portal = can_reuse_portal_geometry(&base, &coarse, &full);
+    let portal_draw_plan = if reuse_portal {
+        base.portal_draw_plan.clone()
+    } else {
+        base.visibility.as_ref().map_or_else(Default::default, |vis|
+            super::build_prepared_portal_draw_plan(&coarse, &full, vis, &base.vertices, |_| {}))
+    };
+    let texture_hashes = textures.content_hashes();
+    for video in &mut textures.videos {
+        video.texture += base.textures.len();
+    }
+    rverbose!(1, "[SHADER REMAP] material-only CPU plan {:.2} ms; {} coarse / {} PVS / {} inline stages (no PreparedMap clone)",
+        started.elapsed().as_secs_f64() * 1000.0, coarse.len(), full.len(), inline.len());
+    if reuse_portal { rverbose!(2, "[SHADER REMAP] AUTO4 geometries reused; existing merged members remain compatible"); }
+    Ok(PreparedRemapPlan {
+        base,
+        batches: coarse,
+        pvs_batches: full,
+        inline_batches: inline,
+        inline_models: models,
+        portal_draw_plan,
+        replacement_textures: textures.images,
+        replacement_texture_hashes: texture_hashes,
+        replacement_videos: textures.videos,
+        warnings: textures.warnings,
+    })
 }
 
 /// Apply an opt-in OpenJK reverse-lightmap fold to a *derived* PreparedMap.

@@ -109,6 +109,9 @@ impl App {
         self.asset_viewer_catalog_loaded = false;
         self.asset_viewer_catalog_error = None;
         self.asset_viewer_entries.clear();
+        // The model VFS and its renderer registrations are being replaced;
+        // old locally placed MD3 instances must not keep stale asset pointers.
+        self.model_placement = Default::default();
         self.asset_viewer_cache = None;
         self.asset_viewer_selected = None;
         self.asset_viewer_shader_file.clear();

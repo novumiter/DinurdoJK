@@ -34,6 +34,22 @@ app_cvars! {
             }
         }]
     }
+    APP_R_OCEANSKYEXTEND {
+        runtime: CvarDef::new("r_oceanSkyExtend", "1", "0|1",
+            "Camera-relative promoted clipmap beyond qualifying sky walls (default on); no infinite plane or coastal changes.",
+            CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.ocean_sky_extend),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!() };
+                if app.ocean_sky_extend != enabled {
+                    app.ocean_sky_extend = enabled;
+                    app.render_command(RenderCommand::SetOceanSkyExtend(enabled));
+                }
+                Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_R_COASTAL {
         runtime: CvarDef::new("r_coastal", "0", "0|1",
             "Opt-in GPU shallow-bank solver for one promoted pool; r_coastalPool selects its 1-based pool number (0 automatic).",
@@ -76,6 +92,219 @@ app_cvars! {
                 },
             ),
         config: CvarBinding::NONE,
+        implementations: []
+    }
+    // A single switch for the opt-in visual corrections; does not mutate
+    // the individual A/B CVar values or the simulation state.
+    APP_R_OCEANVISUALFIXES {
+        runtime: CvarDef::new("r_oceanVisualFixes", "0", "0..2",
+            "0 original; 1 balanced whitecaps + lit foam + promoted-water body; 2 stronger Godot-like look. No FFT reset.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.visual_fixes as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.visual_fixes = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.visual_fixes = v.min(2); }
+            }),
+            archive: Some((25018, |state| state.video.ocean_settings.visual_fixes.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANFOAMSOURCE {
+        runtime: CvarDef::new("r_oceanFoamSource", "0", "0..2",
+            "FFT Jacobian foam generation: 0 original, 1 slightly earlier crests and 1.3x growth, 2 stronger earlier crests and 1.6x growth. Bundle selects minimum level.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_source_mode as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.foam_source_mode = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_source_mode = v.min(2); }
+            }),
+            archive: Some((25019, |state| state.video.ocean_settings.foam_source_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    // Which swell controls follow the master amplitude (see ocean::links).
+    APP_R_OCEANLINKS {
+        runtime: CvarDef::new("r_oceanLinks", "127", "0..127",
+            "Bitmask of ocean controls that follow the swell amplitude: 1 wavelength, 2 speed, 4 choppiness, 8 wind chop, 16 foam, 32 spray, 64 roughness. 127 all linked (default), 0 none.",
+            CvarType::Int { min: 0, max: 127 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.links as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.links = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.links = v & crate::ocean::links::ALL; }
+            }),
+            archive: Some((25020, |state| state.video.ocean_settings.links.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    // Independent surface-shading A/B controls. Defaults retain the current look.
+    APP_R_OCEANFOAMDETAIL {
+        runtime: CvarDef::new("r_oceanFoamDetail", "1", "0|1",
+            "0 keep whitecaps when normals LOD out, 1 (default) sample all cascades at any distance like Godot and keep far normals.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_detail_mode as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.foam_detail_mode = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_detail_mode = v.min(1); }
+            }),
+            archive: Some((25010, |state| state.video.ocean_settings.foam_detail_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANFOAMACTIVITY {
+        runtime: CvarDef::new("r_oceanFoamActivity", "0", "0..3",
+            "Promoted water foam attenuation: 0 original, 1 omit texture heuristic, 2 omit amplitude gate, 3 omit both. No FFT reset.",
+            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_activity_mode as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.foam_activity_mode = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_activity_mode = v.min(3); }
+            }),
+            archive: Some((25011, |state| state.video.ocean_settings.foam_activity_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANFOAMGAIN {
+        runtime: CvarDef::new("r_oceanFoamGain", "1", "0..16",
+            "Post-simulation breaker foam strength before smoothstep. 1 unchanged, 4 or 8 shows marginal foam.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.foam_gain.to_string()),
+            |app, value| App::cvar_set_ab_foam_gain(app, APP_R_OCEANFOAMGAIN.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ab_foam_gain, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.foam_gain = v.clamp(0.0, 16.0); }
+                }
+            }),
+            archive: Some((25012, |state| state.video.ocean_settings.foam_gain.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_ab_foam_gain(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.foam_gain = Self::parse_cvar_finite(name, value)?.clamp(0.0, 16.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_OCEANCOLORMODE {
+        runtime: CvarDef::new("r_oceanColorMode", "0", "0..3",
+            "Color A/B: 0 original, 1 override authored base with configured ocean color, 2 opaque lit water, 3 both.",
+            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.color_mode as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.color_mode = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.color_mode = v.min(3); }
+            }),
+            archive: Some((25014, |state| state.video.ocean_settings.color_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANFOAMBRIGHTNESS {
+        runtime: CvarDef::new("r_oceanFoamBrightness", "1", "0..8",
+            "Multiplier on linear foam RGB in ocean surface illumination, 1 unchanged.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.foam_brightness.to_string()),
+            |app, value| App::cvar_set_ab_foam_brightness(app, APP_R_OCEANFOAMBRIGHTNESS.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ab_foam_brightness, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.foam_brightness = v.clamp(0.0, 8.0); }
+                }
+            }),
+            archive: Some((25015, |state| state.video.ocean_settings.foam_brightness.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_ab_foam_brightness(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.foam_brightness = Self::parse_cvar_finite(name, value)?.clamp(0.0, 8.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_OCEANSUNGAIN {
+        runtime: CvarDef::new("r_oceanSunGain", "1", "0..8",
+            "Multiplier on direct sun diffuse/specular contribution (not sky ambient), 1 unchanged.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.sun_gain.to_string()),
+            |app, value| App::cvar_set_ab_sun_gain(app, APP_R_OCEANSUNGAIN.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_ab_sun_gain, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.sun_gain = v.clamp(0.0, 8.0); }
+                }
+            }),
+            archive: Some((25016, |state| state.video.ocean_settings.sun_gain.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_ab_sun_gain(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.sun_gain = Self::parse_cvar_finite(name, value)?.clamp(0.0, 8.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_OCEANFOAMDEBUG {
+        runtime: CvarDef::new("r_oceanFoamDebug", "0", "0..3",
+            "Foam diagnostic: 0 shaded water, 1 raw sampled FFT foam, 2 after promoted gates, 3 final breaker + windrows.",
+            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.foam_debug as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.foam_debug = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.foam_debug = v.min(3); }
+            }),
+            archive: Some((25017, |state| state.video.ocean_settings.foam_debug.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: []
     }
     APP_R_OCEANINTERACTION {
@@ -698,7 +927,6 @@ app_cvars! {
                         if v.is_finite() {
                             let o = &mut settings.ocean_settings.optics;
                             match name.to_ascii_lowercase().as_str() {
-                                "r_oceanfogdistance" => o.fog_distance = v,
                                 "r_oceantransparency" => o.transparency = v,
                                 "r_oceandepthdarkening" => o.depth_darkening = v,
                                 "r_oceanrefraction" => o.refraction = v,
@@ -731,7 +959,6 @@ app_cvars! {
                         }
                         let o = &mut self.video.ocean_settings.optics;
                         match name.to_ascii_lowercase().as_str() {
-                            "r_oceanfogdistance" => o.fog_distance = v,
                             "r_oceantransparency" => o.transparency = v,
                             "r_oceandepthdarkening" => o.depth_darkening = v,
                             "r_oceanrefraction" => o.refraction = v,
@@ -771,7 +998,6 @@ app_cvars! {
                         if v.is_finite() {
                             let o = &mut settings.ocean_settings.optics;
                             match name.to_ascii_lowercase().as_str() {
-                                "r_oceanfogdistance" => o.fog_distance = v,
                                 "r_oceantransparency" => o.transparency = v,
                                 "r_oceandepthdarkening" => o.depth_darkening = v,
                                 "r_oceanrefraction" => o.refraction = v,
@@ -808,7 +1034,6 @@ app_cvars! {
                         }
                         let o = &mut self.video.ocean_settings.optics;
                         match name.to_ascii_lowercase().as_str() {
-                            "r_oceanfogdistance" => o.fog_distance = v,
                             "r_oceantransparency" => o.transparency = v,
                             "r_oceandepthdarkening" => o.depth_darkening = v,
                             "r_oceanrefraction" => o.refraction = v,
@@ -929,32 +1154,31 @@ app_cvars! {
         ]
     }
 
-    APP_R_OCEANFOGDISTANCE {
+    APP_R_OCEANTRANSPARENCY {
         runtime: CvarDef::new(
-                "r_oceanFogDistance",
+                "r_oceanTransparency",
                 "",
                 "1..65536",
-                "Base water absorption distance in game units.",
+                "Water transparency: how far light travels through the water before it is absorbed, in game units. Lower is murkier, above and below the surface.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
-                |app| CvarValue::String(App::cvar_get_r_oceanfogdistance(app)),
+                |app| CvarValue::String(App::cvar_get_r_oceantransparency(app)),
                 |app, value| {
-                    App::cvar_set_r_oceanfogdistance(
+                    App::cvar_set_r_oceantransparency(
                         app,
-                        APP_R_OCEANFOGDISTANCE.entry.name,
+                        APP_R_OCEANTRANSPARENCY.entry.name,
                         &value.to_string(),
                     )
                 },
             )
-            .with_text_setter(App::cvar_set_r_oceanfogdistance, None),
+            .with_text_setter(App::cvar_set_r_oceantransparency, None),
         config: CvarBinding {
                 load_video: Some(|settings, name, value, _context| {
                     if let Ok(v) = value.parse::<f32>() {
                         if v.is_finite() {
                             let o = &mut settings.ocean_settings.optics;
                             match name.to_ascii_lowercase().as_str() {
-                                "r_oceanfogdistance" => o.fog_distance = v,
                                 "r_oceantransparency" => o.transparency = v,
                                 "r_oceandepthdarkening" => o.depth_darkening = v,
                                 "r_oceanrefraction" => o.refraction = v,
@@ -968,16 +1192,16 @@ app_cvars! {
                 archive: Some((10413, |state| {
                     let settings = state.video;
                     let o = settings.ocean_settings.optics;
-                    format!("{}", o.fog_distance)
+                    format!("{}", o.transparency)
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
-                fn cvar_get_r_oceanfogdistance(&self) -> String {
-                    self.video.ocean_settings.optics.fog_distance.to_string()
+                fn cvar_get_r_oceantransparency(&self) -> String {
+                    self.video.ocean_settings.optics.transparency.to_string()
                 }
-                fn cvar_set_r_oceanfogdistance(&mut self, name: &str, value: &str) -> Result<(), String> {
+                fn cvar_set_r_oceantransparency(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         let v = value
                             .parse::<f32>()
@@ -987,7 +1211,6 @@ app_cvars! {
                         }
                         let o = &mut self.video.ocean_settings.optics;
                         match name.to_ascii_lowercase().as_str() {
-                            "r_oceanfogdistance" => o.fog_distance = v,
                             "r_oceantransparency" => o.transparency = v,
                             "r_oceandepthdarkening" => o.depth_darkening = v,
                             "r_oceanrefraction" => o.refraction = v,
@@ -1182,7 +1405,6 @@ app_cvars! {
                         if v.is_finite() {
                             let o = &mut settings.ocean_settings.optics;
                             match name.to_ascii_lowercase().as_str() {
-                                "r_oceanfogdistance" => o.fog_distance = v,
                                 "r_oceantransparency" => o.transparency = v,
                                 "r_oceandepthdarkening" => o.depth_darkening = v,
                                 "r_oceanrefraction" => o.refraction = v,
@@ -1215,7 +1437,6 @@ app_cvars! {
                         }
                         let o = &mut self.video.ocean_settings.optics;
                         match name.to_ascii_lowercase().as_str() {
-                            "r_oceanfogdistance" => o.fog_distance = v,
                             "r_oceantransparency" => o.transparency = v,
                             "r_oceandepthdarkening" => o.depth_darkening = v,
                             "r_oceanrefraction" => o.refraction = v,
@@ -1317,85 +1538,12 @@ app_cvars! {
         ]
     }
 
-    APP_R_OCEANTRANSPARENCY {
-        runtime: CvarDef::new(
-                "r_oceanTransparency",
-                "",
-                "0.1..16",
-                "Water absorption-distance multiplier.",
-                CvarType::String,
-                CvarFlags::ARCHIVE,
-                LatchScope::None,
-                |app| CvarValue::String(App::cvar_get_r_oceantransparency(app)),
-                |app, value| {
-                    App::cvar_set_r_oceantransparency(
-                        app,
-                        APP_R_OCEANTRANSPARENCY.entry.name,
-                        &value.to_string(),
-                    )
-                },
-            )
-            .with_text_setter(App::cvar_set_r_oceantransparency, None),
-        config: CvarBinding {
-                load_video: Some(|settings, name, value, _context| {
-                    if let Ok(v) = value.parse::<f32>() {
-                        if v.is_finite() {
-                            let o = &mut settings.ocean_settings.optics;
-                            match name.to_ascii_lowercase().as_str() {
-                                "r_oceanfogdistance" => o.fog_distance = v,
-                                "r_oceantransparency" => o.transparency = v,
-                                "r_oceandepthdarkening" => o.depth_darkening = v,
-                                "r_oceanrefraction" => o.refraction = v,
-                                "r_oceancaustics" => o.caustics = v,
-                                _ => o.underwater_cull = v,
-                            }
-                            *o = o.sanitize();
-                        }
-                    }
-                }),
-                archive: Some((10414, |state| {
-                    let settings = state.video;
-                    let o = settings.ocean_settings.optics;
-                    format!("{}", o.transparency)
-                })),
-                ..CvarBinding::NONE
-            },
-        implementations: [
-            impl App {
-                fn cvar_get_r_oceantransparency(&self) -> String {
-                    self.video.ocean_settings.optics.transparency.to_string()
-                }
-                fn cvar_set_r_oceantransparency(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        let v = value
-                            .parse::<f32>()
-                            .map_err(|_| "Expected a finite number".to_owned())?;
-                        if !v.is_finite() {
-                            return Err("Expected a finite number".to_owned());
-                        }
-                        let o = &mut self.video.ocean_settings.optics;
-                        match name.to_ascii_lowercase().as_str() {
-                            "r_oceanfogdistance" => o.fog_distance = v,
-                            "r_oceantransparency" => o.transparency = v,
-                            "r_oceandepthdarkening" => o.depth_darkening = v,
-                            "r_oceanrefraction" => o.refraction = v,
-                            "r_oceancaustics" => o.caustics = v,
-                            _ => o.underwater_cull = v,
-                        }
-                        self.commit_ocean_settings();
-                    }
-                    Ok(())
-                }
-            }
-        ]
-    }
-
     APP_R_OCEANUNDERWATERCULL {
         runtime: CvarDef::new(
                 "r_oceanUnderwaterCull",
                 "",
                 "0..32",
-                "Separate submerged BSP cull distance, as an absorption-distance multiple. Zero disables.",
+                "Cull geometry that water absorption hides, as an absorption-distance multiple (floored at 2): everything past it (min 256) when underwater, and anything under that much water when viewed from above. Zero disables.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1415,7 +1563,6 @@ app_cvars! {
                         if v.is_finite() {
                             let o = &mut settings.ocean_settings.optics;
                             match name.to_ascii_lowercase().as_str() {
-                                "r_oceanfogdistance" => o.fog_distance = v,
                                 "r_oceantransparency" => o.transparency = v,
                                 "r_oceandepthdarkening" => o.depth_darkening = v,
                                 "r_oceanrefraction" => o.refraction = v,
@@ -1452,7 +1599,6 @@ app_cvars! {
                         }
                         let o = &mut self.video.ocean_settings.optics;
                         match name.to_ascii_lowercase().as_str() {
-                            "r_oceanfogdistance" => o.fog_distance = v,
                             "r_oceantransparency" => o.transparency = v,
                             "r_oceandepthdarkening" => o.depth_darkening = v,
                             "r_oceanrefraction" => o.refraction = v,

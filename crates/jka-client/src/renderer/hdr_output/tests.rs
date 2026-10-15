@@ -64,6 +64,26 @@ fn hdr_selection_uses_explicit_color_spaces_and_keeps_sdr_fallback() {
 }
 
 #[test]
+fn hdr_mode_availability_matches_runtime_selection_and_windows_hdr_state() {
+    assert_eq!(available_modes(&capabilities(true), None), 0b1111);
+    assert_eq!(available_modes(&capabilities(false), None), 0b0001);
+    let sdr_display = wgpu::DisplayHdrInfo {
+        coarse: Some(wgpu::DisplayCoarseRange {
+            high_dynamic_range: Some(false),
+            gamut: None,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(available_modes(&capabilities(true), Some(&sdr_display)), 0b0001);
+    let mut pq_only = capabilities(true);
+    pq_only.format_capabilities.retain(|c| c.format != wgpu::TextureFormat::Rgba16Float);
+    assert_eq!(available_modes(&pq_only, None), 0b0111);
+    let mut scrgb_only = capabilities(true);
+    scrgb_only.format_capabilities.retain(|c| c.format != wgpu::TextureFormat::Rgb10a2Unorm);
+    assert_eq!(available_modes(&scrgb_only, None), 0b1011);
+}
+
+#[test]
 fn hdr_display_shader_validates() {
     let module = naga::front::wgsl::parse_str(include_str!("../../hdr_output.wgsl")).unwrap();
     naga::valid::Validator::new(
@@ -150,14 +170,14 @@ fn exercise(backend: wgpu::Backends) {
         ] {
             let mut output = HdrOutput::new(&device, selection, 1, 1, 1);
             output.detected_peak = Some(600.0);
-            output.write_settings(&queue, 200.0, 0.0, false);
+            output.write_settings(&queue, 200.0, 0.0, 0.0);
             assert_eq!(output.peak, 600.0);
-            output.write_settings(&queue, 500.0, 100.0, false);
+            output.write_settings(&queue, 500.0, 100.0, 0.0);
             assert_eq!(
                 output.paper_white, 100.0,
                 "reference white cannot exceed display peak"
             );
-            output.write_settings(&queue, 200.0, 1000.0, false);
+            output.write_settings(&queue, 200.0, 1000.0, 0.0);
             let texture = target(&device, 1, 1, selection.format);
             let view = texture.create_view(&Default::default());
             // Values above SDR white must survive scene rendering and upstream SMAA.
@@ -421,6 +441,12 @@ fn native_hdr_surface_capabilities_and_configuration() {
                 hdr_peak: 0.0,
                 ..Default::default()
             });
+            // SDR fallback must not create an FP16 compositor or output pass.
+            if renderer.hdr_output.is_none() {
+                assert_ne!(renderer.config.format, wgpu::TextureFormat::Rgba16Float);
+                println!("{backend:?} SDR fallback: no HDR compositor allocated");
+                return;
+            }
             assert_eq!(renderer.config.format, wgpu::TextureFormat::Rgba16Float);
             assert!(renderer.hdr_enabled);
             let scope = renderer
@@ -477,6 +503,7 @@ fn native_hdr_surface_capabilities_and_configuration() {
                 paint_jobs: ctx.tessellate(output.shapes, output.pixels_per_point),
                 textures_delta: output.textures_delta,
                 pixels_per_point: output.pixels_per_point,
+                present_token: None,
             }));
             renderer.submit_egui(&scene_view);
             let display = renderer.hdr_output.as_ref().unwrap();
@@ -514,5 +541,17 @@ fn native_hdr_surface_capabilities_and_configuration() {
             renderer.resize(winit::dpi::PhysicalSize::new(64, 64));
             println!("{backend:?} actual FP16 renderer initialization and egui composition passed");
         });
+    }
+}
+
+#[test]
+fn native_output_compositor_only_for_native_encodings() {
+    for encoding in 0..=3 {
+        let selection = super::Selection {
+            format: if encoding == 1 { wgpu::TextureFormat::Rgba16Float } else { wgpu::TextureFormat::Bgra8Unorm },
+            color_space: wgpu::SurfaceColorSpace::Srgb,
+            encoding,
+        };
+        assert_eq!(super::requires_compositor(selection), matches!(encoding, 1 | 2));
     }
 }

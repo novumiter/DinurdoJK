@@ -478,11 +478,31 @@ pub fn tessellate_workers(
     surfaces
 }
 
-/// Keep JKA/OpenJK FX simulation semantics on the CPU, but submit RT_SPRITE
-/// (`Particle` in .efx files) as compact WGPU instances. The final billboard
-/// basis is still evaluated against the final render view on the CPU so this
-/// path changes submission cost, not authored motion/lifetime/orientation.
-/// Non-sprite FX primitives keep the reference CPU tessellation path.
+/// Pack an RB_AddQuadStamp-style quad into the existing four vec4 instancing
+/// layout. Both sprite and line/tail geometry use exactly this representation.
+fn fx_gpu_quad_instance(
+    origin: [f32; 3],
+    left: [f32; 3],
+    up: [f32; 3],
+    color: [f32; 4],
+) -> FxGpuSpriteInstance {
+    let origin = scene::render_position(origin);
+    let left = scene::render_position(left);
+    let up = scene::render_position(up);
+    FxGpuSpriteInstance {
+        origin: [origin[0], origin[1], origin[2], 0.0],
+        left: [left[0], left[1], left[2], 0.0],
+        up: [up[0], up[1], up[2], 0.0],
+        color,
+    }
+}
+
+/// Keep JKA/OpenJK FX simulation semantics on the CPU, but submit common
+/// quad-based FX as compact WGPU instances. The billboard basis is evaluated
+/// against the final render view so this changes geometry submission cost,
+/// not authored motion, lifetime or orientation. GPU-eligible sprites,
+/// oriented quads, saber-glow beads and view-facing line/tail strips use this
+/// path. Complex geometry and tcMod stages keep the reference CPU tessellation.
 pub fn tessellate_gpu_particles(
     draws: &[FxDraw],
     view: &FxView,
@@ -522,21 +542,63 @@ pub fn tessellate_gpu_particles(
                 append_draw(draw, view, mat, &mut entry.1);
                 continue;
             }
-            if let FxDraw::Sprite { origin, radius, rotation, rgba, .. } = draw {
-                let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
-                let origin = scene::render_position(*origin);
-                let left = scene::render_position(left);
-                let up = scene::render_position(up);
+            // Legacy saber glow is a train of camera-facing quad stamps.
+            // Emit the same beads as instances instead of expanding each into
+            // four CPU vertices and indexed triangles every presentation frame.
+            if let FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } = draw {
+                let instances = &mut sprite_batches
+                    .entry((shader_key.clone(), stage_index))
+                    .or_insert_with(|| (mat.clone(), Vec::new()))
+                    .1;
+                let color = mat.vertex_color(*rgba, view.seconds);
+                let mut distance = *length;
+                let mut glow_radius = *radius;
+                while distance > 0.0 {
+                    let point = add(*origin, scale(*direction, distance));
+                    instances.push(fx_gpu_quad_instance(
+                        point, scale(view.axis[1], glow_radius),
+                        scale(view.axis[2], glow_radius), color,
+                    ));
+                    distance -= glow_radius * 0.65;
+                    glow_radius += 0.017;
+                }
+                if *hilt_radius > 0.0 {
+                    instances.push(fx_gpu_quad_instance(
+                        *origin, scale(view.axis[1], *hilt_radius),
+                        scale(view.axis[2], *hilt_radius), color,
+                    ));
+                }
+                continue;
+            }
+            // The existing six-vertex instanced quad also represents a view-facing
+            // line exactly: origin is its midpoint, left its cross-view half-width,
+            // and up the half-vector toward the starting endpoint. That preserves
+            // RB_SurfaceLine's UVs and winding while eliminating four CPU vertices
+            // and six indices per spark/tail. No shader or pipeline variant needed.
+            let billboard = match draw {
+                FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
+                    let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
+                    Some((*origin, left, up, *rgba))
+                }
+                FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
+                    let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
+                    Some((*origin, left, up, *rgba))
+                }
+                FxDraw::Line { start, end, width, rgba, .. } => {
+                    let right = normalize(cross(sub(*start, view.origin), sub(*end, view.origin)));
+                    let center = scale(add(*start, *end), 0.5);
+                    let left = scale(right, *width);
+                    let up = scale(sub(*start, *end), 0.5);
+                    Some((center, left, up, *rgba))
+                }
+                _ => None,
+            };
+            if let Some((origin, left, up, rgba)) = billboard {
                 sprite_batches
                     .entry((shader_key.clone(), stage_index))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1
-                    .push(FxGpuSpriteInstance {
-                        origin: [origin[0], origin[1], origin[2], 0.0],
-                        left: [left[0], left[1], left[2], 0.0],
-                        up: [up[0], up[1], up[2], 0.0],
-                        color: mat.vertex_color(*rgba, view.seconds),
-                    });
+                    .push(fx_gpu_quad_instance(origin, left, up, mat.vertex_color(rgba, view.seconds)));
             } else {
                 let entry = cpu_batches
                     .entry((shader_key.clone(), stage_index))
@@ -586,7 +648,8 @@ pub fn tessellate_gpu_particles(
                 rt_rigid: None,
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: Some(FxGpuSprites { instances: Arc::new(instances), blob_shadow: false }),
+                fx_gpu_sprites: Some(FxGpuSprites {
+                resident: None, instances: Arc::new(instances), blob_shadow: false }),
                 texture: mat.texture_at_time(view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
@@ -596,6 +659,126 @@ pub fn tessellate_gpu_particles(
     surfaces.extend(lit_surfaces);
     surfaces.sort_by_key(|surface| (surface.alpha_mode as u8, surface.vertex_count()));
     surfaces
+}
+
+/// Check only the actual stages belonging to one shader, not every possible
+/// FX alpha mode. The app uses this to avoid any per-particle CPU interpolation
+/// when a warm shader has only one compiled blend variant.
+pub(crate) fn resident_material_pipelines_ready(stages: &[FxMaterial], ready: u16) -> bool {
+    !stages.is_empty() && stages.iter().all(|stage| {
+        ready & (1u16 << stage.blend.alpha_mode().index()) != 0
+    })
+}
+
+/// Material-validated, stable-slot resident sparks. The CPU copies below are
+/// *fallbacks only* while WGPU asynchronously compiles the resident shader;
+/// once ready it draws from the 112-byte birth record plus u32 slot IDs.
+/// Return the exact source draw indices suppressed from the reference path.
+pub fn tessellate_resident_sprites(
+    candidates: &[(usize, u32, &FxDraw)],
+    frame: Arc<crate::renderer::FxGpuResidentFrame>,
+    view: &FxView,
+    materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>,
+) -> (Vec<DynamicModelSurface>, Vec<usize>, Vec<usize>) {
+    type StageBatch = (FxMaterial, Vec<u32>, Vec<FxGpuSpriteInstance>);
+    let mut batches: HashMap<(String, usize), StageBatch> = HashMap::new();
+    let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
+    let mut accepted = Vec::new();
+    let mut warm = Vec::new();
+    for &(index, slot, draw) in candidates {
+        let FxDraw::Sprite { origin, radius, rotation, rgba, shader } = draw else { continue; };
+        // A full shader is atomic: partial promotion could silently remove an
+        // unsupported second stage (glow/tcMod/animation).
+        let key = shader.to_ascii_lowercase();
+        let stages = material_cache.entry(key.clone()).or_insert_with(|| materials(shader));
+        if stages.is_empty() || stages.iter().any(|mat| {
+            crate::fx::gpu_sparks::material_stage_eligible(mat).is_err()
+                || mat.authored_glow
+                || !matches!(mat.blend,
+                    FxBlend::Add | FxBlend::AddAlpha | FxBlend::Alpha)
+        }) { continue; }
+        // Pipeline readiness is published back from the renderer *after* lazy
+        // compilation. In the steady state, there is no reason to build the
+        // reference 64-byte camera-facing instance just to discard it later.
+        let ready = frame.ready_modes.load(std::sync::atomic::Ordering::Acquire);
+        let fallback_needed = stages.iter().any(|mat| {
+            ready & (1u16 << mat.blend.alpha_mode().index()) == 0
+        });
+        if !fallback_needed { warm.push(index); }
+        let basis = fallback_needed.then(|| {
+            rotated_frame(view.axis[1], view.axis[2], *radius, *rotation)
+        });
+        for (stage, mat) in stages.iter().enumerate() {
+            let entry = batches.entry((key.clone(), stage)).or_insert_with(|| {
+                (mat.clone(), Vec::new(), Vec::new())
+            });
+            entry.1.push(slot);
+            if let Some((left, up)) = basis {
+                if ready & (1u16 << mat.blend.alpha_mode().index()) == 0 {
+                    entry.2.push(fx_gpu_quad_instance(*origin, left, up,
+                        mat.vertex_color(*rgba, view.seconds)));
+                }
+            }
+        }
+        accepted.push(index);
+    }
+    let mut surfaces = Vec::with_capacity(batches.len());
+    for (_, (mat, slots, fallback_instances)) in batches {
+        surfaces.push(DynamicModelSurface {
+            geometry_source: crate::renderer::ModelGeometrySource::Fx,
+            authored_lighting: false,
+            material_trace: None,
+            entity_num: FX_ENTITY_NUM,
+            wireframe_class: DynamicWireframeClass::Effect,
+            raster_visible: true,
+            vertices: Arc::new(Vec::new()),
+            indices: Arc::new(Vec::new()),
+            lighting_origin: None,
+            rt_rigid: None,
+            rt_skinned_key: None,
+            ghoul2_gpu: None,
+            fx_gpu_sprites: Some(FxGpuSprites {
+                resident: Some(crate::renderer::FxGpuResidentSprites {
+                    frame: Arc::clone(&frame), slots: Arc::new(slots),
+                }),
+                instances: Arc::new(fallback_instances),
+                blob_shadow: false,
+            }),
+            texture: mat.texture_at_time(view.seconds),
+            alpha_mode: mat.blend.alpha_mode(),
+            authored_glow: false,
+        });
+    }
+    // If the first birth or a demo generation reset occurs while all visual
+    // particles are hidden, still ship the delta to persistent GPU storage.
+    // This marker draws zero instances and never requests a pipeline.
+    if surfaces.is_empty() && (frame.reset || !frame.writes.is_empty()) {
+        surfaces.push(DynamicModelSurface {
+            geometry_source: crate::renderer::ModelGeometrySource::Fx,
+            authored_lighting: false,
+            material_trace: None,
+            entity_num: FX_ENTITY_NUM,
+            wireframe_class: DynamicWireframeClass::Effect,
+            raster_visible: true,
+            vertices: Arc::new(Vec::new()),
+            indices: Arc::new(Vec::new()),
+            lighting_origin: None,
+            rt_rigid: None,
+            rt_skinned_key: None,
+            ghoul2_gpu: None,
+            fx_gpu_sprites: Some(FxGpuSprites {
+                resident: Some(crate::renderer::FxGpuResidentSprites {
+                    frame: Arc::clone(&frame), slots: Arc::new(Vec::new()),
+                }),
+                instances: Arc::new(Vec::new()), blob_shadow: false,
+            }),
+            texture: None,
+            alpha_mode: DynamicModelAlphaMode::BlendUnlit,
+            authored_glow: false,
+        });
+    }
+    surfaces.sort_by_key(|surface| surface.alpha_mode as u8);
+    (surfaces, accepted, warm)
 }
 
 /// A `LitMesh` becomes its own alpha-blended, light-grid-lit surface: it needs
@@ -1208,6 +1391,83 @@ mod tests {
     }
 
     #[test]
+    fn gpu_lines_and_tails_match_reference_quad_corners_and_uvs() {
+        // FX tails are represented as FxDraw::Line after CPU simulation.
+        // Test both a diagonal and a horizontal view-facing spark strip.
+        for (start, end) in [
+            ([100.0, 0.0, 10.0], [110.0, 45.0, -5.0]),
+            ([100.0, 0.0, 0.0], [100.0, 50.0, 0.0]),
+        ] {
+            let draws = [FxDraw::Line {
+                start, end, width: 1.5, rgba: [255, 128, 64, 200], shader: "spark".into(),
+            }];
+            let cpu = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::AddAlpha)]);
+            let gpu = tessellate_gpu_particles(&draws, &view(), &mut |_| vec![white(FxBlend::AddAlpha)]);
+            let instance = gpu[0].fx_gpu_sprites.as_ref().expect("instanced line").instances[0];
+            assert!(gpu[0].vertices.is_empty());
+            assert!(gpu[0].indices.is_empty());
+            let corners = [(1.0, 1.0), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)];
+            let uvs = [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+            for (index, (sx, sy)) in corners.into_iter().enumerate() {
+                let actual: [f32; 3] = std::array::from_fn(|i| {
+                    instance.origin[i] + sx * instance.left[i] + sy * instance.up[i]
+                });
+                for component in 0..3 {
+                    assert!((actual[component] - cpu[0].vertices[index].position[component]).abs() < 1e-4);
+                }
+                assert_eq!(cpu[0].vertices[index].uv, uvs[index]);
+                assert_eq!(cpu[0].vertices[index].color, instance.color);
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_legacy_saber_glow_beads_match_cpu_positions() {
+        let draw = FxDraw::SaberGlow {
+            origin: [100.0, 5.0, 6.0], direction: [0.0, 1.0, 0.0],
+            length: 24.0, radius: 2.0, hilt_radius: 3.0,
+            rgba: [255, 50, 10, 128], shader: "glow".into(),
+        };
+        let cpu = tessellate(&[draw.clone()], &view(), &mut |_| vec![white(FxBlend::AddAlpha)]);
+        let gpu = tessellate_gpu_particles(&[draw], &view(), &mut |_| vec![white(FxBlend::AddAlpha)]);
+        let instances = &gpu[0].fx_gpu_sprites.as_ref().expect("glow instances").instances;
+        assert!(instances.len() > 2);
+        assert_eq!(cpu[0].vertices.len(), instances.len() * 4);
+        for (bead, instance) in instances.iter().enumerate() {
+            let corners = [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)];
+            for (offset, (sx, sy)) in corners.into_iter().enumerate() {
+                let actual: [f32; 3] = std::array::from_fn(|i| {
+                    instance.origin[i] + sx * instance.left[i] + sy * instance.up[i]
+                });
+                let expected = cpu[0].vertices[bead * 4 + offset];
+                for component in 0..3 {
+                    assert!((actual[component] - expected.position[component]).abs() < 1e-4);
+                }
+                assert_eq!(instance.color, expected.color);
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_lines_fall_back_for_shader_tcmods() {
+        use jka_assets::shader::TcMod;
+        let draw = FxDraw::Line {
+            start: [100.0, 0.0, 0.0], end: [100.0, 40.0, 0.0], width: 2.0,
+            rgba: [255; 4], shader: "spark".into(),
+        };
+        let material = FxMaterial { tc_mods: vec![TcMod::Scroll(0.5, 0.25)], ..white(FxBlend::AddAlpha) };
+        let cpu = tessellate(&[draw.clone()], &view(), &mut |_| vec![material.clone()]);
+        let gpu = tessellate_gpu_particles(&[draw], &view(), &mut |_| vec![material.clone()]);
+        assert!(gpu[0].fx_gpu_sprites.is_none());
+        assert_eq!(gpu[0].vertices.len(), cpu[0].vertices.len());
+        assert_eq!(gpu[0].indices.len(), cpu[0].indices.len());
+        for (actual, expected) in gpu[0].vertices.iter().zip(cpu[0].vertices.iter()) {
+            assert_eq!(actual.uv, expected.uv);
+            assert_eq!(actual.position, expected.position);
+        }
+    }
+
+    #[test]
     fn line_width_spans_perpendicular_to_view_and_segment() {
         let draws = [FxDraw::Line { start: [100.0, 0.0, 0.0], end: [100.0, 50.0, 0.0], width: 1.5, rgba: [255, 255, 255, 128], shader: "b".into() }];
         let surfaces = tessellate(&draws, &view(), &mut |_| vec![white(FxBlend::AddAlpha)]);
@@ -1268,5 +1528,103 @@ mod tests {
             .map(|p| (p[0] * p[0] + p[1] * p[1]).sqrt())
             .collect();
         assert!((radii[0] - 1.0).abs() < 1e-4 && (radii[1] - 3.0).abs() < 1e-4);
+    }
+}
+
+#[cfg(test)]
+mod resident_fx_tests {
+    use super::*;
+
+    fn stage() -> FxMaterial {
+        FxMaterial {
+            texture: None, animation: None, blend: FxBlend::AddAlpha,
+            rgb_vertex: true, alpha_vertex: true,
+            rgb_const: [1.0; 3], alpha_const: 1.0,
+            rgb_wave: None, alpha_wave: None,
+            rgb_one_minus_vertex: false, alpha_one_minus_vertex: false,
+            tc_mods: Vec::new(), shader_time_offset: 0.0,
+            shader_clamp_time: None, authored_glow: false,
+        }
+    }
+
+    #[test]
+    fn material_atomicity_and_original_indices() {
+        let draw = FxDraw::Sprite {
+            origin: [10.0, 5.0, 1.0], radius: 4.0,
+            rotation: 33.0, rgba: [80, 90, 120, 255], shader: "testfx".into(),
+        };
+        let view = FxView {
+            origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            fov_x: 90.0, seconds: 0.1,
+        };
+        let frame = Arc::new(crate::renderer::FxGpuResidentFrame::default());
+        let (surfaces, accepted, _) = tessellate_resident_sprites(
+            &[(18, 3, &draw)], Arc::clone(&frame), &view, &mut |_| vec![stage(), stage()],
+        );
+        assert_eq!(accepted, [18]);
+        assert_eq!(surfaces.len(), 2);
+        for surface in surfaces {
+            let sprite = surface.fx_gpu_sprites.as_ref().unwrap();
+            assert_eq!(sprite.resident.as_ref().unwrap().slots.as_slice(), &[3]);
+            assert_eq!(sprite.instances.len(), 1, "retain fallback during compilation");
+        }
+        let bad_stage = FxMaterial { authored_glow: true, ..stage() };
+        let (surfaces, accepted, _) = tessellate_resident_sprites(
+            &[(18, 3, &draw)], frame, &view, &mut |_| vec![stage(), bad_stage.clone()],
+        );
+        assert!(accepted.is_empty(), "reject ALL stages when any is unsupported");
+        assert!(surfaces.is_empty());
+    }
+
+    #[test]
+    fn ready_gpu_pipeline_skips_reference_sprite_expansion() {
+        let view = FxView {
+            origin: [0.0; 3],
+            axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            fov_x: 90.0,
+            seconds: 0.0,
+        };
+        let draw = FxDraw::Sprite {
+            origin: [1.0, 2.0, 3.0], radius: 8.0,
+            rotation: 22.0, rgba: [255; 4], shader: "testfx".into(),
+        };
+        let frame = Arc::new(crate::renderer::FxGpuResidentFrame::default());
+        let mode = stage().blend.alpha_mode();
+        let (cold, accepted, _) = tessellate_resident_sprites(
+            &[(0, 12, &draw)], Arc::clone(&frame), &view, &mut |_| vec![stage()],
+        );
+        assert_eq!(accepted, [0]);
+        assert_eq!(cold[0].fx_gpu_sprites.as_ref().unwrap().instances.len(), 1);
+        frame.ready_modes.store(1u16 << mode.index(), std::sync::atomic::Ordering::Release);
+        let (warm, accepted, warm_ids) = tessellate_resident_sprites(
+            &[(0, 12, &draw)], Arc::clone(&frame), &view, &mut |_| vec![stage()],
+        );
+        assert_eq!(accepted, [0]);
+        assert_eq!(warm_ids, [0]);
+        let sprites = warm[0].fx_gpu_sprites.as_ref().unwrap();
+        assert!(sprites.instances.is_empty(), "GPU-ready path avoids CPU billboard preparation");
+        assert_eq!(sprites.resident.as_ref().unwrap().slots.as_slice(), &[12]);
+        frame.ready_modes.store(0, std::sync::atomic::Ordering::Release);
+        let (rebuild, _, _) = tessellate_resident_sprites(
+            &[(0, 12, &draw)], frame, &view, &mut |_| vec![stage()],
+        );
+        assert_eq!(rebuild[0].fx_gpu_sprites.as_ref().unwrap().instances.len(), 1,
+            "pipeline rebuild must restore the fallback");
+    }
+
+    #[test]
+    fn clock_or_birth_with_no_visible_particle_still_sends_storage_updates() {
+        let frame = Arc::new(crate::renderer::FxGpuResidentFrame {
+            reset: true, ..Default::default()
+        });
+        let view = FxView {
+            origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            fov_x: 90.0, seconds: 0.0,
+        };
+        let (surfaces, accepted, _) = tessellate_resident_sprites(&[], frame, &view, &mut |_| vec![]);
+        assert!(accepted.is_empty());
+        assert_eq!(surfaces.len(), 1);
+        assert!(surfaces[0].fx_gpu_sprites.as_ref().unwrap().resident.is_some());
+        assert!(surfaces[0].fx_gpu_sprites.as_ref().unwrap().instances.is_empty());
     }
 }

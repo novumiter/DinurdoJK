@@ -33,3 +33,30 @@ features must be compile-time dead, not retained behind per-pixel uniform flags.
 
 The cache does not eliminate the cost of a genuinely new, complex NVIDIA/Vulkan
 fragment shader permutation. Native persistent pipeline caches are separate.
+
+## Stage programs (r_fragmentShaderMode 3/4)
+
+`programs.rs` derives structural vertex recipes from the uploaded material.
+Numeric parameters and texture handles stay in uniforms/bind groups. Mode 3
+shares basic/enhanced shader families with uniform material choices; mode 4
+generates matching interfaces and unrolls only the encountered operations.
+
+`program_key` and `program_variant` are the authoritative classification and
+effective base-pass dependencies. Non-snow stages can drop snow deformation;
+stages without PBR companions/detail/planar operations can drop those features.
+Reflected views and authored fog/dlight/glow redraws retain their existing pass
+implementations. Settings outside the experimental envelope retain mode 1.
+
+The program tag and vertex recipe are part of material/cache/binding identity.
+General pass cache identities normalize the mode policy out; managed base passes
+retain their actual program tag and effective feature key. Sorting compares that
+same identity. A mode switch activates the new complete variant atomically.
+
+Generated source reuses the checked-in WGSL equations. Wave evaluation uses the
+same evaluator in the vertex stage and a flat varying in the fragment stage.
+All linked base/redraw position outputs must agree for depth-equal rendering.
+
+`perfsample` and `renderperf` report requested/active modes and actual base-pass
+program binds. Cold `[WORLD STAGE RECIPES]` logs report recipe/program-pair/PSO
+counts and fallback reasons. These counts distinguish prepared recipes, bound
+programs and GPU execution; none is a measurement of shader speed.

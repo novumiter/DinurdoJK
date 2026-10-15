@@ -560,7 +560,6 @@ impl VertexLimits {
 pub(crate) struct VertexSlot {
     pub(crate) buffer: Arc<Buffer>,
     pub(crate) range: Range<BufferAddress>,
-    pub(crate) is_dirty: bool,
 }
 
 /// Vertex buffer tracking state, shared between render passes and render bundles.
@@ -570,6 +569,12 @@ pub(crate) struct VertexSlot {
 #[derive(Debug, Default)]
 pub(crate) struct VertexState {
     slots: [Option<VertexSlot>; hal::MAX_VERTEX_BUFFERS],
+    // DinurdoJK patch: bit `i` is set while `slots[i]` is `Some` (`assigned`)
+    // and while it still has to be flushed to the HAL encoder (`dirty`). Every
+    // draw validates and flushes the slots, so these replace two scans of all
+    // MAX_VERTEX_BUFFERS slots per draw with bit operations.
+    assigned: u32,
+    dirty: u32,
     pub(crate) limits: VertexLimits,
 }
 
@@ -581,16 +586,16 @@ impl VertexState {
         buffer: Arc<Buffer>,
         range: Range<BufferAddress>,
     ) {
-        self.slots[slot] = Some(VertexSlot {
-            buffer,
-            range,
-            is_dirty: true,
-        });
+        self.slots[slot] = Some(VertexSlot { buffer, range });
+        self.assigned |= 1 << slot;
+        self.dirty |= 1 << slot;
     }
 
     /// Clear a vertex buffer slot.
     pub(crate) fn clear_buffer(&mut self, slot: usize) {
         self.slots[slot] = None;
+        self.assigned &= !(1 << slot);
+        self.dirty &= !(1 << slot);
     }
 
     /// Recompute the cached vertex and instance limits based on the current slots and pipeline.
@@ -604,11 +609,7 @@ impl VertexState {
     }
 
     fn last_assigned_index(&self) -> Option<usize> {
-        self.slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|_| i))
-            .next_back()
+        (self.assigned != 0).then(|| (u32::BITS - 1 - self.assigned.leading_zeros()) as usize)
     }
 
     pub(super) fn validate(
@@ -623,7 +624,7 @@ impl VertexState {
             .enumerate()
             .filter_map(|(index, step)| step.map(|_| index))
         {
-            if self.slots[index].is_none() {
+            if self.assigned & (1 << index) == 0 {
                 return Err(DrawError::MissingVertexBuffer {
                     pipeline: pipeline.error_ident(),
                     index,
@@ -653,12 +654,13 @@ impl VertexState {
     where
         F: FnMut(u32, &Arc<Buffer>, BufferAddress, Option<BufferSize>),
     {
-        for (i, slot) in self.slots.iter_mut().enumerate() {
-            let Some(slot) = slot.as_mut() else { continue };
-            if !slot.is_dirty {
+        let mut dirty = core::mem::take(&mut self.dirty);
+        while dirty != 0 {
+            let i = dirty.trailing_zeros() as usize;
+            dirty &= dirty - 1;
+            let Some(slot) = self.slots[i].as_ref() else {
                 continue;
-            }
-            slot.is_dirty = false;
+            };
             let size = slot.range.end - slot.range.start;
             f(
                 i as u32,

@@ -3,7 +3,7 @@
 //! storage stays native, including animation, Force, weapon and event state.
 mod collision;
 mod ffi;
-pub use collision::{CollisionWorld, EntityClip, SourceCollisionBrush, SourceCollisionPlane};
+pub use collision::{collision_merge_enabled, set_collision_merge_enabled, CollisionWorld, EntityClip, PlacedInlineCollision, SourceCollisionBrush, SourceCollisionPlane};
 use std::{
     ffi::{c_void, CStr},
     ptr::NonNull,

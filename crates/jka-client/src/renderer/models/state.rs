@@ -18,6 +18,7 @@ impl DynamicModelRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         camera_layout: &wgpu::BindGroupLayout,
+        glass_layout: &wgpu::BindGroupLayout,
         surface_format: wgpu::TextureFormat,
         samples: u32,
         white: &GpuImage,
@@ -53,7 +54,7 @@ impl DynamicModelRenderer {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA dynamic model shader"),
             source: wgpu::ShaderSource::Wgsl(
-                crate::weather::with_model_weather(include_str!("../../md3.wgsl")).into(),
+                crate::glass::model_shader(include_str!("../../md3.wgsl"), 2).into(),
             ),
         });
         let skin_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -75,10 +76,28 @@ impl DynamicModelRenderer {
             ],
             immediate_size: 0,
         });
+        // Glass variants also sample the shared opaque-scene snapshot. Every
+        // other pipeline keeps the original layouts so no draw path has to
+        // bind a group it does not read.
+        let glass_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA dynamic model glass pipeline layout"),
+            bind_group_layouts: &[Some(camera_layout), Some(&texture_layout), Some(glass_layout)],
+            immediate_size: 0,
+        });
+        let glass_skin_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("JKA Ghoul2 GPU skinning glass pipeline layout"),
+            bind_group_layouts: &[
+                Some(camera_layout),
+                Some(&texture_layout),
+                Some(&skin_layout),
+                Some(glass_layout),
+            ],
+            immediate_size: 0,
+        });
         let skin_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JKA Ghoul2 GPU skinning shader"),
             source: wgpu::ShaderSource::Wgsl(
-                crate::weather::with_model_weather(include_str!("../../ghoul2_skin.wgsl"))
+                crate::glass::model_shader(include_str!("../../ghoul2_skin.wgsl"), 3)
                     .into(),
             ),
         });
@@ -267,6 +286,7 @@ impl DynamicModelRenderer {
         );
 
         Self {
+            camera_layout: camera_layout.clone(),
             texture_layout,
             entity_lighting_buffer,
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
@@ -281,6 +301,8 @@ impl DynamicModelRenderer {
             legacy_fog_compiled: false,
             model_wet_compiled: true,
             pipeline_layout,
+            glass_pipeline_layout,
+            glass_skin_pipeline_layout,
             shader,
             wireframe_pipeline: None,
             model_pipelines: Default::default(),
@@ -334,6 +356,11 @@ impl DynamicModelRenderer {
             fx_sprite_instance_buffer,
             fx_sprite_instance_capacity,
             fx_sprite_draws: Vec::new(),
+            resident_fx: None,
+            resident_fx_frame: None,
+            resident_fx_requested_modes: 0,
+            resident_fx_draws: Vec::new(),
+            resident_fx_slots: Vec::new(),
             scratch_fx_sprite_instances: Vec::new(),
             blob_mesh_vertices: Vec::new(),
             blob_mesh_indices: Vec::new(),
@@ -343,6 +370,7 @@ impl DynamicModelRenderer {
             skin_bone_capacity,
             skin_draw_capacity,
             skin_bind_group,
+            glass_bind_group: None,
             skin_draws: Vec::new(),
             skin_instance_entities: Vec::new(),
             ghoul2_batch_draws: Ghoul2BatchMode::Adaptive,
@@ -360,8 +388,9 @@ impl DynamicModelRenderer {
             md3_stream_cache: Default::default(),
             model_index_upload_cache: true,
             index_upload_cache: super::prepare::IndexUploadCache::default(),
-            ghoul2_batch_key_cache: false,
+            ghoul2_batch_key_cache: true,
             next_texture_binding_id: 1,
+            next_ghoul2_group_id: 1,
             capture_prepare: false,
             perf_prepare: super::prepare::PreparePerf::default(),
             perf_phase_calls: std::cell::Cell::new(super::submission::ModelPhaseCalls::default()),
@@ -376,6 +405,11 @@ impl DynamicModelRenderer {
             scratch_draw_data: Vec::new(),
             scratch_bone_offsets: HashMap::new(),
             scratch_skin_pending: Vec::new(),
+            scratch_batch_counts: HashMap::new(),
+            scratch_group_lookup: HashMap::new(),
+            scratch_frame_groups: Vec::new(),
+            scratch_group_sort: Vec::new(),
+            scratch_group_order: Vec::new(),
             rt_skinning: None,
             rt_prepared: false,
             frame_texture_keys: HashMap::new(),
@@ -430,6 +464,7 @@ impl DynamicModelRenderer {
     ) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         draw.alpha_mode.hash(&mut hasher);
+        draw.source_material.hash(&mut hasher);
         draw.mesh_key.hash(&mut hasher);
         draw.texture_key.hash(&mut hasher);
         // Glow Off keeps the original batching key and grouping behavior.
@@ -439,51 +474,183 @@ impl DynamicModelRenderer {
         hasher.finish()
     }
 
+    /// Probe the complete frame in O(n), instead of sampling 64 entries and
+    /// missing repeated skins at the tail of a crowd. Only enable the sort
+    /// when at least two indexed draws could be eliminated. An individual
+    /// two-instance surface is legal to batch, but rarely repays a full sort.
+    /// A hash collision can only cause an unnecessary sort: exact keys are
+    /// checked again by the grouping pass, and never merged by hash alone.
     pub(in crate::renderer) fn should_adaptively_batch(
         pending: &mut [Ghoul2PendingDraw],
         prepare_authored_glow: bool,
+        separate_wireframe_classes: bool,
+        excluded_entity: Option<u16>,
+        counts: &mut HashMap<(u64, u32), u32>,
     ) -> bool {
-        const MIN_SURFACES: usize = 32;
-        const SAMPLE_SURFACES: usize = 64;
-        const MIN_MATCHING_INSTANCES: u8 = 3;
-
-        if pending.len() < MIN_SURFACES {
-            return false;
-        }
-
-        // Start the real batching analysis, but only over a bounded set of
-        // entries spread across the full frame.  The previous implementation
-        // inspected only the first 64 surfaces, which could completely miss a
-        // large repeated crowd later in the submission list.
-        let sample_count = pending.len().min(SAMPLE_SURFACES);
-        let mut counts: HashMap<u64, u8> = HashMap::with_capacity(sample_count);
-        for sample in 0..sample_count {
-            let index = if sample_count <= 1 {
-                0
-            } else {
-                sample * (pending.len() - 1) / (sample_count - 1)
-            };
-            let draw = &mut pending[index];
-            if !matches!(
-                draw.alpha_mode,
-                DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
-            ) {
+        const MIN_SAVED_DRAWS: usize = 2;
+        counts.clear();
+        let mut saved_draws = 0usize;
+        for draw in pending {
+            if !matches!(draw.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                || Some(draw.entity_num) == excluded_entity
+            {
                 continue;
             }
-            let hash = if let Some(hash) = draw.batch_hash {
-                hash
-            } else {
-                let hash = Self::ghoul2_batch_hash(draw, prepare_authored_glow);
-                draw.batch_hash = Some(hash);
-                hash
+            let hash = match draw.batch_hash {
+                Some(hash) => hash,
+                None => {
+                    let hash = Self::ghoul2_batch_hash(draw, prepare_authored_glow);
+                    draw.batch_hash = Some(hash);
+                    hash
+                }
             };
-            let count = counts.entry(hash).or_insert(0);
-            *count = count.saturating_add(1);
-            if *count >= MIN_MATCHING_INSTANCES {
-                return true;
+            let wireframe = if separate_wireframe_classes {
+                draw.wireframe_class.mask_bit()
+            } else { 0 };
+            let count = counts.entry((hash, wireframe)).or_insert(0);
+            if *count != 0 {
+                saved_draws += 1;
+                if saved_draws >= MIN_SAVED_DRAWS { return true; }
             }
+            *count += 1;
         }
         false
+    }
+
+    /// Cached, linear-time gather of visible GLM surfaces. Precomputed unique
+    /// group IDs encode invariant mesh/material compatibility; the only work
+    /// left on the render thread is bucketing *visible* instances. Sort the
+    /// number of distinct groups instead of sorting all surface submissions.
+    /// Unlike snapshot-cached visibility this also handles interpolation,
+    /// local prediction, LOD, material and companion changes between snaps.
+    pub(in crate::renderer) fn prepare_cached_ghoul2_order(
+        pending: &[Ghoul2PendingDraw],
+        separate_wireframe_classes: bool,
+        excluded_entity: Option<u16>,
+        mode: Ghoul2BatchMode,
+        lookup: &mut HashMap<(u64, u32), usize>,
+        groups: &mut Vec<super::prepare::Ghoul2FrameGroup>,
+        group_sort: &mut Vec<usize>,
+        order: &mut Vec<usize>,
+    ) -> bool {
+        lookup.clear();
+        order.clear();
+        group_sort.clear();
+        // Reuse the high-water bucket allocation. Clear only buckets actually
+        // visited in this frame; old, unused buckets may remain untouched.
+        if mode == Ghoul2BatchMode::Off || pending.len() < 2 {
+            return false;
+        }
+        let mut used = 0usize;
+        let mut saved = 0usize;
+        for (index, draw) in pending.iter().enumerate() {
+            if !matches!(draw.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                || Some(draw.entity_num) == excluded_entity
+            {
+                continue;
+            }
+            let Some(id) = draw.batch_group_id else { continue };
+            let wire = if separate_wireframe_classes { draw.wireframe_class.mask_bit() } else { 0 };
+            let key = (id, wire);
+            let group_index = match lookup.entry(key) {
+                Entry::Occupied(entry) => {
+                    saved += 1;
+                    *entry.get()
+                }
+                Entry::Vacant(entry) => {
+                    let group_index = used;
+                    used += 1;
+                    if group_index == groups.len() {
+                        groups.push(super::prepare::Ghoul2FrameGroup::default());
+                    }
+                    let group = &mut groups[group_index];
+                    group.indices.clear();
+                    group.sort_key = (
+                        u8::from(matches!(draw.alpha_mode, DynamicModelAlphaMode::Mask)),
+                        wire,
+                        draw.source_material,
+                        draw.texture_binding_id,
+                        id,
+                    );
+                    entry.insert(group_index);
+                    group_index
+                }
+            };
+            groups[group_index].indices.push(index);
+        }
+        if mode == Ghoul2BatchMode::Adaptive && saved < 2 {
+            return false;
+        }
+        group_sort.extend(0..used);
+        group_sort.sort_unstable_by_key(|&i| groups[i].sort_key);
+        for &i in group_sort.iter() {
+            order.extend_from_slice(&groups[i].indices);
+        }
+        // Preserve order for translucent and companion-excluded surfaces.
+        for (index, draw) in pending.iter().enumerate() {
+            if !matches!(draw.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                || Some(draw.entity_num) == excluded_entity
+                || draw.batch_group_id.is_none()
+            {
+                order.push(index);
+            }
+        }
+        debug_assert_eq!(order.len(), pending.len());
+        true
+    }
+
+    /// Sort only commutative opaque/masked GLM draws. Transparent and
+    /// companion-excluded surfaces retain their relative submission order.
+    pub(in crate::renderer) fn sort_ghoul2_pending(
+        pending: &mut [Ghoul2PendingDraw],
+        prepare_authored_glow: bool,
+        separate_wireframe_classes: bool,
+        companion_excluded_entity: Option<u16>,
+    ) {
+        pending.sort_unstable_by(|a, b| {
+            let batchable_a = matches!(
+                a.alpha_mode,
+                DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
+            ) && Some(a.entity_num) != companion_excluded_entity;
+            let batchable_b = matches!(
+                b.alpha_mode,
+                DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
+            ) && Some(b.entity_num) != companion_excluded_entity;
+            match (batchable_a, batchable_b) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => a.sequence.cmp(&b.sequence),
+                (true, true) => {
+                    let alpha_a = u8::from(matches!(a.alpha_mode, DynamicModelAlphaMode::Mask));
+                    let alpha_b = u8::from(matches!(b.alpha_mode, DynamicModelAlphaMode::Mask));
+                    let order = alpha_a.cmp(&alpha_b);
+                    let order = if separate_wireframe_classes {
+                        order.then_with(|| {
+                            a.wireframe_class
+                                .mask_bit()
+                                .cmp(&b.wireframe_class.mask_bit())
+                        })
+                    } else {
+                        order
+                    };
+                    order
+                        // A Source VMT changes the pipeline. Keep it as a
+                        // primary sort dimension rather than interleaving
+                        // incompatible Source/non-Source draws of a mesh.
+                        .then_with(|| a.source_material.cmp(&b.source_material))
+                        // Multiple GLM meshes commonly share a skin. Sort
+                        // by the existing GPU texture binding instead of
+                        // randomizing material locality with a mesh hash.
+                        .then_with(|| a.texture_binding_id.cmp(&b.texture_binding_id))
+                        .then_with(|| a.texture_key.as_deref().cmp(&b.texture_key.as_deref()))
+                        .then_with(|| a.batch_hash.cmp(&b.batch_hash))
+                        .then_with(|| a.mesh_key.as_ref().cmp(b.mesh_key.as_ref()))
+                        .then_with(|| if prepare_authored_glow {
+                            a.authored_glow.cmp(&b.authored_glow)
+                        } else { std::cmp::Ordering::Equal })
+                }
+            }
+        });
     }
 
     pub(in crate::renderer) fn ghoul2_draw_stats(&self) -> (u32, u32) {

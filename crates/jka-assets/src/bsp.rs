@@ -6,6 +6,7 @@ mod collision;
 pub mod bathymetry;
 mod marks;
 mod visibility;
+pub mod patch;
 pub use collision::{CollisionLeaf, CollisionNode, CollisionTree};
 pub use marks::{MarkBuffer, MarkFragment, MarkSurfaces, CONTENTS_FOG, SURF_NOIMPACT, SURF_NOMARKS};
 pub use visibility::{AreaLocator, Visibility};
@@ -17,6 +18,7 @@ pub const MAX_FILE_BYTES: usize = 512 * 1024 * 1024;
 // JKA codemp/game/surfaceflags.h. The low five bits are MATERIAL_*;
 // Quake 3's 0x4 SKY / 0x80 NODRAW values do NOT apply to RBSP.
 pub const MATERIAL_MASK: u32 = 0x0000_001f;
+pub const MATERIAL_GLASS: u32 = 10;
 pub const MATERIAL_SNOW: u32 = 14;
 pub const CONTENTS_SOLID: u32 = 0x0000_0001;
 pub const CONTENTS_TERRAIN: u32 = 0x0000_1000;
@@ -130,6 +132,8 @@ pub struct Surface {
     pub lightmap_styles: [u8; 4],
     pub vertex_styles: [u8; 4],
     pub patch_size: [usize; 2],
+    /// Patches use lightmapVecs[0..2] as authored LOD-group bounds.
+    pub patch_lod_bounds: [[f32; 3]; 2],
 }
 
 #[derive(Debug, Clone)]
@@ -447,6 +451,11 @@ impl Bsp {
                 lightmap_styles: row[28..32].try_into().unwrap(),
                 vertex_styles: row[32..36].try_into().unwrap(),
                 patch_size,
+                patch_lod_bounds: if kind == SurfaceKind::Patch {
+                    [floats(row, 104)?, floats(row, 116)?]
+                } else {
+                    [[0.0; 3]; 2]
+                },
             });
         }
         let mut planes = Vec::new();
@@ -611,16 +620,16 @@ impl Bsp {
             .collect()
     }
 
-    /// Geometry for the renderer. Patch control grids are pre-tessellated with
-    /// OpenJK's curvature-error subdivision rule (`r_subdivisions` semantics).
-    /// Runtime distance LOD/stitching is not represented by this flattened mesh.
+    /// Fixed geometry for stable map consumers. The historical 1..16 API is
+    /// retained; the renderer uses `world_visual_mesh` for LOD/stitching metadata.
     pub fn world_mesh(&self, patch_subdivisions: usize) -> Result<Mesh> {
         let mut mesh = Mesh {
             vertices: Vec::new(),
             indices: Vec::new(),
             batches: Vec::new(),
+            patches: Vec::new(),
         };
-        self.append_model_mesh(&mut mesh, 0, patch_subdivisions)?;
+        self.append_model_mesh(&mut mesh, 0, patch_subdivisions, None)?;
         Ok(mesh)
     }
 
@@ -634,10 +643,11 @@ impl Bsp {
             vertices: Vec::new(),
             indices: Vec::new(),
             batches: Vec::new(),
+            patches: Vec::new(),
         };
         let mut batch_models = Vec::new();
         for model in 1..self.models.len() {
-            self.append_model_mesh(&mut mesh, model, patch_subdivisions)?;
+            self.append_model_mesh(&mut mesh, model, patch_subdivisions, None)?;
             batch_models.resize(mesh.batches.len(), model as u32);
         }
         Ok((mesh, batch_models))
@@ -790,7 +800,7 @@ impl Bsp {
         Ok(mesh)
     }
 
-    fn append_model_mesh(&self, mesh: &mut Mesh, model: usize, patch_subdivisions: usize) -> Result<()> {
+    fn append_model_mesh(&self, mesh: &mut Mesh, model: usize, patch_subdivisions: usize, visual_grids: Option<&[Option<PatchGrid>]>) -> Result<()> {
         if !(1..=16).contains(&patch_subdivisions) {
             return Err(invalid("patch subdivisions must be 1..16"));
         }
@@ -811,12 +821,13 @@ impl Bsp {
             if surface.kind == SurfaceKind::Patch {
                 let [width, height] = surface.patch_size;
                 let controls = &self.vertices[surface.vertices.clone()];
-                let grid = subdivide_patch_to_grid(
-                    width,
-                    height,
-                    controls,
-                    patch_subdivisions as f32,
-                )?;
+                let generated;
+                let grid = if let Some(grids) = visual_grids {
+                    grids[surface_index].as_ref().expect("drawable patch prepared")
+                } else {
+                    generated = subdivide_patch_to_grid(width, height, controls, patch_subdivisions as f32)?;
+                    &generated
+                };
                 let index_count = (grid.width - 1)
                     .checked_mul(grid.height - 1)
                     .and_then(|quads| quads.checked_mul(6))
@@ -837,6 +848,13 @@ impl Bsp {
                         .copied()
                         .map(|vertex| render_vertex(vertex, surface)),
                 );
+                if visual_grids.is_some() {
+                    mesh.patches.push(patch::MeshPatch {
+                        surface: surface_index,
+                        vertices: base as usize..mesh.vertices.len(),
+                        lod: patch::PatchLod::from_grid(grid, surface.patch_lod_bounds),
+                    });
+                }
                 for y in 0..grid.height - 1 {
                     for x in 0..grid.width - 1 {
                         let a = base + (y * grid.width + x) as u32;
@@ -1159,6 +1177,7 @@ pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub batches: Vec<DrawBatch>,
+    pub patches: Vec<patch::MeshPatch>,
 }
 
 /// Static acoustic triangle soup in native JKA coordinates. `materials` is
@@ -1232,6 +1251,10 @@ struct PatchGrid {
     width: usize,
     height: usize,
     vertices: Vec<Vertex>,
+    width_lod_error: Vec<f32>,
+    height_lod_error: Vec<f32>,
+    subdivision_error: f32,
+    stitched_vertices: usize,
 }
 
 const OPENJK_MAX_GRID_SIZE: usize = 65;
@@ -1366,6 +1389,10 @@ fn subdivide_patch_to_grid(
         width: grid_width,
         height: grid_height,
         vertices,
+        width_lod_error: error_table[0][..grid_width].to_vec(),
+        height_lod_error: error_table[1][..grid_height].to_vec(),
+        subdivision_error,
+        stitched_vertices: 0,
     })
 }
 

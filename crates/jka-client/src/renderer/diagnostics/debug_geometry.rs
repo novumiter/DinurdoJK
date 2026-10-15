@@ -450,7 +450,7 @@ pub(in crate::renderer) fn create_debug_volume_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -512,7 +512,7 @@ pub(in crate::renderer) fn create_sun_ray_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -567,7 +567,7 @@ pub(in crate::renderer) fn create_surface_inspector_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -673,7 +673,7 @@ pub(in crate::renderer) fn create_screen_fx_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -710,6 +710,6 @@ pub(in crate::renderer) fn create_ui_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }

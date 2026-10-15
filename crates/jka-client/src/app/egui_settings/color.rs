@@ -19,7 +19,7 @@ impl App {
                     .width(230.0)
                     .show_ui(ui, |ui| {
                         for method in crate::gamma::GammaMethod::ALL {
-                            if ui.add_enabled(self.video.hdr_output == 0 || method != crate::gamma::GammaMethod::Hardware, egui::Button::selectable(self.video.gamma_method == method, method.label())).clicked() {
+                            if ui.add_enabled(!self.native_hdr_blocks_hardware_gamma() || method != crate::gamma::GammaMethod::Hardware, egui::Button::selectable(self.video.gamma_method == method, method.label())).clicked() {
                                 self.set_gamma_method(method);
                             }
                         }
@@ -95,22 +95,86 @@ impl App {
             "HDR",
             "Scene precision, HDR baked lighting and highlight rolloff.",
         );
-        theme::row(ui, "Display output", "HDR Auto selects scRGB or HDR10 when the display and Windows HDR support it. Apply Video Settings to change output mode. Unsupported modes fall back to SDR.", theme::Reset::Color("r_hdrOutput"), |ui| {
-            egui::ComboBox::from_id_salt("hdr_output").selected_text(crate::renderer::hdr_output::OUTPUT_LABELS[self.video.hdr_output as usize])
-                .show_ui(ui, |ui| {
-                    for (mode, label) in crate::renderer::hdr_output::OUTPUT_LABELS.iter().enumerate() {
-                        if ui.selectable_label(self.video.hdr_output == mode as u32, *label).clicked() {
-                            let _ = self.cvar_set_hdr_output("r_hdrOutput", &mode.to_string());
-                        }
-                    }
-                });
-        });
-        ui.label(
-            egui::RichText::new(&self.hdr_output_status)
-                .small()
-                .color(ui.visuals().weak_text_color()),
+        // Match the Dynamic Lights row: one switch and its enabled quality
+        // levels share a single row. The switch is strictly r_hdr 0/1;
+        // selecting either meter segment sets r_hdr to 1 or 2.
+        let changing_adapter = self.video.renderer_backend != self.applied_renderer_backend
+            || self.video.gpu_adapter != self.applied_gpu_adapter;
+        let known_for_adapter = self.hdr_modes_known && !changing_adapter;
+        let available_modes = self.hdr_available_modes;
+        let supports = |mode: u32| -> bool {
+            (1..=3).contains(&mode)
+                && known_for_adapter
+                && (available_modes & (1 << mode)) != 0
+        };
+        let any_native_output = (1..=3).any(|mode| supports(mode));
+        let hdr_mode = self.video.hdr_mode();
+        let hdr_preview_label = theme::preset_preview_target_label(ui.ctx(), theme::Reset::Video(ui::VIDEO_ROW_HDR));
+        let display_hdr_mode = match hdr_preview_label.as_deref() {
+            Some("Off") => 0usize,
+            Some("HDR Math Only") => 1usize,
+            Some("Full HDR Output") => 2usize,
+            _ => hdr_mode as usize,
+        };
+        let next_hdr_mode = theme::row(
+            ui,
+            "HDR",
+            "Off disables HDR math. HDR Math Only keeps the normal SDR output path. \
+             Full HDR Output requires a supported monitor, GPU and backend.",
+            theme::Reset::Video(ui::VIDEO_ROW_HDR),
+            |ui| {
+                let width = theme::track_width(ui);
+                theme::quality_meter_power_limited(
+                    ui,
+                    display_hdr_mode,
+                    &["HDR Math Only", "Full HDR Output"],
+                    width,
+                    if any_native_output { 2 } else { 1 },
+                )
+            },
         );
-        ui.add_enabled_ui(self.video.hdr_output != 0, |ui| {
+        if let Some(mode) = next_hdr_mode {
+            if mode == 2 && !supports(self.video.hdr_style + 1) {
+                // If the preferred style is unavailable, use the first native
+                // format accepted by this display and backend.
+                if let Some(output) = (1..=3).find(|&output| supports(output)) {
+                    let _ = self.cvar_set_hdr_style("r_hdrStyle", &(output - 1).to_string());
+                }
+            }
+            let _ = self.cvar_set_r_hdr("r_hdr", &mode.to_string());
+        }
+        ui.add_enabled_ui(hdr_mode != 0, |ui| {
+            theme::row(
+                ui, "HDR output style",
+                "Output encoding for Full HDR Output. Changing this preference in HDR Math Only does not change presentation.",
+                theme::Reset::Color("r_hdrStyle"),
+                |ui| {
+                    let style = self.video.hdr_style.min(2);
+                    ui.add_enabled_ui(any_native_output, |ui| {
+                        egui::ComboBox::from_id_salt("hdr_style")
+                            .selected_text(if any_native_output {
+                                crate::renderer::hdr_output::OUTPUT_LABELS[(style + 1) as usize]
+                            } else { "Unavailable" })
+                            .width(230.0)
+                            .show_ui(ui, |ui| {
+                                for candidate in 0..=2_u32 {
+                                    if ui.add_enabled(supports(candidate + 1), egui::Button::selectable(
+                                        style == candidate,
+                                        crate::renderer::hdr_output::OUTPUT_LABELS[(candidate + 1) as usize]
+                                    )).clicked() {
+                                        let _ = self.cvar_set_hdr_style("r_hdrStyle", &candidate.to_string());
+                                    }
+                                }
+                            });
+                    });
+                },
+            );
+        });
+        // Nits calibration is meaningful only with native HDR selected/active.
+        // These controls do not affect HDR Math Only on an SDR display.
+        let native_hdr = self.hdr_output_active
+            || (self.video.hdr_mode() == 2 && supports(self.video.hdr_output));
+        ui.add_enabled_ui(native_hdr, |ui| {
             theme::row(ui, "HDR paper white", "Brightness of ordinary whites and UI, in nits. Highlights have room above this level.", theme::Reset::Color("r_hdrPaperWhite"), |ui| {
                 let mut white = self.video.hdr_paper_white;
                 let readout = format!("{white:.0} nits");
@@ -126,20 +190,7 @@ impl App {
                 }
             });
         });
-        // HDR is a framebuffer format decision: it determines the precision
-        // used by lighting and every downstream color/post-processing pass.
-        ui.add_enabled_ui(self.video.hdr_output == 0, |ui| {
-            self.egui_toggle_row(
-                ui,
-                "HDR rendering",
-                "Renders into a floating-point buffer so highlights can exceed white \
-             instead of clipping. Costs bandwidth, and is what gives bloom and \
-             tone mapping something to work with.",
-                ui::VIDEO_ROW_HDR,
-                self.video.hdr || self.video.hdr_output != 0,
-            );
-        });
-        ui.add_enabled_ui(self.video.hdr || self.video.hdr_output != 0, |ui| {
+        ui.add_enabled_ui(self.video.hdr_mode() != 0, |ui| {
             self.egui_toggle_row(
                 ui,
                 "Float lightmaps",
@@ -149,25 +200,35 @@ impl App {
                 ui::VIDEO_ROW_FLOAT_LIGHTMAP,
                 self.video.float_lightmap,
             );
-            self.egui_toggle_row(
+            theme::row(
                 ui,
                 "Tone mapping",
-                "Maps the HDR frame down to what the display can show, rolling off \
-                 highlights instead of clipping them.",
-                ui::VIDEO_ROW_TONE_MAPPING,
-                self.video.tone_mapping,
+                "Strength of the SDR ACES / native HDR highlight rolloff. 0% disables the effect; 100% keeps the original appearance.",
+                theme::Reset::Video(ui::VIDEO_ROW_TONE_MAPPING),
+                |ui| {
+                    let mut value = self.video.tone_mapping;
+                    let readout = percent(value);
+                    if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                        self.set_tone_mapping_strength(value);
+                    }
+                },
             );
         });
         ui.add_enabled_ui(
-            (self.video.hdr || self.video.hdr_output != 0) && self.video.tone_mapping,
+            (self.video.hdr_mode() != 0) && self.video.tone_mapping > 0.0,
             |ui| {
-                self.egui_toggle_row(
+                theme::row(
                     ui,
                     "Auto exposure",
-                    "Meters HDR scene luminance and smoothly adapts exposure before tone \
-                 mapping, similar to eye/camera adaptation.",
-                    ui::VIDEO_ROW_AUTO_EXPOSURE,
-                    self.video.auto_exposure,
+                    "Amount of adaptive exposure correction. 0% disables metering; 100% keeps the original response speed and range.",
+                    theme::Reset::Video(ui::VIDEO_ROW_AUTO_EXPOSURE),
+                    |ui| {
+                        let mut value = self.video.auto_exposure;
+                        let readout = percent(value);
+                        if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                            self.set_auto_exposure_strength(value);
+                        }
+                    },
                 );
             },
         );

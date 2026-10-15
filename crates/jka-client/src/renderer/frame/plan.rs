@@ -17,10 +17,16 @@ pub(super) struct WorldTransparencyOrder {
 }
 
 impl WorldTransparencyOrder {
+    /// Attached world decals must be in the optical background. Their blend
+    /// class does not make them an independent translucent pane. Explicit late
+    /// authoring still takes precedence. No change when glass is absent.
+    pub(super) fn capture_decal(glass: bool, polygon_offset: bool, late_sorted: bool) -> bool {
+        glass && polygon_offset && !late_sorted
+    }
     pub(super) fn defer_stage(
         &mut self, vertices: &std::ops::Range<u32>, shader: u32,
         class: crate::scene::DrawClass, opaque_composite_before_clouds: bool,
-        late_sorted_material: bool,
+        late_sorted_material: bool, early_sorted_material: bool,
     ) -> bool {
         let same_surface = self.surface.as_ref().is_some_and(|(previous, previous_shader)|
             previous == vertices && *previous_shader == shader);
@@ -31,9 +37,12 @@ impl WorldTransparencyOrder {
         // TaystJK sorts the *shader*, not individual stages. An explicit
         // late sort must defer the alpha-tested/opaque depth seed as well as
         // its blended siblings, preserving `depthFunc equal` overlays.
+        // A shader sorted before SS_OPAQUE (portal mirrors) draws first in
+        // TaystJK even when its stages blend; its depth seeds what follows.
         self.deferred |= late_sorted_material
             || (class == crate::scene::DrawClass::Transparent
-                && !opaque_composite_before_clouds);
+                && !opaque_composite_before_clouds
+                && !early_sorted_material);
         self.deferred
     }
 }
@@ -44,13 +53,21 @@ mod transparency_order_tests {
     use crate::scene::DrawClass::{Opaque, Transparent};
 
     #[test]
+    fn glass_capture_includes_attached_decals_but_preserves_explicit_late_sort() {
+        assert!(WorldTransparencyOrder::capture_decal(true, true, false));
+        assert!(!WorldTransparencyOrder::capture_decal(false, true, false));
+        assert!(!WorldTransparencyOrder::capture_decal(true, false, false));
+        assert!(!WorldTransparencyOrder::capture_decal(true, true, true));
+    }
+
+    #[test]
     fn opaque_entities_render_before_water_without_reversing_later_shader_stages() {
         let mut order = WorldTransparencyOrder::default();
         let stages = [(0..3, 0, Opaque), (3..6, 1, Transparent),
             (3..6, 1, Opaque), (6..9, 2, Opaque)];
         let (mut before_entities, mut after_entities) = (Vec::new(), Vec::new());
         for (index, (vertices, shader, class)) in stages.iter().enumerate() {
-            if order.defer_stage(vertices, *shader, *class, false, false) {
+            if order.defer_stage(vertices, *shader, *class, false, false, false) {
                 after_entities.push(index);
             } else {
                 before_entities.push(index);
@@ -61,15 +78,25 @@ mod transparency_order_tests {
     }
 
     #[test]
+    fn portal_sorted_blended_stages_draw_before_opaque() {
+        // A mirror floor (`portal`, SS_PORTAL) seeds depth from a blended
+        // stage; deferring it would show geometry and entities beneath it.
+        let mut order = WorldTransparencyOrder::default();
+        assert!(!order.defer_stage(&(0..6), 7, Transparent, false, false, true));
+        assert!(!order.defer_stage(&(0..6), 7, Transparent, false, false, true));
+        assert!(order.defer_stage(&(6..12), 8, Transparent, false, false, false));
+    }
+
+    #[test]
     fn opaque_terrain_blend_lightmap_and_caustics_finish_before_clouds() {
         let mut order = WorldTransparencyOrder::default();
         // Mirrors sand -> wet sand -> lightmap -> caustics -> depthfade.
         for class in [Opaque, Transparent, Transparent, Transparent, Transparent] {
-            assert!(!order.defer_stage(&(0..6), 109, class, true, false));
+            assert!(!order.defer_stage(&(0..6), 109, class, true, false, false));
         }
         // Stock water is additive and remains behind the cloud multiplier.
-        assert!(order.defer_stage(&(6..12), 102, Transparent, false, false));
-        assert!(order.defer_stage(&(6..12), 102, Transparent, false, false));
+        assert!(order.defer_stage(&(6..12), 102, Transparent, false, false, false));
+        assert!(order.defer_stage(&(6..12), 102, Transparent, false, false, false));
     }
 
     #[test]
@@ -79,21 +106,21 @@ mod transparency_order_tests {
         // seph_seaweed2: masked GL_ONE GL_ZERO depth seed, followed by
         // additive caustics and a source-alpha depthfade overlay.
         let range = 18..198;
-        assert!(order.defer_stage(&range, 114, Mask, false, true));
+        assert!(order.defer_stage(&range, 114, Mask, false, true, false));
         for _ in 0..4 {
-            assert!(order.defer_stage(&range, 114, Transparent, false, true));
+            assert!(order.defer_stage(&range, 114, Transparent, false, true, false));
         }
         // The next material must not inherit the late-sort decision.
-        assert!(!order.defer_stage(&(198..204), 115, Opaque, false, false));
+        assert!(!order.defer_stage(&(198..204), 115, Opaque, false, false, false));
     }
 
     #[test]
     fn distinct_materials_do_not_inherit_another_surfaces_deferred_state() {
         let mut order = WorldTransparencyOrder::default();
-        assert!(order.defer_stage(&(0..3), 0, Transparent, false, false));
-        assert!(!order.defer_stage(&(0..3), 1, Opaque, false, false));
-        assert!(order.defer_stage(&(0..3), 1, Transparent, false, false));
-        assert!(!order.defer_stage(&(3..6), 1, Opaque, false, false));
+        assert!(order.defer_stage(&(0..3), 0, Transparent, false, false, false));
+        assert!(!order.defer_stage(&(0..3), 1, Opaque, false, false, false));
+        assert!(order.defer_stage(&(0..3), 1, Transparent, false, false, false));
+        assert!(!order.defer_stage(&(3..6), 1, Opaque, false, false, false));
     }
 }
 
@@ -166,6 +193,8 @@ impl Renderer {
         // the feature envelope of the known ~2100 FPS renderer: basic BSP, PVS,
         // texture filtering, MSAA, optional wireframe, optional gamma, and UI.
         let fast_baseline = !self.force_unified_world
+            // Curved-grid LOD belongs to the Unified packed BSP path.
+            && self.world.as_ref().is_none_or(|world| !world.patch_lod.has_patches())
             && !self.dynamic_light_debug
             && !self.hdr_enabled
             && !self.tone_mapping_enabled

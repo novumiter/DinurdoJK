@@ -25,8 +25,13 @@ impl App {
         self.egui_renderer_active = false;
         self.egui_apply_video_requested = false;
         self.map_edit_toolbar_rect = None;
+        self.load_frontend_scene_cache();
         self.solo_levelshot_texture = None;
         self.solo_levelshot_texture_map = None;
+        self.model_placement.thumbnails.clear();
+        self.model_placement.thumbnails_pending.clear();
+        self.shader_remap_ui.thumbnails.clear();
+        self.shader_remap_ui.thumbnails_pending.clear();
     }
 
     /// egui owns every menu overlay, not just the Video page.
@@ -49,6 +54,11 @@ impl App {
                     | OverlayMode::EntityGraph
                     | OverlayMode::Trace
                     | OverlayMode::DevRadial
+                    | OverlayMode::ModelPicker
+                    | OverlayMode::BmodelPicker
+                    | OverlayMode::MapMods
+                    | OverlayMode::EmoteRadial
+                    | OverlayMode::ShaderRemap
                     | OverlayMode::StrafeTrails
                     | OverlayMode::RaceGhosts
             ))
@@ -65,6 +75,12 @@ impl App {
     /// input) rather than opening anything.
     pub(in crate::app) fn egui_paint_needed(&self) -> bool {
         self.egui_menu_active()
+            || (self.model_placement.active
+                && self.video_confirmation.is_none()
+                && self.loading.is_none()
+                && !self.video.skip_ui
+                && self.window.is_some()
+                && self.render.is_some())
             || (self.video.draw_entities
                 && self.video_confirmation.is_none()
                 && self.loading.is_none()
@@ -137,7 +153,7 @@ impl App {
         // In the Dev wheel, physical gameplay keys must reach the raw
         // dispatcher so held WASD/+movement keys remain live and can be
         // released while the wheel is showing. Egui must not swallow them.
-        if self.overlay == OverlayMode::DevRadial
+        if matches!(self.overlay, OverlayMode::DevRadial | OverlayMode::EmoteRadial)
             && matches!(event, WindowEvent::KeyboardInput { .. })
         {
             return false;
@@ -168,7 +184,7 @@ impl App {
 
         // Safety net: the wheel intercepts button events before this routing
         // path, so no mouse button may leak into an attack or another bind.
-        if self.overlay == OverlayMode::DevRadial
+        if matches!(self.overlay, OverlayMode::DevRadial | OverlayMode::EmoteRadial)
             && matches!(event, WindowEvent::MouseInput { .. })
         {
             return true;
@@ -250,8 +266,8 @@ impl App {
             {
                 return false;
             }
-            if self.overlay == OverlayMode::DevRadial
-                && self.key_bound_to_dev(code)
+            if (self.overlay == OverlayMode::DevRadial && self.key_bound_to_dev(code))
+                || (self.overlay == OverlayMode::EmoteRadial && self.key_bound_to_emote(code))
             {
                 return false;
             }
@@ -303,6 +319,7 @@ impl App {
             ctx.set_zoom_factor(zoom);
         }
         let raw_input = state.take_egui_input(&window);
+        let present_token = self.frontend_stage_token();
         let egui::FullOutput {
             platform_output,
             mut textures_delta,
@@ -349,10 +366,14 @@ impl App {
             );
             ctx.tessellate(shapes, pixels_per_point)
         };
+        if self.front_end {
+            crate::startup_timeline::mark(crate::startup_timeline::Milestone::MenuBuilt);
+        }
         self.render_command(RenderCommand::SetEgui(Some(EguiRenderData {
             paint_jobs,
             textures_delta,
             pixels_per_point,
+            present_token,
         })));
         self.egui_renderer_active = true;
         self.egui_repaint_requested = false;
@@ -371,7 +392,12 @@ impl App {
             self.egui_entity_labels(ui);
         }
         if !self.egui_menu_active() {
-            // Only the label painter wanted this frame; no menu to open.
+            // Noninteractive developer HUDs must not enter egui's input
+            // catcher: mouse look, wheel and attacks are handled explicitly
+            // by the placement mode's raw input dispatcher.
+            if self.model_placement.active && self.overlay == OverlayMode::None {
+                self.egui_model_placement_hud(ui);
+            }
             return;
         }
         if self.server_password_prompt.is_some() {
@@ -416,6 +442,26 @@ impl App {
         }
         if self.overlay == OverlayMode::DevRadial {
             self.egui_dev_radial(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::ModelPicker {
+            self.egui_model_picker(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::BmodelPicker {
+            self.egui_bmodel_picker(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::MapMods {
+            self.egui_map_mods(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::EmoteRadial {
+            self.egui_emote_radial(ui);
+            return;
+        }
+        if self.overlay == OverlayMode::ShaderRemap {
+            self.egui_shader_remap(ui);
             return;
         }
         if self.overlay == OverlayMode::EntityGraph {
@@ -584,6 +630,18 @@ impl App {
     pub(in crate::app) fn open_ui_page(&mut self, args: &[&str]) {
         let name = args.first().map(|word| word.to_ascii_lowercase());
         let tab = args.get(1).map(|word| word.to_ascii_lowercase());
+        // Optional video subpage supports unattended settings screenshots:
+        // +uipage setup video glass. This uses the same rail destinations.
+        if name.as_deref() == Some("setup") && tab.as_deref() == Some("video") {
+            if let Some(section_name) = args.get(2) {
+                if let Some(&(section, _)) = VideoSection::RENDERING.iter()
+                    .chain(VideoSection::ENVIRONMENT.iter()).chain(VideoSection::TOOLS.iter())
+                    .find(|(section, label)| label.eq_ignore_ascii_case(section_name)
+                        || format!("{section:?}").eq_ignore_ascii_case(section_name)) {
+                    self.video_section = section;
+                }
+            }
+        }
         self.controls_waiting_for_key = false;
         if self.front_end {
             let page = match name.as_deref() {
@@ -1034,6 +1092,7 @@ impl App {
             paint_jobs,
             textures_delta,
             pixels_per_point,
+            present_token: None,
         })));
         self.egui_renderer_active = true;
         self.egui_repaint_requested = false;

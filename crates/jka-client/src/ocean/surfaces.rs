@@ -99,3 +99,58 @@ pub fn is_upward_water_face(source: &DrawBatch, vertices: &[GpuVertex]) -> bool 
     }
     lowest.is_finite() && facing > 0.0 && lowest >= highest - 1.0
 }
+
+/// Whether every vertex of a water-overlay sheet lies within `PLANE_TOLERANCE`
+/// of a promoted ocean plane and inside that ocean's bounds. Such a sheet (e.g.
+/// costadelsol's `seph_surf` shore surf at y=2 and y=4 over the y=3 sea) only
+/// duplicates the surf and foam the FFT ocean already draws.
+pub fn overlay_covered_by_ocean(slice: &[GpuVertex], surfaces: &[super::OceanSurface]) -> bool {
+    const PLANE_TOLERANCE: f32 = 1.05;
+    const EDGE_TOLERANCE: f32 = 1.0;
+    if slice.is_empty() {
+        return false;
+    }
+    let mut low = [f32::INFINITY; 3];
+    let mut high = [f32::NEG_INFINITY; 3];
+    for vertex in slice {
+        for axis in 0..3 {
+            low[axis] = low[axis].min(vertex.position[axis]);
+            high[axis] = high[axis].max(vertex.position[axis]);
+        }
+    }
+    surfaces.iter().any(|ocean| {
+        low[1] >= ocean.plane_height - PLANE_TOLERANCE
+            && high[1] <= ocean.plane_height + PLANE_TOLERANCE
+            && low[0] >= ocean.minimum[0] - EDGE_TOLERANCE
+            && low[2] >= ocean.minimum[1] - EDGE_TOLERANCE
+            && high[0] <= ocean.maximum[0] + EDGE_TOLERANCE
+            && high[2] <= ocean.maximum[1] + EDGE_TOLERANCE
+    })
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    fn vertex(position: [f32; 3]) -> GpuVertex {
+        GpuVertex {
+            position, uv: [0.0; 2], lightmap_uv: [0.0; 2], normal: [0.0, 1.0, 0.0],
+            color: [1.0; 4], alpha_cutoff: 1.0,
+        }
+    }
+
+    #[test]
+    fn surf_sheets_one_unit_off_the_sea_are_covered_but_distant_water_is_not() {
+        let sea = [crate::ocean::OceanSurface {
+            plane_height: 3.0, minimum: [-1000.0, -1000.0], maximum: [1000.0, 1000.0],
+        }];
+        let sheet = |y| [vertex([0.0, y, 0.0]), vertex([100.0, y, 0.0]), vertex([0.0, y, 100.0])];
+        assert!(overlay_covered_by_ocean(&sheet(2.0), &sea), "y=2 under the y=3 sea");
+        assert!(overlay_covered_by_ocean(&sheet(4.0), &sea), "y=4 over the y=3 sea");
+        assert!(!overlay_covered_by_ocean(&sheet(4.5), &sea), "a waterfall ledge, not a surf sheet");
+        assert!(!overlay_covered_by_ocean(&sheet(80.0), &sea));
+        let outside = [vertex([5000.0, 3.0, 0.0]), vertex([5100.0, 3.0, 0.0]), vertex([5000.0, 3.0, 50.0])];
+        assert!(!overlay_covered_by_ocean(&outside, &sea), "outside the sea's bounds");
+        assert!(!overlay_covered_by_ocean(&[], &sea));
+    }
+}

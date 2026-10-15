@@ -25,10 +25,15 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "STEP RIGHT", command: "+moveright", group: "Movement" },
     ControlAction { label: "JUMP", command: "+moveup", group: "Movement" },
     ControlAction { label: "CROUCH", command: "+movedown", group: "Movement" },
+    ControlAction { label: "NO-ROLL DUCK", command: "+duck", group: "Movement" },
+    ControlAction { label: "LOW JUMP", command: "lowjump", group: "Movement" },
     ControlAction { label: "WALK", command: "+speed", group: "Movement" },
 
     ControlAction { label: "USE / INTERACT", command: "+use", group: "Interaction" },
     ControlAction { label: "USE SELECTED ITEM", command: "+button2", group: "Interaction" },
+    ControlAction { label: "NEXT INVENTORY ITEM", command: "invnext", group: "Interaction" },
+    ControlAction { label: "PREVIOUS INVENTORY ITEM", command: "invprev", group: "Interaction" },
+    ControlAction { label: "USE AVAILABLE INVENTORY ITEM", command: "invfree", group: "Interaction" },
     ControlAction { label: "USE BACTA", command: "use_bacta", group: "Interaction" },
     ControlAction { label: "USE SEEKER", command: "use_seeker", group: "Interaction" },
     ControlAction { label: "USE FORCE FIELD", command: "use_field", group: "Interaction" },
@@ -39,6 +44,10 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "ALT ATTACK", command: "+altattack", group: "Weapons" },
     ControlAction { label: "PREVIOUS WEAPON", command: "weapprev", group: "Weapons" },
     ControlAction { label: "NEXT WEAPON", command: "weapnext", group: "Weapons" },
+    ControlAction { label: "LAST WEAPON", command: "weaplast", group: "Weapons" },
+    ControlAction { label: "SINGLEFIRE", command: "+singlefire", group: "Weapons" },
+    ControlAction { label: "SELECT FIRE MODE", command: "selectfiremode", group: "Weapons" },
+    ControlAction { label: "GRAPPLE", command: "+grapple", group: "Weapons" },
     ControlAction { label: "SABER STYLE", command: "saberAttackCycle", group: "Weapons" },
     ControlAction { label: "SABER / MELEE", command: "weapon 1", group: "Weapons" },
     ControlAction { label: "BRYAR PISTOL", command: "weapon 2", group: "Weapons" },
@@ -78,6 +87,8 @@ pub const CONTROL_ACTIONS: &[ControlAction] = &[
     ControlAction { label: "BINOCULAR ZOOM", command: "zoom", group: "Other" },
     ControlAction { label: "ZOOM", command: "+zoom", group: "Other" },
     ControlAction { label: "TAUNT", command: "taunt", group: "Other" },
+    ControlAction { label: "DEV WHEEL", command: "dev", group: "Other" },
+    ControlAction { label: "EMOTE WHEEL", command: "emote", group: "Other" },
     ControlAction { label: "CHALLENGE DUEL", command: "engage_duel", group: "Other" },
     ControlAction { label: "TOGGLE THIRD PERSON", command: "toggle cg_thirdPerson 0 1", group: "Other" },
     // DinurdoJK-local actions stay available, but do not create extra top-level groups.
@@ -480,6 +491,9 @@ pub fn is_supported_button_stem(stem: &str) -> bool {
             | "button13"
             | "button14"
             | "button15"
+            | "singlefire"
+            | "duck"
+            | "grapple"
             | "scores"
             | "zoom"
     )

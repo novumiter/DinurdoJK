@@ -41,6 +41,7 @@ impl DynamicModelRenderer {
         self.fx_sprite_modulate2x_pipeline = None;
         self.fx_sprite_darken_pipeline = None;
         self.fx_sprite_glow_pipelines = Default::default();
+        if let Some(resident) = self.resident_fx.as_mut() { resident.rebuild(); }
         self.skin_pipelines = Default::default();
         self.skin_glow_pipelines = Default::default();
         self.skin_source_pipelines = Default::default();
@@ -61,7 +62,7 @@ impl DynamicModelRenderer {
         if skin {
             let key = PipelineJobKey::new("ghoul2-model", index as u32, config);
             let device = device.clone();
-            let layout = self.skin_pipeline_layout.clone();
+            let layout = if alpha_mode == DynamicModelAlphaMode::Glass { self.glass_skin_pipeline_layout.clone() } else { self.skin_pipeline_layout.clone() };
             let shader = self.skin_shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
             let model_wet = self.model_wet_compiled;
@@ -82,7 +83,7 @@ impl DynamicModelRenderer {
         } else {
             let key = PipelineJobKey::new("dynamic-model", index as u32, config);
             let device = device.clone();
-            let layout = self.pipeline_layout.clone();
+            let layout = if alpha_mode == DynamicModelAlphaMode::Glass { self.glass_pipeline_layout.clone() } else { self.pipeline_layout.clone() };
             let shader = self.shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
             let model_wet = self.model_wet_compiled;
@@ -115,7 +116,7 @@ impl DynamicModelRenderer {
         let config = pipeline_hash(&(surface_format, samples, self.legacy_fog_compiled, self.model_wet_compiled));
         let key = PipelineJobKey::new("ghoul2-model-source", alpha_mode.index() as u32, config);
         let device = device.clone();
-        let layout = self.skin_pipeline_layout.clone();
+        let layout = if alpha_mode == DynamicModelAlphaMode::Glass { self.glass_skin_pipeline_layout.clone() } else { self.skin_pipeline_layout.clone() };
         let shader = self.skin_shader.clone();
         let legacy_fog = self.legacy_fog_compiled;
         let model_wet = self.model_wet_compiled;
@@ -149,7 +150,7 @@ impl DynamicModelRenderer {
         if skin {
             let key = PipelineJobKey::new("ghoul2-model-glow", index as u32, config);
             let device = device.clone();
-            let layout = self.skin_pipeline_layout.clone();
+            let layout = if alpha_mode == DynamicModelAlphaMode::Glass { self.glass_skin_pipeline_layout.clone() } else { self.skin_pipeline_layout.clone() };
             let shader = self.skin_shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
             let model_wet = self.model_wet_compiled;
@@ -170,7 +171,7 @@ impl DynamicModelRenderer {
         } else {
             let key = PipelineJobKey::new("dynamic-model-glow", index as u32, config);
             let device = device.clone();
-            let layout = self.pipeline_layout.clone();
+            let layout = if alpha_mode == DynamicModelAlphaMode::Glass { self.glass_pipeline_layout.clone() } else { self.pipeline_layout.clone() };
             let shader = self.shader.clone();
             let legacy_fog = self.legacy_fog_compiled;
             let model_wet = self.model_wet_compiled;
@@ -301,7 +302,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.is_some(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.is_some(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.is_some(),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => false,
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass => false,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.is_some(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.is_some(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.is_some(),
@@ -321,7 +322,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.as_ref(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.as_ref(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.as_ref(),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => None,
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass => None,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.as_ref(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.as_ref(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.as_ref(),
@@ -342,7 +343,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline = Some(pipeline),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => {},
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass => {},
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline = Some(pipeline),
             DynamicModelAlphaMode::AdditiveOne => {
                 self.fx_sprite_additive_one_pipeline = Some(pipeline)
@@ -426,6 +427,7 @@ impl DynamicModelRenderer {
                 legacy_fog,
                 zero_alpha_discard,
                 false,
+                false,
             )
         });
     }
@@ -474,6 +476,7 @@ impl DynamicModelRenderer {
                 legacy_fog,
                 zero_alpha_discard,
                 true,
+                false,
             )
         });
     }
@@ -680,7 +683,7 @@ pub(in crate::renderer) fn create_dynamic_wireframe_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -735,7 +738,7 @@ pub(in crate::renderer) fn create_ghoul2_wireframe_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -909,7 +912,13 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
     legacy_fog: bool,
     zero_alpha_discard: bool,
     force_fog_black: bool,
+    resident: bool,
 ) -> wgpu::RenderPipeline {
+    let sprite_attributes = [Some(wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<FxGpuSpriteInstance>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &FX_GPU_SPRITE_INSTANCE_ATTRIBUTES,
+    })];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(match alpha_mode {
             DynamicModelAlphaMode::Opaque => "JKA GPU FX sprite opaque pipeline",
@@ -926,17 +935,14 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
             DynamicModelAlphaMode::DstColorAdd => "JKA GPU FX sprite GL_DST_COLOR GL_ONE pipeline",
             DynamicModelAlphaMode::Modulate2x => "JKA GPU FX sprite modulate2x pipeline",
             DynamicModelAlphaMode::Darken => "JKA GPU FX sprite darken pipeline",
+            DynamicModelAlphaMode::Glass => "JKA GPU FX sprite glass fallback pipeline",
         }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_main"),
             compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<FxGpuSpriteInstance>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &FX_GPU_SPRITE_INSTANCE_ATTRIBUTES,
-            })],
+            buffers: if resident { &[] } else { &sprite_attributes },
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -994,7 +1000,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1049,7 +1055,7 @@ pub(in crate::renderer) fn create_fx_sprite_wireframe_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1232,6 +1238,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
                 "JKA dynamic model GL_DST_COLOR GL_SRC_COLOR pipeline"
             }
             DynamicModelAlphaMode::Darken => "JKA dynamic model darken unlit pipeline",
+            DynamicModelAlphaMode::Glass => "JKA dynamic model glass transmission pipeline",
         }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
@@ -1264,6 +1271,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
             module: shader,
             entry_point: Some(match alpha_mode {
                 DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                DynamicModelAlphaMode::Glass => "fs_glass",
                 // OpenJK GLFOGOVERRIDE_BLACK for GL_ONE GL_ONE and
                 // GL_DST_COLOR GL_ZERO stages under r_drawfog 2.
                 DynamicModelAlphaMode::AdditiveOne | DynamicModelAlphaMode::Modulate => {
@@ -1288,7 +1296,7 @@ pub(in crate::renderer) fn create_dynamic_model_pipeline_inner(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1405,6 +1413,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
                 "JKA Ghoul2 GPU skin GL_DST_COLOR GL_SRC_COLOR pipeline"
             }
             DynamicModelAlphaMode::Darken => "JKA Ghoul2 GPU skin darken unlit pipeline",
+            DynamicModelAlphaMode::Glass => "JKA Ghoul2 GPU skin glass transmission pipeline",
         }),
         layout: Some(layout),
         vertex: wgpu::VertexState {
@@ -1450,6 +1459,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
             module: shader,
             entry_point: Some(match alpha_mode {
                 DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                DynamicModelAlphaMode::Glass => "fs_glass",
                 // OpenJK GLFOGOVERRIDE_BLACK for GL_ONE GL_ONE and
                 // GL_DST_COLOR GL_ZERO stages under r_drawfog 2.
                 DynamicModelAlphaMode::AdditiveOne | DynamicModelAlphaMode::Modulate => {
@@ -1482,7 +1492,7 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1545,7 +1555,7 @@ pub(in crate::renderer) fn create_world_wireframe_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1600,7 +1610,7 @@ pub(in crate::renderer) fn create_fast_world_wireframe_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1779,7 +1789,12 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
     // Select the fused UV vertex interface only when paired with a fused
     // fragment entry point. Legacy projected light and separate fog passes
     // consume the ordinary VertexOut interface, even for fused source batches.
-    let vertex_entry_point = if minimal_entry {
+    let generated_entry = material_key.is_some_and(|key| matches!(key.program,
+        crate::renderer::world::programs::StageProgram::GeneratedBasic
+        | crate::renderer::world::programs::StageProgram::GeneratedEnhanced));
+    let vertex_entry_point = if generated_entry {
+        "vs_generated"
+    } else if minimal_entry {
         "vs_world_minimal"
     } else if key.additive_fusion_count >= 2
         && !legacy_dlight_pass
@@ -1824,6 +1839,8 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
         "fs_legacy_dlight_pass"
     } else if fog_pass {
         "fs_legacy_fog_pass"
+    } else if generated_entry {
+        "fs_generated"
     } else if minimal_entry {
         "fs_world_minimal"
     } else {
@@ -1916,7 +1933,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
     if let Some(id) = compile_id {
         let kind = if is_rt { "RT" } else { "BSP" };

@@ -10,15 +10,15 @@ use crate::renderer::{
     create_specialized_world_pipelines, create_world_pipelines, detail_texture_for_source,
     material_specialization_eligible, material_specialization_jobs, world_base_fragment_entry,
     MaterialFragmentKey, gpu_point_lights, inspector_texture_meta,
-    instantiate_portal_draw_plans, is_upward_water_face, legacy_dlight_runs_for_batch,
+    instantiate_portal_draw_plans, is_upward_water_face, legacy_dlight_runs_for_batch, packed_face_plane, authored_face_runs,
     make_cull_record, material_uniform, ocean_surface_key, rt_alpha_mask_source_from_gpu_vertices, rt_glass_source_from_gpu_vertices,
     same_draw_state, scene, world_blend_probe_bucket, upload_reflection_probes, upload_static_light_grid, upload_texture,
-    upload_texture_bc3_picmip, upload_texture_picmip, upload_voxel_probe_gi,
+    upload_texture_picmip, upload_voxel_probe_gi,
     visible_batches_by_cluster, water_surface_extent, weather, Arc, Auto4CollapseCache,
     Auto4CollapseWorker, Auto4GeometryState, Auto4Instance, BTreeMap, BTreeSet, BlendMode,
     DrawBatch, DrawClass, DrawIndexedIndirectArgs, GpuCullRecord, GpuImage, GpuPointLight,
     GpuVertex, GrassRenderer, HashMap, IndexedGeometryBuilder, InlineModelGpu, InspectorVertex,
-    Instant, MaterialUniform, Mutex, PreparedMap, PreparedPortalPlanBatchRef, RtAlphaMaskSource,
+    Instant, MaterialUniform, PreparedMap, PreparedPortalPlanBatchRef, RtAlphaMaskSource,
     RuntimeOceanClipmap, OceanPromotionDecision,
     StaticAoBaseLightmap, StaticAoWorldSource, SurfaceSpriteEffectGpu, SurfaceSpriteEffectRenderer,
     texture_compression, TextureData, UniformArena, UniformSlot, WorldBatch, WorldGpu, WorldPipelineVariant, WorldShaderVariantKey,
@@ -133,12 +133,28 @@ pub(in crate::renderer) fn build_world(
     picmip: u32,
     texture_compression: u8,
     map: PreparedMap,
+    reuse_world: Option<&WorldGpu>,
+    requested_base_texture_count: usize,
 ) -> (WorldGpu, WorldUploadTimings) {
+    // An R_RemapShader changes stage/material tables, not original decoded
+    // images. Cache keys are checked here only on the remap command path;
+    // ordinary map loads and frame rendering do no additional work.
+    let remap_asset_source = map.source.clone();
+    let remap_asset_hash = map.map_hash;
+    let remap_texture_hashes = map.texture_hashes.clone();
+    let remap_base_texture_count = if reuse_world.is_some() {
+        requested_base_texture_count
+    } else {
+        map.textures.len()
+    };
     let source_map = map.map_file_stats.is_some();
     let sky_portal = map.sky_portal;
     let PreparedMap {
         vertices,
+        patch_draws,
+        inline_patch_draws,
         legacy_dlight_triangle_surfaces,
+        bsp_compiled_model_surfaces,
         legacy_dlight_surfaces,
         batches: coarse_sources,
         pvs_batches: full_sources,
@@ -165,6 +181,154 @@ pub(in crate::renderer) fn build_world(
         mark_surfaces,
         ..
     } = map;
+    // Decide texture usages immediately after receiving the prepared map. BC
+    // encoding depends on this immutable material classification, NOT on GPU
+    // state, so workers can encode while the renderer builds indexed geometry.
+    let texture_classify_started = Instant::now();
+    // Companion maps are only safe to BC-compress when that image is not also
+    // referenced as authored color/emissive/sky data. The optional benchmark
+    // path uses BC3 because it preserves all RGB channels plus alpha (required
+    // by normalHeightMap and rmosMap) without changing shader decoding.
+    const TEX_USE_COMPANION: u8 = 1;
+    const TEX_USE_COLOR: u8 = 2;
+    const TEX_NO_PICMIP: u8 = 4;
+    let mut texture_usage = vec![0u8; texture_data.len()];
+    let mut mark = |index: Option<usize>, usage: u8| {
+        if let Some(index) = index {
+            if let Some(bits) = texture_usage.get_mut(index) {
+                *bits |= usage;
+            }
+        }
+    };
+    // Ambient illumination is a property of the authored skybox, not the
+    // number of geometry/PVS batches which happen to reference it. Select the
+    // same primary skybox used for world rendering, without consulting FULL/
+    // AUTO PVS pieces. Include inline sources for source-map edge cases.
+    let primary_skybox = coarse_sources
+        .iter()
+        .chain(inline_batch_sources.iter())
+        .find_map(|source| source.skybox);
+    for source in coarse_sources.iter().chain(full_sources.iter()).chain(inline_batch_sources.iter()) {
+        mark(source.texture, TEX_USE_COLOR);
+        if source.no_picmip {
+            mark(source.texture, TEX_NO_PICMIP);
+            if let Some(animation) = &source.animation {
+                for &index in &animation.frames { mark(Some(index), TEX_NO_PICMIP); }
+            }
+            if let Some(skybox) = source.skybox {
+                for index in skybox { mark(Some(index), TEX_NO_PICMIP); }
+            }
+        }
+        mark(source.emissive_texture, TEX_USE_COLOR);
+        mark(source.normal_texture, TEX_USE_COMPANION);
+        mark(source.roughness_texture, TEX_USE_COMPANION);
+        mark(source.height_texture, TEX_USE_COMPANION);
+        mark(source.metallic_texture, TEX_USE_COMPANION);
+        mark(source.specular_texture, TEX_USE_COMPANION);
+        if let Some(skybox) = source.skybox {
+            for index in skybox {
+                mark(Some(index), TEX_USE_COLOR);
+            }
+        }
+    }
+    for index in footprint_mark_textures.into_iter().flatten() {
+        mark(Some(index), TEX_USE_COLOR);
+    }
+    for effect in &surface_sprite_effect_sources {
+        mark(Some(effect.texture), TEX_USE_COLOR);
+    }
+    let texture_classify_ms = texture_classify_started.elapsed().as_secs_f64() * 1000.0;
+    // Move the source vectors into Arc without copying texture bytes. Renderer
+    // uploads and BC encoder workers only borrow the same immutable pixels.
+    let texture_data = Arc::new(texture_data);
+    let lightmap_data = Arc::new(lightmap_data);
+    // Existing GPU textures are safe to alias only when *all* decode/upload
+    // inputs agree. In particular, the use classification can change BC
+    // format, detail treatment, or picmip eligibility after a remap.
+    let reusable_world = reuse_world.filter(|previous| {
+        previous.remap_asset_source == remap_asset_source
+            && previous.remap_asset_hash == remap_asset_hash
+            && previous.remap_base_texture_count >= remap_base_texture_count
+            && previous.remap_picmip == picmip
+            && previous.remap_compression == texture_compression
+            && previous.remap_pbr_compression == compress_pbr_companions
+    });
+    let mut old_by_hash = HashMap::<u64, usize>::new();
+    if let Some(previous) = reusable_world {
+        for (i, &hash) in previous.remap_texture_hashes.iter().enumerate() {
+            if hash != 0 && i < previous.textures.len() {
+                old_by_hash.entry(hash).or_insert(i);
+            }
+        }
+    }
+    let reusable_textures = texture_usage.iter().enumerate().map(|(index, &usage)| {
+        let previous = reusable_world?;
+        let hash = *remap_texture_hashes.get(index).unwrap_or(&0);
+        // Unhashed procedural images can be reused only within the original
+        // unchanged map-texture prefix, never by name or guesswork.
+        let candidate = if index < remap_base_texture_count {
+            Some(index)
+        } else if hash != 0 {
+            old_by_hash.get(&hash).copied()
+        } else {
+            None
+        }?;
+        (previous.textures.get(candidate).is_some()
+            && previous.remap_texture_usage.get(candidate) == Some(&usage)
+            && (hash == 0 && index < remap_base_texture_count
+                || hash != 0 && previous.remap_texture_hashes.get(candidate) == Some(&hash)))
+            .then_some(candidate)
+    }).collect::<Vec<_>>();
+    let reuse_bitmap = reusable_textures.iter().map(Option::is_some).collect::<Vec<_>>();
+    let reused_count = reuse_bitmap.iter().filter(|&&v| v).count();
+    if reused_count != 0 {
+        rverbose!(1, "[SHADER REMAP] GPU texture reuse: {reused_count}/{} images", texture_usage.len());
+    }
+    // The original lightmap pages are immutable across remaps. Compare the
+    // actual decoded data (not filenames) before aliasing GPU lightmaps, and
+    // decline the shortcut while a runtime AO replacement is active.
+    let reusable_lightmaps = reusable_world.filter(|previous| {
+        !previous.static_ao_lightmap_active
+            && previous.lightmaps.len() == lightmap_data.len()
+            && previous.lightmap_base_data.len() == lightmap_data.len()
+            && previous.lightmap_base_data.iter().zip(lightmap_data.iter()).all(|(a, b)| {
+                a.width == b.width && a.height == b.height
+                    && a.mip_level_count == b.mip_level_count
+                    && a.srgb == b.srgb && a.clamp == b.clamp
+                    && a.rgba == b.rgba && a.rgba16f == b.rgba16f
+            })
+    });
+    if reusable_lightmaps.is_some() {
+        rverbose!(1, "[SHADER REMAP] reused {} resident lightmaps", lightmap_data.len());
+    }
+    let color_encode_rx = if texture_compression >= 1 || compress_pbr_companions {
+        let data = Arc::clone(&texture_data);
+        let usage = texture_usage.clone();
+        let skip = reuse_bitmap.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        rayon::spawn(move || {
+            let started = Instant::now();
+            let encoded = texture_compression::encode_world_textures_skipping(
+                &data, &usage, picmip, texture_compression >= 1, compress_pbr_companions, &skip,
+            );
+            let _ = tx.send((encoded, started.elapsed().as_secs_f64() * 1000.0));
+        });
+        Some(rx)
+    } else {
+        None
+    };
+    let lightmap_encode_rx = if texture_compression >= 2 && reusable_lightmaps.is_none() {
+        let data = Arc::clone(&lightmap_data);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        rayon::spawn(move || {
+            let started = Instant::now();
+            let encoded = texture_compression::encode_textures(&data, |_| Some(0));
+            let _ = tx.send((encoded, started.elapsed().as_secs_f64() * 1000.0));
+        });
+        Some(rx)
+    } else {
+        None
+    };
     let snow_started = Instant::now();
     let snow_shell = create_snow_shell_gpu(device, &vertices, &coarse_sources);
     let snow_shell_ms = snow_started.elapsed().as_secs_f64() * 1000.0;
@@ -211,9 +375,11 @@ pub(in crate::renderer) fn build_world(
 
     let mut upload_timings = WorldUploadTimings::default();
     upload_timings.snow_shell_ms = snow_shell_ms;
+    upload_timings.texture_classify_ms = texture_classify_ms;
     upload_timings.prelude_ms = prelude_started.elapsed().as_secs_f64() * 1000.0;
 
     let vertex_started = Instant::now();
+    let mut vertex_gpu_calls_ms = 0.0;
     let mut indexed_builder =
         IndexedGeometryBuilder::new(&vertices, &legacy_dlight_triangle_surfaces);
     let coarse_index_ranges = coarse_sources
@@ -243,6 +409,9 @@ pub(in crate::renderer) fn build_world(
     let mut ocean_promotion_decisions = BTreeMap::<[u32; 6], OceanPromotionDecision>::new();
     let mut ocean_appearances = BTreeMap::new();
     let mut ocean_masks = crate::ocean::OceanMasks::default();
+    // Sky contacts are directions, NOT geometry; the finite clipmap follows
+    // the camera at runtime. Do not feed this data to coastal/bathymetry.
+    let mut ocean_sky_regions = vec![None; crate::ocean::OCEAN_MAX_SURFACES];
     let mut runtime_ocean_clipmaps = Vec::<RuntimeOceanClipmap>::new();
     let mut ocean_coarsest_spacing = 0.0f32;
     let mut diffuse_stages = HashMap::new();
@@ -274,6 +443,13 @@ pub(in crate::renderer) fn build_world(
             } else { None });
             water_faces.push(entry.face);
         }
+        let sky_triangles: Vec<crate::ocean::sky_extend::SkyTriangle> = coarse_sources.iter()
+            .filter(|s| s.pipeline.class == DrawClass::Sky)
+            .flat_map(|source| vertices[source.vertices.start as usize..source.vertices.end as usize]
+                .chunks_exact(3)
+                .map(|triangle| [triangle[0].position,triangle[1].position,triangle[2].position])
+                .collect::<Vec<_>>())
+            .collect();
         let footprints = crate::ocean::build_water_footprints(
             &water_faces,
             &water_face_triangles,
@@ -327,39 +503,61 @@ pub(in crate::renderer) fn build_world(
                 promoted_source = Some(source);
             }
 
-            // A map-authored ocean carries its own bounds, so it takes no mask.
-            let mask_slot = if authored {
-                None
+            // Phase 1: extend only where real water triangles touch a vertical
+            // BSP sky wall at the same height. Never derive this from coastal
+            // banks, bathymetry or the shoreline solver.
+            let sky_candidate = (!authored).then(||
+                crate::ocean::sky_extend::detect(footprint, &sky_triangles)
+            ).flatten();
+            // Keep two fully independent masks, so r_oceanSkyExtend 0 restores
+            // the exact original source-water outline without a map reload.
+            let base_needs_mask = !authored && crate::ocean::promoted_outline_needs_mask(
+                footprint.minimum, footprint.maximum, &footprint.triangles,
+            );
+            let base_masked = if authored {
+                false
+            } else if base_needs_mask {
+                ocean_masks.push_footprint(slot, footprint)
             } else {
-                if crate::ocean::promoted_outline_needs_mask(
-                    footprint.minimum,
-                    footprint.maximum,
-                    &footprint.triangles,
-                ) {
-                    ocean_masks.push_footprint(slot, footprint).then_some(slot)
-                } else {
-                    // Rectangles still retain their exact CPU footprint for
-                    // centering/distance even though fragment clipping is free.
-                    ocean_masks.set_footprint(slot,footprint);
-                    None
-                }
+                ocean_masks.set_footprint(slot, footprint);
+                false
             };
+            // Source water outline/mask stays exactly as authored. Sky contact
+            // intervals are passed separately to the ocean shader; no finite
+            // synthetic mask or coastal footprint is ever generated.
+            if let Some(sky) = sky_candidate {
+                eprintln!("OCEAN SKY phase1: pool {} has {} sky contacts (camera-relative)",
+                    slot + 1, sky.count);
+                ocean_sky_regions[slot] = Some(sky);
+            }
+            let mask_slot = (base_masked || sky_candidate.is_some()).then_some(slot);
+            // Reserve the existing eight clipmap grids for a camera-relative
+            // extension. Baseline OFF still uses its exact footprint-based LOD.
             // Both mesh qualities are uploaded so the quality setting stays a
             // live switch instead of needing a map reload. Promoted water uses
             // upload-once vertex grids plus rewriteable index ranges: amplitude
             // overrides and true 3D camera distance can therefore change the
             // ring topology live instead of being frozen at map upload.
             let ranges = if let Some(appearance) = appearance {
-                let low = crate::ocean::build_runtime_promoted_clipmap(
+                let mut low = crate::ocean::build_runtime_promoted_clipmap(
                     crate::ocean::OCEAN_LOW_MESH_SPACING_UNITS,
                     footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
                     appearance.heuristic.amplitude,
                 );
-                let high = crate::ocean::build_runtime_promoted_clipmap(
+                let mut high = crate::ocean::build_runtime_promoted_clipmap(
                     crate::ocean::OCEAN_HIGH_MESH_SPACING_UNITS,
                     footprint.plane, footprint.minimum, footprint.maximum, mask_slot,
                     appearance.heuristic.amplitude,
                 );
+                if sky_candidate.is_some() {
+                    // The grids already contain all eight possible levels.
+                    // Reserve a full camera-relative index range without
+                    // injecting INFINITY into the actual vertex attributes.
+                    for clipmap in [&mut low, &mut high] {
+                        clipmap.layout.extent = f32::INFINITY;
+                        clipmap.index_capacity = clipmap.layout.maximum_index_count();
+                    }
+                }
                 ocean_coarsest_spacing = low.coarsest_spacing;
                 upload_timings.ocean_clipmap_vertices +=
                     (low.vertices.len() + high.vertices.len()) as u64;
@@ -381,8 +579,10 @@ pub(in crate::renderer) fn build_world(
                         active_range: active_range.clone(),
                         current_half_cells: half_cells,
                         current_minimum_level: 0,
+                        current_level_limit: u32::MAX,
                         current_centre: [f32::NAN; 2],
                         current_pvs_cluster: None,
+                        current_sky_extend: false,
                     });
                     active_range
                 };
@@ -433,6 +633,11 @@ pub(in crate::renderer) fn build_world(
             });
         }
     }
+    if build_ocean_meshes {
+        let extended = ocean_sky_regions.iter().filter(|region| region.is_some()).count();
+        eprintln!("OCEAN SKY phase1: {} / {} pools have sky contacts; r_oceanSkyExtend 0 baseline, 1 camera-relative clipmap, coastal untouched",
+            extended, ocean_surfaces.len());
+    }
     let _ = ocean_coarsest_spacing;
     upload_timings.ocean_water_batches = coarse_sources
         .iter()
@@ -476,6 +681,7 @@ pub(in crate::renderer) fn build_world(
     if ray_tracing_supported {
         world_vertex_usage |= wgpu::BufferUsages::BLAS_INPUT;
     }
+    let vertex_gpu_started = Instant::now();
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA indexed static world vertices"),
         contents: bytemuck::cast_slice(&indexed_builder.vertices),
@@ -492,12 +698,31 @@ pub(in crate::renderer) fn build_world(
             contents: bytemuck::cast_slice(&legacy_surface_ids),
             usage: wgpu::BufferUsages::VERTEX,
         });
+    vertex_gpu_calls_ms += vertex_gpu_started.elapsed().as_secs_f64() * 1000.0;
+    let static_index_count=indexed_builder.indices.len();
+    let mut patch_lod = super::patch_lod::WorldPatchLod::prepare(
+        &mut indexed_builder, &patch_draws, &inline_patch_draws,
+        coarse_sources.iter().zip(&coarse_index_ranges).chain(full_sources.iter().zip(&full_index_ranges)).map(|(s,r)|(s.vertices.clone(),r.clone())),
+        inline_batch_sources.iter().zip(&inline_index_ranges).map(|(s,r)|(s.vertices.clone(),r.clone())),
+        &inline_model_sources, &inline_gpu_starts, &legacy_dlight_triangle_surfaces,
+    );
+    // After patch LOD has snapshotted its immutable source. Every compiled-model
+    // LOD is an additional index-only range, never a replacement of original
+    // geometry (AUTO4, marks, RT, and secondary views retain the original).
+    let mut bsp_model_lod = super::bsp_model_lod::BspModelLod::prepare(
+        &mut indexed_builder,
+        &coarse_sources, &coarse_index_ranges,
+        &full_sources, &full_index_ranges,
+        &bsp_compiled_model_surfaces, &patch_draws,
+    );
     let auto4_source_indices = Arc::new(std::mem::take(&mut indexed_builder.indices));
+    patch_lod.finish(Arc::clone(&auto4_source_indices));
+    bsp_model_lod.finish(Arc::clone(&auto4_source_indices));
     let base_index_count = u32::try_from(auto4_source_indices.len()).unwrap_or(u32::MAX);
     let base_index_bytes =
         (auto4_source_indices.len() as u64).saturating_mul(std::mem::size_of::<u32>() as u64);
     // Never reserve more than building every non-contiguous recipe would need.
-    let requested_auto4_cache_bytes = (portal_draw_plan.packed_index_count as u64)
+    let requested_auto4_cache_bytes = (portal_draw_plan.packed_index_count as u64 + if patch_draws.is_empty() {0} else {full_index_ranges.iter().map(|r|u64::from(r.end-r.start)).sum::<u64>()} + bsp_model_lod.auto4_extra_indices())
         .saturating_mul(std::mem::size_of::<u32>() as u64)
         .min(AUTO4_COLLAPSE_CACHE_BYTES);
     let max_extra_bytes = device
@@ -520,6 +745,7 @@ pub(in crate::renderer) fn build_world(
     if ray_tracing_supported {
         world_index_usage |= wgpu::BufferUsages::BLAS_INPUT;
     }
+    let index_gpu_started = Instant::now();
     let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("JKA static world indices + AUTO 4 collapse cache"),
         size: index_buffer_size,
@@ -530,9 +756,10 @@ pub(in crate::renderer) fn build_world(
         queue.write_buffer(
             &index_buffer,
             0,
-            bytemuck::cast_slice(auto4_source_indices.as_ref()),
+            bytemuck::cast_slice(&auto4_source_indices[..static_index_count]),
         );
     }
+    vertex_gpu_calls_ms += index_gpu_started.elapsed().as_secs_f64() * 1000.0;
     let source_vertex_count = vertices.len();
     let indexed_vertex_count = indexed_builder.vertices.len();
     let reused_vertex_count = source_vertex_count.saturating_sub(indexed_vertex_count);
@@ -549,64 +776,25 @@ pub(in crate::renderer) fn build_world(
         }
     );
     upload_timings.vertex_buffer_ms = vertex_started.elapsed().as_secs_f64() * 1000.0;
+    upload_timings.vertex_gpu_calls_ms = vertex_gpu_calls_ms;
+    upload_timings.vertex_cpu_ms = (upload_timings.vertex_buffer_ms - vertex_gpu_calls_ms).max(0.0);
     let texture_started = Instant::now();
     let texture_clamp: Vec<_> = texture_data.iter().map(|data| data.clamp).collect();
-    // Companion maps are only safe to BC-compress when that image is not also
-    // referenced as authored color/emissive/sky data. The optional benchmark
-    // path uses BC3 because it preserves all RGB channels plus alpha (required
-    // by normalHeightMap and rmosMap) without changing shader decoding.
-    const TEX_USE_COMPANION: u8 = 1;
-    const TEX_USE_COLOR: u8 = 2;
-    const TEX_NO_PICMIP: u8 = 4;
-    let mut texture_usage = vec![0u8; texture_data.len()];
-    let mut mark = |index: Option<usize>, usage: u8| {
-        if let Some(index) = index {
-            if let Some(bits) = texture_usage.get_mut(index) {
-                *bits |= usage;
-            }
-        }
-    };
-    let mut skybox_faces: Vec<usize> = Vec::new();
-    for source in coarse_sources.iter().chain(full_sources.iter()).chain(inline_batch_sources.iter()) {
-        mark(source.texture, TEX_USE_COLOR);
-        if source.no_picmip {
-            mark(source.texture, TEX_NO_PICMIP);
-            if let Some(animation) = &source.animation {
-                for &index in &animation.frames { mark(Some(index), TEX_NO_PICMIP); }
-            }
-            if let Some(skybox) = source.skybox {
-                for index in skybox { mark(Some(index), TEX_NO_PICMIP); }
-            }
-        }
-        mark(source.emissive_texture, TEX_USE_COLOR);
-        mark(source.normal_texture, TEX_USE_COMPANION);
-        mark(source.roughness_texture, TEX_USE_COMPANION);
-        mark(source.height_texture, TEX_USE_COMPANION);
-        mark(source.metallic_texture, TEX_USE_COMPANION);
-        mark(source.specular_texture, TEX_USE_COMPANION);
-        if let Some(skybox) = source.skybox {
-            for index in skybox {
-                mark(Some(index), TEX_USE_COLOR);
-                skybox_faces.push(index);
-            }
-        }
-    }
-    let primary_skybox = coarse_sources
-        .iter()
-        .chain(full_sources.iter())
-        .find_map(|source| source.skybox);
     let sky_covers_background = sky_outer_box_covers_background(
         coarse_sources.iter().chain(full_sources.iter()),
     );
     println!("r_colorClearMode: sky box covers the background: {}",
         if sky_covers_background { "yes (clear can be skipped)" } else { "no (clear kept)" });
-    let sky_average = average_skybox_color(&texture_data, &skybox_faces);
-    for index in footprint_mark_textures.into_iter().flatten() {
-        mark(Some(index), TEX_USE_COLOR);
-    }
-    for effect in &surface_sprite_effect_sources {
-        mark(Some(effect.texture), TEX_USE_COLOR);
-    }
+    let sky_average_started = Instant::now();
+    // This single RGB value feeds optional cloud/ocean lighting. Keep it
+    // available for runtime toggles; sampling at most six texture faces is
+    // inexpensive and no longer scales with PVS or draw batch count.
+    let sky_average = average_skybox_color(&texture_data, primary_skybox);
+    upload_timings.skybox_average_ms = sky_average_started.elapsed().as_secs_f64() * 1000.0;
+    upload_timings.skybox_face_references = primary_skybox.map_or(0, |faces| faces.len());
+    upload_timings.skybox_unique_images = primary_skybox.map_or(0, |faces| {
+        faces.into_iter().collect::<BTreeSet<_>>().len()
+    });
     let mut compressed_count = 0usize;
     let companion_bc3 = |index: usize, data: &TextureData| {
         compress_pbr_companions
@@ -628,37 +816,48 @@ pub(in crate::renderer) fn build_world(
             0
         }
     };
-    // r_ext_compress_textures: colour images only. PBR companions keep their
-    // data-tuned BC3 path above; unused slots are not encoded.
-    let encode_started = Instant::now();
-    let encoded = if texture_compression >= 1 {
-        texture_compression::encode_textures(&texture_data, |index| {
-            let data = &texture_data[index];
-            let used = texture_usage.get(index).copied().unwrap_or_default();
-            (used & TEX_USE_COLOR != 0 && !companion_bc3(index, data))
-                .then(|| texture_picmip(index, data))
-        })
-    } else {
-        Vec::new()
+    // Encoding began before geometry preparation. Only block here if workers
+    // still have outstanding compression, and attribute that wait separately.
+    let color_wait_started = Instant::now();
+    let (encoded, encode_ms) = match color_encode_rx {
+        Some(rx) => rx.recv().unwrap_or_else(|_| {
+            eprintln!("World BC encoder worker failed; retrying on render thread");
+            let started = Instant::now();
+            let result = texture_compression::encode_world_textures_skipping(
+                &texture_data, &texture_usage, picmip,
+                texture_compression >= 1, compress_pbr_companions, &reuse_bitmap,
+            );
+            (result, started.elapsed().as_secs_f64() * 1000.0)
+        }),
+        None => (Vec::new(), 0.0),
     };
-    let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
+    upload_timings.texture_encode_wait_ms = color_wait_started.elapsed().as_secs_f64() * 1000.0;
+    upload_timings.texture_encode_cpu_ms = encode_ms;
     let mut color_compressed = 0usize;
+    let texture_gpu_started = Instant::now();
     let textures: Vec<_> = texture_data
         .iter()
         .enumerate()
         .map(|(index, data)| {
+            if let Some(previous) = reusable_world.and_then(|world| {
+                reusable_textures[index].and_then(|old_index| world.textures.get(old_index))
+            }) {
+                return previous.clone();
+            }
             let texture_picmip = texture_picmip(index, data);
-            if companion_bc3(index, data) {
-                compressed_count += 1;
-                upload_texture_bc3_picmip(device, queue, data, texture_picmip)
-            } else if let Some(Some(encoded)) = encoded.get(index) {
-                color_compressed += 1;
+            if let Some(Some(encoded)) = encoded.get(index) {
+                if companion_bc3(index, data) {
+                    compressed_count += 1;
+                } else {
+                    color_compressed += 1;
+                }
                 texture_compression::upload_encoded_texture(device, queue, &data.label, encoded)
             } else {
                 upload_texture_picmip(device, queue, data, texture_picmip)
             }
         })
         .collect();
+    upload_timings.texture_gpu_calls_ms = texture_gpu_started.elapsed().as_secs_f64() * 1000.0;
     if texture_compression >= 1 {
         rverbose!(
             1,
@@ -701,12 +900,23 @@ pub(in crate::renderer) fn build_world(
     let lightmap_started = Instant::now();
     // r_ext_compress_textures 2 also takes 8-bit lightmaps to BC1; FP16
     // lightmaps (r_floatLightmap) are never compressed.
-    let encoded_lightmaps = if texture_compression >= 2 {
-        texture_compression::encode_textures(&lightmap_data, |_| Some(0))
-    } else {
-        Vec::new()
+    let lightmap_wait_started = Instant::now();
+    let (encoded_lightmaps, lightmap_encode_ms) = match lightmap_encode_rx {
+        Some(rx) => rx.recv().unwrap_or_else(|_| {
+            eprintln!("World BC lightmap encoder worker failed; retrying on render thread");
+            let started = Instant::now();
+            let result = texture_compression::encode_textures(&lightmap_data, |_| Some(0));
+            (result, started.elapsed().as_secs_f64() * 1000.0)
+        }),
+        None => (Vec::new(), 0.0),
     };
-    let lightmaps: Vec<_> = lightmap_data
+    upload_timings.lightmap_encode_wait_ms = lightmap_wait_started.elapsed().as_secs_f64() * 1000.0;
+    upload_timings.lightmap_encode_cpu_ms = lightmap_encode_ms;
+    let lightmap_gpu_started = Instant::now();
+    let lightmaps: Vec<_> = if let Some(previous) = reusable_lightmaps {
+        previous.lightmaps.clone()
+    } else {
+        lightmap_data
         .iter()
         .enumerate()
         .map(|(index, data)| match encoded_lightmaps.get(index) {
@@ -715,8 +925,12 @@ pub(in crate::renderer) fn build_world(
             }
             _ => upload_texture(device, queue, data),
         })
-        .collect();
-    let deluxemaps: Vec<_> = if deluxemap_data.is_empty() {
+        .collect()
+    };
+    let deluxemaps: Vec<_> = if reusable_lightmaps.is_some_and(|previous|
+        previous.deluxemaps.len() == deluxemap_data.len().max(1)) {
+        reusable_lightmaps.unwrap().deluxemaps.clone()
+    } else if deluxemap_data.is_empty() {
         let neutral = TextureData {
             label: "JKA neutral deluxemap fallback".into(),
             source: None,
@@ -735,6 +949,7 @@ pub(in crate::renderer) fn build_world(
             .map(|data| upload_texture(device, queue, data))
             .collect()
     };
+    upload_timings.lightmap_gpu_calls_ms = lightmap_gpu_started.elapsed().as_secs_f64() * 1000.0;
     upload_timings.lightmap_upload_ms = lightmap_started.elapsed().as_secs_f64() * 1000.0;
     let reflection_probe_started = Instant::now();
     let reflection_probes = upload_reflection_probes(device, queue, &reflection_probe_data);
@@ -776,7 +991,16 @@ pub(in crate::renderer) fn build_world(
                 let (plane, min, max) = water_surface_extent(&source, source_vertices);
                 ocean_surface_key(plane, min, max, source.bsp_shader_index)
             });
-            let ocean_replaced = surface_key.is_some_and(|key| ocean_clipmaps.contains_key(&key));
+            // A demoted overlay sheet lying over a promoted ocean is a duplicate of
+            // the surf and foam that ocean draws. Same suppression as a replaced
+            // face, so it still returns when r_ocean is off.
+            let overlay_covered = source.water_overlay
+                && crate::ocean::surfaces::overlay_covered_by_ocean(
+                    &source_vertices[source.vertices.start as usize..source.vertices.end as usize],
+                    &ocean_surfaces,
+                );
+            let ocean_replaced = overlay_covered
+                || surface_key.is_some_and(|key| ocean_clipmaps.contains_key(&key));
             let (ocean_clipmap, ocean_clipmap_id) =
                 match water_plane.and_then(|(plane, minimum, maximum)| {
                     ocean_clipmaps
@@ -803,7 +1027,7 @@ pub(in crate::renderer) fn build_world(
                 material_uniform.ocean_blend_color = own.blend_color;
             }
             let fragment_key =
-                MaterialFragmentKey::from_material(material_uniform.header, material_uniform.params[0]);
+                MaterialFragmentKey::from_uniform(&material_uniform);
             let material_buffer =
                 material_arena.push(device, queue, bytemuck::bytes_of(&material_uniform));
             // Extra authored stage descriptors share the existing material uniform
@@ -894,6 +1118,10 @@ pub(in crate::renderer) fn build_world(
                         let own =
                             crate::ocean::appearance::from_stage(stage, source_vertices, &texture_data);
                         let mut uniform = crate::renderer::material_uniform(stage, false);
+                        // The diffuse stage never received the plane resolved
+                        // for `source` above, and ocean_environment matches the
+                        // planar reflection slot against this uniform's plane.
+                        uniform.planar_plane = source.planar_plane;
                         uniform.ocean_color = appearance.color;
                         uniform.ocean_material = appearance.material;
                         uniform.ocean_waves = [
@@ -913,6 +1141,15 @@ pub(in crate::renderer) fn build_world(
                 None
             };
             let ocean_surface_bind_group = ocean_material.as_ref().map(|(stage, buffer)| {
+                // The six sky slots double as additive-companion and legacy
+                // overlay textures. The FFT ocean never draws those stages, but
+                // its environment reflection (`sample_map_sky_renderer`) reads
+                // the slots as the map's skybox faces, so a companion left in
+                // slot 0 replaces the whole +X face with a water texture.
+                let mut sky_stage = (*stage).clone();
+                sky_stage.additive_companions.clear();
+                sky_stage.legacy_srgb_overlay = None;
+                let stage = &sky_stage;
                 create_world_bind_group(
                     device,
                     surface_layout,
@@ -1045,12 +1282,27 @@ pub(in crate::renderer) fn build_world(
                 bounds_min[1] -= 256.0;
                 bounds_max[1] += 256.0;
             }
-            cull_records.push(record);
             let legacy_dlight_runs =
                 legacy_dlight_runs_for_batch(&source, &index_range, triangle_surfaces);
+            // Use original BSP surface planes only for a wholly coplanar,
+            // one-sided draw range. Mixed/PVS-packed surfaces remain visible.
+            let face_cull_plane = packed_face_plane(
+                &source, &legacy_dlight_runs, &legacy_dlight_surfaces, source_vertices,
+            );
+            let face_cull_runs = authored_face_runs(
+                &source, &index_range, &legacy_dlight_runs, &legacy_dlight_surfaces, source_vertices,
+            );
+            let mut record = record;
+            record.face_plane = face_cull_plane;
+            cull_records.push(record);
             uploaded.push(WorldBatch {
+                full_indexed_range: index_range.clone(),
+                patch_geometry: None,
+                patch_suppressed: false,
                 indexed_range: index_range,
                 legacy_dlight_runs,
+                face_cull_runs: face_cull_runs.into(),
+                face_cull_plane,
                 is_inline_entity: false,
                 inline_model_slot: u32::MAX,
                 inline_group: u32::MAX,
@@ -1315,18 +1567,24 @@ pub(in crate::renderer) fn build_world(
     }
     for (index, batch) in coarse_batches[inline_coarse_start..].iter_mut().enumerate() {
         batch.is_inline_entity = true;
+        batch.face_cull_plane = [0.0; 4];
+        batch.face_cull_runs = Arc::from([]);
         batch.inline_model_slot = inline_slot_for_batch[index];
         // The fourth cull-record draw word identifies inline movers. Bits
         // may change on snapshots, but their original geometry is immutable.
         if let Some(record) = cull_records.get_mut(batch.cull_index as usize) {
             record.draw[3] = 1;
+            record.face_plane = [0.0; 4];
         }
     }
     for (index, batch) in full_batches[inline_full_start..].iter_mut().enumerate() {
         batch.is_inline_entity = true;
+        batch.face_cull_plane = [0.0; 4];
+        batch.face_cull_runs = Arc::from([]);
         batch.inline_model_slot = inline_slot_for_batch[index];
         if let Some(record) = cull_records.get_mut(batch.cull_index as usize) {
             record.draw[3] = 1;
+            record.face_plane = [0.0; 4];
         }
     }
     let mut inline_group_states = Vec::<DrawBatch>::new();
@@ -1400,7 +1658,7 @@ pub(in crate::renderer) fn build_world(
     // Recipe batches are deliberately not compacted: a warm plan draws each
     // recipe as one real indexed draw. Their FULL fallback pieces keep FULL's
     // compaction groups.
-    let auto4 = if visibility.is_some() {
+    let mut auto4 = if visibility.is_some() {
         instantiate_portal_draw_plans(
             &portal_draw_plan,
             &full_batches,
@@ -1411,6 +1669,25 @@ pub(in crate::renderer) fn build_world(
     } else {
         None
     };
+    bsp_model_lod.bind(&coarse_batches, &full_batches);
+    patch_lod.bind(&mut coarse_batches,0);
+    patch_lod.bind(&mut full_batches,1);
+    if let Some(instance) = &mut auto4 {
+        patch_lod.bind(&mut instance.batches[..instance.variant_base],2);
+        patch_lod.recipes(&instance.geometry_members, &full_batches, &mut instance.geometry_states);
+        bsp_model_lod.recipes(&instance.geometry_members, &full_batches, &mut instance.geometry_states);
+        for (geometry, state) in instance.geometry_states.iter().enumerate() {
+            if matches!(state, Auto4GeometryState::Uncached) {
+                for &variant in &instance.geometry_variants[geometry] {
+                    let batch = &mut instance.batches[instance.variant_base+variant];
+                    batch.patch_geometry = None;
+                    batch.indexed_range = 0..0;
+                    cull_records[batch.cull_index as usize].draw[0] = 0;
+                    initial_indirect[batch.cull_index as usize].index_count = 0;
+                }
+            }
+        }
+    }
     let compact_draw_capacity = compact_groups
         .iter()
         .map(|group| group.max_count)
@@ -1778,97 +2055,133 @@ pub(in crate::renderer) fn build_world(
     upload_timings.lighting_resources_ms = lighting_started.elapsed().as_secs_f64() * 1000.0;
 
     let pipeline_started = Instant::now();
-    let pipelines = create_world_pipelines(
-        device,
-        pipeline_layout,
-        shader,
-        surface_format,
-        msaa_samples,
-        &coarse_batches,
-        legacy_fog,
-        Some(shader_variant),
-    );
-    let legacy_dlight_pipelines = if shader_variant.legacy_dlights {
-        create_legacy_dlight_pass_pipelines(
+    // Pointer-style PSO reuse on the remap mutation path: material stage
+    // descriptors still change, but a compatible compiled PSO never recompiles.
+    let reusable_pipeline = reusable_world
+        .filter(|old| old.remap_scene_format == surface_format
+            && old.remap_msaa_samples == msaa_samples)
+        .and_then(|old| old.pipeline_variants.get(&shader_variant).map(|psos| (old, psos)))
+        .filter(|(_, psos)| {
+            let keys = coarse_batches.iter().map(|b| b.source.pipeline).collect::<BTreeSet<_>>();
+            keys.iter().all(|key| psos.pipelines.contains_key(key))
+                && (!shader_variant.legacy_dlights || coarse_batches.iter()
+                    .filter(|b| crate::renderer::legacy_dlight_receives(&b.source))
+                    .all(|b| psos.legacy_dlight_pipelines.contains_key(&b.source.pipeline)))
+                && (!legacy_fog || crate::renderer::legacy_fog_pass_jobs(&coarse_batches)
+                    .iter().all(|job| psos.fog_pass_pipelines.contains_key(job)))
+                && (planar_reflectors.is_empty() || !shader_variant.planar_reflections
+                    || keys.iter().all(|key| psos.reflection_pipelines.contains_key(key)))
+                && (planar_reflectors.is_empty() || !shader_variant.planar_reflections || !legacy_fog
+                    || crate::renderer::legacy_fog_pass_jobs(&coarse_batches)
+                        .iter().all(|job| psos.reflection_fog_pass_pipelines.contains_key(job)))
+                && (!shader_variant.material_specialization ||
+                    material_specialization_jobs(coarse_batches.iter().chain(&full_batches))
+                        .iter().all(|job| psos.specialized_pipelines.contains_key(job)))
+        });
+    let (pipeline_variants, fast_pipelines) = if let Some((old, compiled)) = reusable_pipeline {
+        rverbose!(1, "[SHADER REMAP] reused existing world PSOs (no pipeline compilation)");
+        let mut variants = BTreeMap::new();
+        variants.insert(shader_variant, compiled.clone());
+        let fast = if coarse_batches.iter().all(|b| old.fast_pipelines.contains_key(&b.source.pipeline)) {
+            old.fast_pipelines.clone()
+        } else {
+            BTreeMap::new()
+        };
+        (variants, fast)
+    } else {
+        let pipelines = create_world_pipelines(
             device,
             pipeline_layout,
             shader,
             surface_format,
             msaa_samples,
-            &coarse_batches,
-            shader_variant,
-        )
-    } else {
-        BTreeMap::new()
-    };
-    let fog_pass_pipelines = if legacy_fog {
-        create_legacy_fog_pass_pipelines(
-            device,
-            pipeline_layout,
-            shader,
-            surface_format,
-            msaa_samples,
-            &coarse_batches,
-            Some(shader_variant),
-        )
-    } else {
-        BTreeMap::new()
-    };
-    // The known-fast baseline pipelines are compiled on first use by
-    // `ensure_fast_world_pipelines`; most sessions never leave the advanced path.
-    let fast_pipelines = BTreeMap::new();
-    let reflection_pipelines = if planar_reflectors.is_empty() || !shader_variant.planar_reflections
-    {
-        BTreeMap::new()
-    } else {
-        create_reflection_pipelines(
-            device,
-            pipeline_layout,
-            shader,
-            surface_format,
             &coarse_batches,
             legacy_fog,
-            shader_variant,
-        )
-    };
-    let reflection_fog_pass_pipelines =
-        if legacy_fog && !planar_reflectors.is_empty() && shader_variant.planar_reflections {
-            create_reflection_fog_pass_pipelines(
+            Some(shader_variant),
+        );
+        let legacy_dlight_pipelines = if shader_variant.legacy_dlights {
+            create_legacy_dlight_pass_pipelines(
                 device,
                 pipeline_layout,
                 shader,
                 surface_format,
+                msaa_samples,
                 &coarse_batches,
                 shader_variant,
             )
         } else {
             BTreeMap::new()
         };
-    if let Some(path) = std::env::var_os("JKA_DUMP_WORLD_BATCHES") {
-        dump_world_batches(&path, &coarse_batches, &full_batches, shader_variant, legacy_fog,
-            &material_debug);
-    }
-    let specialized_pipelines = create_specialized_world_pipelines(
-        device,
-        pipeline_layout,
-        shader,
-        surface_format,
-        msaa_samples,
-        &material_specialization_jobs(coarse_batches.iter().chain(&full_batches)),
-        shader_variant,
-    );
-    let mut pipeline_variants = BTreeMap::new();
-    pipeline_variants.insert(
-        shader_variant,
-        WorldPipelineVariant {
-            pipelines,
-            legacy_dlight_pipelines,
-            fog_pass_pipelines,
-            reflection_pipelines,
-            reflection_fog_pass_pipelines,
-            specialized_pipelines,
-        },
-    );
+        let fog_pass_pipelines = if legacy_fog {
+            create_legacy_fog_pass_pipelines(
+                device,
+                pipeline_layout,
+                shader,
+                surface_format,
+                msaa_samples,
+                &coarse_batches,
+                Some(shader_variant),
+            )
+        } else {
+            BTreeMap::new()
+        };
+        // The known-fast baseline pipelines are compiled on first use by
+        // `ensure_fast_world_pipelines`; most sessions never leave the advanced path.
+        let fast_pipelines = BTreeMap::new();
+        let reflection_pipelines = if planar_reflectors.is_empty() || !shader_variant.planar_reflections
+        {
+            BTreeMap::new()
+        } else {
+            create_reflection_pipelines(
+                device,
+                pipeline_layout,
+                shader,
+                surface_format,
+                &coarse_batches,
+                legacy_fog,
+                shader_variant,
+            )
+        };
+        let reflection_fog_pass_pipelines =
+            if legacy_fog && !planar_reflectors.is_empty() && shader_variant.planar_reflections {
+                create_reflection_fog_pass_pipelines(
+                    device,
+                    pipeline_layout,
+                    shader,
+                    surface_format,
+                    &coarse_batches,
+                    shader_variant,
+                )
+            } else {
+                BTreeMap::new()
+            };
+        if let Some(path) = std::env::var_os("JKA_DUMP_WORLD_BATCHES") {
+            dump_world_batches(&path, &coarse_batches, &full_batches, shader_variant, legacy_fog,
+                &material_debug);
+        }
+        let specialized_pipelines = create_specialized_world_pipelines(
+            device,
+            pipeline_layout,
+            shader,
+            surface_format,
+            msaa_samples,
+            &material_specialization_jobs(coarse_batches.iter().chain(&full_batches)),
+            shader_variant,
+        );
+        let mut pipeline_variants = BTreeMap::new();
+        pipeline_variants.insert(
+            shader_variant,
+            WorldPipelineVariant {
+                pipelines,
+                legacy_dlight_pipelines,
+                fog_pass_pipelines,
+                reflection_pipelines,
+                reflection_fog_pass_pipelines,
+                specialized_pipelines,
+            },
+        );
+        (pipeline_variants, fast_pipelines)
+    };
     upload_timings.pipeline_create_ms = pipeline_started.elapsed().as_secs_f64() * 1000.0;
 
     let visibility_started = Instant::now();
@@ -2062,8 +2375,32 @@ pub(in crate::renderer) fn build_world(
         lightmap_bases: Arc::new(static_ao_lightmap_bases),
     });
 
+    let ocean_sky_representatives = ocean_sky_regions.iter().enumerate()
+        .map(|(slot, extension)| extension.and_then(|_| full_batches.iter().position(|batch|
+            batch.ocean_clipmap.is_some() && batch.ocean_clipmap_id as usize == slot
+                && batch.source.water_primary)))
+        .collect::<Vec<_>>();
+
     (
         WorldGpu {
+            remap_index_source: Arc::clone(&auto4_source_indices),
+            remap_asset_source,
+            remap_asset_hash,
+            remap_texture_hashes,
+            remap_base_texture_count,
+            remap_texture_usage: texture_usage,
+            remap_picmip: picmip,
+            remap_compression: texture_compression,
+            remap_pbr_compression: compress_pbr_companions,
+            remap_scene_format: surface_format,
+            remap_msaa_samples: msaa_samples,
+            has_glass_primary: coarse_batches
+                .iter()
+                .chain(&full_batches)
+                .any(|batch| batch.source.glass_primary),
+            animated_batches: None,
+            patch_lod,
+            bsp_model_lod,
             mark_surfaces,
             source_map,
             source_map_lighting,
@@ -2075,7 +2412,10 @@ pub(in crate::renderer) fn build_world(
             ocean_meshes_built: build_ocean_meshes,
             ocean_promotion_decisions,
             promoted_oceans: upload_timings.promoted_oceans.clone(),
-            ocean_masks: Arc::new(ocean_masks),
+            ocean_masks: Arc::new(ocean_masks.clone()),
+            ocean_base_masks: Arc::new(ocean_masks),
+            ocean_sky_regions,
+            ocean_sky_representatives,
             ocean_pvs_footprints,
             runtime_ocean_clipmaps,
             inline_models,
@@ -2111,7 +2451,9 @@ pub(in crate::renderer) fn build_world(
             _cluster_buffer: cluster_buffer,
             legacy_dlight_surface_id_buffer,
             legacy_dlight_surface_mask_buffer,
-            legacy_dlight_surface_masks_cpu: Mutex::new(initial_legacy_masks),
+            legacy_dlight: crate::renderer::lighting::legacy_dlight_lists::LegacyDlightLists::new(
+                legacy_dlight_surfaces.len(),
+            ),
             legacy_dlight_triangle_surfaces: legacy_triangle_surfaces,
             legacy_dlight_surfaces,
             dynamic_lights,
@@ -2161,7 +2503,10 @@ pub(in crate::renderer) fn build_world(
             footprint_mark_textures,
             lightmaps,
             deluxemaps,
-            lightmap_base_data: lightmap_data,
+            // BC workers have joined by this point; recover the original Vec
+            // without copying multi-megabyte lightmap pixels in the common case.
+            lightmap_base_data: Arc::try_unwrap(lightmap_data)
+                .unwrap_or_else(|data| data.as_ref().clone()),
             static_ao_source,
             static_ao_source_to_gpu,
             static_ao_gpu_vertices,

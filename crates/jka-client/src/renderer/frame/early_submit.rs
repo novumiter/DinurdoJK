@@ -33,6 +33,12 @@ impl Renderer {
 
     fn offscreen_present_eligible(&self, menu_backdrop_active: bool) -> bool {
         !menu_backdrop_active
+            // A menu-scene snapshot reads the scene back before any native UI
+            // overlay; that needs the ordinary acquire-first frame structure.
+            && !matches!(
+                self.screenshot_requested.as_ref(),
+                Some(crate::renderer::ScreenshotDestination::FrontendScene { .. })
+            )
             && self.crt_scope == crate::renderer::ui::CrtScope::Off
             && !self.smaa_enabled
             && !self.egui_active

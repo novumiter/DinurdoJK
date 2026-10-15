@@ -641,6 +641,7 @@ fn minimal_key() -> WorldShaderVariantKey {
         dynamic_light_debug: false,
         material_specialization: false,
         minimal_entries: false,
+        program_mode: super::world::programs::WorldProgramMode::Specialized,
         sky_debug: false,
     }
 }

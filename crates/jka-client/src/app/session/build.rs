@@ -127,6 +127,7 @@ impl App {
                     self.audio.steam_audio_environmental,
                 );
                 sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
+                sound.set_eal_enabled(self.audio.eal_enabled);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);
@@ -135,6 +136,7 @@ impl App {
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),
                 );
+                if let Some(map_name) = session.map_name.as_deref() { sound.set_eal_map(map_name); }
                 session.sound_presenter = Some(sound);
             }
             Err(error) => eprintln!("AUDIO ASSET PATH UNAVAILABLE: {error}"),
@@ -257,6 +259,7 @@ impl App {
                     self.audio.steam_audio_environmental,
                 );
                 sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
+                sound.set_eal_enabled(self.audio.eal_enabled);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
                 sound.set_game_sounds(self.audio.game);
@@ -265,6 +268,7 @@ impl App {
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),
                 );
+                if let Some(map_name) = session.map_name.as_deref() { sound.set_eal_map(map_name); }
                 session.sound_presenter = Some(sound);
             }
             Err(error) => eprintln!("AUDIO ASSET PATH UNAVAILABLE: {error}"),

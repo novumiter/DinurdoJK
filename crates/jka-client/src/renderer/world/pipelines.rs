@@ -2,7 +2,7 @@
 use crate::renderer::{
     camera_depth_compare, create_cull_debug_pipeline, create_ssr_visibility_resources,
     create_surface_inspector_pipeline, create_taa_post_pipeline, create_targets,
-    create_world_pipeline, create_world_pipeline_specialized, gpu_blend_factor, pipeline_hash, scene, thread, AlphaGen, BTreeMap, BTreeSet, BlendFactor,
+    create_world_pipeline, gpu_blend_factor, pipeline_hash, scene, thread, AlphaGen, BTreeMap, BTreeSet, BlendFactor,
     BlendMode, CullDebugMode, CullMode, DrawBatch, DrawClass, GpuVertex, Instant, MaterialFragmentKey,
     MaterialUniform,
     OnceLock, Ordering, PipelineJobKey, PipelineKey, Renderer, RgbGen, TcGen, TcMod, Vec3,
@@ -678,6 +678,10 @@ pub(in crate::renderer) fn material_uniform(
         out.header[3] |= 2;
     }
     out.header[3] |= u32::from(source.surface_material & 31) << 8;
+    if source.glass_primary {
+        out.header[3] |= 1 << 17;
+        out.ocean_color = [source.glass_tint[0], source.glass_tint[1], source.glass_tint[2], source.glass_reflectance];
+    }
     out.color = source.color;
     // TaystJK rd-vanilla/tr_shade_calc.cpp RB_CalcDiffuseColor evaluates
     // the CURRENT refEntity's ambient + max(dot(N,L),0)*directed lighting.
@@ -829,6 +833,7 @@ impl WorldPassPipelineIdentity {
         // in every mode, so switching r_fragmentShaderMode reuses them.
         variant.material_specialization = false;
         variant.minimal_entries = false;
+        variant.program_mode = super::programs::WorldProgramMode::Specialized;
         Self { variant, pass, native_key, target_format, samples, material: None, minimal: false }
     }
 
@@ -840,7 +845,7 @@ impl WorldPassPipelineIdentity {
         Self {
             material: Some(material),
             minimal,
-            ..Self::new(variant, WorldPipelinePass::Base { authored_fog }, native_key,
+            ..Self::new(super::programs::program_variant(variant, material), WorldPipelinePass::Base { authored_fog }, native_key,
                 target_format, samples)
         }
     }
@@ -896,7 +901,7 @@ pub(in crate::renderer) fn create_sky_box_pipelines(
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         })
     })
 }
@@ -958,7 +963,7 @@ pub(in crate::renderer) fn create_sky_cloud_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1049,7 +1054,7 @@ fn specialized_pipeline_plan(
     let slots = jobs
         .iter()
         .map(|&(key, material)| {
-            let narrowed = material.for_variant(variant, key.class != DrawClass::Opaque);
+            let narrowed = super::programs::program_key(variant, key, material);
             *index.entry((key, narrowed)).or_insert_with(|| {
                 unique.push((key, narrowed));
                 unique.len() - 1
@@ -1086,26 +1091,43 @@ pub(in crate::renderer) fn create_specialized_world_pipelines(
         return Default::default();
     }
     let started = Instant::now();
-    let base_variant = variant.base_pass_key();
     let (unique, slots) = specialized_pipeline_plan(jobs, variant);
+    let modules = super::programs::ProgramModules::default();
     let pipelines = compile_pipeline_jobs("world-specialized", unique.clone(), |&(key, material)| {
-        create_world_pipeline_specialized(device, layout, shader, surface_format, key,
-            msaa_samples, variant.legacy_fog, false, Some(base_variant), false, None,
-            Some(material), material_minimal_entry(variant, &key))
+        modules.pipeline(device, layout, shader, surface_format, msaa_samples, variant, key, material)
     });
-    log_material_specialization(jobs.len(), &unique, started);
+    log_material_specialization(jobs, &unique, variant, started);
     specialized_pipeline_map(jobs, &unique, &slots, pipelines)
 }
 
 fn log_material_specialization(
-    jobs: usize,
+    jobs: &[(PipelineKey, MaterialFragmentKey)],
     pipelines: &[(PipelineKey, MaterialFragmentKey)],
+    variant: WorldShaderVariantKey,
     started: Instant,
 ) {
     let count = |class| pipelines.iter().filter(|(key, _)| key.class == class).count();
-    rverbose!(1, "Fragment specialization: {jobs} material key(s) -> {} specialized PSO(s)         (opaque {}, mask {}, transparent {}) in {:.1} ms",
-        pipelines.len(), count(DrawClass::Opaque), count(DrawClass::Mask),
+    rverbose!(1, "Fragment specialization: {} material key(s) -> {} specialized PSO(s)         (opaque {}, mask {}, transparent {}) in {:.1} ms",
+        jobs.len(), pipelines.len(), count(DrawClass::Opaque), count(DrawClass::Mask),
         count(DrawClass::Transparent), started.elapsed().as_secs_f64() * 1000.0);
+    use super::programs::{StageProgram, WorldProgramMode, program_key, program_variant};
+    if variant.program_mode != WorldProgramMode::Specialized {
+        let mut families = BTreeMap::<StageProgram, usize>::new();
+        let mut fallbacks = BTreeMap::<&str, usize>::new();
+        for &(pipeline, raw) in jobs {
+            let choice = program_key(variant, pipeline, raw);
+            *families.entry(choice.program).or_default() += 1;
+            if choice.program == StageProgram::Specialized {
+                *fallbacks.entry(super::programs::fallback_reason(variant, pipeline, raw)).or_default() += 1;
+            }
+        }
+        let programs = pipelines.iter().map(|&(pipeline, material)| (
+            program_variant(variant, material), material, pipeline.class != DrawClass::Opaque,
+            pipeline.auto_sprite2, pipeline.legacy_srgb_three_stage,
+        )).collect::<BTreeSet<_>>();
+        println!("[WORLD STAGE RECIPES] mode={} prepared_recipes={} program_pairs={} pipelines={} coverage={families:?} fallbacks={fallbacks:?} compile_ms={:.1}",
+            super::programs::active_mode(variant), jobs.len(), programs.len(), pipelines.len(), started.elapsed().as_secs_f64()*1000.0);
+    }
 }
 
 /// A cold-path snapshot of the compiled pass identities currently retained by
@@ -1134,7 +1156,7 @@ impl WorldPipelineReuseCatalog {
                     for (&(key, _), (material, pipeline)) in &set.specialized_pipelines {
                 catalog.insert(WorldPassPipelineIdentity::specialized(
                     variant, variant.legacy_fog, key, *material,
-                    material_minimal_entry(variant, &key), format, samples,
+                    super::programs::uses_minimal_entry(*material), format, samples,
                 ), pipeline);
             }
             for (&original, pipeline) in &set.legacy_dlight_pipelines {
@@ -1325,17 +1347,15 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
 
     let specialized_pipelines = if shader_variant.material_specialization {
         let started = Instant::now();
-        let base_variant = shader_variant.base_pass_key();
         let (unique, slots) = specialized_pipeline_plan(&plan.material_jobs, shader_variant);
+        let modules = super::programs::ProgramModules::default();
         let compiled = compile_cached_world_pass("world-specialized-runtime", &unique, reusable, cancelled,
             |&(key, material)| WorldPassPipelineIdentity::specialized(
                 shader_variant, shader_variant.legacy_fog, key, material,
-                material_minimal_entry(shader_variant, &key), surface_format, msaa_samples),
-            |&(key, material)| create_world_pipeline_specialized(
-                device, layout, shader, surface_format, key, msaa_samples,
-                shader_variant.legacy_fog, false, Some(base_variant), false, None, Some(material),
-                material_minimal_entry(shader_variant, &key)))?;
-        log_material_specialization(plan.material_jobs.len(), &unique, started);
+                super::programs::uses_minimal_entry(material), surface_format, msaa_samples),
+            |&(key, material)| modules.pipeline(
+                device, layout, shader, surface_format, msaa_samples, shader_variant, key, material))?;
+        log_material_specialization(&plan.material_jobs, &unique, shader_variant, started);
         specialized_pipeline_map(&plan.material_jobs, &unique, &slots, compiled)
     } else {
         Default::default()
@@ -1808,7 +1828,7 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
             ],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1862,7 +1882,7 @@ pub(in crate::renderer) fn create_rain_depth_prepass_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1911,7 +1931,7 @@ pub(in crate::renderer) fn create_hiz_prepass_pipeline(
             targets: &[],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1969,7 +1989,7 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline(
             ],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -2034,7 +2054,7 @@ pub(in crate::renderer) fn create_entity_prepass_pipeline(
             ],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -2084,7 +2104,7 @@ pub(in crate::renderer) fn create_entity_rain_prepass_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -2149,6 +2169,6 @@ pub(in crate::renderer) fn create_entity_shadow_pipeline(
             targets: &[],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }

@@ -215,7 +215,7 @@ impl Renderer {
                 // independent. 0 disables ACES, 1 enables SDR ACES, and 3
                 // preserves highlights for the native display-output stage. HDR rendering is
                 // selected separately by scene_format().
-                tone_mapping: if self.hdr_output.is_some() { 3.0 } else if self.tone_mapping_enabled { 1.0 } else { 0.0 },
+                tone_mapping: if self.hdr_output.is_some() { 3.0 } else { self.tone_mapping_strength },
                 bloom: if self.glow_mode.enabled() { 1.0 } else { 0.0 },
                 ssao: if self.ssao_enabled { 1.0 } else { 0.0 },
             },
@@ -271,6 +271,7 @@ impl Renderer {
                 time: self.started.elapsed().as_secs_f32(),
                 exposure: self.color_grade.exposure_ev,
             },
+            exposure_controls: [self.auto_exposure_strength, 0.0, 0.0, 0.0],
             camera_fx: PostCameraFxSettings {
                 motion_blur_scale,
                 depth_of_field: self.depth_of_field_strength,

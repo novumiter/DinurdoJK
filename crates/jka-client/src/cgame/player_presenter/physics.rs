@@ -210,6 +210,32 @@ impl PlayerPresenter {
         }
     }
 
+    /// EV_DEBRIS is presentation-only: keep physics in the existing ragdoll
+    /// solver and never create a predicted or authoritative game entity.
+    pub(crate) fn spawn_physics_debris(
+        &mut self,
+        specs: &[crate::cgame::weapon_fx::ChunkSpec],
+        current_time: i32,
+    ) -> bool {
+        self.ragdolls.spawn_debris(specs, current_time)
+    }
+
+    pub(crate) fn physics_debris_models(&self, time: i32) -> Vec<crate::cgame::weapon_fx::ChunkModel> {
+        self.ragdolls.debris_models(time)
+    }
+    pub(crate) fn spawn_physics_glass(
+        &mut self,
+        specs: &[crate::cgame::weapon_fx::ShardSpec],
+        current_time: i32,
+    ) -> usize {
+        self.ragdolls.spawn_glass(specs, current_time)
+    }
+
+    pub(crate) fn physics_glass_draws(&self, time: i32) -> Vec<crate::fx::system::FxDraw> {
+        self.ragdolls.glass_draws(time)
+    }
+
+
     pub fn set_physics_map_mesh(&mut self, mesh: &PhysicsMapMesh) -> Result<(), String> {
         self.ragdolls.set_map_mesh(mesh)
     }
@@ -650,6 +676,7 @@ impl PlayerPresenter {
             rt_skinned_key: None,
             ghoul2_gpu: None,
             fx_gpu_sprites: Some(FxGpuSprites {
+                resident: None,
                 instances: Arc::new(std::mem::take(&mut self.blob_shadow_instances)),
                 blob_shadow: true,
             }),

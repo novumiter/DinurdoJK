@@ -63,6 +63,11 @@ impl Renderer {
         } else {
             None
         };
+        // Compile queue just drained: persist the new pipelines now, so a crash
+        // or kill later in the session does not lose them.
+        if status.is_none() && self.ui_state.shader_compile_progress.is_some() {
+            crate::pipeline_cache::save_in_background();
+        }
         let signature = |bar: &Option<ui::MapLoadingBar>| {
             bar.as_ref().map(|bar| (bar.completed, bar.total))
         };
@@ -500,6 +505,7 @@ impl Renderer {
     pub(in crate::renderer) fn set_egui(&mut self, frame: Option<EguiRenderData>) {
         let Some(mut frame) = frame else {
             self.egui_active = false;
+            self.egui_present_token = None;
             self.egui_paint_jobs.clear();
             for texture_id in self.egui_pending_free.drain(..) {
                 self.egui_renderer.free_texture(&texture_id);
@@ -518,6 +524,7 @@ impl Renderer {
         self.egui_paint_jobs = std::mem::take(&mut frame.paint_jobs);
         self.egui_pixels_per_point = frame.pixels_per_point.max(0.25);
         self.egui_active = true;
+        self.egui_present_token = frame.present_token;
     }
 
     pub(in crate::renderer) fn submit_egui(&mut self, frame_view: &wgpu::TextureView) {

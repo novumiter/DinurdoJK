@@ -2,7 +2,7 @@
 use crate::renderer::{
     legacy_dlight_receives, legacy_fog_pass_jobs, material_specialization_jobs, scene, Arc, Auto4CollapseCache, BTreeMap,
     BTreeSet, CullMode, DirectionalSun, DrawBatch, GpuImage, GpuVertex, GrassMapGpu, Hash,
-    InlineModelInstance, InspectorTextureMeta, InspectorVertex, LocalShadowResources, Mat4, Mutex,
+    InlineModelInstance, InspectorTextureMeta, InspectorVertex, LocalShadowResources, Mat4,
     MaterialFragmentKey, PipelineKey, PreparedPortalPlanBatchRef, PvsMode, RtAlphaMaskSource, SnowShellGpu,
     StaticAoWorldSource, SurfaceSpriteEffectGpu, TextureData, Vec3, WorldShaderVariantKey,
 };
@@ -19,6 +19,24 @@ pub(in crate::renderer) struct OceanPromotionDecision {
     pub(in crate::renderer) faces: usize,
     /// A missing slot means this valid candidate lost the eight-slot selection.
     pub(in crate::renderer) slot: Option<u8>,
+}
+
+#[derive(Clone)]
+pub(in crate::renderer) struct FacePlaneRun {
+    /// Index offsets from the current batch's indexed_range.start, not absolute
+    /// indices. AUTO-4 can relocate collapsed recipes while preserving this list.
+    pub(in crate::renderer) offsets: std::ops::Range<u32>,
+    /// Zero plane keeps this run, e.g. tri-soup, patch or unknown.
+    pub(in crate::renderer) plane: [f32; 4],
+    /// Render-space bounds of this run's geometry. Unknown bounds span all of
+    /// space so no volume test can ever reject the run.
+    pub(in crate::renderer) bounds_min: [f32; 3],
+    pub(in crate::renderer) bounds_max: [f32; 3],
+}
+
+impl FacePlaneRun {
+    pub(in crate::renderer) const UNKNOWN_BOUNDS: ([f32; 3], [f32; 3]) =
+        ([f32::NEG_INFINITY; 3], [f32::INFINITY; 3]);
 }
 
 #[derive(Clone)]
@@ -114,12 +132,15 @@ pub(in crate::renderer) struct RuntimeOceanClipmap {
     pub(in crate::renderer) active_range: std::ops::Range<u32>,
     pub(in crate::renderer) current_half_cells: i32,
     pub(in crate::renderer) current_minimum_level: u32,
+    /// Levels drawn past which water absorption hides the sheet (u32::MAX = all).
+    pub(in crate::renderer) current_level_limit: u32,
     /// Final per-surface centre after global and outer-ring snapping. NaN
     /// forces the first rendered frame to install footprint-pruned indices.
     pub(in crate::renderer) current_centre: [f32; 2],
     /// Exact BSP cluster whose visible water pieces shaped `active_range`.
     /// `None` is the conservative PVS-off/outside-the-tree footprint.
     pub(in crate::renderer) current_pvs_cluster: Option<usize>,
+    pub(in crate::renderer) current_sky_extend: bool,
 }
 
 /// Prebuilt texture bindings for a TaystJK animMap stage. These are the same
@@ -139,6 +160,9 @@ pub(in crate::renderer) struct WorldBatchAnimation {
 
 #[derive(Clone)]
 pub(in crate::renderer) struct WorldBatch {
+    pub(in crate::renderer) full_indexed_range: std::ops::Range<u32>,
+    pub(in crate::renderer) patch_geometry: Option<usize>,
+    pub(in crate::renderer) patch_suppressed: bool,
     pub(in crate::renderer) source: DrawBatch,
     pub(in crate::renderer) indexed_range: std::ops::Range<u32>,
     /// Contiguous authored-BSP surface runs inside `indexed_range`. Legacy
@@ -146,6 +170,11 @@ pub(in crate::renderer) struct WorldBatch {
     /// surface whose OpenJK-style dlight mask is non-zero. Inline BSP models
     /// intentionally leave this empty and use their existing all-light fallback.
     pub(in crate::renderer) legacy_dlight_runs: Vec<LegacyDlightRun>,
+    /// Shared: AUTO variants of one geometry reference the same merged runs.
+    pub(in crate::renderer) face_cull_runs: Arc<[FacePlaneRun]>,
+    /// Only nonzero for a packed run of coincident, single-sided BSP planar faces.
+    /// ZERO means mixed/unknown => never reject the batch on its face plane.
+    pub(in crate::renderer) face_cull_plane: [f32; 4],
     /// True for a CG_Mover inline BSP model rather than static world geometry.
     /// Used by grouped mover submission and diagnostics.
     pub(in crate::renderer) is_inline_entity: bool,
@@ -236,6 +265,7 @@ impl WorldPipelineCompilePlan {
     }
 }
 
+#[derive(Clone)]
 pub(in crate::renderer) struct WorldPipelineVariant {
     pub(in crate::renderer) pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     /// OpenJK-style projected-light redraw. The normal world material pipelines
@@ -383,8 +413,17 @@ pub(in crate::renderer) struct InlineModelGpu {
     pub(in crate::renderer) coarse_batches: Vec<usize>,
     pub(in crate::renderer) full_batches: Vec<usize>,
     /// Last uploaded pose: `None` = never updated (buffer holds the compiled
-    /// pose), `Some(None)` = hidden (not in the snapshot).
+    /// pose), `Some(None)` = hidden (not in the snapshot). Portal membership
+    /// is carried in each submitted pose, never attached to a BSP model handle.
     pub(in crate::renderer) uploaded: Option<Option<InlineModelInstance>>,
+}
+
+#[derive(Default)]
+pub(in crate::renderer) struct AnimatedBatches {
+    /// (FULL set?, index) into coarse_batches / full_batches.
+    pub(in crate::renderer) batches: Vec<(bool, usize)>,
+    /// (auto4 index, FULL source index) for AUTO batches that mirror an animated FULL batch.
+    pub(in crate::renderer) auto4: Vec<(usize, usize)>,
 }
 
 impl WorldGpu {
@@ -395,6 +434,30 @@ impl WorldGpu {
 }
 
 pub(in crate::renderer) struct WorldGpu {
+    /// Immutable index source retained for material-only AUTO4 recipe rebinding.
+    pub(in crate::renderer) remap_index_source: Arc<Vec<u32>>,
+    /// Remap-only reuse key; never consulted by frame/draw code.
+    pub(in crate::renderer) remap_asset_source: std::path::PathBuf,
+    pub(in crate::renderer) remap_asset_hash: u64,
+    pub(in crate::renderer) remap_texture_hashes: Vec<u64>,
+    /// Count of pristine-map images before remap-only targets were appended.
+    pub(in crate::renderer) remap_base_texture_count: usize,
+    pub(in crate::renderer) remap_texture_usage: Vec<u8>,
+    pub(in crate::renderer) remap_picmip: u32,
+    pub(in crate::renderer) remap_compression: u8,
+    pub(in crate::renderer) remap_pbr_compression: bool,
+    pub(in crate::renderer) remap_scene_format: wgpu::TextureFormat,
+    pub(in crate::renderer) remap_msaa_samples: u32,
+
+    pub(in crate::renderer) bsp_model_lod: super::bsp_model_lod::BspModelLod,
+    pub(in crate::renderer) patch_lod: super::patch_lod::WorldPatchLod,
+    /// Any batch carries a promoted glass primary stage. Fixed at upload so the
+    /// frame path does not scan every batch to decide whether post is needed.
+    pub(in crate::renderer) has_glass_primary: bool,
+    /// Batches whose material has an animMap. Sources and batch sets never
+    /// change after upload; filled on first use so the per-frame animation tick
+    /// does not walk every batch.
+    pub(in crate::renderer) animated_batches: Option<AnimatedBatches>,
     /// Drawn, markable world surfaces shared with saber marks (R_MarkFragments).
     pub(in crate::renderer) mark_surfaces: Option<Arc<jka_assets::bsp::MarkSurfaces>>,
     /// Direct source-.map worlds have no compiled BSP/PVS. They therefore use
@@ -421,6 +484,11 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     /// Real outlines of `ocean_surfaces`, by the slot baked into each clipmap.
     pub(in crate::renderer) ocean_masks: Arc<crate::ocean::OceanMasks>,
+    /// OFF and ON masks are independent; ON adds only sky-connected geometry.
+    pub(in crate::renderer) ocean_base_masks: Arc<crate::ocean::OceanMasks>,
+    pub(in crate::renderer) ocean_sky_regions: Vec<Option<crate::ocean::sky_extend::SkyExtension>>,
+    /// FULL-batch representatives for continuation draws that outlive PVS.
+    pub(in crate::renderer) ocean_sky_representatives: Vec<Option<usize>>,
     /// Fine footprints for exact FULL water pieces, indexed in parallel with
     /// `full_batches`; unioned only when the camera changes BSP cluster.
     pub(in crate::renderer) ocean_pvs_footprints: crate::ocean::OceanPvsFootprints,
@@ -470,10 +538,9 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) _cluster_buffer: wgpu::Buffer,
     pub(in crate::renderer) legacy_dlight_surface_id_buffer: wgpu::Buffer,
     pub(in crate::renderer) legacy_dlight_surface_mask_buffer: wgpu::Buffer,
-    /// Mirrors the GPU surface-mask buffer so the isolated Legacy dlight pass
-    /// can submit only touched triangle runs instead of rasterizing every BSP
-    /// surface just to discover a zero mask in the fragment shader.
-    pub(in crate::renderer) legacy_dlight_surface_masks_cpu: Mutex<Vec<u32>>,
+    /// Legacy dlight lit-surface lists: mask mirror and this frame's draws.
+    pub(in crate::renderer) legacy_dlight:
+        crate::renderer::lighting::legacy_dlight_lists::LegacyDlightLists,
     /// CPU copy used only by the Trace/surface-inspector diagnostic.
     pub(in crate::renderer) legacy_dlight_triangle_surfaces: Vec<u32>,
     pub(in crate::renderer) legacy_dlight_surfaces: Vec<scene::LegacyDlightSurface>,

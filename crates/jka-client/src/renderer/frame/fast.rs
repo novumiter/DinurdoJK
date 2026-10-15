@@ -1,7 +1,7 @@
 //! Frame fast.
 use crate::renderer::{
     world_stage_probe_excludes, aabb_intersects_clip_frustum, active_batch_selection, batch_area_visible, camera_depth_clear,
-    draw_snow_shell_fast, draw_world_batch, effective_area_mask, hidden_inline_batch, inspector_index_range,
+    draw_snow_shell_fast, draw_world_batch, effective_area_mask, hidden_bsp_model_surface, hidden_inline_batch, inspector_index_range,
     ocean_suppresses_batch, refresh_auto4_lazy_collapse, sample_view_rotation,
     snow_shell_draw_near_center, ui, update_visibility, Camera, CameraUniform, CompanionSceneView,
     CullDebugMode, DrawClass, DynamicModelSurface, FootprintMode, FrameInfo, GpuPass, Instant,
@@ -45,7 +45,8 @@ impl Renderer {
             clip_plane: [0.0; 4],
             render_flags: [
                 0,
-                (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)),
+                (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)
+                    | self.ocean_sky_horizon_flag()),
                 self.classic_world_render_flags(),
                 if self.taa_enabled {
                     self.taa_frame_index
@@ -80,6 +81,7 @@ impl Renderer {
             late_latch_after_acquire: latest_view.is_some() && !needs_early_latch,
             ..FrameInfo::default()
         };
+        info.world_shader_programs.requested = self.fragment_shader_mode;
         let snow_deform_center = self.surface_deformation.field_center();
         let mut prepared_grass = None;
         let mut prepared_surface_sprite_effects = None;
@@ -160,6 +162,10 @@ impl Renderer {
             false,
             false,
         );
+        let glass_capture_needed = self.world.as_ref().is_some_and(|world| {
+            world.has_glass_primary
+        }) || self.dynamic_model_renderer.draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
+            || self.dynamic_model_renderer.skin_draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass);
         self.ensure_prepared_wireframe_pipelines(
             prepared_grass.as_ref(),
             prepared_surface_sprite_effects.as_ref(),
@@ -243,6 +249,29 @@ impl Renderer {
                 .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         }
         info.late_latch = late_view_sample;
+        if glass_capture_needed {
+            let key = (self.config.width.max(1), self.config.height.max(1), self.msaa_samples, self.scene_format());
+            if self.ocean_optics.key != key {
+                self.ocean_optics = crate::ocean::optics::Resources::new(
+                    &self.device, &self.ocean_optics_layout, &self.ocean_layout, key,
+                );
+            }
+            let optics = crate::ocean::optics::Uniform {
+                inverse_view_projection: view_proj.inverse().to_cols_array_2d(),
+                eye: render_camera.position.extend(1.0).to_array(),
+                forward: render_camera.forward().extend(0.0).to_array(),
+                fog: [0.0; 4], params: [0.0; 4],
+                minimum: [[0.0; 4]; 8], maximum: [[0.0; 4]; 8],
+                sky_regions: [crate::ocean::optics::SkyFogRegion::default(); 8],
+                sky_info: [0.0; 4],
+            };
+            self.queue.write_buffer(&self.ocean_optics.uniform, 0, bytemuck::bytes_of(&optics));
+        }
+        if glass_capture_needed {
+            self.prepare_glass();
+        }
+        self.dynamic_model_renderer.glass_bind_group =
+            glass_capture_needed.then(|| self.ocean_optics.bind_group.clone());
         let crosshair_world = late_view_sample
             .map(|measurement| measurement.crosshair_world)
             .unwrap_or(dynamic_crosshair_world);
@@ -265,7 +294,9 @@ impl Renderer {
         let perf_pre_world_started = perf_timing.then(Instant::now);
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Frame, false);
-        let use_gamma_post = self.frame_plan.use_post;
+        // A transmissive snapshot needs a sampleable scene attachment. The
+        // swapchain view is renderable but is not guaranteed TEXTURE_BINDING.
+        let use_gamma_post = self.frame_plan.use_post || glass_capture_needed;
         let menu_backdrop_active = self.menu_backdrop_requested() && self.menu_backdrop.is_some();
         let crt_active = self.crt_scope != ui::CrtScope::Off;
         if crt_active {
@@ -320,6 +351,11 @@ impl Renderer {
             };
 
             let active = active_batch_selection(world, self.pvs_mode);
+            let glass_capture_needed = glass_capture_needed && (
+                active.indices.iter().any(|&index| active.batches[index].source.glass_primary)
+                    || self.dynamic_model_renderer.draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
+                    || self.dynamic_model_renderer.skin_draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
+            );
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
             if capture_api_calls {
@@ -377,11 +413,7 @@ impl Renderer {
             let mut transparency_order = super::plan::WorldTransparencyOrder::default();
             for (active_pos, &batch_index) in active.indices.iter().enumerate() {
                 let batch = &active.batches[batch_index];
-                if !self.draw_bsp_model_surfaces && !batch.is_inline_entity
-                    && world.material_debug.entries
-                        .get(batch.source.material_debug_index as usize)
-                        .is_some_and(|entry| entry.name.starts_with("models/"))
-                {
+                if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) {
                     continue;
                 }
                 if world_stage_probe_excludes(self.world_stage_probe, batch.source.pipeline, batch.source.water) {
@@ -423,6 +455,7 @@ impl Renderer {
                             world,
                             view_proj,
                             snow_deform_center,
+                            self.draw_bsp_model_surfaces,
                             &mut current_pipeline,
                         );
                         if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
@@ -469,13 +502,17 @@ impl Renderer {
                     }
                     grass_drawn = true;
                 }
-                if transparency_order.defer_stage(
+                let capture_decal = super::plan::WorldTransparencyOrder::capture_decal(
+                    glass_capture_needed, batch.source.pipeline.offset, batch.source.late_sorted_material,
+                );
+                if batch.source.glass_primary || (!capture_decal && transparency_order.defer_stage(
                     &batch.source.vertices,
                     batch.source.bsp_shader_index,
                     batch.source.pipeline.class,
                     batch.source.opaque_composite_before_clouds,
                     batch.source.late_sorted_material,
-                ) {
+                    batch.source.authored_sort_priority < crate::scene::SS_OPAQUE_SORT_PRIORITY,
+                )) {
                     deferred_transparent.push(active_pos);
                     continue;
                 }
@@ -495,6 +532,7 @@ impl Renderer {
                     world,
                     view_proj,
                     snow_deform_center,
+                    self.draw_bsp_model_surfaces,
                     &mut current_pipeline,
                 );
                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
@@ -545,6 +583,23 @@ impl Renderer {
                     self.ocean_spray_pipeline.as_ref(),
                 );
             }
+            if glass_capture_needed && self.glass_world.as_ref().is_some_and(|glass| glass.settings.needs_background()) {
+                drop(pass);
+                self.ocean_optics.capture_background(&self.device, &mut encoder, color_view,
+                    &self.targets.depth_view, &self.ocean_inert_bind_group);
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA fast models after glass background capture"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view, depth_slice: None, resolve_target,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }), ..Default::default()
+                });
+            }
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, false);
             self.dynamic_model_renderer.draw_phase(
@@ -552,6 +607,31 @@ impl Renderer {
             );
             self.gpu_profiler
                 .write_render_pass_timestamp(&mut pass, GpuPass::DynamicModels, true);
+            if glass_capture_needed {
+                drop(pass);
+                self.ocean_optics.capture(
+                    &self.device, &mut encoder, color_view, &self.targets.depth_view,
+                    &self.ocean_inert_bind_group, None,
+                );
+                self.glass_world.as_ref().expect("glass pipeline").capture_geometry(
+                    &mut encoder, &self.ocean_optics, &self.camera_bind_group, world,
+                    &active.batches, &active.indices, &deferred_transparent,
+                    &self.dynamic_model_renderer, false,
+                );
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA fast glass transmission"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: color_view, depth_slice: None, resolve_target,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+            }
             if !deferred_transparent.is_empty() {
                 // The model renderer changed the vertex/index streams and bind
                 // groups. Restore the fast world state once, then draw the
@@ -567,6 +647,16 @@ impl Renderer {
                 current_pipeline = None;
                 for &active_pos in &deferred_transparent {
                     let batch = &active.batches[active.indices[active_pos]];
+                    if batch.source.glass_primary {
+                        pass.set_pipeline(&self.glass_world.as_ref().expect("glass pipeline").pipelines[&batch.source.pipeline.cull]);
+                        pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        pass.set_bind_group(1, &batch.bind_group, &[]);
+                        pass.set_bind_group(2, &self.ocean_optics.bind_group, &[]);
+                        draw_world_batch(&mut pass, batch, 0..1, None);
+                        pass.set_bind_group(0, &self.fast_camera_bind_group, &[]);
+                        current_pipeline = None;
+                        continue;
+                    }
                     if current_pipeline != Some(batch.source.pipeline) {
                         if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
@@ -623,6 +713,7 @@ impl Renderer {
                                 // World wireframe must follow the resolved remap, not
                                 // resurrect framebuffer/depth no-op shaders (e.g. clear).
                                 && batch.source.contributes_to_world_wireframe()
+                                && !hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug)
                                 && (!batch.is_inline_entity || self.draw_inline_models)
                                 && !hidden_inline_batch(batch, &world.inline_models)
                                 && (!self.ocean_enabled || batch.ocean_clipmap.is_none())
@@ -674,6 +765,9 @@ impl Renderer {
                                 else {
                                     continue;
                                 };
+                                if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) {
+                                    continue;
+                                }
                                 if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
                                 pass.set_bind_group(1, &batch.fast_bind_group, &[]);
                                 if capture_api_calls { info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1); }
@@ -780,9 +874,7 @@ impl Renderer {
                         let mut last_key = None;
                         for &batch_index in active.indices {
                             let batch = &active.batches[batch_index];
-                            if !self.draw_bsp_model_surfaces && !batch.is_inline_entity
-                                && world.material_debug.entries.get(batch.source.material_debug_index as usize)
-                                    .is_some_and(|entry| entry.name.starts_with("models/")) { continue; }
+                            if hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug) { continue; }
                             if ocean_suppresses_batch(self.ocean_enabled, batch)
                                 || world_stage_probe_excludes(self.world_stage_probe, batch.source.pipeline, batch.source.water)
                                 || batch.source.pipeline.class == DrawClass::Sky

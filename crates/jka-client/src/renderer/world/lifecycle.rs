@@ -7,7 +7,30 @@ use crate::renderer::{
 };
 
 impl Renderer {
-    pub(in crate::renderer) fn load_map(&mut self, mut map: PreparedMap) -> WorldUploadTimings {
+    pub(in crate::renderer) fn load_map(&mut self, map: PreparedMap) -> WorldUploadTimings {
+        self.load_map_internal(map, None)
+    }
+
+    /// Material-only plan: no clone of the PreparedMap or deferred destruction
+    /// on the render thread. The Arc pristine map is held solely for the rare
+    /// explicit geometry-changing fallback.
+    pub(in crate::renderer) fn load_remapped_map(
+        &mut self,
+        plan: crate::scene::PreparedRemapPlan,
+        base_texture_count: usize,
+    ) -> WorldUploadTimings {
+        match self.remap_resident_world(&plan, base_texture_count) {
+            Ok(timings) => timings,
+            Err(reason) => {
+                rverbose!(1, "[SHADER REMAP] resident update unavailable ({reason}); using full compatibility reconstruction");
+                let mut timings = self.load_map_internal(plan.into_full_map(), Some(base_texture_count));
+                timings.remap_full_fallback = true;
+                timings
+            }
+        }
+    }
+
+    fn load_map_internal(&mut self, mut map: PreparedMap, reuse: Option<usize>) -> WorldUploadTimings {
         let load_map_started = Instant::now();
         self.promoted_ocean_overrides.clear();
         self.ocean_interaction.clear(&self.queue);
@@ -158,6 +181,8 @@ impl Renderer {
             self.picmip,
             if self.bc_compression_supported { self.texture_compression } else { 0 },
             map,
+            if reuse.is_some() { self.world.as_ref() } else { None },
+            reuse.unwrap_or(0),
         );
         upload_timings.pre_build_ms = pre_build_ms;
         let post_bind_started = Instant::now();

@@ -36,11 +36,18 @@ impl App {
     pub(in crate::app) fn apply_setting_reset(&mut self, reset: theme::Reset) {
         match reset {
             theme::Reset::None => {}
+            theme::Reset::Glass(name) => self.reset_glass_control(name),
             theme::Reset::Color(name) => {
+                // Both controls are immediate UI state; route through their
+                // normal setters rather than the console's vid_restart latch.
+                if name == "r_hdrStyle" {
+                    let _ = self.cvar_set_hdr_style("r_hdrStyle", "0");
+                    return;
+                }
                 let defaults = crate::color_grading::SplitToningSettings::default();
                 let grade = crate::color_grading::ColorGradeSettings::default();
                 let value = match name {
-                    "r_hdrOutput" => "0".to_owned(),
+                    "r_hdrStyle" => "0".to_owned(),
                     "r_hdrPaperWhite" => "200".to_owned(),
                     "r_hdrPeak" => "0".to_owned(),
                     "r_gammaMethod" => "shader".to_owned(),
@@ -96,6 +103,24 @@ impl App {
     pub(in crate::app::egui_settings) fn reset_video_row(&mut self, row: usize) {
         let defaults = VideoSettings::default();
         match row {
+            ui::VIDEO_ROW_PATCH_SUBDIVISIONS => {
+                self.set_patch_menu_cvar("r_subdivisions", &defaults.patch_subdivisions.to_string());
+            }
+            ui::VIDEO_ROW_PATCH_LOD_ERROR => {
+                let _ = self.set_console_cvar("r_lodCurveError", &defaults.lod_curve_error.to_string());
+            }
+            ui::VIDEO_ROW_PATCH_STITCHING => {
+                let _ = self.set_console_cvar("r_patchStitching", if defaults.patch_stitching { "1" } else { "0" });
+            }
+            ui::VIDEO_ROW_DRAW_CURVES => {
+                let _ = self.set_console_cvar("r_nocurves", if defaults.no_curves { "1" } else { "0" });
+            }
+            ui::VIDEO_ROW_PATCH_STATS => {
+                let _ = self.set_console_cvar("r_speeds", &defaults.speeds.to_string());
+            }
+            ui::VIDEO_ROW_MODEL_LOD_SCALE => {
+                let _ = self.set_console_cvar("r_lodScale", &defaults.lod_scale.to_string());
+            }
             ui::VIDEO_ROW_FULLSCREEN => self.set_fullscreen_mode(defaults.fullscreen),
             ui::VIDEO_ROW_RESOLUTION => {
                 self.video.resolution = defaults.resolution;
@@ -150,6 +175,12 @@ impl App {
                 self.video.texture_filter = defaults.texture_filter;
                 self.render_command(RenderCommand::SetTextureFilter(self.video.texture_filter));
                 self.mark_config_dirty();
+            }
+            ui::VIDEO_ROW_TEXTURE_COMPRESSION => {
+                let _ = self.set_console_cvar(
+                    "r_ext_compress_textures",
+                    &defaults.texture_compression.to_string(),
+                );
             }
             ui::VIDEO_ROW_PICMIP => {
                 self.video.picmip = defaults.picmip;
@@ -396,9 +427,7 @@ impl App {
                 self.sync_planar_reflection_debug();
             }
             ui::VIDEO_ROW_HDR => {
-                self.video.hdr = defaults.hdr;
-                self.sync_post_effects();
-                self.mark_config_dirty();
+                let _ = self.cvar_set_r_hdr("r_hdr", if defaults.hdr { "1" } else { "0" });
             }
             ui::VIDEO_ROW_FLOAT_LIGHTMAP => {
                 self.video.float_lightmap = defaults.float_lightmap;
@@ -914,8 +943,7 @@ impl App {
             OCEAN_SEA_SPRAY => settings.sea_spray = defaults.sea_spray,
             OCEAN_WIND_FOAM => settings.wind_foam_streaks = defaults.wind_foam_streaks,
             9 => settings.optics.fog_color = defaults.optics.fog_color,
-            10 => settings.optics.fog_distance = defaults.optics.fog_distance,
-            11 => settings.optics.transparency = defaults.optics.transparency,
+            10 => settings.optics.transparency = defaults.optics.transparency,
             12 => settings.optics.depth_darkening = defaults.optics.depth_darkening,
             13 => settings.optics.refraction = defaults.optics.refraction,
             14 => settings.optics.caustics = defaults.optics.caustics,

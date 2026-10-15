@@ -1,4 +1,9 @@
 // Bounded Beer-Lambert medium, captured before water and diagnostic overlays.
+struct SkyFogRegion {
+    bounds: vec4<f32>,
+    plane: vec4<f32>,
+    segments: array<vec4<f32>, 16>,
+};
 struct Optics {
     inverse_view_projection: mat4x4<f32>,
     eye: vec4<f32>,
@@ -7,6 +12,8 @@ struct Optics {
     params: vec4<f32>,
     minimum: array<vec4<f32>, 8>,
     maximum: array<vec4<f32>, 8>,
+    sky_regions: array<SkyFogRegion, 8>,
+    sky_info: vec4<f32>,
 };
 COLOR_DECLARATION
 @group(0) @binding(1) var scene_sampler: sampler;
@@ -112,6 +119,10 @@ var<private> g_spans: array<vec2<f32>, OCEAN_MAX_SPANS>;
 var<private> g_span_count: u32;
 var<private> g_eye_depth: f32;
 
+// Water deeper than this below the surface counts as water even inside an
+// outline hollow (see capture_sample).
+const MASK_DRY_DEPTH: f32 = 128.0;
+
 fn add_span(span: vec2<f32>, top: f32, delta_y: f32) {
     if (span.y <= span.x) {
         return;
@@ -190,6 +201,77 @@ fn mask_triangle_interval(a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, origin: vec2
     return t;
 }
 
+// Clip one interval against p(t) <= limit; reversed inputs express >=.
+// No arbitrary ocean extent: every XZ constraint is a half-plane.
+fn sky_fog_clip(span: vec2<f32>, origin: f32, delta: f32, limit: f32) -> vec2<f32> {
+    if (abs(delta) < 1.0e-7) {
+        return select(span, vec2<f32>(1.0, 0.0), origin > limit);
+    }
+    let t = (limit - origin) / delta;
+    if (delta > 0.0) {
+        return vec2<f32>(span.x, min(span.y, t));
+    }
+    return vec2<f32>(max(span.x, t), span.y);
+}
+
+fn sky_fog_column(span: vec2<f32>, origin: vec2<f32>, delta: vec2<f32>,
+    wall: vec4<f32>) -> vec2<f32> {
+    let side = u32(round(wall.w));
+    var result = span;
+    if (side == 1u || side == 2u) {
+        // -X / +X half-strip with bounded tangential Z.
+        result = sky_fog_clip(result, origin.x * select(1.0, -1.0, side == 2u),
+            delta.x * select(1.0, -1.0, side == 2u),
+            wall.x * select(1.0, -1.0, side == 2u) + 2.0);
+        result = sky_fog_clip(result, -origin.y, -delta.y, -wall.y);
+        result = sky_fog_clip(result, origin.y, delta.y, wall.z);
+    } else if (side == 3u || side == 4u) {
+        // -Z / +Z half-strip with bounded tangential X.
+        result = sky_fog_clip(result, origin.y * select(1.0, -1.0, side == 4u),
+            delta.y * select(1.0, -1.0, side == 4u),
+            wall.x * select(1.0, -1.0, side == 4u) + 2.0);
+        result = sky_fog_clip(result, -origin.x, -delta.x, -wall.y);
+        result = sky_fog_clip(result, origin.x, delta.x, wall.z);
+    } else {
+        return vec2<f32>(1.0, 0.0);
+    }
+    return result;
+}
+
+// The optical medium must agree with the extended clipmap mask. Original
+// bounded water boxes above remain unchanged; only the added sky-contact
+// columns are semi-infinite below their water surface. Adjacent quadrants
+// are admitted only when both touched sky walls meet at a real corner.
+fn add_sky_ocean_spans(delta: vec3<f32>) {
+    let origin = optics.eye.xz;
+    let direction = delta.xz;
+    for (var i = 0u; i < u32(optics.sky_info.x); i += 1u) {
+        let top = optics.sky_regions[i].plane.x;
+        let wet = sky_fog_clip(vec2<f32>(0.0, 1.0), optics.eye.y, delta.y, top);
+        if (wet.y <= wet.x) { continue; }
+        for (var j = 0u; j < u32(optics.sky_regions[i].plane.y); j += 1u) {
+            let seg = optics.sky_regions[i].segments[j];
+            let span = sky_fog_column(wet, origin, direction, seg);
+            if (span.y > span.x) { add_span(span, top, delta.y); }
+        }
+        let corners = u32(round(optics.sky_regions[i].plane.z));
+        for (var c = 0u; c < 4u; c += 1u) {
+            if ((corners & (1u << c)) == 0u) { continue; }
+            // Bit order: (-X,-Z), (+X,-Z), (-X,+Z), (+X,+Z).
+            let right = (c & 1u) != 0u;
+            let far = (c & 2u) != 0u;
+            // Explicit second constraint avoids an XZ rectangle or finite radius.
+            let x_edge = select(optics.sky_regions[i].bounds.x, optics.sky_regions[i].bounds.z, right);
+            let z_edge = select(optics.sky_regions[i].bounds.y, optics.sky_regions[i].bounds.w, far);
+            var span = sky_fog_clip(wet, origin.x * select(1.0, -1.0, right),
+                direction.x * select(1.0, -1.0, right), x_edge * select(1.0, -1.0, right));
+            span = sky_fog_clip(span, origin.y * select(1.0, -1.0, far),
+                direction.y * select(1.0, -1.0, far), z_edge * select(1.0, -1.0, far));
+            if (span.y > span.x) { add_span(span, top, delta.y); }
+        }
+    }
+}
+
 // Adds the runs of `span` that lie inside the volume's real outline.
 fn add_masked_spans(slot: i32, span: vec2<f32>, top: f32, delta: vec3<f32>) {
     let range = ocean.mask_ranges[slot];
@@ -260,6 +342,10 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
         if (span.y > span.x) {
             if (slot >= 0 && slot < 8) {
                 add_masked_spans(slot, span, hi.y, delta);
+                // The outline hollows (islands, piers, docks) are dry only above
+                // the surface. Deep below it a visible ray is in water, so the
+                // hollow must not leave seabed seen past a pier unabsorbed.
+                add_span(sky_fog_clip(span, optics.eye.y, delta.y, hi.y - MASK_DRY_DEPTH), hi.y, delta.y);
             } else {
                 add_span(span, hi.y, delta.y);
             }
@@ -269,6 +355,14 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
             && ocean_mask_contains(slot, world.xz)) {
             bottom_depth = max(bottom_depth, max(hi.y - world.y, 0.0));
         }
+    }
+    // The continuation exists under the rendered ocean, NOT as fog-painted
+    // background geometry. A depth=0 sample is sky (no finite receiver):
+    // marching that far-plane ray through semi-infinite sky columns creates
+    // large triangular fog wedges, including on the underwater skybox.
+    // Finite world/model receivers still receive the continued absorption.
+    if (depth > 0.0) {
+        add_sky_ocean_spans(delta);
     }
     let eye_depth = g_eye_depth;
     var water_fraction = 0.0;
@@ -313,6 +407,16 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
             }
         }
     }
+    // No-receiver pixels keep the original box fog only (identical to OFF);
+    // sky columns never paint them (see above). The exception is a downward
+    // ray seen from above the surface of an extended ocean: it can only end in
+    // an unbounded water column, so a ray clipped by the original box edge
+    // must not leave a dark void-coloured border there.
+    if (depth <= 0.0 && delta.y < 0.0) {
+        for (var i = 0u; i < u32(optics.sky_info.x); i += 1u) {
+            if (optics.eye.y > optics.sky_regions[i].plane.x) { water_fraction = 1.0; }
+        }
+    }
     if (water_fraction > 0.0) {
         // log2(20) corresponds to FIVE percent transmission, not four.
         let ratios = vec3<f32>(38.0/7.5, 38.0/22.0, 1.0);
@@ -326,8 +430,17 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
     return out;
 }
 
-@fragment fn fs_capture(@builtin(position) p: vec4<f32>) -> Capture {
+fn capture_pixel(p: vec4<f32>) -> Capture {
     let pixel = vec2<i32>(p.xy);
     let uv = p.xy / vec2<f32>(textureDimensions(scene_color));
     CAPTURE_BODY
+}
+@fragment fn fs_capture(@builtin(position) p: vec4<f32>) -> Capture {
+    return capture_pixel(p);
+}
+@fragment fn fs_glass_background(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+    let sample=capture_pixel(p);
+    // Keep world depth with color to distinguish a recoverable model occlusion
+    // from an opaque world wall in front of the pane.
+    return vec4<f32>(sample.color.rgb,min(sample.depth,60000.0));
 }

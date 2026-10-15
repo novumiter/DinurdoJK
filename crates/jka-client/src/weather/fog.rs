@@ -708,7 +708,7 @@ fn create_froxel_resources(device: &wgpu::Device) -> FroxelResources {
         module: &shader,
         entry_point: Some("cs_main"),
         compilation_options: Default::default(),
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
     let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("JKA froxel volumetric fog uniform"),

@@ -417,7 +417,7 @@ impl WorldFlareRenderer {
                 label: Some("RBSP world flare GPU center depth test"),
                 layout: Some(&pipeline_layout), module: &shader,
                 entry_point: Some("cs_main"), compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             })));
         }
         if self.stage_pipeline_format == Some((format, samples))
@@ -470,7 +470,7 @@ impl WorldFlareRenderer {
                 stencil: Default::default(), bias: Default::default(),
             }), multisample: wgpu::MultisampleState {
                 count: samples, ..Default::default()
-            }, multiview_mask: None, cache: None,
+            }, multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
         });
         self.stage_pipeline.insert(blend, pipeline);
         }

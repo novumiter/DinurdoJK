@@ -3,6 +3,10 @@ use api::{FrameInfo, RenderError};
 use crate::ui::GlowMode;
 use frame::plan::FramePlan;
 use lighting::legacy_dlights::legacy_dlight_runs_for_batch;
+use visibility::face_plane::{
+    authored_face_runs, batch_face_plane_rejected, draw_partial_face_batch, face_plane_selection,
+    merged_face_plane, merged_face_runs, packed_face_plane, selection_stats, FacePlaneSelection, RunCull,
+};
 use overlay::ScreenFxBatch;
 use world::deferred_bundles::{DeferredCommand, DeferredResources, DeferredWorldBundles};
 use world::videos::{WorldVideoPlayer, WORLD_VIDEO_MAX_CATCH_UP};
@@ -14,6 +18,7 @@ mod context;
 mod diagnostics;
 mod environment;
 mod frame;
+mod glass;
 mod initialize;
 pub(crate) mod gpu_adapter;
 mod input_diagnostic;
@@ -47,7 +52,7 @@ use api::{
 pub use api::{
     ClientFramePerf, CloudForegroundBlade, CompanionId, CompanionSceneView, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
-    FxGpuSpriteInstance, FxGpuSprites, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
+    FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand,
     RenderSnapshot, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
     SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
@@ -230,7 +235,7 @@ use visibility::compaction::{
     Auto4CollapseWorker, Auto4GeometryState, Auto4Instance, Auto4PlanStats, IndexedGeometryBuilder,
 };
 use visibility::pvs::{
-    active_batch_selection, batch_area_visible, effective_area_mask, legacy_dlight_batch_selection,
+    active_batch_selection, ActiveBatchSelection, batch_area_visible, effective_area_mask, legacy_dlight_batch_selection,
     refresh_auto4_lazy_collapse, update_active_cull_indices, update_visibility,
     visible_batches_by_cluster,
 };
@@ -245,8 +250,8 @@ use world::detail_textures::{
     required_auto_detail_indices, AUTO_DETAIL_ENABLED_BIT, AUTO_DETAIL_TEXTURE_FILES,
 };
 use world::draw::{
-    average_skybox_color, claim_ocean_clipmap, draw_world_batch, inspector_index_range,
-    ocean_suppresses_batch,
+    average_skybox_color, claim_ocean_clipmap, draw_world_batch, draw_world_batch_secondary, secondary_batch_range, inspector_index_range,
+    ocean_suppresses_batch, hidden_bsp_model_surface,
 };
 use world::geometry::{
     build_draw_compaction_groups, make_cull_record, posed_inline_vertices, same_draw_state,
@@ -272,7 +277,7 @@ use world::pipelines::{
 #[cfg(test)]
 use world::pipelines::{WorldPassPipelineIdentity, WorldPipelinePass};
 use world::types::{
-    GpuReflectionProbe, InlineModelGpu, LegacyDlightRun, PlanarReflectionResources,
+    FacePlaneRun, GpuReflectionProbe, InlineModelGpu, LegacyDlightRun, PlanarReflectionResources,
     PlanarReflectionView, PlanarReflector, PlanarReflectorKind, ReflectionProbeGpuSet,
     RuntimeOceanClipmap, OceanPromotionDecision,
     StaticLightGridGpu, UniformArena, UniformSlot, VoxelProbeGiGpu, WorldBatch, WorldBatchSet,
@@ -538,6 +543,27 @@ fn note_device_lost(detail: String) {
     DEVICE_LOST.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// True when egui draws into an sRGB-aware target. egui's linear-framebuffer
+/// shader converts the *premultiplied* vertex RGB gamma->linear but leaves alpha
+/// alone, so a translucent white tint `(a,a,a,a)` over-darkens; callers that
+/// crossfade a texture must use `egui_alpha_tint` instead.
+pub(crate) static EGUI_LINEAR_FRAMEBUFFER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Premultiplied white tint that composites as `alpha * texture` in linear light
+/// regardless of egui's target type (gamma-encode alpha for the RGB channels
+/// when egui will linearise them).
+pub(crate) fn egui_alpha_tint(alpha: f32) -> egui::Color32 {
+    let alpha = alpha.clamp(0.0, 1.0);
+    let rgb = if EGUI_LINEAR_FRAMEBUFFER.load(std::sync::atomic::Ordering::Relaxed) {
+        alpha.powf(1.0 / 2.2)
+    } else {
+        alpha
+    };
+    let byte = |v: f32| (v * 255.0).round() as u8;
+    egui::Color32::from_rgba_premultiplied(byte(rgb), byte(rgb), byte(rgb), byte(alpha))
+}
+
 /// Cleared for every freshly created device so a backend restart starts clean.
 fn clear_device_lost() {
     if let Ok(mut reason) = DEVICE_LOST_REASON.lock() {
@@ -627,6 +653,7 @@ struct Renderer {
     ocean_interaction: crate::ocean::interaction::InteractionGpu,
     ocean_optics_layout: wgpu::BindGroupLayout,
     ocean_optics: crate::ocean::optics::Resources,
+    glass_world: Option<glass::WorldPipeline>,
     ocean_inert_bind_group: wgpu::BindGroup,
     ocean_spray_albedo: GpuImage,
     detail_texture: GpuImage,
@@ -647,6 +674,7 @@ struct Renderer {
     /// Top of the water volume the camera is inside, or NO_WATER_SURFACE.
     camera_water_surface: f32,
     ocean_enabled: bool,
+    ocean_sky_extend: bool,
     coastal_enabled: bool,
     coastal_pool: u8,
     coastal_atlas: Option<Arc<jka_assets::bsp::bathymetry::Atlas>>,
@@ -669,9 +697,17 @@ struct Renderer {
     fast_world_shader: wgpu::ShaderModule,
     wireframe_supported: bool,
     wireframe_mask: u32,
+    patch_curve_error: f32,
+    bsp_model_lod_scale: f32,
+    bsp_model_lod_bias: i32,
+    bsp_model_lod_debug: bool,
+    bsp_model_lod_enabled: bool,
+    patch_no_curves: bool,
+    patch_speeds: i32,
     shader_complexity_enabled: bool,
     shader_complexity_target: Option<diagnostics::shader_complexity::ShaderComplexityTarget>,
     pvs_mode: PvsMode,
+    face_plane_cull: bool,
     wireframe_pipeline_layout: wgpu::PipelineLayout,
     wireframe_shader: wgpu::ShaderModule,
     wireframe_pipeline: Option<wgpu::RenderPipeline>,
@@ -746,6 +782,8 @@ struct Renderer {
     egui_paint_jobs: Vec<egui::ClippedPrimitive>,
     egui_pixels_per_point: f32,
     egui_active: bool,
+    /// Token carried by the paint data currently being presented.
+    egui_present_token: Option<u64>,
     egui_pending_free: Vec<egui::TextureId>,
     asset_preview_mode: bool,
     asset_preview_viewport: Option<[u32; 4]>,
@@ -793,7 +831,9 @@ struct Renderer {
     gamma_method: crate::gamma::GammaMethod,
     hdr_enabled: bool,
     tone_mapping_enabled: bool,
+    tone_mapping_strength: f32,
     auto_exposure_enabled: bool,
+    auto_exposure_strength: f32,
     glow_mode: GlowMode,
     halation_enabled: bool,
     ssao_enabled: bool,
@@ -896,6 +936,8 @@ struct Renderer {
     gpu_compaction_supported: bool,
     world_compact_min_draws: u32,
     compact_group_scratch: Vec<bool>,
+    /// Reused CPU face-plane selection; never allocates every frame.
+    face_plane_cull_scratch: Vec<usize>,
     // CPU-culling counterpart to the GPU compactor. These retained vectors let
     // the ordinary PVS + frustum path pack same-state visible draws into the
     // existing indirect buffer without per-frame allocation churn.
@@ -915,6 +957,9 @@ struct Renderer {
     /// written its displaced depth. Stores positions in the already-selected
     /// active draw list so no second visibility/PVS traversal is required.
     post_ocean_transparent_scratch: Vec<usize>,
+    /// Lit-overlay stages drawn between the cloud multiplier and the ocean
+    /// optics capture (reused across frames).
+    pre_optics_overlay_scratch: Vec<usize>,
     inline_pose_scratch: Vec<Vec<InlineModelInstance>>,
     inline_draw_scratch: InlineDrawScratch,
     deferred_world_bundles: DeferredWorldBundles,
@@ -934,6 +979,8 @@ struct Renderer {
     dynamic_light_debug: bool,
     /// r_fragmentShaderMode (see `MaterialFragmentKey`).
     fragment_shader_mode: u8,
+    /// r_worldSortMode, 0 authored-sort baseline, 1 pipeline-first within safe opaque runs.
+    world_sort_mode: u8,
     /// TaystJK-style sky box face PSOs, keyed by (scene format, MSAA, Enhanced).
     sky_box_pipelines: Option<((wgpu::TextureFormat, u32, bool), [wgpu::RenderPipeline; 6])>,
     /// Cloud-layer PSOs for the box sky, per authored blend; same key as above.

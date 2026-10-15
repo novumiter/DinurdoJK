@@ -232,20 +232,15 @@ impl Renderer {
             return;
         }
 
-        let transient_count = self.active_transient_light_count().min(32);
-        let mut masks = vec![0u32; world.legacy_dlight_surfaces.len().max(1)];
-        for (surface_index, surface) in world.legacy_dlight_surfaces.iter().enumerate() {
-            masks[surface_index] =
-                legacy_dlight_surface_mask(surface, &self.transient_lights, transient_count);
-        }
-        self.queue.write_buffer(
-            &world.legacy_dlight_surface_mask_buffer,
-            0,
-            bytemuck::cast_slice(&masks),
+        let transient_count = self
+            .active_transient_light_count()
+            .min(32)
+            .min(self.transient_lights.len());
+        super::legacy_dlight_lists::update_legacy_dlight_masks(
+            &self.queue,
+            world,
+            &self.transient_lights[..transient_count],
         );
-        if let Ok(mut cpu_masks) = world.legacy_dlight_surface_masks_cpu.lock() {
-            *cpu_masks = masks;
-        }
     }
 
     pub(in crate::renderer) fn upload_light_buffer(&self) {

@@ -116,6 +116,22 @@ impl App {
         )
     }
 
+    /// TaystJK CG_TellTarget_f / CG_TellAttacker_f: route one console
+    /// message to a resolved client slot, without opening the Chat overlay.
+    pub(in crate::app) fn tell_selected_player(&mut self, command: &str, attacker: bool) {
+        let client = if attacker { self.message_mode_attacker() } else { self.message_mode_target() };
+        let Some(client) = client else { return; };
+        let message = command.split_once(char::is_whitespace)
+            .map(|(_, rest)| rest.trim()).unwrap_or("");
+        // The CGame original passes Cmd_Args without quote delimiters.
+        // Filter control characters before putting text on the reliable wire.
+        let message = message.chars().filter(|ch| !ch.is_control()).collect::<String>();
+        let safe = crate::cgame::unicode_input_to_jka_text(&message);
+        if let Err(error) = self.queue_server_command(&format!("tell {client} {safe}")) {
+            self.push_console_line(format!("^1tell:^7 {error}"));
+        }
+    }
+
     pub(in crate::app) fn push_chat_line(&mut self, mode: ChatMode, message: &str) {
         let rendered = match mode {
             // Match JKA/OpenJK chat coloring: the name/punctuation finish in

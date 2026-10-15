@@ -48,6 +48,7 @@ pub(in crate::app) struct PerfSample {
     pub(in crate::app) gpu_ms: Vec<f64>,
     /// Last window's main world program binds: specialized, general.
     pub(in crate::app) world_program_binds: (u32, u32),
+    pub(in crate::app) world_shader_programs: crate::runtime::WorldShaderPrograms,
 }
 
 pub(in crate::app) struct MapLoadingState {
@@ -161,6 +162,7 @@ impl MapLoadingState {
     pub(in crate::app) fn apply_prepare_options(&mut self, options: &scene::MapPrepareOptions) {
         use crate::thread_activity::Task;
         for (enabled, task) in [
+            (!options.visual_only, Task::MapCollision),
             (options.grass, Task::MapGrass),
             (options.voxel_probe_gi, Task::MapGi),
             (options.ocean, Task::MapOcean),
@@ -319,6 +321,9 @@ pub(in crate::app) fn prepared_map_has_ocean_surface(map: &scene::PreparedMap) -
 impl App {
     pub(in crate::app) fn current_map_prepare_options(&self) -> scene::MapPrepareOptions {
         scene::MapPrepareOptions {
+            visual_only: false,
+            patch_subdivisions_bits: self.video.patch_subdivisions.to_bits(),
+            patch_stitching: self.video.patch_stitching,
             picmip: self.video.picmip,
             grass: self.video.grass,
             voxel_probe_gi: self.video.voxel_probe_gi,
@@ -548,8 +553,17 @@ impl App {
     }
 
     pub(in crate::app) fn request_frontend_background(&mut self) {
+        self.request_frontend_background_scene(FRONTEND_BACKGROUND_MAP, FRONTEND_BACKGROUND_MAP);
+    }
+
+    /// Scene selection entry point: future UI/config can select any map *and*
+    /// give differently staged camera/lighting treatments distinct cache ids.
+    /// The snapshot belongs to the authored scene, not specifically duel3.
+    pub(in crate::app) fn request_frontend_background_scene(&mut self, scene_id: &str, map: &str) {
+        crate::startup_timeline::mark(crate::startup_timeline::Milestone::MapRequested);
+        self.select_frontend_scene(scene_id);
         self.request_map_internal(
-            scene::MapSource::Bsp(FRONTEND_BACKGROUND_MAP.to_owned()),
+            scene::MapSource::Bsp(map.to_owned()),
             MapLoadPurpose::FrontendBackground,
         );
     }
@@ -558,6 +572,7 @@ impl App {
         let mut options = self.current_map_prepare_options();
         // The menu scene is visual-only. Do not build gameplay-only collision or
         // kick an offline Steam Audio bake simply because duel3 is on screen.
+        options.visual_only = true;
         options.client_physics = false;
         options.steam_audio = false;
         options
@@ -569,19 +584,36 @@ impl App {
         if self.loading.is_some() {
             return;
         }
-        let Some(session) = self
-            .game_session
-            .as_ref()
-            .filter(|session| session.phase == crate::app::SessionPhase::Playing)
-        else {
-            return;
-        };
         let Some(cache) = self.prepared_map_cache.as_ref() else {
             return;
         };
         let mut counts = std::collections::BTreeMap::new();
-        for instance in session.inline_models.iter() {
-            *counts.entry(instance.model).or_insert(0) += 1;
+        let authoritative = self.game_session.as_ref()
+            .filter(|session| session.phase == crate::app::SessionPhase::Playing)
+            .filter(|session| session.current_snapshot.is_some());
+        if let Some(session) = authoritative {
+            for instance in session.inline_models.iter() {
+                *counts.entry(instance.model).or_insert(0) += 1;
+            }
+        } else {
+            // No CGame snapshot owns the movers yet. Preserve the compiled
+            // representation (one world-space pose per BSP inline model).
+            for model in &cache.map.inline_models {
+                counts.entry(model.model).or_insert(1);
+            }
+        }
+        // Local BMODEL stamps and the active preview share the exact
+        // world-geometry pipeline. Reserve distinct render slots for each;
+        // resubmission only occurs when this total exceeds past capacity.
+        for placement in &self.model_placement.bmodel_placed {
+            *counts.entry(placement.model).or_insert(0) += 1;
+        }
+        if self.model_placement.active
+            && self.model_placement.kind == super::egui_model_placement::PlacementKind::Bmodel
+        {
+            if let Some(model) = self.model_placement.bmodel_selection {
+                *counts.entry(model).or_insert(0) += 1;
+            }
         }
         let capacity = cache.map.inline_instance_capacity();
         if !counts
@@ -613,7 +645,10 @@ impl App {
         // A real world/cgame registration must not inherit runtime redirects
         // from the previous map. Remap-only presentation uploads bypass this
         // entry point; a new gamestate replays its CS_SHADERSTATE normally.
+        // A superseded early frontend result must not hold a stale BSP alive.
+        self.deferred_frontend_map = None;
         self.shader_remaps.clear();
+        self.shader_remap_ui = Default::default();
         self.shader_remap_upload = false;
         self.shader_remap_dirty = false;
         let sub_bsp_names = if purpose == MapLoadPurpose::FrontendBackground {
@@ -849,17 +884,50 @@ impl App {
         }
     }
 
+    /// Cold mutation-path check: an entity/MD3/GLM-only R_RemapShader must
+    /// never trigger a BSP world upload. Compare effective one-hop redirects
+    /// and time offsets for *actual world batch* shader names; unused catalog
+    /// entries and chained targets do not affect the world. No frame hot-path
+    /// lookup, additional draw, or persistent per-frame bookkeeping.
+    fn shader_remap_changes_world(&self, before: &scene::ShaderRemapState) -> bool {
+        if self.loading.is_some() {
+            return true; // A new map may use a shader absent from the old map.
+        }
+        let Some(cache) = &self.prepared_map_cache else {
+            // A pending map load still needs to fold the redirect into its
+            // initial upload; do not accidentally drop the dirty state.
+            return true;
+        };
+        let map = cache.map.as_ref();
+        map.batches.iter().chain(&map.pvs_batches).chain(&map.inline_batches).any(|batch| {
+            let Some(entry) = map.material_debug.entries.get(batch.material_debug_index as usize) else {
+                // An unknown debug index cannot be remapped by rebuild_batches.
+                return false;
+            };
+            let source = scene::canonical_shader_name(&entry.name);
+            let prior_name = before.effective_name(&source);
+            let next_name = self.shader_remaps.effective_name(&source);
+            prior_name != next_name
+                || before.time_offset_for(&prior_name) != self.shader_remaps.time_offset_for(&next_name)
+        })
+    }
+
     fn apply_visual_shader_remap(
         &mut self,
         old: &str,
         new: &str,
         time_offset: Option<f32>,
     ) -> Result<bool, String> {
+        let previous = self.shader_remaps.clone();
         if !self.shader_remaps.apply(old, new, time_offset) {
             return Ok(false);
         }
         self.sync_shader_remap_presenters();
-        self.rebuild_shader_remapped_world()?;
+        if self.shader_remap_changes_world(&previous) {
+            self.rebuild_shader_remapped_world()?;
+        } else {
+            rverbose!(1, "[SHADER REMAP] model/FX-only redirect: no BSP world reload");
+        }
         Ok(true)
     }
 
@@ -916,6 +984,15 @@ impl App {
             {
                 continue;
             }
+            // An explicit editor OFF toggle wins over later CS_SHADERSTATE
+            // refreshes. Keep the newest server target as the remembered
+            // replacement, but do not reactivate the live redirect until
+            // the user enables it again.
+            let old = scene::canonical_shader_name(&remap.from);
+            if let Some(saved) = self.shader_remap_ui.disabled.get_mut(&old) {
+                *saved = scene::canonical_shader_name(&remap.to);
+                continue;
+            }
             changed |= self.shader_remaps.apply(
                 &remap.from,
                 &remap.to,
@@ -929,11 +1006,16 @@ impl App {
     }
 
     pub(in crate::app) fn process_server_shader_remaps(&mut self) {
+        let previous = self.shader_remaps.clone();
         if !self.consume_server_shader_remaps() {
             return;
         }
-        if let Err(error) = self.rebuild_shader_remapped_world() {
-            self.push_console_line(format!("^1shader remap: {error}"));
+        if self.shader_remap_changes_world(&previous) {
+            if let Err(error) = self.rebuild_shader_remapped_world() {
+                self.push_console_line(format!("^1shader remap: {error}"));
+            }
+        } else {
+            rverbose!(1, "[SHADER REMAP] server model/FX-only redirect: no BSP world reload");
         }
     }
 
@@ -943,7 +1025,9 @@ impl App {
     /// path is identical to an ordinarily prepared map (no remap hash lookup,
     /// string comparison, or extra branch per draw).
     pub(in crate::app) fn rebuild_shader_remapped_world(&mut self) -> Result<bool, String> {
-        if self.loading.is_some() {
+        // Coalesce remaps submitted before the previous replacement reaches
+        // the renderer. Material replacement is not a level load.
+        if self.loading.is_some() || self.shader_remap_upload {
             self.shader_remap_dirty = true;
             return Ok(false);
         }
@@ -954,68 +1038,45 @@ impl App {
             return Ok(false);
         };
         let label = cache.label.clone();
-        let prepare_options = cache.prepare_options;
-        let mut map = scene::apply_shader_remaps(
-            cache.map.as_ref(),
-            &self.base,
-            self.game.as_deref(),
-            prepare_options,
-            &self.shader_remaps,
-        )?;
-        if self.video.stage_collapse_extra {
-            scene::apply_reverse_lightmap_collapse_in_place(&mut map);
-        }
-        if self.video.additive_stage_fusion {
-            scene::fuse_additive_stage_fusion_in_place(&mut map);
-        } else {
-            scene::expand_additive_stage_fusion_in_place(&mut map);
-        }
-        map.load_timings = scene::MapLoadTimings::default();
+        let options = cache.prepare_options;
+        let base_texture_count = cache.map.textures.len();
+        let base_map = Arc::clone(&cache.map);
+        let root = self.base.clone();
+        let game = self.game.clone();
+        let remaps = self.shader_remaps.clone();
+        let reverse_lightmap = self.video.stage_collapse_extra;
+        let additive_fusion = self.video.additive_stage_fusion;
+        let proxy = self.proxy.clone();
 
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
         let request_id = self.latest_request_id;
         let started = Instant::now();
-        let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
-        loading.sub_bsp_names = map.sub_bsp_names.clone();
-        loading.apply_prepare_options(&prepare_options);
-        // The remap rebuild reused every expensive preparation stage; only
-        // material resolution for the replacement shaders and GPU upload are new.
-        {
-            use crate::thread_activity::Task;
-            for task in [
-                Task::MapBspParse,
-                Task::MapCollision,
-                Task::MapShaderParse,
-                Task::MapTextureDecode,
-                Task::MapMaterials,
-                Task::MapFxLightProfiles,
-                Task::MapGeometry,
-            ] {
-                loading.mark_cached(task);
-            }
-            if prepare_options.grass {
-                loading.mark_cached(Task::MapGrass);
-            }
-            if prepare_options.voxel_probe_gi {
-                loading.mark_cached(Task::MapGi);
-            }
-            if prepare_options.steam_audio {
-                loading.mark_cached(Task::MapAcoustics);
-            }
-            if !map.portal_draw_plan.plan_by_cluster.is_empty() {
-                loading.mark_cached(Task::MapPortalPlans);
-            }
-        }
-        loading.begin_upload();
-        self.loading = Some(loading);
         self.shader_remap_upload = true;
         self.shader_remap_dirty = false;
-        self.render_command(RenderCommand::LoadMap {
-            request_id,
-            started,
-            name: label,
-            map: Box::new(map),
-        });
+        // Use the app's existing persistent jka-background-cpu lane, which
+        // already handles non-frame-critical tasks. This queues no new OS
+        // thread or Rayon global-pool work for a shader remap; ordinary draw
+        // frames never consult the queue.
+        if let Err(error) = self.background_jobs.cpu(move || {
+            // The shared lane survives a panicking task. Always send a
+            // completion so the app can release shader_remap_upload too.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scene::prepare_remap_plan(
+                    base_map, &root, game.as_deref(), options, &remaps,
+                    reverse_lightmap, additive_fusion,
+                ).map(Box::new)
+            })).unwrap_or_else(|_| Err("shader remap preparation worker panicked".to_owned()));
+            let _ = proxy.send_event(UserEvent::ShaderRemapPrepared {
+                request_id, started, name: label, base_texture_count, result,
+            });
+        }) {
+            // A full/disconnected background queue must not strand future
+            // remaps behind the upload-in-flight flag. Preserve the desired
+            // logical remap for the next opportunity to submit it.
+            self.shader_remap_upload = false;
+            self.shader_remap_dirty = true;
+            return Err(format!("could not queue shader remap on background CPU worker: {error}"));
+        }
         Ok(true)
     }
 }

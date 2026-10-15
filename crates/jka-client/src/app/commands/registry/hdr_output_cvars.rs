@@ -1,13 +1,12 @@
-//! Native display output preferences, kept separate from r_hdr scene precision.
+//! Display encoding preference for unified r_hdr 0/1/2. No legacy HDR output cvars.
 use super::cvar_prelude::*;
 
-fn mode(value: &str) -> Result<u32, String> {
+fn parse_hdr_style(value: &str) -> Result<u32, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "0" | "off" | "sdr" => Ok(0),
-        "1" | "auto" => Ok(1),
-        "2" | "hdr10" | "pq" => Ok(2),
-        "3" | "scrgb" => Ok(3),
-        _ => Err("r_hdrOutput: expected 0 SDR, 1 Auto, 2 HDR10 or 3 scRGB".to_owned()),
+        "0" | "auto" => Ok(0),
+        "1" | "hdr10" | "pq" => Ok(1),
+        "2" | "scrgb" => Ok(2),
+        _ => Err("r_hdrStyle: expected 0 Auto, 1 HDR10/PQ, or 2 scRGB".to_owned()),
     }
 }
 
@@ -16,67 +15,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_hdr_preferences_archive_and_reload_without_changing_scene_controls() {
+    fn new_hdr_cvars_roundtrip_without_legacy_controls() {
+        assert!(crate::app::commands::registry::cvar_definition("r_hdrOutput").is_none());
+        assert!(crate::app::commands::registry::cvar_definition("r_hdrOutputStyle").is_none());
         let mut video = ui::VideoSettings::default();
         let mut context = VideoLoadState::default();
-        for (name, value) in [
-            ("r_hdrOutput", "hdr10"),
-            ("r_hdrPaperWhite", "250"),
-            ("r_hdrPeak", "1400"),
-        ] {
+        for (name, value) in [("r_hdr", "2"), ("r_hdrStyle", "1"), ("r_hdrPaperWhite", "250")] {
             let def = crate::app::commands::registry::cvar_definition(name).unwrap();
             def.config.load_video.unwrap()(&mut video, name, value, &mut context);
         }
-        assert_eq!(video.hdr_output, 2);
+        assert_eq!((video.hdr_mode(), video.hdr_style, video.hdr_output), (2, 1, 2));
         assert_eq!(video.hdr_paper_white, 250.0);
-        assert_eq!(video.hdr_peak, 1400.0);
-        assert!(
-            !video.hdr && !video.tone_mapping,
-            "display output must not rewrite independent scene settings"
-        );
-        let presentation = ClientPresentationSettings::default();
-        let audio = AudioSettings::default();
-        let state = ArchiveState {
-            video: &video,
-            presentation: &presentation,
-            audio: &audio,
-        };
-        let mut loaded = ui::VideoSettings::default();
-        for name in ["r_hdrOutput", "r_hdrPaperWhite", "r_hdrPeak"] {
-            let def = crate::app::commands::registry::cvar_definition(name).unwrap();
-            let value = def.config.archive.unwrap().1(&state);
-            def.config.load_video.unwrap()(&mut loaded, name, &value, &mut context);
-        }
-        assert_eq!(
-            (loaded.hdr_output, loaded.hdr_paper_white, loaded.hdr_peak),
-            (2, 250.0, 1400.0)
-        );
-        let output = crate::app::commands::registry::cvar_definition("r_hdrOutput").unwrap();
-        assert_eq!(output.runtime.entry.latch, LatchScope::VidRestart);
-        output.config.load_video.unwrap()(&mut loaded, "r_hdrOutput", "invalid", &mut context);
-        let white = crate::app::commands::registry::cvar_definition("r_hdrPaperWhite").unwrap();
-        white.config.load_video.unwrap()(&mut loaded, "r_hdrPaperWhite", "NaN", &mut context);
-        assert_eq!((loaded.hdr_output, loaded.hdr_paper_white), (2, 250.0));
+        video.set_hdr_mode(1);
+        assert_eq!((video.hdr_mode(), video.hdr_output), (1, 0));
+        video.set_hdr_mode(0);
+        assert_eq!((video.hdr_mode(), video.hdr_output), (0, 0));
+        video.set_hdr_mode(2);
+        assert_eq!(video.hdr_output, 2);
     }
 }
+
 app_cvars! {
-    APP_R_HDROUTPUT {
-        runtime: CvarDef::new("r_hdrOutput", "0", "0..3", "Display output: SDR, HDR Auto, HDR10/PQ or scRGB. Apply Video Settings/vid_restart; unsupported HDR falls back to SDR.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::VidRestart,
-            |app: &App| CvarValue::String(app.video.hdr_output.to_string()),
-            |app, value| app.cvar_set_hdr_output("r_hdrOutput", &value.to_string()))
-            .with_text_setter(App::cvar_set_hdr_output, Some(|_, value| mode(value).map(|m| m.to_string()))),
+    APP_R_HDRSTYLE {
+        runtime: CvarDef::new("r_hdrStyle", "0", "0..2", "Full HDR output style: 0 Auto, 1 HDR10/PQ, 2 scRGB. Does not enable HDR output by itself.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.hdr_style.to_string()),
+            |app, value| app.cvar_set_hdr_style("r_hdrStyle", &value.to_string()))
+            .with_text_setter(App::cvar_set_hdr_style, Some(|_, value| parse_hdr_style(value).map(|m| m.to_string()))),
         config: CvarBinding {
-            load_video: Some(|settings, _, value, _| { if let Ok(m) = mode(value) { settings.hdr_output = m; } }),
-            apply_latched: Some(|settings, value| { if let Ok(m) = mode(value) { settings.hdr_output = m; } }),
-            archive: Some((26000, |state| state.video.hdr_output.to_string())), ..CvarBinding::NONE
+            load_video: Some(|settings, _, value, _| { if let Ok(style) = parse_hdr_style(value) { settings.set_hdr_style(style); } }),
+            archive: Some((26003, |state| state.video.hdr_style.to_string())), ..CvarBinding::NONE
         },
         implementations: [impl App {
-            pub(in crate::app) fn cvar_set_hdr_output(&mut self, _: &str, value: &str) -> Result<(), String> {
-                self.video.hdr_output = mode(value)?;
-                self.latched_console_cvars.remove("r_hdroutput");
-                if self.video.hdr_output != 0 && self.video.gamma_method == crate::gamma::GammaMethod::Hardware {
-                    self.set_gamma_method(crate::gamma::GammaMethod::Shader);
+            pub(in crate::app) fn cvar_set_hdr_style(&mut self, _: &str, value: &str) -> Result<(), String> {
+                let style = parse_hdr_style(value)?;
+                let output = style + 1;
+                if self.video.hdr_mode() == 2 && self.hdr_modes_known
+                    && self.video.renderer_backend == self.applied_renderer_backend
+                    && self.video.gpu_adapter == self.applied_gpu_adapter
+                    && self.hdr_available_modes & (1 << output) == 0
+                {
+                    return Err("Selected native HDR format is unavailable for this display/backend".to_owned());
                 }
+                self.video.set_hdr_style(style);
                 self.mark_config_dirty(); self.publish_ui(); Ok(())
             }
         }]

@@ -25,8 +25,14 @@ pub(crate) enum GameCommand {
     Generic(u8),
     WeaponNext,
     WeaponPrev,
+    WeaponLast,
+    WeaponClean,
+    ToggleFireMode,
     ForceNext,
     ForcePrev,
+    InventoryNext,
+    InventoryPrev,
+    InventoryFree,
     Weapon,
     Flipkick,
     AmRun,
@@ -199,6 +205,7 @@ pub(crate) mod postprocess_cvars;
 pub(crate) mod presentation_cvars;
 pub(crate) mod race_ghost_cvars;
 pub(crate) mod renderer_cvars;
+pub(crate) mod patch_cvars;
 pub(crate) mod weather_cvars;
 
 pub(crate) struct CommandRegistry {
@@ -278,6 +285,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(weather_cvars::DEFINITIONS.iter());
         definitions.extend(ocean_cvars::DEFINITIONS.iter());
         definitions.extend(renderer_cvars::DEFINITIONS.iter());
+        definitions.extend(patch_cvars::DEFINITIONS.iter());
         definitions.extend(physics_cvars::DEFINITIONS.iter());
         definitions.extend(material_cvars::DEFINITIONS.iter());
         definitions.extend(jiggle_cvars::DEFINITIONS.iter());

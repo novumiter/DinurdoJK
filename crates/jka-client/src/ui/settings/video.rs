@@ -10,6 +10,11 @@ use crate::ui::{
 
 #[derive(Debug, Clone, Copy)]
 pub struct VideoSettings {
+    pub patch_subdivisions: f32,
+    pub patch_stitching: bool,
+    pub lod_curve_error: f32,
+    pub no_curves: bool,
+    pub speeds: i32,
     pub fullscreen: FullscreenMode,
     pub renderer_backend: RendererBackend,
     /// 0 Auto, 1 discrete, 2 integrated, 3 CPU/software (if WGPU exposes it).
@@ -44,6 +49,7 @@ pub struct VideoSettings {
     pub shader_complexity: bool,
     pub skip_ui: bool,
     pub pvs_mode: PvsMode,
+    pub face_plane_cull: bool,
     pub fps_cap: u32,
     /// Continuous projectile FX sampling rate. `0` preserves legacy JKA's
     /// render-frame-driven behavior; non-zero values are fixed Hz.
@@ -64,6 +70,8 @@ pub struct VideoSettings {
     /// runs on the dedicated `jka-fx` worker; this controls the later sprite/line
     /// tessellation step against the final camera.
     pub fx_geometry: FxGeometryMode,
+    /// Opt-in GPU-resident EFX sprite motion; requires r_fxGeometry gpu.
+    pub fx_particle_simulation: bool,
     /// A/B diagnostic for GPU-instanced EFX sprites. When enabled, fragments
     /// whose final source alpha is exactly zero are discarded before fog/blend.
     /// This preserves non-zero-alpha edges and is intentionally limited to
@@ -79,6 +87,8 @@ pub struct VideoSettings {
     /// r_fragmentShaderMode: 0 general world fragment program, 1 TaystJK-style
     /// per-material specialized programs (MaterialFragmentKey).
     pub fragment_shader_mode: u8,
+    /// Session-only world submission ordering: 0 authored-sort baseline, 1 safe pipeline-first.
+    pub world_sort_mode: u8,
     /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
     pub color_clear_mode: u8,
     /// Render-only heuristic: keep BSP-authored stages whose shader qpath starts with models/.
@@ -129,6 +139,9 @@ pub struct VideoSettings {
     pub md3_geometry_cache: bool,
     /// Use authored MD3 variants (always); optionally generate missing LODs in background.
     pub md3_auto_lod: bool,
+    /// Developer A/B override for baked models. The shared r_md3AutoLod gate
+    /// remains authoritative; this only disables the BSP subset.
+    pub bsp_model_lod: bool,
     pub md3_lod_debug: bool,
     pub model_render_bundles: bool,
     pub encoder_finish_threads: u32,
@@ -235,14 +248,19 @@ pub struct VideoSettings {
     /// Dynamic (runtime) light brightness, same scale and lock rules.
     pub dynamic_light_brightness: f32,
     pub dynamic_light_brightness_locked: bool,
+    /// HDR math is enabled for both Math Only and Full modes.
     pub hdr: bool,
+    /// Internal swapchain request (0 SDR, 1 Auto, 2 PQ, 3 scRGB).
+    /// Derived from r_hdr and r_hdrStyle, never configured independently.
     pub hdr_output: u32,
+    /// 0 Auto, 1 HDR10/PQ, 2 scRGB (r_hdrStyle).
+    pub hdr_style: u32,
     pub hdr_paper_white: f32,
     /// Zero uses the display's reported peak, falling back to 1000 nits.
     pub hdr_peak: f32,
     pub float_lightmap: bool,
-    pub tone_mapping: bool,
-    pub auto_exposure: bool,
+    pub tone_mapping: f32,
+    pub auto_exposure: f32,
     pub glow: GlowMode,
     pub halation: bool,
     pub ssao: bool,
@@ -545,6 +563,11 @@ mod flare_cvar_tests {
 impl Default for VideoSettings {
     fn default() -> Self {
         let mut settings = Self {
+            patch_subdivisions: 4.0,
+            patch_stitching: true,
+            lod_curve_error: 250.0,
+            no_curves: false,
+            speeds: 0,
             fullscreen: FullscreenMode::Windowed,
             renderer_backend: RendererBackend::Vulkan,
             gpu_adapter: 0,
@@ -566,6 +589,7 @@ impl Default for VideoSettings {
             shader_complexity: false,
             skip_ui: false,
             pvs_mode: PvsMode::Auto,
+            face_plane_cull: false,
             fps_cap: 0,
             fx_fps: crate::fx::FX_FPS_DEFAULT,
             fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
@@ -574,12 +598,14 @@ impl Default for VideoSettings {
             fx_count_scale: 1.0,
             fx_lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             lod_scale: crate::fx::LOD_SCALE_DEFAULT,
-            fx_geometry: FxGeometryMode::Cpu,
+            fx_geometry: FxGeometryMode::Gpu,
+            fx_particle_simulation: true,
             fx_zero_alpha_discard: false,
             debug_world_vertex_alpha_one: false,
             draw_map_models: true,
             draw_inline_models: true,
             fragment_shader_mode: 1,
+            world_sort_mode: 0,
             color_clear_mode: 1,
             draw_bsp_model_surfaces: true,
             world_stage_probe: 0,
@@ -607,12 +633,13 @@ impl Default for VideoSettings {
             world_compact_min_draws: 1,
             model_prepare_threads: 0,
             md3_geometry_cache: true,
-            md3_auto_lod: false,
+            md3_auto_lod: true,
+            bsp_model_lod: true,
             md3_lod_debug: false,
             model_render_bundles: false,
             encoder_finish_threads: 2,
             model_index_upload_cache: true,
-            ghoul2_batch_key_cache: false,
+            ghoul2_batch_key_cache: true,
             ghoul2_anim_smooth: 0.3,
             timer_resolution_1ms: false,
             input_latelatch: false,
@@ -687,11 +714,12 @@ impl Default for VideoSettings {
             dynamic_light_brightness_locked: true,
             hdr: false,
             hdr_output: 0,
+            hdr_style: 0,
             hdr_paper_white: 200.0,
             hdr_peak: 0.0,
             float_lightmap: false,
-            tone_mapping: false,
-            auto_exposure: false,
+            tone_mapping: 0.0,
+            auto_exposure: 0.0,
             glow: GlowMode::Off,
             halation: false,
             ssao: false,
@@ -840,5 +868,44 @@ impl Default for VideoSettings {
         crate::app::video_cvar_registry().apply_defaults(&mut settings)
             .expect("registered video defaults must apply");
         settings
+    }
+}
+
+// One external HDR setting; the underlying boolean and swapchain request are
+// only implementation details. Do not add separately archived cvars for them.
+impl VideoSettings {
+    pub fn hdr_mode(&self) -> u32 {
+        if self.hdr_output != 0 { 2 } else { u32::from(self.hdr) }
+    }
+
+    pub fn set_hdr_mode(&mut self, mode: u32) {
+        self.hdr = mode != 0;
+        self.hdr_output = if mode == 2 { self.hdr_style.min(2) + 1 } else { 0 };
+    }
+
+    pub fn set_hdr_style(&mut self, style: u32) {
+        self.hdr_style = style.min(2);
+        if self.hdr_output != 0 {
+            self.hdr_output = self.hdr_style + 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod hdr_mode_tests {
+    use super::VideoSettings;
+    #[test]
+    fn output_is_only_requested_by_full_mode() {
+        let mut settings = VideoSettings::default();
+        settings.set_hdr_style(2);
+        assert_eq!(settings.hdr_output, 0);
+        settings.set_hdr_mode(1);
+        assert!(settings.hdr);
+        assert_eq!(settings.hdr_output, 0);
+        settings.set_hdr_mode(2);
+        assert_eq!(settings.hdr_output, 3);
+        settings.set_hdr_mode(0);
+        assert!(!settings.hdr);
+        assert_eq!(settings.hdr_output, 0);
     }
 }

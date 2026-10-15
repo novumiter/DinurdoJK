@@ -27,6 +27,78 @@ const LIQUIDS: u32 = CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
 const EPS: f64 = 0.001;
 pub const CACHE_VERSION: u32 = 5;
 
+/// BSP shader indices that are the surface of a real body of water: a shader
+/// applied to a `CONTENTS_WATER` brush of the world model (the brush's own
+/// shader and every shader on its sides), or any water-contents shader with a
+/// face lying on such a brush's top plane (a visible sheet over a `caulk_water`
+/// volume). `surfaceparm water` alone is not enough: costadelsol's shore-surf
+/// patches `seph_surf` and waterfall sheets carry water contents but are neither
+/// on a brush nor on a volume's top plane, so they must not become the FFT ocean.
+pub fn water_volume_shaders(bsp: &Bsp) -> std::collections::BTreeSet<usize> {
+    /// Same order as the renderer's flat-water test: the sheet and the brush top
+    /// must coincide, otherwise a sheet a unit above or below a pool is an overlay.
+    const TOP_TOLERANCE: f32 = 0.5;
+    let mut shaders = std::collections::BTreeSet::new();
+    let Some(world) = bsp.models.first() else {
+        return shaders;
+    };
+    // (min, max) of each water brush from its axial bounding planes.
+    let mut volumes = Vec::<([f32; 3], [f32; 3])>::new();
+    for id in world.brushes.clone() {
+        let Some(brush) = bsp.brushes.get(id) else { continue };
+        if bsp.shaders.get(brush.shader).is_none_or(|s| s.contents & CONTENTS_WATER == 0) {
+            continue;
+        }
+        shaders.insert(brush.shader);
+        let mut low = [f32::NEG_INFINITY; 3];
+        let mut high = [f32::INFINITY; 3];
+        for side in brush.sides.clone() {
+            let Some(side) = bsp.brush_sides.get(side) else { continue };
+            shaders.insert(side.shader);
+            let Some(plane) = bsp.planes.get(side.plane) else { continue };
+            for axis in 0..3 {
+                if plane.normal[axis].abs() > 0.999 {
+                    if plane.normal[axis] > 0.0 {
+                        high[axis] = high[axis].min(plane.distance);
+                    } else {
+                        low[axis] = low[axis].max(-plane.distance);
+                    }
+                }
+            }
+        }
+        volumes.push((low, high));
+    }
+    for surface in &bsp.surfaces {
+        if shaders.contains(&surface.shader)
+            || bsp.shaders.get(surface.shader).is_none_or(|s| s.contents & CONTENTS_WATER == 0)
+        {
+            continue;
+        }
+        let Some(points) = bsp.vertices.get(surface.vertices.clone()) else { continue };
+        if points.is_empty() {
+            continue;
+        }
+        let mut low = [f32::INFINITY; 3];
+        let mut high = [f32::NEG_INFINITY; 3];
+        for point in points {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(point.position[axis]);
+                high[axis] = high[axis].max(point.position[axis]);
+            }
+        }
+        let on_top = volumes.iter().any(|(volume_low, volume_high)| {
+            (high[2] - volume_high[2]).abs() <= TOP_TOLERANCE
+                && (0..2).all(|axis| {
+                    low[axis] >= volume_low[axis] - 1.0 && high[axis] <= volume_high[axis] + 1.0
+                })
+        });
+        if on_top {
+            shaders.insert(surface.shader);
+        }
+    }
+    shaders
+}
+
 pub type FootprintTriangle = [[f32; 2]; 3];
 
 #[derive(Clone, Debug)]

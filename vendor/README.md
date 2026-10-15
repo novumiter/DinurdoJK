@@ -80,6 +80,21 @@ reports to the pixel delta from the previous absolute position (reset on focus)
 and leaves relative reports untouched.
 Remove the vendor and the patch entry once upstream winit fixes this.
 
+wgpu-core also has a draw-validation patch in `src/command/render.rs`
+(`VertexState`) and `src/command/bind.rs` (`BindGroupManager::last_assigned`),
+both marked "DinurdoJK patch". wgpu 30 defers `set_vertex_buffer` to the next
+draw. Each draw runs `VertexState::validate`, which scans all 16 vertex slots
+and the bind-group slots, and `VertexState::flush`, which scans all 16 slots
+again even when nothing changed. Render passes are replayed in
+`CommandEncoder::finish`, so that is where the cost shows up. The patch keeps
+two bitmasks of assigned and dirty slots, and scans the bind-group slots from
+the end. Validation and the HAL calls are unchanged.
+
+Measured 2026-10-14 with a headless AMJH3TE-shaped microbench (Vulkan, RTX 3060,
+900 draws, 48 pipelines, 640 bind groups, 40 multi-draws): `finish` took
+311-315 us on wgpu 29, 326-333 us on wgpu 30, and 315-319 us patched.
+Remove this patch once upstream wgpu tracks vertex slots without per-draw scans.
+
 wgpu-core also has a second DinurdoJK patch in `src/instance.rs`:
 `Instance::new` logs "failed to create <backend> backend" at `warn` instead of
 `debug`, so the reason a backend is unavailable reaches latest.log (otherwise

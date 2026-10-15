@@ -84,8 +84,15 @@ pub(in crate::app) enum MapLoadPurpose {
 pub(in crate::app) struct FrontendCinematic {
     pub(in crate::app) position: [f32; 3],
     pub(in crate::app) yaw: f32,
-    /// Camera animation may start as soon as CPU preparation completes.
-    pub(in crate::app) started: Instant,
+    /// The Ghoul2 clock is independent of camera animation and GPU upload.
+    pub(in crate::app) anim_started: Instant,
+    /// Actual first frame containing this uploaded BSP, not model readiness.
+    pub(in crate::app) world_ready_at: Option<Instant>,
+    /// Time the requested model stopped being a provisional async stand-in.
+    pub(in crate::app) model_visible_since: Option<Instant>,
+    /// Exact idle Ghoul2 time held for both the screenshot and crossfade.
+    pub(in crate::app) pose_hold_ms: Option<i32>,
+    pub(in crate::app) pose_locked_at: Option<Instant>,
     /// Start the reveal only after the renderer presents the uploaded world.
     /// Otherwise GPU upload time consumes part of the fade before it is visible.
     pub(in crate::app) fade_started: Option<Instant>,
@@ -566,6 +573,8 @@ impl App {
         // asset-override policy alter prepared material/texture data in both
         // directions, so any mismatch is restart-sensitive.
         (requested.voxel_probe_gi && !prepared.voxel_probe_gi)
+            || requested.patch_subdivisions_bits != prepared.patch_subdivisions_bits
+            || requested.patch_stitching != prepared.patch_stitching
             || requested.picmip != prepared.picmip
             || requested.gen_normal_maps != prepared.gen_normal_maps
             || requested.float_lightmap != prepared.float_lightmap
@@ -683,6 +692,14 @@ impl App {
 
         if let Some(prepared) = self.loaded_map_prepare_options() {
             let requested = self.active_map_prepare_options();
+            if requested.patch_subdivisions_bits != prepared.patch_subdivisions_bits {
+                add("patch_subdivisions", "Curve detail", format!("r_subdivisions {} -> {}",
+                    f32::from_bits(prepared.patch_subdivisions_bits), f32::from_bits(requested.patch_subdivisions_bits)));
+            }
+            if requested.patch_stitching != prepared.patch_stitching {
+                add("patch_stitching", "Stitch patch edges", format!("{} -> {}",
+                    on_off(prepared.patch_stitching), on_off(requested.patch_stitching)));
+            }
             if requested.picmip != prepared.picmip {
                 add(
                     "picmip",
@@ -763,6 +780,9 @@ impl App {
             self.apply_latched_values_to_settings(&mut target);
             for (name, value) in &self.latched_console_cvars {
                 match name.as_str() {
+                    "r_glasspromotion" => add("glass_promotion", "Glass promotion",
+                        format!("{} -> {}", on_off(crate::materials::glass_promotion_enabled()),
+                            on_off(Self::parse_cvar_bool("r_glassPromotion", value).unwrap_or(true)))),
                     "r_gpuadapter" => add("gpu_adapter", "Graphics processor",
                         format!("{} -> {}", crate::renderer::gpu_adapter::label(self.applied_gpu_adapter),
                             crate::renderer::gpu_adapter::label(target.gpu_adapter))),
@@ -1191,6 +1211,8 @@ impl App {
         self.perf = PerfStats::default();
         self.supported_msaa = vec![1];
         self.wireframe_supported = false;
+        // The new GPU/backend/display may have different HDR surface formats.
+        self.hdr_modes_known = false;
         self.reset_egui_for_window(&window);
         let initial = self.render_snapshot();
         let initial_ui = self.ui_snapshot();

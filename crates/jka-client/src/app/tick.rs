@@ -3,6 +3,38 @@ use crate::app::{
     scene, App, DemoAdvance, Duration, Instant, OverlayMode, RenderCommand, SessionPhase,
 };
 
+/// Integrate a continuously differentiable speed ramp rather than simply
+/// starting a sine at t=0 (a sine starts with maximum *velocity*).
+/// The camera begins with zero velocity/acceleration and reaches full speed
+/// gradually over four seconds; no phase discontinuity at the transition.
+fn frontend_motion_phase(elapsed: f32) -> f32 {
+    const RAMP: f32 = 4.0;
+    let elapsed = elapsed.max(0.0);
+    if elapsed >= RAMP {
+        elapsed - RAMP * 0.5
+    } else {
+        let t = elapsed / RAMP;
+        // Integral of smootherstep(t) = 6t^5 - 15t^4 + 10t^3.
+        RAMP * (t.powi(6) - 3.0 * t.powi(5) + 2.5 * t.powi(4))
+    }
+}
+
+#[cfg(test)]
+mod menu_camera_tests {
+    use super::frontend_motion_phase;
+
+    #[test]
+    fn camera_starts_at_rest_and_reaches_full_speed_smoothly() {
+        let dt = 0.001;
+        assert!((frontend_motion_phase(dt) - frontend_motion_phase(0.0)) / dt < 0.0001);
+        assert!((frontend_motion_phase(4.0) - 2.0).abs() < 0.0001);
+        let before = (frontend_motion_phase(4.0) - frontend_motion_phase(4.0 - dt)) / dt;
+        let after = (frontend_motion_phase(4.0 + dt) - frontend_motion_phase(4.0)) / dt;
+        assert!((before - 1.0).abs() < 0.01);
+        assert!((after - 1.0).abs() < 0.01);
+    }
+}
+
 impl App {
     pub(in crate::app) fn tick_frontend_cinematic(&mut self, now: Instant) {
         if !self.front_end || self.loading.is_some() {
@@ -15,13 +47,33 @@ impl App {
         // Keep the camera safely at a real duel spawn and animate only the view.
         // This gives the menu a living 3D background without pathing a camera
         // through BSP walls or requiring gameplay collision/input.
-        let seconds = now
-            .saturating_duration_since(cinematic.started)
-            .as_secs_f32();
+        // The first presented 3D frame is exactly the camera pose saved in the
+        // scene cache. Hold that pose through the image->world crossfade, then
+        // begin the animation from phase zero (no position or angle jump).
+        let seconds = cinematic.fade_started.map_or(0.0, |ready| {
+            now.saturating_duration_since(ready + Duration::from_secs_f32(
+                crate::app::egui_menu::FRONTEND_SCENE_FADE_IN_SECS,
+            ))
+            .as_secs_f32()
+        });
+        let phase = frontend_motion_phase(seconds);
         self.camera.position = glam::Vec3::from_array(cinematic.position);
-        self.camera.position.y += (seconds * 0.32).sin() * 0.65;
-        self.camera.yaw = cinematic.yaw + (seconds * 0.115).sin() * 0.28;
-        self.camera.pitch = (-2.0_f32).to_radians() + (seconds * 0.09).sin() * 0.025;
+        self.camera.position.y += (phase * 0.32).sin() * 0.65;
+        self.camera.yaw = cinematic.yaw + (phase * 0.115).sin() * 0.28;
+        self.camera.pitch = (-2.0_f32).to_radians() + (phase * 0.09).sin() * 0.025;
+
+        // A broken/missing model must not leave a cold first-run menu black
+        // indefinitely; never persist a snapshot without a settled model.
+        if cinematic.fade_started.is_none()
+            && cinematic.world_ready_at.is_some_and(|ready| {
+                now.saturating_duration_since(ready) >= Duration::from_secs(5)
+            })
+        {
+            if let Some(active) = self.frontend_cinematic.as_mut() {
+                active.fade_started = Some(now);
+            }
+            self.egui_repaint_requested = true;
+        }
     }
 
     pub(in crate::app) fn tick(&mut self) {
@@ -123,7 +175,7 @@ impl App {
         let mut deformation_stamps = Vec::new();
         let mut local_movement_error = None;
         if local_is_playing
-            && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial)
+            && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial | OverlayMode::EmoteRadial)
             && self.captured
         {
             // Local play originates the same CL_CreateCmd action payload as
@@ -254,6 +306,7 @@ impl App {
         // sample *before* publishing RenderSnapshot; doing it afterward leaves
         // dynamic_crosshair_world one main tick behind only while spectating.
         self.update_crosshair_target(now);
+        self.update_model_placement();
         if self.video.depth_of_field_strength > 0.001 && self.video.dof_autofocus {
             if let Some(hit) = self.crosshair_hit_world {
                 self.dof_focus_target = self

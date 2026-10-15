@@ -27,12 +27,29 @@ pub(in crate::renderer) fn presentation_config(
     config
 }
 
+/// The scene/compositor format differs from the swapchain format when native
+/// HDR output is actually available. On SDR fallback there is no compositor. A surface texture view must use the format
+/// selected for the *presentation surface*, not the FP16 compositor.
+#[inline]
+fn surface_view_format(
+    scene_format: wgpu::TextureFormat,
+    hdr_surface_format: Option<wgpu::TextureFormat>,
+) -> wgpu::TextureFormat {
+    hdr_surface_format.unwrap_or(scene_format)
+}
+
 impl Renderer {
-    /// View of an acquired swapchain image in the render format (sRGB view of
-    /// the UNORM presentation image; see `presentation_config`).
+    /// View of the acquired swapchain image. In the normal SDR path this can
+    /// be an sRGB view of a UNORM swapchain (see `presentation_config`). Native
+    /// HDR output instead uses the selected native HDR surface format,
+    /// never the internal Rgba16Float compositor format.
     pub(in crate::renderer) fn surface_texture_view(&self, frame: &wgpu::SurfaceTexture) -> wgpu::TextureView {
+        let format = surface_view_format(
+            self.config.format,
+            self.hdr_output.as_ref().map(|output| output.selection.format),
+        );
         frame.texture.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.config.format),
+            format: Some(format),
             ..Default::default()
         })
     }
@@ -177,14 +194,31 @@ impl Renderer {
         if self.vsync == vsync {
             return;
         }
+        let previous_present_mode = self.config.present_mode;
+        let configure_started = std::time::Instant::now();
         self.vsync = vsync;
         self.config.present_mode = present_mode_for_vsync(vsync, &self.present_modes);
         self.reconfigure_presentation_surface("vsync");
+        // This is wgpu's actual configured surface state (not just our mirror
+        // in self.config). It cannot reveal any OS compositor/driver override.
+        let applied = self.surface.get_configuration();
+        if self.size.width > 0 && self.size.height > 0 && applied.as_ref().is_some_and(|config| {
+            config.present_mode != self.config.present_mode
+                || config.desired_maximum_frame_latency
+                    != self.config.desired_maximum_frame_latency
+        }) {
+            eprintln!("[JKA PRESENT] WARNING: requested presentation configuration differs from surface configuration: {applied:?}");
+        }
         rverbose!(
             1,
-            "VSync: {} -> present mode {:?}",
+            "VSync: {:?} -> {:?} (requested {}, surface {:?}, queue {}, configure {:.3} ms, surface generation {})",
+            previous_present_mode,
+            self.config.present_mode,
             vsync.label(),
-            self.config.present_mode
+            applied.as_ref().map(|config| config.present_mode),
+            self.config.desired_maximum_frame_latency,
+            configure_started.elapsed().as_secs_f64() * 1000.0,
+            self.surface_config_generation
         );
     }
 
@@ -320,5 +354,27 @@ pub(in crate::renderer) fn present_mode_for_vsync(
                 wgpu::PresentMode::Fifo
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod presentation_view_tests {
+    use super::surface_view_format;
+    use wgpu::TextureFormat as Format;
+
+    #[test]
+    fn native_hdr_and_sdr_fallback_use_the_actual_swapchain_view_format() {
+        // The internal compositor remains FP16 in all three cases.
+        let scene = Format::Rgba16Float;
+        assert_eq!(surface_view_format(scene, Some(Format::Rgb10a2Unorm)), Format::Rgb10a2Unorm);
+        assert_eq!(surface_view_format(scene, Some(Format::Rgba16Float)), Format::Rgba16Float);
+        assert_eq!(surface_view_format(scene, Some(Format::Bgra8Unorm)), Format::Bgra8Unorm);
+        assert_eq!(surface_view_format(scene, Some(Format::Bgra8UnormSrgb)), Format::Bgra8UnormSrgb);
+    }
+
+    #[test]
+    fn ordinary_sdr_retains_its_srgb_render_view() {
+        // SDR uses an sRGB render view of a UNORM presentation surface.
+        assert_eq!(surface_view_format(Format::Bgra8UnormSrgb, None), Format::Bgra8UnormSrgb);
     }
 }

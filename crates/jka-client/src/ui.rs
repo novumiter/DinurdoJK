@@ -86,6 +86,8 @@ pub use settings::environment::{
     VIDEO_ROW_FILM_GRAIN,
 };
 pub use settings::rendering::{
+    VIDEO_ROW_PATCH_SUBDIVISIONS, VIDEO_ROW_PATCH_LOD_ERROR, VIDEO_ROW_PATCH_STITCHING,
+    VIDEO_ROW_DRAW_CURVES, VIDEO_ROW_PATCH_STATS, VIDEO_ROW_MODEL_LOD_SCALE,
     ColorLutPreset, CrtMask, CrtQuality, CrtReferenceResolution, CrtScope, CrtStyle, CullDebugMode,
     DofQuality, DynamicLightsMode, GlowMode,
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FullscreenMode,
@@ -122,7 +124,7 @@ pub use settings::rendering::{
     VIDEO_ROW_PICMIP, VIDEO_ROW_PLANAR_REFLECTIONS,
     VIDEO_ROW_PLANAR_REFLECTION_DEBUG, VIDEO_ROW_PVS, VIDEO_ROW_QUALITY_PRESET,
     VIDEO_ROW_RENDERER_VERBOSE, VIDEO_ROW_RENDER_BACKEND, VIDEO_ROW_GPU_ADAPTER, VIDEO_ROW_RESOLUTION,
-    VIDEO_ROW_SABER_FLARES, VIDEO_ROW_SABER_IMPACT_FX, VIDEO_ROW_SABER_MARKS, VIDEO_ROW_SSR, VIDEO_ROW_TEXTURE_FILTER,
+    VIDEO_ROW_SABER_FLARES, VIDEO_ROW_SABER_IMPACT_FX, VIDEO_ROW_SABER_MARKS, VIDEO_ROW_SSR, VIDEO_ROW_TEXTURE_COMPRESSION, VIDEO_ROW_TEXTURE_FILTER,
     VIDEO_ROW_TONE_MAPPING, VIDEO_ROW_VERTEX_LIGHTING, VIDEO_ROW_VID_RESTART, VIDEO_ROW_VIGNETTE,
     VIDEO_ROW_CRT_SCOPE, VIDEO_ROW_CRT_STYLE, VIDEO_ROW_CRT_QUALITY, VIDEO_ROW_CRT_REFERENCE, VIDEO_ROW_CRT_MASK,
     VIDEO_ROW_CRT_SCANLINE, VIDEO_ROW_CRT_SHARPNESS, VIDEO_ROW_CRT_MASK_INTENSITY,
@@ -172,6 +174,16 @@ pub enum OverlayMode {
     Trace,
     /// `/dev`: mouse-driven wheel for developer tooling, rendered over the live scene.
     DevRadial,
+    /// The asset picker for the client-only world MD3 placement tool.
+    ModelPicker,
+    /// Picker for BSP inline submodels (`*N`) in the loaded world.
+    BmodelPicker,
+    /// Import/export full BSP entity replacement .ent files.
+    MapMods,
+    /// `/emote`: two-tier relative-mouse wheel for taunts and mod emotes.
+    EmoteRadial,
+    /// Searchable map-material remap editor, also linked from Trace.
+    ShaderRemap,
     /// Loaded/live jaPRO strafe trails and asynchronous trail-file browser.
     StrafeTrails,
     /// Remote/local race demo browser and synchronized visual ghosts.
@@ -1018,6 +1030,10 @@ pub struct UiSnapshot {
     /// startup kicks the first map request. This prevents the first visible WGPU
     /// frame from being an empty/no-world clear.
     pub startup_splash: bool,
+    /// Draw the `menu/splash` artwork on that frame. Menu launches leave it off
+    /// so the first presented frame is plain black, matching the start of the
+    /// menu stage fade (cached scene photograph) instead of a different image.
+    pub startup_splash_art: bool,
     pub loading: Option<MapLoadingUi>,
     pub static_ao_progress: Option<MapLoadingBar>,
     /// Renderer-owned status of asynchronously compiled shader/PSO pipelines.
@@ -1085,6 +1101,7 @@ impl Default for UiSnapshot {
             threads: std::sync::Arc::from([]),
             surface_inspector: None,
             startup_splash: false,
+            startup_splash_art: true,
             loading: None,
             static_ao_progress: None,
             shader_compile_progress: None,

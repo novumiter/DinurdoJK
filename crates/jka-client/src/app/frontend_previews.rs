@@ -753,6 +753,46 @@ impl App {
         self.solo_dynamic_models = Arc::new(surfaces);
     }
 
+    /// Only capture a reusable menu frame after the actual player model has
+    /// settled AND its held idle animation has been submitted for multiple frames.
+    /// WorldUploaded alone is insufficient because Ghoul2 models stream later.
+    fn advance_frontend_scene_readiness(&mut self, model_ready: bool, current_time: i32) {
+        let now = Instant::now();
+        let Some(cinematic) = self.frontend_cinematic.as_mut() else { return; };
+        if cinematic.world_ready_at.is_none() || cinematic.fade_started.is_some() {
+            return;
+        }
+        if !model_ready {
+            cinematic.model_visible_since = None;
+            cinematic.pose_hold_ms = None;
+            cinematic.pose_locked_at = None;
+            return;
+        }
+        let first_visible = *cinematic.model_visible_since.get_or_insert(now);
+        // Let initial Ghoul2 anim transitions settle, without recording a
+        // transient bind/landing pose or the fallback model from a cold load.
+        if now.saturating_duration_since(first_visible) < Duration::from_millis(850) {
+            return;
+        }
+        if cinematic.pose_locked_at.is_none() {
+            cinematic.pose_hold_ms = Some(current_time);
+            cinematic.pose_locked_at = Some(now);
+            return;
+        }
+        // The held pose must have passed through the app snapshot and actual
+        // render thread several times before the scene-only GPU readback.
+        if now.saturating_duration_since(cinematic.pose_locked_at.unwrap())
+            < Duration::from_millis(200)
+        {
+            return;
+        }
+        cinematic.fade_started = Some(now);
+        if let Some(path) = self.frontend_scene_cache_path.as_ref().filter(|path| !path.exists()) {
+            self.render_command(RenderCommand::CaptureFrontendScene { path: path.clone() });
+        }
+        self.egui_repaint_requested = true;
+    }
+
     pub(in crate::app) fn update_frontend_foreground_player(&mut self) {
         let Some(cinematic) = self.frontend_cinematic else {
             self.solo_dynamic_models = Arc::new(Vec::new());
@@ -809,11 +849,21 @@ impl App {
             return;
         };
 
-        let current_time = cinematic
-            .started
-            .elapsed()
-            .as_millis()
-            .min(i32::MAX as u128) as i32;
+        // Share the menu camera's stationary->animated timeline: the player
+        // must not advance while the cached frame is fading into live 3D.
+        let current_time = cinematic.pose_hold_ms.map_or_else(
+            || cinematic.anim_started.elapsed().as_millis().min(i32::MAX as u128) as i32,
+            |held| {
+                let resumed = cinematic.fade_started.map_or(0, |start| {
+                    Instant::now().saturating_duration_since(
+                        start + Duration::from_secs_f32(
+                            crate::app::egui_menu::FRONTEND_SCENE_FADE_IN_SECS,
+                        ),
+                    ).as_millis().min(i32::MAX as u128) as i32
+                });
+                held.saturating_add(resumed)
+            },
+        );
         let presenter = self
             .local_player_presenter
             .as_mut()
@@ -824,7 +874,7 @@ impl App {
         presenter.set_ghoul2_anim_smooth(self.video.ghoul2_anim_smooth);
         presenter.set_lod_scale(self.video.lod_scale);
         let info = ClientInfo::solo_model(FRONTEND_FOREGROUND_MODEL);
-        match presenter.present_player_entity(
+        let result = presenter.present_player_entity(
             &entity,
             &info,
             current_time,
@@ -834,10 +884,17 @@ impl App {
             true,
             false,
             None,
-        ) {
-            Ok(draws) => self.solo_dynamic_models = Arc::new(draws),
+        );
+        let settled = presenter.player_model_settled(entity.number);
+        match result {
+            Ok(draws) => {
+                let model_ready = settled && !draws.is_empty();
+                self.solo_dynamic_models = Arc::new(draws);
+                self.advance_frontend_scene_readiness(model_ready, current_time);
+            }
             Err(error) => {
                 self.solo_dynamic_models = Arc::new(Vec::new());
+                self.advance_frontend_scene_readiness(false, current_time);
                 if self.console_status != error {
                     self.console_status = error.clone();
                     self.push_console_line(format!("^1FRONTEND PLAYER PRESENTATION: {error}"));
@@ -868,7 +925,6 @@ impl App {
             view_angles,
             presentation_origin,
             presentation_time,
-            camera_time_precise,
         )) = self.local_server.as_ref().map(|player| {
             player.camera_subframe(&mut first_person_camera);
             let player_view = player.view();
@@ -880,7 +936,6 @@ impl App {
                 view_angles,
                 player.presentation_origin(),
                 player.presentation_time(),
-                player.presentation_time_precise(),
             )
         })
         else {
@@ -917,7 +972,7 @@ impl App {
                         health: entity_view.health,
                         dead_yaw: entity_view.dead_yaw as f32,
                         client_num: entity_view.client_num,
-                        time: camera_time_precise,
+                        time: f64::from(presentation_time),
                         teleported: false,
                     },
                 );

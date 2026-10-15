@@ -212,9 +212,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -706,9 +705,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -827,9 +825,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -1116,9 +1113,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -1237,9 +1233,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -1358,9 +1353,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;

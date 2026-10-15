@@ -138,10 +138,22 @@ struct OceanRenderSettings {
     mask_bounds: array<vec4<f32>, 8>,
     mask_tiles: array<vec4<u32>, 8>,
     mask_triangles: array<vec4<f32>, 512>,
+    // Extra per-pool rendering data, NOT part of the coastal or spray inputs.
+    sky_segments: array<vec4<f32>, 16>,
+    appearance_a: vec4<f32>, // detail mode, promoted foam gates, foam gain, foam distance fade
+    appearance_b: vec4<f32>, // body color mode, foam brightness, sun gain, foam debug
+    appearance_c: vec4<f32>, // 0 existing, 1 balanced improvements, 2 Godot-inspired strong look
+};
+struct SkyFogRegion {
+    bounds: vec4<f32>,
+    plane: vec4<f32>,
+    segments: array<vec4<f32>, 16>,
 };
 struct OceanOptics {
     inverse_view_projection: mat4x4<f32>, eye: vec4<f32>, forward: vec4<f32>,
     fog: vec4<f32>, params: vec4<f32>, minimum: array<vec4<f32>,8>, maximum: array<vec4<f32>,8>,
+    sky_regions: array<SkyFogRegion, 8>,
+    sky_info: vec4<f32>,
 };
 @group(5) @binding(0) var ocean_scene: texture_2d<f32>;
 @group(5) @binding(1) var ocean_scene_sampler: sampler;
@@ -360,11 +372,24 @@ fn coastal_connected(a:vec2<i32>,b:vec2<i32>)->bool {
     return (coastal_open_at(a,x)&&coastal_open_at(vec2<i32>(b.x,a.y),y))
         ||(coastal_open_at(a,y)&&coastal_open_at(vec2<i32>(a.x,b.y),x));
 }
+// Sky-promoted ocean uses the same FFT geometry and shader, but exterior
+// pixels have no authored seabed or scene behind them. This flag exists only
+// in the promoted per-pool render uniform (1 = original, 2 = extended).
+// The original shoreline/outline and the separate coastal solver are never
+// expanded. Checking the original water AABB is enough here because the
+// precise sky-contact admission runs separately in ocean_mask_contains.
+fn ocean_sky_exterior(position: vec2<f32>) -> bool {
+    return ocean.authored_plane.w > 1.5
+        && (any(position < ocean.authored_bounds.xy)
+            || any(position > ocean.authored_bounds.zw));
+}
+
 fn sample_coastal(position:vec3<f32>)->CoastalSample {
     var result:CoastalSample;
     result.field=vec4<f32>(0.0);result.slope=vec2<f32>(0.0);
     // Scope by stable slot and still-water plane so stacked pools cannot alias.
-    if (coastal_params.control.x==0u || coastal_surface.failed!=0u || ocean.authored_plane.w<0.5
+    if (ocean_sky_exterior(position.xz) || coastal_params.control.x==0u
+        || coastal_surface.failed!=0u || ocean.authored_plane.w<0.5
         || abs(ocean.spray_planes[0].z-coastal_params.grid.w)>0.1
         || abs(position.y-coastal_params.grid.z)>0.5) {return result;}
     let cell=position.xz*vec2<f32>(1.0,-1.0)/coastal_params.grid.x-vec2<f32>(0.5);
@@ -612,8 +637,12 @@ fn is_ocean_vertex(input: VertexIn) -> bool {
 // half of them land exactly on a coarse vertex, so the 2:1 LOD seam closes with
 // degenerate triangles instead of needing transition fans.
 fn ocean_clipmap_position(input: VertexIn) -> vec3<f32> {
-    let minimum = select(input.uv, ocean.authored_bounds.xy, ocean.authored_plane.x > 0.0);
-    let maximum = select(input.lightmap_uv, ocean.authored_bounds.zw, ocean.authored_plane.x > 0.0);
+    let promoted_dynamic = ocean.authored_plane.w > 0.5;
+    // Reuse the per-pool bounds uniform, so switching between the original
+    // water and the sky extension requires no extra mask fetch per vertex.
+    let use_uniform_bounds = ocean.authored_plane.x > 0.0 || promoted_dynamic;
+    let minimum = select(input.uv, ocean.authored_bounds.xy, use_uniform_bounds);
+    let maximum = select(input.lightmap_uv, ocean.authored_bounds.zw, use_uniform_bounds);
 
     // The clipmap follows the viewer, but the viewer is often nowhere near the
     // water - a lake is a small part of a map. Pulling the centre back into the
@@ -624,10 +653,14 @@ fn ocean_clipmap_position(input: VertexIn) -> vec3<f32> {
     // water is runtime-adaptive: amplitude changes its ring width and true 3D
     // camera distance can skip fine levels, so its per-pool uniform carries the
     // current outer lattice instead.
-    let promoted_dynamic = ocean.authored_plane.w > 0.5;
     let static_step = select(max(ocean.clipmap.z, 1.0), input.color.b, input.color.b > 0.0);
     let step = select(static_step, max(ocean.wind_motion.w, 1.0), promoted_dynamic);
-    let centre = round(clamp(ocean.clipmap.xy, minimum, maximum) / step) * step;
+    // The selected pool's own render uniform is authoritative. The previous
+    // lookup depended on the vertex-mask slot, even for rectangular source
+    // pools whose baseline geometry needed no outline mask.
+    let sky_enabled = promoted_dynamic && ocean.authored_plane.w > 1.5;
+    let origin = select(clamp(ocean.clipmap.xy, minimum, maximum), ocean.clipmap.xy, sky_enabled);
+    let centre = round(origin / step) * step;
 
     var offset = input.position.xz;
     if (promoted_dynamic) {
@@ -655,7 +688,8 @@ fn ocean_clipmap_position(input: VertexIn) -> vec3<f32> {
             offset = round(offset / snap) * snap;
         }
     }
-    let folded = clamp(centre + offset, minimum, maximum);
+    let unfolded = centre + offset;
+    let folded = select(clamp(unfolded, minimum, maximum), unfolded, sky_enabled);
     return vec3<f32>(folded.x, select(input.position.y, ocean.authored_plane.y, ocean.authored_plane.x > 0.0), folded.y);
 }
 
@@ -668,13 +702,43 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
     }
     let range = ocean.mask_ranges[slot];
     let count = u32(range.y);
-    if (count == 0u) {
-        return true;
-    }
     let bounds = ocean.mask_bounds[slot];
-    if (any(p < bounds.xy) || any(p > bounds.zw)) {
-        return false;
+    if (range.z > 0.5) {
+        // Sky continuation is admitted ONLY beyond the source water AABB.
+        // Source pools retain their exact land/shoreline mask inside it.
+        if (any(p < bounds.xy) || any(p > bounds.zw)) {
+            for (var i = 0u; i < u32(range.z); i = i + 1u) {
+                let segment = ocean.sky_segments[i];
+                let side = u32(segment.w);
+                if ((side == 1u && p.x <= segment.x + 2.0 && p.y >= segment.y && p.y <= segment.z)
+                    || (side == 2u && p.x >= segment.x - 2.0 && p.y >= segment.y && p.y <= segment.z)
+                    || (side == 3u && p.y <= segment.x + 2.0 && p.x >= segment.y && p.x <= segment.z)
+                    || (side == 4u && p.y >= segment.x - 2.0 && p.x >= segment.y && p.x <= segment.z)) {
+                    return true;
+                }
+            }
+            // Fill an exterior quadrant only when BOTH sky-connected edges
+            // meet at its original water corner; independent strips leave gaps.
+            let xside = select(select(0u, 2u, p.x > bounds.z), 1u, p.x < bounds.x);
+            let zside = select(select(0u, 4u, p.y > bounds.w), 3u, p.y < bounds.y);
+            if (xside != 0u && zside != 0u) {
+                let xc = select(bounds.z, bounds.x, xside == 1u);
+                let zc = select(bounds.w, bounds.y, zside == 3u);
+                var found_x = false;
+                var found_z = false;
+                for (var i = 0u; i < u32(range.z); i = i + 1u) {
+                    let s = ocean.sky_segments[i];
+                    let side = u32(s.w);
+                    if (side == xside && zc >= s.y - 2.0 && zc <= s.z + 2.0) { found_x = true; }
+                    if (side == zside && xc >= s.y - 2.0 && xc <= s.z + 2.0) { found_z = true; }
+                }
+                if (found_x && found_z) { return true; }
+            }
+            return false;
+        }
     }
+    if (count == 0u) { return true; }
+    if (any(p < bounds.xy) || any(p > bounds.zw)) { return false; }
     let tile_xy = vec2<u32>(clamp(
         floor((p - bounds.xy) / max(bounds.zw - bounds.xy, vec2<f32>(1.0e-4)) * 8.0),
         vec2<f32>(0.0), vec2<f32>(7.0)));
@@ -3081,6 +3145,19 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     // resolution automatically rather than inventing another horizontal ring.
     let metres_per_pixel = max(length(dpdx(world_m)), length(dpdy(world_m)));
 
+    // An opt-in one-switch bundle for comparing the restrained BSP-derived
+    // appearance to the more complete FFT/foam presentation. Individual A/B
+    // controls below still work with this switch off, and can be increased
+    // further when a bundle is active. No FFT, map topology or material cache
+    // needs rebuilding to toggle this runtime setting.
+    let visual_mode = ocean.appearance_c.x;
+    let tuned_foam_detail = max(ocean.appearance_a.x, select(0.0, 1.0, visual_mode > 0.5));
+    // The bundle keeps both promoted-pool foam gates: they are what keeps a
+    // near-flat pond from being blanketed by the shared FFT foam field.
+    let tuned_foam_activity = ocean.appearance_a.y;
+    let tuned_foam_gain = max(ocean.appearance_a.z,
+        select(0.0, select(1.35, 1.15, visual_mode < 1.5), visual_mode > 0.5));
+
     // Preserve the upstream three-cascade sum while a cascade is resolvable.
     // Near water keeps the faithful bicubic/bilinear response. Distant or tiny
     // projected detail falls to one bilinear tap, then zero taps.
@@ -3091,10 +3168,11 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         let texels_per_metre = map_size * max(scale.x, scale.y);
         let texels_per_pixel = metres_per_pixel * texels_per_metre;
         let cascade_weight = 1.0 - smoothstep(0.75, 2.25, texels_per_pixel);
-        if (cascade_weight > 0.001) {
+        let detail_mode = tuned_foam_detail;
+        if (cascade_weight > 0.001 || detail_mode > 0.5) {
             let bilinear_weight = min(1.0, map_size * min(scale.x, scale.y) * 0.1);
             var sample = vec4<f32>(0.0);
-            if (bilinear_weight >= 0.94 || texels_per_pixel >= 0.70) {
+            if (bilinear_weight >= 0.94 || (texels_per_pixel >= 0.70 && detail_mode < 1.5)) {
                 sample = textureSampleLevel(ocean_normal, ocean_sampler, coords.xy, i32(i), 0.0);
             } else {
                 let bicubic = ocean_texture_bicubic(coords);
@@ -3105,7 +3183,12 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
                     sample = mix(bicubic, bilinear, bilinear_weight);
                 }
             }
-            gradient_foam += vec3<f32>(sample.x * scale.w, -sample.y * scale.w, sample.w) * cascade_weight;
+            // Mode 1 keeps foam even when normals become subpixel; mode 2
+            // keeps the complete Godot cascade response, including gradients.
+            let normal_weight = select(cascade_weight, 1.0, detail_mode > 1.5);
+            let foam_weight = select(cascade_weight, 1.0, detail_mode > 0.5);
+            gradient_foam += vec3<f32>(sample.x * scale.w * normal_weight,
+                -sample.y * scale.w * normal_weight, sample.w * foam_weight);
         }
     }
 
@@ -3115,8 +3198,13 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     // Match the wave normals to the displaced geometry, and avoid ocean-sized
     // whitecaps on an almost-flat promoted pool.
     let foam_gain = select(1.0, ocean.spray_planes[0].w, ocean.authored_plane.w > 0.5);
-    gradient_foam = vec3<f32>(gradient_foam.xy, gradient_foam.z * wave_activity * foam_gain);
-    let breaker_foam = smoothstep(0.0, 1.0, gradient_foam.z*0.75) * exp(-dist*0.0075);
+    let raw_foam = gradient_foam.z;
+    let activity_mode = tuned_foam_activity;
+    let activity_gate = select(wave_activity, 1.0, activity_mode >= 1.5);
+    let heuristic_gate = select(foam_gain, 1.0, activity_mode == 1.0 || activity_mode >= 2.5);
+    gradient_foam = vec3<f32>(gradient_foam.xy, raw_foam * activity_gate * heuristic_gate);
+    // Whitecaps carry no distance fade.
+    let breaker_foam = smoothstep(0.0, 1.0, gradient_foam.z * 0.75 * tuned_foam_gain);
     var windrow_foam = 0.0;
     if (ocean.surface.w > 0.5 && dist < 180.0 && metres_per_pixel < 0.75) {
         let windrow_uv = fract(world_m / max(ocean.ocean_info.w, 1.0));
@@ -3141,9 +3229,21 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         // sub-texel structure before it reaches the horizon.
         windrow_foam = smoothstep(0.08, 0.72, transported) * exp(-dist*0.0022);
     }
-    windrow_foam *= wave_activity * foam_gain;
+    windrow_foam *= activity_gate * heuristic_gate;
     let foam_factor = 1.0 - (1.0-breaker_foam) * (1.0-windrow_foam);
-    let normal_fade = mix(0.015, ocean.surface.y, exp(-dist*0.0175));
+    // Foam debug is deliberately before optics, allowing an unambiguous
+    // check of simulation -> promoted gates -> final shading coverage.
+    if (ocean.appearance_b.w > 0.5) {
+        let debug_foam = select(raw_foam,
+            select(gradient_foam.z, foam_factor, ocean.appearance_b.w >= 2.5),
+            ocean.appearance_b.w >= 1.5);
+        return vec4<f32>(vec3<f32>(clamp(debug_foam, 0.0, 1.0)), 1.0);
+    }
+    // Godot fades normals to 1.5% with distance; that flattens the far sea into a
+    // mirror. With full-distance detail (mode 2) keep 40% so far waves still
+    // roughen the reflection and the sun's glints.
+    let normal_floor = select(0.015, 0.4 * ocean.surface.y, tuned_foam_detail > 1.5);
+    let normal_fade = mix(normal_floor, ocean.surface.y, exp(-dist*0.0175));
     let interaction_plane = select(ocean.authored_plane.y, ocean.spray_planes[0].x, ocean.authored_plane.w > 0.5);
     let interaction = sample_ocean_interaction(vec3<f32>(world_m.x*units_per_meter, interaction_plane, world_m.y*units_per_meter));
     if (interaction.w > 0.5) {
@@ -3181,7 +3281,7 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     // negate it to obtain surface -> light. Intensity is normalized such that
     // the common q3map value 250 maps to the upstream reference energy 1.0.
     let light_dir = normalize(-ocean.sun_direction_intensity.xyz);
-    let sun_radiance = ocean.sun_color.rgb * ocean.sun_direction_intensity.w;
+    let sun_radiance = ocean.sun_color.rgb * ocean.sun_direction_intensity.w * ocean.appearance_b.z;
     let halfway = normalize(light_dir + view_dir);
     let dot_nl = max(dot(n, light_dir), 2e-5);
     let light_mask = ocean_smith_masking_shadowing(roughness, dot_nv);
@@ -3202,7 +3302,15 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     let sss_near = 0.5*pow(dot_nv, 2.0);
     let lambertian = 0.5*dot_nl;
     let water_diffuse = (sss_height + sss_near) * sss_modifier / (1.0 + light_mask) + vec3<f32>(lambertian);
-    let direct_diffuse = mix(water_diffuse, ocean.foam_color.rgb, foam_factor)
+    // Existing path multiplies the foam's albedo by its diffuse tint again.
+    // The bundled comparison keeps the foam tint only in albedo, making its
+    // direct and ambient light respond as a whitecap instead of muddy foam.
+    // Albedo stays at or below the configured foam color (single tint, no
+    // brightness boost): lit foam must not exceed a white surface in the same
+    // light, and there is no tonemap to roll an overshoot off.
+    let foam_color = ocean.foam_color.rgb * ocean.appearance_b.y;
+    let foam_diffuse = select(foam_color, vec3<f32>(1.0), visual_mode > 0.5);
+    let direct_diffuse = mix(water_diffuse, foam_diffuse, foam_factor)
         * (1.0 - fresnel) * attenuation * sun_radiance;
 
     // Keep the global water color control as a tint relative to its
@@ -3211,7 +3319,18 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     var body_color = select(ocean.water_color.rgb,
         material.ocean_color.rgb * ocean.water_color.rgb / default_water_color,
         authored_water && ocean.authored_plane.w < 0.5);
+    if (ocean.appearance_b.x == 1.0 || ocean.appearance_b.x >= 2.5) {
+        body_color = ocean.water_color.rgb;
+    }
+    // The synthetic extension samples the same captured underwater medium;
+    // the optics pass analytically continues that medium beyond sky contacts.
+    // Source and extension both retain authored opacity and FFT lighting.
+    let sky_exterior = ocean_sky_exterior(input.ocean_uv_m * units_per_meter);
     var body_opacity = select(0.0, material.ocean_color.a, authored_water);
+    // The ocean optics capture now recognizes the same extended underwater
+    // medium outside the BSP. Do NOT force exterior opacity to 1: that would
+    // discard the fogged transmission and recreate the hard-colored rectangle.
+    // The authored alpha blends against Beer-Lambert-attenuated background.
     // Generators remain live; clipmap vertex colors contain mesh metadata,
     // so their authored averages were resolved at upload instead.
     if (authored_water && (material_flags() & 134217728u) != 0u) {
@@ -3220,7 +3339,7 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     if (authored_water && (material_flags() & 268435456u) != 0u) {
         body_opacity *= clamp(wave_value(material.wave_funcs.y, material.wave_alpha, shader_stage_time()), 0.0, 1.0);
     }
-    let albedo = mix(body_color, ocean.foam_color.rgb, foam_factor);
+    let albedo = mix(body_color, foam_color, foam_factor);
     let environment = ocean_environment(input, n, view_dir, ibl_roughness);
     let indirect = ocean_indirect_lighting(input, n, albedo);
     let local_lights = ocean_dynamic_lighting(input, n, view_dir, albedo, roughness);
@@ -3243,13 +3362,34 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         // transparency with the captured scene but skip the second depth lookup.
         refracted_uv = uv;
     }
-    // The snapshot already contains water-path absorption. Do not charge it twice.
-    let transmission = textureSampleLevel(ocean_scene, ocean_scene_sampler, refracted_uv, 0.0).rgb;
+    // Preserve captured scene transmission for exterior ocean pixels too.
+    // Substituting the raw ocean fog color here creates artificial flat fog
+    // wedges at the authored-water/sky-extension boundary.
+    var transmission = textureSampleLevel(ocean_scene, ocean_scene_sampler, refracted_uv, 0.0).rgb;
+    // Extension pixels with no receiver behind them (capture depth 1e6) see
+    // an unbounded water column: the optics medium at full opacity is the fog
+    // colour, matching the inner ocean's deep water instead of the void.
+    if (sky_exterior && !below) {
+        let behind = textureLoad(ocean_scene_depth, vec2<i32>(refracted_uv*dims), 0).r;
+        if (behind >= 900000.0) { transmission = ocean_optics.fog.rgb; }
+    }
     let surface_light = indirect + albedo * direct_diffuse + local_lights;
     // alphaGen/texture alpha controls how much lit water replaces the
     // transmitted scene. Fresnel and foam still use the FFT ocean response.
+    // A/B against Godot's fully shaded body, rather than JKA's alpha-blended
+    // authored map water. Ignore authored blending in this comparison mode.
+    let opaque_body_test = ocean.appearance_b.x >= 1.5;
+    if (opaque_body_test) { body_opacity = max(body_opacity, 0.95); }
+    // The baseline respects JKA stage transparency verbatim. A/B mode offers
+    // a lit water-body floor in promoted oceans; otherwise near-opaque foam
+    // swims on top of largely unchanged gray scene capture.
+    if (visual_mode > 0.5 && ocean.authored_plane.w > 0.5 && !below) {
+        body_opacity = max(body_opacity, select(0.42, 0.72, visual_mode > 1.5));
+    }
     var body_transmission = mix(transmission, surface_light, clamp(body_opacity, 0.0, 1.0));
-    let authored_blend = authored_water && material.ocean_waves.z > 0.0;
+    // Authored framebuffer blends are meaningful only over the authored
+    // geometry. Extending them onto sky would simply reintroduce sky pixels.
+    let authored_blend = authored_water && material.ocean_waves.z > 0.0 && !opaque_body_test;
     let factors = vec2<u32>(u32(max(material.ocean_waves.z-1.0,0.0)),u32(material.ocean_waves.w));
     var stage = vec4<f32>(0.0);
     if (authored_blend) {
@@ -3259,8 +3399,10 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         stage = vec4<f32>(material.ocean_blend_color.rgb*tint,body_opacity);
         body_transmission = ocean_authored_blend(stage,vec4<f32>(transmission,1.0),factors);
     }
+    // Foam is matte: no mirror reflection or sun glint on whitecaps.
+    let glossy = 1.0 - foam_factor;
     var color = body_transmission * (1.0-fresnel) * (1.0-foam_factor)
-        + surface_light * foam_factor + specular + environment * fresnel;
+        + surface_light * foam_factor + (specular + environment * fresnel) * glossy;
     if (below) {
         // Reflected/surface light travels from the interface to the eye through water.
         let ratios = vec3<f32>(38.0/7.5, 38.0/22.0, 1.0);
@@ -3272,7 +3414,7 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
             below_body = ocean_authored_blend(vec4<f32>(stage.rgb*t,stage.a),vec4<f32>(transmission,1.0),factors);
         }
         color = below_body * (1.0-fresnel) * (1.0-foam_factor)
-            + (surface_light * foam_factor + specular + environment * fresnel) * t
+            + (surface_light * foam_factor + (specular + environment * fresnel) * glossy) * t
             + ambient * (1.0-t) * (fresnel + (1.0-fresnel)*foam_factor);
     }
     return vec4<f32>(color, 1.0);
@@ -3305,7 +3447,8 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         // is the only place Legacy fog reaches the GodotOcean surface. It is
         // compiled only into Legacy fog world variants.
         let ocean_color = ocean_surface_sample(input, !front);
-        if (ENABLE_LEGACY_FOG) {
+        // Numeric foam diagnostics must not be washed out by map fog.
+        if (ENABLE_LEGACY_FOG && ocean.appearance_b.w < 0.5) {
             return apply_ocean_legacy_fog(ocean_color, input.world_position);
         }
         return ocean_color;
@@ -3748,9 +3891,32 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
 // approximation while blending remains linear in the scene target. Both use
 // the SAME transfer function. Keep alpha and authored blend factors unchanged.
 const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
+// Approximate TaystJK's additive SOURCE modulation: its 8-bit rgbGen wave
+// multiplies the encoded texture sample before the blend. The scene target
+// remains linear, so this does not emulate encoded-framebuffer destination
+// blending (which would require access to the destination color).
+fn legacy_additive_source(source: vec4<f32>, waveform: f32, has_wave: bool) -> vec4<f32> {
+    if (!has_wave) {
+        return source;
+    }
+    if (waveform <= 0.0) {
+        return vec4<f32>(vec3<f32>(0.0), source.a);
+    }
+    // Textures were sRGB-decoded by sampling and modulated by rgbGen wave.
+    // Recover their linear sample, perform the legacy modulation in encoded
+    // space with the reference 8-bit wave, then decode for WGPU blending.
+    let texel_linear = max(source.rgb / waveform, vec3<f32>(0.0));
+    let vertex_wave_byte = round(clamp(waveform, 0.0, 1.0) * 255.0) / 255.0;
+    return vec4<f32>(legacy_rgb_decode(legacy_rgb_encode(texel_linear) * vertex_wave_byte), source.a);
+}
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
     if ((material_flags() & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
-        return vec4<f32>(legacy_rgb_encode(color.rgb), color.a);
+        let has_wave = (material_flags() & 134217728u) != 0u;
+        var wave = 1.0;
+        if (has_wave) {
+            wave = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, shader_stage_time()), 0.0, 1.0);
+        }
+        return legacy_additive_source(color, wave, has_wave);
     }
     return color;
 }
@@ -3922,22 +4088,16 @@ fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
 }
 fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
     var sample = texel * additive_stage_tint(m, vertex_color);
-    // Same material flag as the source stages (1u << 29u). Keep this
-    // fusion-only check independent of optional legacy helper declarations.
-    if ((m.header.z & 536870912u) != 0u) {
-        // Inline the exact sRGB transfer function used by the legacy stage
-        // path. Fused entry points must not depend on the optional three-stage
-        // compositing helper being present in a specialized BSP module.
-        let v = max(sample.rgb, vec3<f32>(0.0));
-        let encoded = select(
-            1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
-            12.92 * v,
-            v <= vec3<f32>(0.0031308),
-        );
-        sample = vec4<f32>(encoded, sample.a);
+    if ((m.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
+        let has_wave = (m.header.z & 134217728u) != 0u;
+        var wave = 1.0;
+        if (has_wave) {
+            wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+        }
+        sample = legacy_additive_source(sample, wave, has_wave);
     }
-    // GL_SRC_ALPHA GL_ONE applies source alpha to both RGB and alpha. The
-    // fused pipeline uses GL_ONE GL_ONE with already-weighted contributions.
+    // Authored source blend is GL_SRC_ALPHA GL_ONE. Fused fixed blend is ONE/ONE,
+    // so preweight RGB and alpha by the source alpha as before.
     return vec4<f32>(sample.rgb * sample.a, sample.a * sample.a);
 }
 fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
@@ -3975,12 +4135,25 @@ fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f3
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy, (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u))) { discard; }
     return additive_fused_contributions(input, 3u);
 }
+// Secondary views have no matching transmission capture. Main-view glass
+// uses the dedicated shared shader, independent of world shader family.
+fn promoted_glass(input: VertexOut, front: bool) -> vec4<f32> {
+    let to_eye = normalize(camera.camera_pos_time.xyz - input.world_position);
+    let facing = abs(dot(normalize(input.world_normal), to_eye));
+    let f0 = clamp(material.ocean_color.a, 0.02, 0.18);
+    let fresnel = f0 + (1.0 - f0) * pow(1.0 - clamp(facing, 0.0, 1.0), 5.0);
+    return vec4<f32>(mix(vec3<f32>(0.65), material.ocean_color.rgb, 0.35), 0.08 + 0.55 * fresnel);
+}
+
 @fragment fn fs_main(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(
         input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
+    }
+    if ((material_flags_w() & (1u << 17u)) != 0u) {
+        return promoted_glass(input, front);
     }
     let shaded = shade_surface(input, front);
     if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
@@ -3995,6 +4168,9 @@ fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f3
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
+    }
+    if ((material_flags_w() & (1u << 17u)) != 0u) {
+        return promoted_glass(input, front);
     }
     let shaded = shade_surface(input, front);
     if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
@@ -4124,11 +4300,22 @@ fn sample_sky_cost_probe(d: vec3<f32>, probe: u32) -> vec4<f32> {
     return sample_outer_sky(d);
 }
 
+// Rendering policy, independent from r_oceanSkyExtend: a BSP map with
+// an authored water/vertical-sky contact uses a black lower sky hemisphere.
+// This is an angular horizon test in JKA Z-up, NOT a water height/depth test.
+// Camera render_flags.y bit 16 is set by the frame after map-load detection.
+fn ocean_connected_sky_below_horizon(direction_z: f32) -> bool {
+    return (camera.render_flags.y & 65536u) != 0u && direction_z < 0.0;
+}
+
 @fragment fn fs_sky_outer(input: VertexOut) -> @location(0) vec4<f32> {
     if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         return vec4<f32>(0.012, 0.012, 0.012, 1.0);
     }
     let direction = vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y);
+    if (ocean_connected_sky_below_horizon(direction.z)) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     if (ENABLE_SKY_DEBUG) {
         let probe = (camera.render_flags.y >> 8u) & 3u;
         if (probe != 0u) { return sample_sky_cost_probe(direction, probe); }
@@ -4145,6 +4332,12 @@ fn sample_sky_cost_probe(d: vec3<f32>, probe: u32) -> vec4<f32> {
     }
     // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
     let raw_direction = vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y);
+    if (ocean_connected_sky_below_horizon(raw_direction.z)) {
+        // Clouds may be blended/additive: suppress rather than write an
+        // opaque black cloud stage over the already black outer sky.
+        if (material_tc_gen() == 4u || (material_flags_w() & 1u) == 0u) { discard; }
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     if (ENABLE_SKY_DEBUG) {
         let probe = (camera.render_flags.y >> 8u) & 3u;
         if (probe != 0u && material_tc_gen() != 4u && (material_flags_w() & 1u) != 0u) {
@@ -4191,6 +4384,7 @@ fn fs_wireframe() -> @location(0) vec4<f32> {
 struct SkyBoxOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    @location(1) direction_z: f32, // JKA Z-up, interpolated on each sky face
 };
 
 // JKA-space view direction of face point (p, q) in [-1, 1]^2: the inverse of
@@ -4223,8 +4417,10 @@ fn sky_box_vertex(face: u32, vertex_index: u32) -> SkyBoxOut {
     );
     let pq = corners[vertex_index];
     var out: SkyBoxOut;
-    out.clip_position = sky_box_clip(sky_box_direction(face, pq.x, pq.y));
+    let direction = sky_box_direction(face, pq.x, pq.y);
+    out.clip_position = sky_box_clip(direction);
     out.uv = vec2<f32>((pq.x + 1.0) * 0.5, (1.0 - pq.y) * 0.5);
+    out.direction_z = direction.z;
     return out;
 }
 
@@ -4236,6 +4432,7 @@ struct SkyCloudOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) color: vec4<f32>,
+    @location(2) direction_z: f32,
 };
 
 @vertex fn vs_sky_cloud(@builtin(vertex_index) vertex_index: u32,
@@ -4255,10 +4452,12 @@ struct SkyCloudOut {
     // Per vertex like TaystJK ComputeColors; cloud-box vertices carry no colour,
     // so rgbGen/alphaGen vertex see white and the result is constant per draw.
     out.color = sky_cloud_stage_color(vec4<f32>(1.0));
+    out.direction_z = d.z;
     return out;
 }
 
 @fragment fn fs_sky_cloud(input: SkyCloudOut) -> @location(0) vec4<f32> {
+    if (ocean_connected_sky_below_horizon(input.direction_z)) { discard; }
     let base = textureSample(base_texture, base_sampler, input.uv) * input.color;
     if (material_alpha_rejects(base.a)) {
         discard;
@@ -4277,9 +4476,15 @@ struct SkyCloudOut {
 fn sky_box_uv(uv: vec2<f32>) -> vec2<f32> {
     return clamp(uv, vec2<f32>(0.001), vec2<f32>(0.999));
 }
-@fragment fn fs_sky_box_rt(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_rt, sky_sampler, sky_box_uv(input.uv)); }
-@fragment fn fs_sky_box_bk(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_bk, sky_sampler, sky_box_uv(input.uv)); }
-@fragment fn fs_sky_box_lf(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_lf, sky_sampler, sky_box_uv(input.uv)); }
-@fragment fn fs_sky_box_ft(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_ft, sky_sampler, sky_box_uv(input.uv)); }
-@fragment fn fs_sky_box_up(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_up, sky_sampler, sky_box_uv(input.uv)); }
-@fragment fn fs_sky_box_dn(input: SkyBoxOut) -> @location(0) vec4<f32> { return textureSample(sky_dn, sky_sampler, sky_box_uv(input.uv)); }
+fn sky_box_color(input: SkyBoxOut, color: vec4<f32>) -> vec4<f32> {
+    if (ocean_connected_sky_below_horizon(input.direction_z)) {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
+    return color;
+}
+@fragment fn fs_sky_box_rt(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_rt, sky_sampler, sky_box_uv(input.uv))); }
+@fragment fn fs_sky_box_bk(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_bk, sky_sampler, sky_box_uv(input.uv))); }
+@fragment fn fs_sky_box_lf(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_lf, sky_sampler, sky_box_uv(input.uv))); }
+@fragment fn fs_sky_box_ft(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_ft, sky_sampler, sky_box_uv(input.uv))); }
+@fragment fn fs_sky_box_up(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_up, sky_sampler, sky_box_uv(input.uv))); }
+@fragment fn fs_sky_box_dn(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_dn, sky_sampler, sky_box_uv(input.uv))); }

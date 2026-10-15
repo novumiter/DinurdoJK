@@ -1,6 +1,6 @@
 //! Water.
 use crate::app::egui_settings::{
-    color_row, ocean_slider, percent, quality_table_row, theme, ui, App, FootprintMode,
+    color_row, linked_ocean_slider, ocean_slider, percent, quality_table_row, theme, ui, App, FootprintMode,
     OCEAN_FOAM_COLOR, OCEAN_MAP_SIZE, OCEAN_MESH_QUALITY, OCEAN_NORMAL_STRENGTH, OCEAN_ROUGHNESS,
     OCEAN_SEA_SPRAY, OCEAN_UPDATES, OCEAN_WATER_COLOR, OCEAN_WIND_FOAM,
 };
@@ -197,7 +197,14 @@ impl App {
             let pool = &self.promoted_oceans[index];
             let local = self.promoted_ocean_overrides.iter().find(|(slot,_)| *slot == pool.index).map(|(_,s)| *s);
             crate::ocean::appearance::surface_settings(self.video.ocean_settings, pool, local)
-        } else { self.video.ocean_settings };
+        } else {
+            let mut shared = self.video.ocean_settings;
+            if self.ocean_settings_target > -2 { shared.apply_links(false); }
+            shared
+        };
+        // Locks live on the shared settings; a lock toggle edits this copy and
+        // is written back with the rest of the change below.
+        let mut links = self.video.ocean_settings.links;
         let mut changed = false;
 
         theme::section(
@@ -212,19 +219,20 @@ impl App {
                 ocean_slider(
                     ui,
                     "Swell amplitude",
-                    "Wave height in map units for the selected ocean. Promoted pools retain a small nonzero ripple.",
+                    "Master sea state, in map units. Wavelength, speed, choppiness, wind chop, foam, spray and roughness follow it while their padlocks are closed. Promoted pools retain a small nonzero ripple.",
                     theme::Reset::None,
                     &mut a.amplitude,
                     if promoted_index.is_some() { crate::ocean::appearance::MIN_PROMOTED_AMPLITUDE..=5000.0 } else { 0.0..=5000.0 },
                     &mut changed,
                 );
-                ocean_slider(
+                linked_ocean_slider(
                     ui,
                     "Swell wavelength",
-                    "Distance between authored swell crests, in map units.",
-                    theme::Reset::None,
+                    "Distance between authored swell crests, in map units. Follows the swell amplitude while locked; unlock to set it yourself.",
                     &mut a.wavelength,
                     64.0..=32768.0,
+                    crate::ocean::links::WAVELENGTH,
+                    &mut links,
                     &mut changed,
                 );
                 ocean_slider(
@@ -236,22 +244,24 @@ impl App {
                     -180.0..=180.0,
                     &mut changed,
                 );
-                ocean_slider(
+                linked_ocean_slider(
                     ui,
                     "Primary wave speed",
-                    "Travel speed of the authored swell in map units per second.",
-                    theme::Reset::None,
+                    "Travel speed of the authored swell in map units per second. Follows the swell amplitude while locked; unlock to set it yourself.",
                     &mut a.speed,
                     -4096.0..=4096.0,
+                    crate::ocean::links::SPEED,
+                    &mut links,
                     &mut changed,
                 );
-                ocean_slider(
+                linked_ocean_slider(
                     ui,
                     "Base choppiness",
-                    "Horizontal steepness of the authored swell.",
-                    theme::Reset::None,
+                    "Horizontal steepness of the authored swell. Follows the swell amplitude while locked; unlock to set it yourself.",
                     &mut a.steepness,
                     0.0..=1.0,
+                    crate::ocean::links::STEEPNESS,
+                    &mut links,
                     &mut changed,
                 );
                 ocean_slider(
@@ -263,31 +273,34 @@ impl App {
                     0.0..=1.0,
                     &mut changed,
                 );
-                ocean_slider(
+                linked_ocean_slider(
                     ui,
                     "Wind chop",
-                    "Scales the weather-driven fine chop cascade.",
-                    theme::Reset::None,
+                    "Scales the weather-driven fine chop cascade. Follows the swell amplitude while locked; unlock to set it yourself.",
                     &mut a.wind_chop,
                     0.0..=4.0,
+                    crate::ocean::links::WIND_CHOP,
+                    &mut links,
                     &mut changed,
                 );
-                ocean_slider(
+                linked_ocean_slider(
                     ui,
                     "Foam amount",
-                    "Foam strength for the selected ocean.",
-                    theme::Reset::None,
+                    "Foam strength for the selected ocean. Follows the swell amplitude while locked; unlock to set it yourself.",
                     &mut a.foam,
                     0.0..=4.0,
+                    crate::ocean::links::FOAM,
+                    &mut links,
                     &mut changed,
                 );
-                ocean_slider(
+                linked_ocean_slider(
                     ui,
                     "Spray amount",
-                    "Spray strength for the selected ocean.",
-                    theme::Reset::None,
+                    "Spray strength for the selected ocean. Follows the swell amplitude while locked; unlock to set it yourself.",
                     &mut a.spray,
                     0.0..=4.0,
+                    crate::ocean::links::SPRAY,
+                    &mut links,
                     &mut changed,
                 );
 
@@ -389,7 +402,8 @@ impl App {
             "GodotOceanWaves-style crest spray. Samples the same FFT foam/normal field and emits only from breaking whitecaps.",
             reset(theme::Reset::Ocean(OCEAN_SEA_SPRAY)),
             |ui| {
-                if let Some(value) = theme::switch(ui, settings.sea_spray) {
+                let preview = theme::preview_toggle_value(ui.ctx(), reset(theme::Reset::Ocean(OCEAN_SEA_SPRAY)), settings.sea_spray);
+                if let Some(value) = theme::switch(ui, preview) {
                     settings.sea_spray = value;
                     changed = true;
                 }
@@ -402,7 +416,8 @@ impl App {
             "Severe-wind surface foam transport. Reuses real FFT whitecaps, advects them with weather wind, and concentrates them into long wind-aligned foam streaks for gale conditions.",
             reset(theme::Reset::Ocean(OCEAN_WIND_FOAM)),
             |ui| {
-                if let Some(value) = theme::switch(ui, settings.wind_foam_streaks) {
+                let preview = theme::preview_toggle_value(ui.ctx(), reset(theme::Reset::Ocean(OCEAN_WIND_FOAM)), settings.wind_foam_streaks);
+                if let Some(value) = theme::switch(ui, preview) {
                     settings.wind_foam_streaks = value;
                     changed = true;
                 }
@@ -414,12 +429,20 @@ impl App {
             ui,
             "Roughness",
             "Microfacet roughness of the water. Low is glassy and mirror-like, \
-             high is a dull matte sheet.",
+             high is a dull matte sheet. Locked, it follows the swell amplitude              (calm water glossy, a full sea at the upstream 0.65); unlock to set it yourself.",
             reset(theme::Reset::Ocean(OCEAN_ROUGHNESS)),
             |ui| {
+                let locked = links & crate::ocean::links::ROUGHNESS != 0;
                 let mut value = settings.roughness;
                 let readout = percent(value);
-                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                let moved = ui
+                    .add_enabled_ui(!locked, |ui| theme::slider(ui, &mut value, 0.0..=1.0, &readout))
+                    .inner;
+                ui.add_space(8.0);
+                if let Some(now_locked) = theme::lock_toggle(ui, locked) {
+                    if now_locked { links |= crate::ocean::links::ROUGHNESS } else { links &= !crate::ocean::links::ROUGHNESS }
+                    changed = true;
+                } else if moved {
                     settings.roughness = value;
                     changed = true;
                 }
@@ -468,20 +491,11 @@ impl App {
         );
         ocean_slider(
             ui,
-            "Fog distance",
-            "Base absorption distance in game units.",
-            reset(theme::Reset::Ocean(10)),
-            &mut settings.optics.fog_distance,
-            1.0..=4000.0,
-            &mut changed,
-        );
-        ocean_slider(
-            ui,
             "Transparency",
-            "Multiplies the absorption distance above and below water.",
-            reset(theme::Reset::Ocean(11)),
+            "How far light travels through the water before it is absorbed, in game units. Lower is murkier, above and below the surface.",
+            reset(theme::Reset::Ocean(10)),
             &mut settings.optics.transparency,
-            0.1..=16.0,
+            1.0..=30000.0,
             &mut changed,
         );
         ocean_slider(
@@ -511,7 +525,7 @@ impl App {
             0.0..=4.0,
             &mut changed,
         );
-        ocean_slider(ui, "Underwater cull", "Absorption-distance multiple for fully submerged distant world geometry. Zero disables.", reset(theme::Reset::Ocean(15)), &mut settings.optics.underwater_cull, 0.0..=8.0, &mut changed);
+        ocean_slider(ui, "Underwater cull", "Skips geometry the water already hides, as a multiple of the absorption distance (the transparency distance; never below 2, where 0.2% of the light is left). Underwater: everything beyond it (never closer than 256), plus the far ocean sheet. From above: anything lying under that much water. Murkier water culls more. Zero disables.", reset(theme::Reset::Ocean(15)), &mut settings.optics.underwater_cull, 0.0..=8.0, &mut changed);
 
         });
         ui.add_enabled_ui(promoted_index.is_none(), |ui| {
@@ -585,6 +599,11 @@ impl App {
         }
 
         if changed {
+            settings.links = links;
+            if links != self.video.ocean_settings.links {
+                self.video.ocean_settings.links = links;
+                if promoted_index.is_some() { self.commit_ocean_settings(); }
+            }
             if let Some(index) = promoted_index {
                 let slot = self.promoted_oceans[index].index;
                 self.promoted_ocean_overrides.retain(|(i,_)| *i != slot);

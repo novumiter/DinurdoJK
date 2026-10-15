@@ -500,7 +500,7 @@ impl SurfaceDeformationGpu {
                 module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
             }),
-            multiview_mask: None, cache: None,
+            multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
         });
 
         Self {

@@ -4,7 +4,9 @@ use std::ops::Range;
 
 #[derive(Default)]
 pub(in crate::renderer) struct BatchKeyCache {
-    keys: std::collections::HashMap<(usize, u64, Option<bool>), u64>,
+    keys: std::collections::HashMap<(usize, u64, bool, Option<bool>), u64>,
+    // Permanent material/mesh variant identities, allocated only on first use.
+    group_ids: std::collections::HashMap<(usize, u64, bool, Option<bool>), u64>,
 }
 
 impl BatchKeyCache {
@@ -19,6 +21,7 @@ impl BatchKeyCache {
         let key = (
             draw.alpha_mode.index(),
             texture_id,
+            draw.source_material,
             glow.then_some(draw.authored_glow),
         );
         if let Some(&hash) = self.keys.get(&key) {
@@ -28,6 +31,39 @@ impl BatchKeyCache {
         self.keys.insert(key, hash);
         (hash, false)
     }
+    /// A collision-free ID for the exact mesh + material/pipeline variant.
+    /// The renderer owns the monotonically increasing ID space; `BatchKeyCache`
+    /// is owned by the already-resident Ghoul2 mesh. No string/Arc hashing or
+    /// cross-frame snapshot dependency is needed to group visible instances.
+    pub fn resolve_group_id(
+        &mut self,
+        draw: &crate::renderer::Ghoul2PendingDraw,
+        texture_id: u64,
+        glow: bool,
+        next_id: &mut u64,
+    ) -> (u64, bool) {
+        let key = (
+            draw.alpha_mode.index(), texture_id, draw.source_material,
+            glow.then_some(draw.authored_glow),
+        );
+        if let Some(&id) = self.group_ids.get(&key) {
+            return (id, true);
+        }
+        let id = *next_id;
+        *next_id = next_id.checked_add(1).expect("Ghoul2 group ID overflow");
+        self.group_ids.insert(key, id);
+        (id, false)
+    }
+
+}
+
+/// Reused per-frame bucket. The indices keep Ghoul2PendingDraw in its original
+/// storage; only *distinct* groups need sorting. Group vectors are retained
+/// across frames rather than allocating one Vec per visible player surface.
+#[derive(Default)]
+pub(in crate::renderer) struct Ghoul2FrameGroup {
+    pub sort_key: (u8, u32, bool, u64, u64),
+    pub indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -202,9 +238,11 @@ mod tests {
             wireframe_class: DynamicWireframeClass::Player,
             authored_glow: false,
             source_material: false,
+            texture_binding_id: 1,
             uniform: Ghoul2GpuDrawUniform::zeroed(),
             sequence: 0,
             batch_hash: None,
+            batch_group_id: None,
         };
         for (texture, texture_id, alpha, authored_glow, prepare_glow) in [
             ("skin1", 1, DynamicModelAlphaMode::Opaque, false, false),
@@ -224,6 +262,43 @@ mod tests {
                 (expected, true)
             );
         }
+        draw.source_material = true;
+        let expected = DynamicModelRenderer::ghoul2_batch_hash(&draw, true);
+        assert_eq!(cache.resolve(&draw, 2, true), (expected, false));
+        assert_eq!(cache.resolve(&draw, 2, true), (expected, true));
+    }
+
+    #[test]
+    fn group_ids_are_persistent_unique_across_mesh_and_material_variants() {
+        use crate::renderer::{
+            DynamicModelAlphaMode, DynamicWireframeClass, Ghoul2GpuDrawUniform, Ghoul2PendingDraw,
+        };
+        use bytemuck::Zeroable;
+        let mut next_id = 1;
+        let mut mesh_a = BatchKeyCache::default();
+        let mut mesh_b = BatchKeyCache::default();
+        let mut draw = Ghoul2PendingDraw {
+            entity_num: 1, mesh_key: "model#surface1".into(),
+            texture_key: Some("skin".into()), alpha_mode: DynamicModelAlphaMode::Opaque,
+            wireframe_class: DynamicWireframeClass::Player,
+            authored_glow: false, source_material: false, texture_binding_id: 9,
+            uniform: Ghoul2GpuDrawUniform::zeroed(), sequence: 0,
+            batch_hash: None, batch_group_id: None,
+        };
+        assert_eq!(mesh_a.resolve_group_id(&draw, 9, false, &mut next_id), (1, false));
+        assert_eq!(mesh_a.resolve_group_id(&draw, 9, false, &mut next_id), (1, true));
+        assert_eq!(mesh_b.resolve_group_id(&draw, 9, false, &mut next_id), (2, false));
+        draw.source_material = true;
+        assert_eq!(mesh_a.resolve_group_id(&draw, 9, false, &mut next_id), (3, false));
+        draw.source_material = false;
+        draw.authored_glow = true;
+        assert_eq!(mesh_a.resolve_group_id(&draw, 9, false, &mut next_id), (1, true));
+        assert_eq!(mesh_a.resolve_group_id(&draw, 9, true, &mut next_id), (4, false));
+        draw.alpha_mode = DynamicModelAlphaMode::Mask;
+        assert_eq!(mesh_a.resolve_group_id(&draw, 9, true, &mut next_id), (5, false));
+        draw.alpha_mode = DynamicModelAlphaMode::Opaque;
+        assert_eq!(mesh_a.resolve_group_id(&draw, 10, true, &mut next_id), (6, false));
+        assert_eq!(next_id, 7);
     }
 
     #[test]

@@ -269,7 +269,7 @@ struct VertexIn {
     @location(4) static_ao: f32,
 };
 struct VertexOut {
-    @builtin(position) clip_position: vec4<f32>,
+    @builtin(position) @invariant clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) lightmap_uv: vec2<f32>,
     @location(2) color: vec4<f32>,
@@ -291,7 +291,7 @@ struct VertexOut {
 // Affine tcMods commute with perspective-correct interpolation, so calculate
 // each stage's coordinates per vertex as the original JKA stage path did.
 struct AdditiveVertexOut {
-    @builtin(position) clip_position: vec4<f32>,
+    @builtin(position) @invariant clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) additive_uv1: vec2<f32>,
     @location(2) color: vec4<f32>,
@@ -2723,9 +2723,32 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
 // approximation while blending remains linear in the scene target. Both use
 // the SAME transfer function. Keep alpha and authored blend factors unchanged.
 const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
+// Approximate TaystJK's additive SOURCE modulation: its 8-bit rgbGen wave
+// multiplies the encoded texture sample before the blend. The scene target
+// remains linear, so this does not emulate encoded-framebuffer destination
+// blending (which would require access to the destination color).
+fn legacy_additive_source(source: vec4<f32>, waveform: f32, has_wave: bool) -> vec4<f32> {
+    if (!has_wave) {
+        return source;
+    }
+    if (waveform <= 0.0) {
+        return vec4<f32>(vec3<f32>(0.0), source.a);
+    }
+    // Textures were sRGB-decoded by sampling and modulated by rgbGen wave.
+    // Recover their linear sample, perform the legacy modulation in encoded
+    // space with the reference 8-bit wave, then decode for WGPU blending.
+    let texel_linear = max(source.rgb / waveform, vec3<f32>(0.0));
+    let vertex_wave_byte = round(clamp(waveform, 0.0, 1.0) * 255.0) / 255.0;
+    return vec4<f32>(legacy_rgb_decode(legacy_rgb_encode(texel_linear) * vertex_wave_byte), source.a);
+}
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
     if ((material_flags() & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
-        return vec4<f32>(legacy_rgb_encode(color.rgb), color.a);
+        let has_wave = (material_flags() & 134217728u) != 0u;
+        var wave = 1.0;
+        if (has_wave) {
+            wave = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, shader_stage_time()), 0.0, 1.0);
+        }
+        return legacy_additive_source(color, wave, has_wave);
     }
     return color;
 }
@@ -2897,22 +2920,16 @@ fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
 }
 fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
     var sample = texel * additive_stage_tint(m, vertex_color);
-    // Same material flag as the source stages (1u << 29u). Keep this
-    // fusion-only check independent of optional legacy helper declarations.
-    if ((m.header.z & 536870912u) != 0u) {
-        // Inline the exact sRGB transfer function used by the legacy stage
-        // path. Fused entry points must not depend on the optional three-stage
-        // compositing helper being present in a specialized BSP module.
-        let v = max(sample.rgb, vec3<f32>(0.0));
-        let encoded = select(
-            1.055 * pow(v, vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055),
-            12.92 * v,
-            v <= vec3<f32>(0.0031308),
-        );
-        sample = vec4<f32>(encoded, sample.a);
+    if ((m.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
+        let has_wave = (m.header.z & 134217728u) != 0u;
+        var wave = 1.0;
+        if (has_wave) {
+            wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+        }
+        sample = legacy_additive_source(sample, wave, has_wave);
     }
-    // GL_SRC_ALPHA GL_ONE applies source alpha to both RGB and alpha. The
-    // fused pipeline uses GL_ONE GL_ONE with already-weighted contributions.
+    // Authored source blend is GL_SRC_ALPHA GL_ONE. Fused fixed blend is ONE/ONE,
+    // so preweight RGB and alpha by the source alpha as before.
     return vec4<f32>(sample.rgb * sample.a, sample.a * sample.a);
 }
 fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
@@ -2957,6 +2974,13 @@ fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f3
     )) {
         discard;
     }
+    if ((material_flags_w() & (1u << 17u)) != 0u) {
+        let to_eye = normalize(camera.camera_pos_time.xyz - input.world_position);
+        let facing = abs(dot(normalize(input.world_normal), to_eye));
+        let f0 = clamp(material.ocean_color.a, 0.02, 0.18);
+        let fresnel = f0 + (1.0 - f0) * pow(1.0 - clamp(facing, 0.0, 1.0), 5.0);
+        return vec4<f32>(mix(vec3<f32>(0.65), material.ocean_color.rgb, 0.35), 0.08 + 0.55 * fresnel);
+    }
     let shaded = shade_surface(input);
     if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
         return shaded;
@@ -2970,6 +2994,13 @@ fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f3
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
+    }
+    if ((material_flags_w() & (1u << 17u)) != 0u) {
+        let to_eye = normalize(camera.camera_pos_time.xyz - input.world_position);
+        let facing = abs(dot(normalize(input.world_normal), to_eye));
+        let f0 = clamp(material.ocean_color.a, 0.02, 0.18);
+        let fresnel = f0 + (1.0 - f0) * pow(1.0 - clamp(facing, 0.0, 1.0), 5.0);
+        return vec4<f32>(mix(vec3<f32>(0.65), material.ocean_color.rgb, 0.35), 0.08 + 0.55 * fresnel);
     }
     let shaded = shade_surface(input);
     if ((ENABLE_DYNAMIC_LIGHT_DEBUG && dynamic_light_debug_enabled())) {
@@ -3269,7 +3300,7 @@ fn sky_box_uv(uv: vec2<f32>) -> vec2<f32> {
 // VertexOut's twelve. Material checks still go through material_flags(), so the
 // per-material override constants fold them exactly as in mode 1.
 struct MinimalVertexOut {
-    @builtin(position) clip_position: vec4<f32>,
+    @builtin(position) @invariant clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) lightmap_uv: vec2<f32>,
     @location(2) color: vec4<f32>,

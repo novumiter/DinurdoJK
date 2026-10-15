@@ -7,7 +7,7 @@ use std::{
     sync::{
         atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, Sender},
-        Mutex, OnceLock,
+        Mutex, OnceLock, Condvar, Arc,
     },
 };
 
@@ -58,6 +58,70 @@ pub struct LogRecord {
 const MAX_UI_LOG_LINES: usize = 10_000;
 
 static LOGGER: OnceLock<Mutex<Logger>> = OnceLock::new();
+
+// Terminal painting is performed by a single worker, never by the critical
+// renderer/main/map threads while they hold the synchronous crash-log lock.
+// A bounded queue prevents runaway RAM use with verbose diagnostics. All
+// entries, including ones dropped from terminal output, remain in latest.log.
+struct TerminalLine {
+    level: Level,
+    text: String,
+    color: bool,
+}
+struct TerminalOutput {
+    tx: mpsc::SyncSender<TerminalLine>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+}
+static TERMINAL_OUTPUT: OnceLock<TerminalOutput> = OnceLock::new();
+
+fn initialize_terminal_output() {
+    if !io::stdout().is_terminal() && !io::stderr().is_terminal() {
+        return; // Redirected output retains normal synchronous semantics.
+    }
+    let (tx, rx) = mpsc::sync_channel::<TerminalLine>(8192);
+    let gate = Arc::new((Mutex::new(!crate::startup_console::deferred()), Condvar::new()));
+    let worker_gate = Arc::clone(&gate);
+    if std::thread::Builder::new()
+        .name("console-output".into())
+        .spawn(move || {
+            for line in rx {
+                let (lock, wake) = &*worker_gate;
+                let Ok(mut ready) = lock.lock() else { break; };
+                while !*ready {
+                    match wake.wait(ready) {
+                        Ok(next) => ready = next,
+                        Err(_) => return,
+                    }
+                }
+                drop(ready);
+                write_console(line.level, &line.text, line.color);
+            }
+        })
+        .is_ok()
+    {
+        let _ = TERMINAL_OUTPUT.set(TerminalOutput { tx, gate });
+    }
+}
+
+/// Allow queued startup output to be rendered once the first game frame has
+/// presented, or on a startup error/panic. Never waits for terminal painting.
+pub(crate) fn activate_console_output() {
+    if let Some(output) = TERMINAL_OUTPUT.get() {
+        let (lock, wake) = &*output.gate;
+        if let Ok(mut ready) = lock.lock() {
+            *ready = true;
+            wake.notify_one();
+        }
+    }
+}
+
+fn enqueue_console(level: Level, text: String, color: bool) {
+    if let Some(output) = TERMINAL_OUTPUT.get() {
+        let _ = output.tx.try_send(TerminalLine { level, text, color });
+    } else {
+        write_console(level, &text, color);
+    }
+}
 
 /// Runtime diagnostic levels mirror the familiar id-tech cvars while avoiding
 /// plumbing them through every worker/render/cgame object. They are process-wide
@@ -119,6 +183,7 @@ pub fn init() -> Result<PathBuf, String> {
         .map_err(|e| format!("{}: {e}", path.display()))?;
 
     let console_color = enable_console_color();
+    initialize_terminal_output();
     let _ = LOGGER.set(Mutex::new(Logger {
         file,
         console_color,
@@ -127,6 +192,8 @@ pub fn init() -> Result<PathBuf, String> {
     }));
 
     std::panic::set_hook(Box::new(|info| {
+        crate::startup_console::reveal();
+        activate_console_output();
         let location = info
             .location()
             .map(|location| {
@@ -263,12 +330,12 @@ fn write_line_inner(
             let _ = writeln!(logger.file, "{plain}");
             // Flush every line deliberately: latest.log is primarily a crash diagnostic.
             let _ = logger.file.flush();
-            write_console(level, &message, logger.console_color);
+            let console_color = logger.console_color;
             if logger.ui_lines.len() >= MAX_UI_LOG_LINES {
                 logger.ui_lines.pop_front();
             }
             let record = LogRecord {
-                text: message,
+                text: message.clone(),
                 local_time: local_hms(),
                 path_links,
                 console_kind,
@@ -279,6 +346,10 @@ fn write_line_inner(
                     logger.ui_sink = None;
                 }
             }
+            // Do not hold the logger lock during expensive Windows terminal
+            // drawing (especially per-color writes/console host repaints).
+            drop(logger);
+            enqueue_console(level, message, console_color);
             return;
         }
     }
@@ -432,21 +503,25 @@ fn default_ansi(level: Level, text: &str) -> &'static str {
 }
 
 fn write_colored(mut out: impl Write, text: &str, base: &str) -> io::Result<()> {
-    write!(out, "{base}")?;
+    // Console hosts are expensive when fed one character per WriteFile.
+    // Compose the same ANSI color sequence in memory, then issue one write.
+    let mut buffer = String::with_capacity(base.len() + text.len() + 80);
+    buffer.push_str(base);
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '^' {
             if let Some(next) = chars.peek().copied() {
                 if let Some(color) = jka_ansi(next) {
                     chars.next();
-                    write!(out, "{color}")?;
+                    buffer.push_str(color);
                     continue;
                 }
             }
         }
-        write!(out, "{ch}")?;
+        buffer.push(ch);
     }
-    writeln!(out, "\x1b[0m")?;
+    buffer.push_str("\x1b[0m\n");
+    out.write_all(buffer.as_bytes())?;
     out.flush()
 }
 

@@ -342,7 +342,7 @@ mod tests {
                     }),
                     primitive: Default::default(), depth_stencil: None,
                     multisample: wgpu::MultisampleState { count: key.1, ..Default::default() },
-                    multiview_mask: None, cache: None,
+                    multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
                 });
                 let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
                 let lights = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[] });
@@ -541,7 +541,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             module: &shader,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
         let size = 768 * 16;
         let output = device.create_buffer(&wgpu::BufferDescriptor {

@@ -1,8 +1,38 @@
 //! Display.
 use crate::app::egui_settings::{
-    config, index_of, optional_quality_table_row, pending_video_reset, segmented_row, theme, ui,
+    config, index_of, pending_video_reset, preview_quality_preset_row, segmented_row, theme, ui,
     App, FullscreenMode, QualityPreset, RendererBackend, VideoSection, VsyncMode,
 };
+
+#[derive(Clone, Copy)]
+struct PendingPresetDialog {
+    preset: QualityPreset,
+    section: VideoSection,
+}
+
+fn pending_preset_dialog_id() -> egui::Id {
+    egui::Id::new("jka_quality_preset_scope_dialog")
+}
+
+fn video_section_label(section: VideoSection) -> &'static str {
+    match section {
+        VideoSection::Display => "Display & graphics",
+        VideoSection::Geometry => "Geometry",
+        VideoSection::Lighting => "Lighting",
+        VideoSection::Effects => "Effects",
+        VideoSection::Shadows => "Shadows",
+        VideoSection::Color => "Color & HDR",
+        VideoSection::PostProcessing => "Post processing",
+        VideoSection::DebugTools => "Debug & tools",
+        VideoSection::Physics => "Physics",
+        VideoSection::Sun => "Sun",
+        VideoSection::Clouds => "Clouds",
+        VideoSection::Weather => "Weather",
+        VideoSection::Surface => "Surface interaction",
+        VideoSection::Water => "Water",
+        VideoSection::Glass => "Glass",
+    }
+}
 
 impl App {
     pub(in crate::app) fn egui_video_page(&mut self, ui: &mut egui::Ui) {
@@ -23,7 +53,7 @@ impl App {
             ),
             VideoSection::Geometry => (
                 "GEOMETRY",
-                "World visibility and model rendering.",
+                "World visibility, curved surfaces and model rendering.",
             ),
             VideoSection::Lighting => ("LIGHTING", "Ambient, dynamic and indirect lighting."),
             VideoSection::Effects => (
@@ -61,7 +91,16 @@ impl App {
                 "Footprints and procedural ground detail.",
             ),
             VideoSection::Water => ("WATER", "FFT ocean simulation and promoted water surfaces."),
+            VideoSection::Glass => ("GLASS", "Glass promotion, transmission, frosting and refractive edges."),
         };
+        // The preset toolbar is global to Video, not part of any individual
+        // page title or scrollable setting group.
+        egui::Frame::new()
+            .fill(theme::RAIL_FILL)
+            .stroke(egui::Stroke::new(1.0, theme::LINE))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| self.egui_preset_header(ui));
+        ui.add_space(10.0);
         theme::page_title(ui, title, detail);
 
         egui::ScrollArea::vertical()
@@ -74,6 +113,7 @@ impl App {
                 }
                 VideoSection::Geometry => {
                     self.egui_visibility(ui);
+                    self.egui_patches(ui);
                     self.egui_models(ui);
                 }
                 VideoSection::Lighting => self.egui_lighting(ui),
@@ -91,6 +131,7 @@ impl App {
                 VideoSection::Weather => self.egui_weather(ui),
                 VideoSection::Surface => self.egui_surface(ui),
                 VideoSection::Water => self.egui_water(ui),
+                VideoSection::Glass => self.egui_glass(ui),
             });
 
         // Drained after the page is built: a label click posts its tag while
@@ -100,6 +141,97 @@ impl App {
             self.apply_setting_reset(reset);
         }
         theme::clear_pending_resets(ui.ctx());
+        theme::clear_preset_preview(ui.ctx());
+        // Foreground overlay: never consumes vertical space in the settings
+        // column and can be dismissed without changing any cvars.
+        self.egui_preset_scope_popup(ui);
+    }
+
+    fn egui_preset_scope_popup(&mut self, ui: &mut egui::Ui) {
+        let Some(pending) = ui.ctx().data(|data| data.get_temp::<PendingPresetDialog>(pending_preset_dialog_id())) else {
+            return;
+        };
+        #[derive(Clone, Copy)]
+        enum Choice { Page, All, Cancel }
+        let mut choice = None;
+        let has_page_settings = pending.preset.settings().iter().any(|(name, _)| {
+            super::preset_preview::preset_cvar_section(name) == Some(pending.section)
+        });
+        egui::Area::new(egui::Id::new("quality_preset_scope_popup"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::PANEL_FILL)
+                    .stroke(egui::Stroke::new(1.0, theme::LINE_STRONG))
+                    .inner_margin(egui::Margin::same(22))
+                    .show(ui, |ui| {
+                        ui.set_width(390.0);
+                        theme::page_title(ui, "APPLY QUALITY PRESET", pending.preset.label());
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(format!(
+                            "Current page: {}", video_section_label(pending.section)
+                        )).color(theme::TEXT_DIM));
+                        ui.add_space(12.0);
+                        ui.add_enabled_ui(has_page_settings, |ui| {
+                            if theme::primary_button(ui, "APPLY TO THIS PAGE").clicked() {
+                                choice = Some(Choice::Page);
+                            }
+                        });
+                        if !has_page_settings {
+                            ui.label(egui::RichText::new(
+                                "This preset has no settings on this page."
+                            ).small().color(theme::TEXT_FAINT));
+                        }
+                        ui.add_space(8.0);
+                        if theme::primary_button(ui, "APPLY TO ALL PAGES").clicked() {
+                            choice = Some(Choice::All);
+                        }
+                        ui.add_space(12.0);
+                        if theme::ghost_button(ui, "CANCEL").clicked() {
+                            choice = Some(Choice::Cancel);
+                        }
+                    });
+            });
+        if choice.is_none() && ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            choice = Some(Choice::Cancel);
+        }
+        if let Some(choice) = choice {
+            ui.ctx().data_mut(|data| data.remove::<PendingPresetDialog>(pending_preset_dialog_id()));
+            match choice {
+                Choice::Page => self.apply_quality_preset_to_page(pending.preset, pending.section),
+                Choice::All => self.apply_quality_preset(pending.preset),
+                Choice::Cancel => {}
+            }
+        }
+    }
+
+    fn egui_preset_header(&mut self, ui: &mut egui::Ui) {
+        const PRESETS: [(QualityPreset, &str); 6] = [
+            (QualityPreset::Minimal, "Minimal (Legacy)"),
+            (QualityPreset::MinimalUnified, "Minimal (Unified)"),
+            (QualityPreset::Low, "Low"),
+            (QualityPreset::Medium, "Medium"),
+            (QualityPreset::High, "High"),
+            (QualityPreset::Ultra, "Ultra"),
+        ];
+        let (selected, hovered) = preview_quality_preset_row(ui, self.active_quality_preset(), &PRESETS);
+        if let Some(index) = selected {
+            // A preset click selects a scope, it does not apply any settings.
+            ui.ctx().data_mut(|data| data.insert_temp(
+                pending_preset_dialog_id(),
+                PendingPresetDialog { preset: PRESETS[index].0, section: self.video_section },
+            ));
+        }
+        // Keep preview visible after opening the dialog even though the pointer
+        // has left the bar. On Cancel it disappears without touching settings.
+        let pending = ui.ctx().data(|data| data.get_temp::<PendingPresetDialog>(pending_preset_dialog_id()));
+        let hovered_preset = pending.map(|dialog| dialog.preset).or_else(|| hovered.map(|index| PRESETS[index].0));
+        if let Some(preset) = hovered_preset {
+            theme::set_preset_preview(ui.ctx(), self.preset_row_preview(preset));
+        } else {
+            theme::set_preset_preview(ui.ctx(), Vec::new());
+        }
     }
 
     // ------------------------------------------------------------ rendering --
@@ -110,30 +242,6 @@ impl App {
             "DISPLAY & FRAME PACING",
             "Window mode, timing, output and presentation.",
         );
-        const PRESETS: [(QualityPreset, &str); 6] = [
-            (QualityPreset::Minimal, "Minimal (Legacy)"),
-            (QualityPreset::MinimalUnified, "Minimal (Unified)"),
-            (QualityPreset::Low, "Low"),
-            (QualityPreset::Medium, "Medium"),
-            (QualityPreset::High, "High"),
-            (QualityPreset::Ultra, "Ultra"),
-        ];
-        if let Some(index) = optional_quality_table_row(
-            ui,
-            "Quality preset",
-            "Sets every rendering cost lever at once and uses the Balanced frame queue. \
-             Resolution, display mode, render backend, vsync, FPS cap and debug toggles are left \
-             alone. The bar becomes Custom once you change a preset-controlled setting. \
-             Minimal (Legacy) and Minimal (Unified) have identical settings; Legacy uses \
-             the known-fast world renderer and Unified the general one, for comparison.",
-            theme::Reset::Video(ui::VIDEO_ROW_QUALITY_PRESET),
-            self.active_quality_preset(),
-            &PRESETS,
-        ) {
-            self.video_selected = ui::VIDEO_ROW_QUALITY_PRESET;
-            self.apply_quality_preset(PRESETS[index].0);
-        }
-
         const BACKENDS: [(RendererBackend, &str); 2] = [
             (RendererBackend::Vulkan, "Vulkan"),
             (RendererBackend::Dx12, "DX12"),

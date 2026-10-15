@@ -122,6 +122,9 @@ unsafe extern "C" {
     ) -> i32;
     pub fn jka_world_new(data: *const u8, length: i32) -> *mut c_void;
     pub fn jka_world_free(world: *mut c_void);
+    pub fn jka_world_prepare_merge(world: *mut c_void) -> i32;
+    pub fn jka_collision_merge_get() -> i32;
+    pub fn jka_collision_merge_set(enabled: i32);
     pub fn jka_world_load_sub_bsp(
         world: *mut c_void,
         name: *const c_char,

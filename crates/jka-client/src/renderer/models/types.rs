@@ -275,14 +275,15 @@ pub(in crate::renderer) struct Ghoul2PendingDraw {
     pub(in crate::renderer) wireframe_class: DynamicWireframeClass,
     pub(in crate::renderer) authored_glow: bool,
     pub(in crate::renderer) source_material: bool,
+    /// Stable material bind-group ID, for material-local Ghoul2 sorting.
+    pub(in crate::renderer) texture_binding_id: u64,
     pub(in crate::renderer) uniform: Ghoul2GpuDrawUniform,
     pub(in crate::renderer) sequence: u32,
-    // Adaptive batching starts by hashing a bounded distributed sample.  If
-    // the probe says batching is worthwhile, retain those hashes so the full
-    // grouping pass continues from the work already done instead of starting
-    // over.  Exact keys are still compared after the hash, so collisions are
-    // harmless.
+    // Cached sort/probe hash; exact keys are compared before instancing, so
+    // collisions cannot combine incompatible GLM surfaces.
     pub(in crate::renderer) batch_hash: Option<u64>,
+    /// Collision-free precomputed identity for mesh/material/pipeline/glow.
+    pub(in crate::renderer) batch_group_id: Option<u64>,
 }
 
 #[repr(C)]
@@ -398,6 +399,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) rt_raw_color_buffer: Option<wgpu::Buffer>,
     pub(in crate::renderer) scratch_raw_colors: Vec<[f32; 4]>,
     pub(in crate::renderer) texture_layout: wgpu::BindGroupLayout,
+    pub(in crate::renderer) camera_layout: wgpu::BindGroupLayout,
     pub(in crate::renderer) entity_lighting_buffer: wgpu::Buffer,
     pub(in crate::renderer) entity_ambient_lighting: EntityAmbientLightingMode,
     /// Set by the renderer each frame before `prepare`; None keeps the stock
@@ -420,6 +422,10 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// ENABLE_MODEL_WET in the model pipelines (see `set_model_wet`).
     pub(in crate::renderer) model_wet_compiled: bool,
     pub(in crate::renderer) pipeline_layout: wgpu::PipelineLayout,
+    /// Group 2 = shared opaque-scene snapshot; used only by Glass pipelines.
+    pub(in crate::renderer) glass_pipeline_layout: wgpu::PipelineLayout,
+    /// Group 3 = shared opaque-scene snapshot; used only by Glass pipelines.
+    pub(in crate::renderer) glass_skin_pipeline_layout: wgpu::PipelineLayout,
     pub(in crate::renderer) shader: wgpu::ShaderModule,
     pub(in crate::renderer) wireframe_pipeline: Option<wgpu::RenderPipeline>,
     /// Lazy per-alpha-mode pipelines; built only for modes with draws.
@@ -499,6 +505,12 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) fx_sprite_instance_buffer: wgpu::Buffer,
     pub(in crate::renderer) fx_sprite_instance_capacity: u64,
     pub(in crate::renderer) fx_sprite_draws: Vec<FxGpuSpritePreparedDraw>,
+    /// Allocated only after the first eligible resident particle is submitted.
+    pub(in crate::renderer) resident_fx: Option<super::resident_fx::ResidentFxBackend>,
+    pub(in crate::renderer) resident_fx_frame: Option<Arc<crate::renderer::FxGpuResidentFrame>>,
+    pub(in crate::renderer) resident_fx_requested_modes: u16,
+    pub(in crate::renderer) resident_fx_draws: Vec<super::resident_fx::PreparedResidentFxDraw>,
+    pub(in crate::renderer) resident_fx_slots: Vec<u32>,
     pub(in crate::renderer) scratch_fx_sprite_instances: Vec<FxGpuSpriteInstance>,
     /// Floor-clipped blob-shadow mesh (local indices) for the frame's
     /// `FxGpuSprites::blob_shadow` surface, built by the renderer before `prepare`.
@@ -510,6 +522,8 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) skin_bone_capacity: u64,
     pub(in crate::renderer) skin_draw_capacity: u64,
     pub(in crate::renderer) skin_bind_group: wgpu::BindGroup,
+    /// Shared opaque-scene snapshot for the Glass model variants.
+    pub(in crate::renderer) glass_bind_group: Option<wgpu::BindGroup>,
     pub(in crate::renderer) skin_draws: Vec<Ghoul2PreparedDraw>,
     /// Entity number for each entry in `skin_draw_buffer`, preserving identity even
     /// when Ghoul2 surfaces are instanced across multiple players.
@@ -529,6 +543,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) index_upload_cache: super::prepare::IndexUploadCache,
     pub(in crate::renderer) ghoul2_batch_key_cache: bool,
     pub(in crate::renderer) next_texture_binding_id: u64,
+    pub(in crate::renderer) next_ghoul2_group_id: u64,
     pub(in crate::renderer) capture_prepare: bool,
     pub(in crate::renderer) perf_prepare: super::prepare::PreparePerf,
     pub(in crate::renderer) perf_phase_calls: std::cell::Cell<super::submission::ModelPhaseCalls>,
@@ -546,6 +561,13 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) scratch_draw_data: Vec<Ghoul2GpuDrawUniform>,
     pub(in crate::renderer) scratch_bone_offsets: HashMap<usize, u32>,
     pub(in crate::renderer) scratch_skin_pending: Vec<Ghoul2PendingDraw>,
+    /// Reuse adaptive group counts across frames (no per-frame hashmap allocation).
+    pub(in crate::renderer) scratch_batch_counts: HashMap<(u64, u32), u32>,
+    /// Linear-time cached-group path; these retain allocations across frames.
+    pub(in crate::renderer) scratch_group_lookup: HashMap<(u64, u32), usize>,
+    pub(in crate::renderer) scratch_frame_groups: Vec<super::prepare::Ghoul2FrameGroup>,
+    pub(in crate::renderer) scratch_group_sort: Vec<usize>,
+    pub(in crate::renderer) scratch_group_order: Vec<usize>,
     /// Lazily created only while RT Shadows is active. RT-off keeps the original
     /// Ghoul2 vertex-shader skinning path and never allocates/dispatches this.
     pub(in crate::renderer) rt_skinning: Option<Ghoul2RtSkinningResources>,

@@ -1,6 +1,32 @@
 use super::*;
 
 #[test]
+fn promoted_glass_shader_variants_validate() {
+    for (name, source) in [
+        ("glass", crate::glass::world_shader()),
+        ("glass boundaries", include_str!("../../glass_edges.wgsl").to_owned()),
+        ("glass Gaussian", include_str!("../../glass_blur.wgsl").to_owned()),
+        ("world", compose_world_shader(include_str!("../../bsp.wgsl"))),
+        ("lean", compose_world_shader(include_str!("../../bsp_lean.wgsl"))),
+        ("fast", format!("{}\n{}\n{}",
+            include_str!("../../bsp_fast.wgsl"),
+            include_str!("../../surface_deformation.wgsl"),
+            include_str!("../../sky_fractal.wgsl"))),
+        ("md3", crate::glass::model_shader(include_str!("../../md3.wgsl"), 2)),
+        ("ghoul2", crate::glass::model_shader(include_str!("../../ghoul2_skin.wgsl"), 3)),
+    ] {
+        let module = wgpu::naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(&source)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("{name}: {}", error.emit_to_string(&source)));
+    }
+}
+
+#[test]
 fn legacy_rgb_transfer_is_shared_by_fused_and_additive_bsp_paths() {
     // Both zero-pass implementations must use the same exact-sRGB transfer.
     // Keep fast, lean and full variants in sync without another pipeline.
@@ -14,7 +40,11 @@ fn legacy_rgb_transfer_is_shared_by_fused_and_additive_bsp_paths() {
         assert!(shader.contains("fn legacy_rgb_output("), "{name}: missing additive output");
         assert!(shader.contains("MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u"), "{name}: material bit changed");
         assert!(shader.contains("legacy_rgb_encode(overlay_sample.rgb)"), "{name}: fused path drifted");
-        assert!(shader.contains("legacy_rgb_encode(color.rgb)"), "{name}: additive path drifted");
+        assert!(shader.contains("let vertex_wave_byte = round(clamp(waveform, 0.0, 1.0) * 255.0) / 255.0;"), "{name}: 8-bit TaystJK wave modulation missing");
+        assert!(shader.contains("legacy_rgb_encode(texel_linear) * vertex_wave_byte"), "{name}: encoded-space wave modulation missing");
+        assert!(shader.contains("fn legacy_additive_source("), "{name}: missing additive source transfer");
+        assert!(shader.contains("sample = legacy_additive_source("), "{name}: fused additive path must use parity source transfer");
+        assert!(!shader.contains("additive_blend_debug_mode"), "{name}: A/B selection leaked into production shader");
         assert!(!shader.contains("LEGACY_ADDITIVE_SOURCE_SRGB_TEST"), "{name}: temporary test leaked");
     }
 }
@@ -181,6 +211,7 @@ fn post_uniform_matches_the_shared_wgsl_struct() {
         ("scene", offset_of!(PostUniform, scene)),
         ("film", offset_of!(PostUniform, film)),
         ("grain", offset_of!(PostUniform, grain)),
+        ("exposure_controls", offset_of!(PostUniform, exposure_controls)),
         ("camera_fx", offset_of!(PostUniform, camera_fx)),
         ("legacy_fog", offset_of!(PostUniform, legacy_fog)),
         ("clouds", offset_of!(PostUniform, clouds)),
@@ -854,6 +885,7 @@ fn inline_model_pose_matches_cg_mover_transform_in_jka_space() {
         model: 3,
         origin: [5.0, 0.0, 2.0],
         axis: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        is_portal_entity: false,
     };
     let (posed, minimum, maximum) = posed_inline_vertices(&base, pose);
     assert_eq!(scene::jka_position(posed[0].position), [5.0, 10.0, 2.0]);
@@ -878,6 +910,7 @@ fn inline_model_rt_transform_matches_raster_pose() {
         model: 7,
         origin: [5.0, -3.0, 2.0],
         axis: [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        is_portal_entity: false,
     };
     let point = scene::render_position([10.0, 4.0, -6.0]);
     let expected = pose.transform_point(point);
@@ -997,7 +1030,7 @@ fn skybox_average_linearises_and_uses_the_smallest_mip() {
         clamp: true,
         srgb: true,
     };
-    let average = super::average_skybox_color(&[face], &[0]);
+    let average = super::average_skybox_color(&[face], Some([0; 6]));
     // 188/255 in sRGB linearises to about 0.5.
     for channel in average {
         assert!(
@@ -1008,11 +1041,84 @@ fn skybox_average_linearises_and_uses_the_smallest_mip() {
 }
 
 #[test]
+fn skybox_average_weights_cube_face_slots_not_batches() {
+    let face = |name: &str, color: [u8; 4]| TextureData {
+        label: name.to_owned(),
+        source: None,
+        width: 1,
+        height: 1,
+        rgba: color.to_vec(),
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    };
+    let images = [
+        face("red", [255, 0, 0, 255]),
+        face("blue", [0, 0, 255, 255]),
+    ];
+    // Four skybox faces use red, two use blue. The mean must depend only
+    // on those six face slots, not on world or PVS batch multiplicity.
+    let average = super::average_skybox_color(&images, Some([0, 1, 0, 0, 1, 0]));
+    assert!((average[0] - 2.0 / 3.0).abs() < 0.00001);
+    assert!(average[1].abs() < 0.00001);
+    assert!((average[2] - 1.0 / 3.0).abs() < 0.00001);
+}
+
+#[test]
+fn skybox_average_preserves_srgb_transfer_for_mipless_image() {
+    let face = TextureData {
+        label: "mipless sky".to_owned(),
+        source: None,
+        width: 2,
+        height: 1,
+        rgba: vec![64, 128, 188, 255, 255, 0, 0, 255],
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    };
+    let average = super::average_skybox_color(&[face], Some([0; 6]));
+    let srgb = |v: u8| {
+        let raw = v as f32 / 255.0;
+        if raw <= 0.04045 { raw / 12.92 } else { ((raw + 0.055) / 1.055).powf(2.4) }
+    };
+    for (actual, expected) in average.into_iter().zip([
+        (srgb(64) + srgb(255)) / 2.0,
+        (srgb(128) + srgb(0)) / 2.0,
+        (srgb(188) + srgb(0)) / 2.0,
+    ]) {
+        assert!((actual - expected).abs() < 0.00001);
+    }
+}
+
+#[test]
+fn skybox_average_uses_only_selected_primary_skybox() {
+    use crate::materials::TextureData;
+    let image = |label: &str, rgb: [u8; 3]| TextureData {
+        label: label.to_owned(),
+        source: None,
+        width: 1,
+        height: 1,
+        rgba: vec![rgb[0], rgb[1], rgb[2], 255],
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    };
+    let images = [image("primary", [255, 0, 0]), image("other", [0, 0, 255])];
+    let primary = super::average_skybox_color(&images, Some([0; 6]));
+    let secondary = super::average_skybox_color(&images, Some([1; 6]));
+    assert_eq!(primary, [1.0, 0.0, 0.0]);
+    assert_eq!(secondary, [0.0, 0.0, 1.0]);
+}
+
+#[test]
 fn skybox_average_falls_back_without_faces() {
-    let average = super::average_skybox_color(&[], &[]);
+    let average = super::average_skybox_color(&[], None);
     assert_eq!(average, [0.45, 0.55, 0.75]);
     // An out-of-range face index must not panic or return black.
-    let average = super::average_skybox_color(&[], &[7]);
+    let average = super::average_skybox_color(&[], Some([7; 6]));
     assert_eq!(average, [0.45, 0.55, 0.75]);
 }
 
@@ -1100,8 +1206,8 @@ fn all_renderer_shaders_validate() {
     let ssr_temporal = weather::with_bound_weather_surface(include_str!("../../ssr_temporal.wgsl"));
     let rain = weather::with_weather_surface(include_str!("../../rain.wgsl"));
     let rain_haze_mask = weather::with_post_settings(include_str!("../../rain_haze_mask.wgsl"));
-    let md3 = weather::with_model_weather(include_str!("../../md3.wgsl"));
-    let ghoul2_skin = weather::with_model_weather(include_str!("../../ghoul2_skin.wgsl"));
+    let md3 = crate::glass::model_shader(include_str!("../../md3.wgsl"), 2);
+    let ghoul2_skin = crate::glass::model_shader(include_str!("../../ghoul2_skin.wgsl"), 3);
     for (name, source) in [
         ("bsp", bsp.as_str()),
         ("bsp_lean", bsp_lean.as_str()),
@@ -1255,6 +1361,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             &device,
             &queue,
             &camera_layout,
+            &crate::ocean::optics::layout(&device),
             wgpu::TextureFormat::Bgra8UnormSrgb,
             1,
             &white,
@@ -1510,7 +1617,7 @@ fn blob_shadow_request_projects_onto_a_render_space_floor() {
 fn ghoul2_draw_uniform_matches_the_skin_draw_wgsl_struct() {
     use crate::weather::rain_layout::{offset_of_member, wgsl_struct_layout};
     use std::mem::{offset_of, size_of};
-    for source in [weather::with_model_weather(include_str!("../../ghoul2_skin.wgsl")),
+    for source in [crate::glass::model_shader(include_str!("../../ghoul2_skin.wgsl"), 3),
         include_str!("../../ghoul2_skin_compute.wgsl").to_string()] {
     let (size, members) = wgsl_struct_layout(&source, "SkinDraw");
     assert_eq!(size as usize, size_of::<Ghoul2GpuDrawUniform>());
@@ -1821,4 +1928,28 @@ fn ocean_shading_does_not_sample_the_authored_base_texture() {
             }
         }
     }
+}
+
+#[test]
+fn additive_encoded_stage_wave_is_evaluated_before_srgb_decode() {
+    // TaystJK rd-vanilla reads byte vertex RGB from RB_CalcWaveColor and
+    // multiplies it with the encoded GL texture. wgpu textures are already
+    // decoded to linear; mixing the order produces a much stronger contribution.
+    fn decode(v: f32) -> f32 {
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    }
+    let encoded_texel: f32 = 0.5;
+    let wave = (0.2_f32 * 255.0).round() / 255.0;
+    let expected_linear = decode(encoded_texel * wave);
+    let incorrect_linear = decode(encoded_texel) * wave;
+    assert!((expected_linear - decode(0.1)).abs() < 1.0e-6);
+    assert!(expected_linear < incorrect_linear * 0.6,
+        "legacy encoded modulation must precede decode");
+}
+
+#[test]
+fn additive_parity_has_no_runtime_debug_mode() {
+    assert!(!include_str!("../../ui/settings/video.rs").contains("additive_blend_debug"));
+    assert!(!include_str!("../api.rs").contains("SetAdditiveBlendDebug"));
+    assert!(!include_str!("../../app/commands/registry/renderer_cvars.rs").contains("r_additiveBlendDebug"));
 }

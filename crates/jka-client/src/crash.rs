@@ -371,6 +371,8 @@ mod win {
     }
 
     unsafe extern "system" fn filter(info: *const ExceptionPointers) -> i32 {
+        crate::startup_console::reveal();
+        crate::logging::activate_console_output();
         static REPORTED: AtomicBool = AtomicBool::new(false);
         if info.is_null() || REPORTED.swap(true, Ordering::SeqCst) {
             return EXCEPTION_CONTINUE_SEARCH;

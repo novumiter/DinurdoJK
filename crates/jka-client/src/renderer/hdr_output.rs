@@ -66,6 +66,31 @@ pub(super) fn select(
     None
 }
 
+/// Bit 0 is SDR; bits 1..3 advertise currently usable HDR Auto/PQ/scRGB.
+/// Use the same selection rule as the swapchain so the menu cannot claim a
+/// mode is available when the renderer would immediately fall back to SDR.
+/// This is display + adapter + backend specific, not a global GPU property.
+pub(super) fn available_modes(
+    caps: &wgpu::SurfaceCapabilities,
+    info: Option<&wgpu::DisplayHdrInfo>,
+) -> u8 {
+    let mut modes = 1_u8; // SDR is always the user-facing recovery option.
+    for requested in 1..=3 {
+        if select(caps, requested, info)
+            .is_some_and(|selection| matches!(selection.encoding, 1 | 2))
+        {
+            modes |= 1 << requested;
+        }
+    }
+    modes
+}
+
+/// Native compositor only when the *selected* swapchain is HDR, never just
+/// because the user requested HDR or the display is in SDR fallback.
+pub(super) fn requires_compositor(selection: Selection) -> bool {
+    matches!(selection.encoding, 1 | 2)
+}
+
 pub(super) struct HdrOutput {
     pub selection: Selection,
     pub requested: u32,
@@ -125,7 +150,7 @@ fn pipeline(
         depth_stencil: None,
         multisample: Default::default(),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -273,7 +298,7 @@ impl HdrOutput {
         }
     }
 
-    pub fn write_settings(&mut self, queue: &wgpu::Queue, white: f32, peak: f32, rolloff: bool) {
+    pub fn write_settings(&mut self, queue: &wgpu::Queue, white: f32, peak: f32, rolloff: f32) {
         self.peak = if peak > 0.0 && peak.is_finite() {
             peak.clamp(80.0, 10000.0)
         } else {
@@ -295,7 +320,7 @@ impl HdrOutput {
                 self.selection.encoding as f32,
                 self.paper_white,
                 self.peak,
-                f32::from(rolloff),
+                rolloff.clamp(0.0, 1.0),
             ]),
         );
     }
@@ -401,7 +426,7 @@ impl Renderer {
                 &self.queue,
                 old.paper_white,
                 old.peak,
-                self.tone_mapping_enabled,
+                self.tone_mapping_strength,
             );
             self.hdr_output = Some(output);
         }
@@ -425,6 +450,14 @@ impl Renderer {
         };
         let changed = output.selection != selection;
         if changed {
+            // HDR disappeared (Windows HDR toggle / display move): stay on SDR
+            // until the client rebuilds the renderer with HDR Math Only.
+            // Do not keep the native output compositor alive on SDR fallback.
+            if matches!(output.selection.encoding, 1 | 2)
+                && !matches!(selection.encoding, 1 | 2)
+            {
+                output.requested = 0;
+            }
             output.selection = selection;
             output.output_pipeline = pipeline(
                 &self.device,
@@ -439,7 +472,7 @@ impl Renderer {
             &self.queue,
             self.ui_state.video.hdr_paper_white,
             self.ui_state.video.hdr_peak,
-            self.tone_mapping_enabled,
+            self.tone_mapping_strength,
         );
         let status = output.status();
         let status_changed = output.last_status != status;

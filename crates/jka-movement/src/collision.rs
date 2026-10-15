@@ -1,6 +1,7 @@
 use super::*;
 use jka_assets::bsp::{Bsp, SurfaceKind};
 use std::collections::HashMap;
+use std::sync::{RwLock, atomic::AtomicUsize};
 
 const SOURCE_CELL_SIZE: f32 = 1024.0;
 const SOURCE_MAX_BRUSH_CELLS: usize = 4096;
@@ -14,6 +15,7 @@ type SourceCell = (i32, i32, i32);
 struct NativeWorld {
     handle: NonNull<c_void>,
     model_count: usize,
+    merged_brushes: usize,
 }
 impl NativeWorld {
     fn has_inline_model(&self, index: i32) -> bool {
@@ -58,6 +60,24 @@ enum CollisionBackend {
     Source(SourceWorld),
 }
 
+/// A local editor's *unscaled* copy of an existing BSP inline collision model.
+/// Coordinates are the same native JKA position and angles used by
+/// CM_TransformedBoxTrace, not a new (approximate) box collider.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedInlineCollision {
+    pub index: i32,
+    pub origin: [f32; 3],
+    pub angles: [f32; 3],
+}
+
+/// Shared with CollisionWorld clones (local server, client prediction, editor).
+/// When unused, the trace hot path pays only an atomic zero check.
+#[derive(Default)]
+struct PlacedCollisionState {
+    count: AtomicUsize,
+    models: RwLock<Arc<[PlacedInlineCollision]>>,
+}
+
 pub struct CollisionWorld {
     backend: Arc<CollisionBackend>,
     // Per-clone scratch: CollisionWorld is cloned into the local-server/prediction
@@ -66,6 +86,7 @@ pub struct CollisionWorld {
     source_visit: Vec<u32>,
     source_generation: u32,
     source_candidates_scratch: Vec<usize>,
+    placed: Arc<PlacedCollisionState>,
 }
 
 impl Clone for CollisionWorld {
@@ -75,6 +96,7 @@ impl Clone for CollisionWorld {
             source_visit: vec![0; self.source_visit.len()],
             source_generation: 1,
             source_candidates_scratch: Vec::new(),
+            placed: Arc::clone(&self.placed),
         }
     }
 }
@@ -106,7 +128,25 @@ fn aabb_overlaps(a_min: [f32; 3], a_max: [f32; 3], b_min: [f32; 3], b_max: [f32;
     (0..3).all(|axis| a_min[axis] <= b_max[axis] && a_max[axis] >= b_min[axis])
 }
 
+/// Change which collision representation OpenJK uses for world traces.
+/// Off by default. Only the world model is eligible; inline models and temp
+/// player boxes keep the original native collision code and brush geometry.
+pub fn set_collision_merge_enabled(enabled: bool) {
+    unsafe { ffi::jka_collision_merge_set(i32::from(enabled)); }
+}
+
+pub fn collision_merge_enabled() -> bool {
+    unsafe { ffi::jka_collision_merge_get() != 0 }
+}
+
 impl CollisionWorld {
+    pub fn merged_static_brush_count(&self) -> usize {
+        match self.backend.as_ref() {
+            CollisionBackend::Native(native) => native.merged_brushes,
+            CollisionBackend::Source(_) => 0,
+        }
+    }
+
     /// Validates every native collision reference before passing the original RBSP to OpenJK.
     pub fn from_bsp(data: &[u8]) -> Result<Self, String> {
         Self::from_bsp_with_sub_bsps(data, &[])
@@ -142,6 +182,7 @@ impl CollisionWorld {
         let mut native = NativeWorld {
             handle: native,
             model_count: bsp.models.len(),
+            merged_brushes: 0,
         };
         for (name, bytes, count) in imports {
             let offset = unsafe {
@@ -160,11 +201,21 @@ impl CollisionWorld {
             }
             native.model_count += count;
         }
+        // Build on this SAME BSP worker, after submodel imports. Never mutate
+        // the original OpenJK collision data: the cvar switches between maps.
+        let merged = unsafe { ffi::jka_world_prepare_merge(native.handle.as_ptr()) };
+        if merged >= 0 {
+            native.merged_brushes = merged as usize;
+        } else {
+            eprintln!("[COLLISION UNION] skipped: {}", error());
+        }
+        eprintln!("[COLLISION UNION] map-load candidates merged: {} brushes; cm_collisionMerge={} (original=0 / union=1)", native.merged_brushes, u8::from(collision_merge_enabled()));
         Ok(Self {
             backend: Arc::new(CollisionBackend::Native(native)),
             source_visit: Vec::new(),
             source_generation: 1,
             source_candidates_scratch: Vec::new(),
+            placed: Arc::new(PlacedCollisionState::default()),
         })
     }
 
@@ -216,7 +267,57 @@ impl CollisionWorld {
             source_visit: vec![0; brush_count],
             source_generation: 1,
             source_candidates_scratch: Vec::new(),
+            placed: Arc::new(PlacedCollisionState::default()),
         })
+    }
+
+    /// Replace editor placements atomically. Native collision handles must
+    /// belong to this loaded BSP; caller passes its renderer instance's
+    /// translation plus authored angles. All CollisionWorld clones see the
+    /// update, including the in-process server's existing world clone.
+    /// The caller decides whether locally-authored collision is appropriate:
+    /// it must never be injected into authoritative remote-server prediction.
+    pub fn set_placed_inline_models(&self, models: Vec<PlacedInlineCollision>) {
+        let models: Arc<[PlacedInlineCollision]> = models.into_iter()
+            .filter(|m| m.index > 0 && m.origin.iter().chain(&m.angles).all(|v| v.is_finite()))
+            .collect::<Vec<_>>().into();
+        let n = models.len();
+        *self.placed.models.write().unwrap_or_else(|e| e.into_inner()) = models;
+        self.placed.count.store(n, Ordering::Release);
+    }
+
+    fn placed_models(&self) -> Option<Arc<[PlacedInlineCollision]>> {
+        if self.placed.count.load(Ordering::Acquire) == 0 { return None; }
+        let models = self.placed.models.read().unwrap_or_else(|e| e.into_inner());
+        Some(Arc::clone(&*models))
+    }
+
+    /// Merge the editor's copied inline models with the native BSP trace. A
+    /// placed brush behaves as stationary *world* collision, not a fake actor.
+    fn trace_placed(&mut self, q: TraceQuery, best: &mut TraceResult) {
+        let Some(models) = self.placed_models() else { return; };
+        for m in models.iter() {
+            let mut hit = self.trace_entity(q, EntityClip::InlineModel {
+                index: m.index, origin: m.origin, angles: m.angles,
+            });
+            if hit.all_solid != 0 || hit.fraction < best.fraction {
+                hit.entity = ENTITY_WORLD;
+                *best = hit;
+            } else if hit.start_solid != 0 {
+                best.start_solid = 1;
+                best.entity = ENTITY_WORLD;
+            }
+            if best.all_solid != 0 { break; }
+        }
+    }
+
+    fn contents_placed(&mut self, point: [f32; 3], original: i32) -> i32 {
+        let Some(models) = self.placed_models() else { return original; };
+        let mut contents = original;
+        for m in models.iter() {
+            contents |= self.inline_model_contents(point, m.index, m.origin, m.angles);
+        }
+        contents
     }
 
     pub fn is_source_map(&self) -> bool {
@@ -579,6 +680,7 @@ impl TraceWorld for CollisionWorld {
             )
         };
         assert_ne!(ok, 0, "{}", error());
+        self.trace_placed(q, &mut result);
         result
     }
 
@@ -616,7 +718,7 @@ impl TraceWorld for CollisionWorld {
             )
         };
         assert_ne!(contents, -1, "{}", error());
-        contents
+        self.contents_placed(point, contents)
     }
 }
 
@@ -638,6 +740,27 @@ mod tests {
             maxs: [64.0; 3],
             contents: 1,
         }
+    }
+
+    #[test]
+    fn placed_model_updates_propagate_to_existing_collision_clones() {
+        let world = CollisionWorld::from_source_brushes(vec![cube()]).unwrap();
+        let local_server_world = world.clone();
+        let placed = PlacedInlineCollision {
+            index: 4, origin: [10.0, 20.0, 30.0], angles: [0.0, 90.0, 0.0],
+        };
+        assert!(local_server_world.placed_models().is_none());
+        world.set_placed_inline_models(vec![placed]);
+        assert_eq!(local_server_world.placed_models().as_deref(), Some(&[placed][..]));
+        local_server_world.set_placed_inline_models(Vec::new());
+        assert!(world.placed_models().is_none());
+        // Invalid model handles and transforms never enter the native FFI.
+        world.set_placed_inline_models(vec![PlacedInlineCollision {
+            index: 0, ..placed
+        }, PlacedInlineCollision {
+            origin: [f32::NAN, 0.0, 0.0], ..placed
+        }]);
+        assert!(world.placed_models().is_none());
     }
 
     #[test]

@@ -658,6 +658,8 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
     let mark_surfaces = mark_surfaces_from_batches(&vertices, &batches);
     let world_effect_registrations = map_world_effect_registrations(&document.entities);
     Ok(PreparedMap {
+        patch_draws: Vec::new(),
+        inline_patch_draws: Vec::new(),
         coastal_bathymetry: None,
         world_flares: Vec::new(),
         shader_library: Arc::new(library),
@@ -666,6 +668,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         authored_oceans: Vec::new(),
         vertices,
         legacy_dlight_triangle_surfaces: Vec::new(),
+        bsp_compiled_model_surfaces: Vec::new(),
         legacy_dlight_surfaces: Vec::new(),
         batches,
         pvs_batches: Vec::new(),

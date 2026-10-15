@@ -11,6 +11,32 @@ use crate::app::{
     MAX_SPECTATOR_ORBIT_RANGE, MIN_SPECTATOR_ORBIT_RANGE,
 };
 
+fn show_startup_window(window: &Window) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Graphics::Gdi::{GetStockObject, BLACK_BRUSH},
+            UI::WindowsAndMessaging::{SetClassLongPtrW, GCLP_HBRBACKGROUND},
+        };
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                // Winit has no class background brush. Supply a stock black
+                // brush so Windows paints the client area before WGPU is ready.
+                // Stock brushes live for the process lifetime; do not delete it.
+                unsafe {
+                    SetClassLongPtrW(
+                        handle.hwnd.get() as *mut std::ffi::c_void,
+                        GCLP_HBRBACKGROUND,
+                        GetStockObject(BLACK_BRUSH) as isize,
+                    );
+                }
+            }
+        }
+    }
+    window.set_visible(true);
+}
+
 impl ApplicationHandler<UserEvent> for App {
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         let cause = match cause {
@@ -34,10 +60,8 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
-        // Keep the native window hidden while WGPU creates the device/surface and
-        // builds the initial renderer state. RendererReady reveals it before the
-        // first present; waiting for RendererFirstFrame can deadlock when a hidden
-        // Windows surface reports itself as occluded.
+        // Set up placement/fullscreen while hidden, then show the native window
+        // before graphics initialization so startup is not console-only.
         let mut attributes = Window::default_attributes()
             .with_title("DinurdoJK")
             .with_visible(false)
@@ -56,6 +80,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        crate::startup_timeline::mark(crate::startup_timeline::Milestone::WindowCreated);
         if !self.video.fullscreen.is_windowed() {
             if let Err(error) = Self::apply_fullscreen_mode(
                 &window,
@@ -70,6 +95,8 @@ impl ApplicationHandler<UserEvent> for App {
         if self.video.fullscreen.is_windowed() && self.video.window_maximized {
             window.set_maximized(true);
         }
+        show_startup_window(&window);
+        crate::startup_timeline::mark(crate::startup_timeline::Milestone::WindowShown);
         self.applied_fullscreen = self.video.fullscreen;
         self.applied_renderer_backend = self.video.renderer_backend;
         self.applied_gpu_adapter = self.video.gpu_adapter;
@@ -104,9 +131,12 @@ impl ApplicationHandler<UserEvent> for App {
         // A config written before this rule, or by hand, can still say 0. Resolve
         // it now that the window exists and the monitor refresh rate is readable.
         self.set_fps_cap(self.video.fps_cap);
-        // The initial map request is intentionally deferred until RendererFirstFrame.
-        // That gives the startup splash a real presented frame and prevents the fast
-        // map worker from finishing invisibly while the renderer is still initializing.
+        // Start *CPU-only* map preparation while WGPU initializes. A worker
+        // result arriving before the first egui-presented frame is held below;
+        // it cannot preempt the first clickable menu with GPU uploads.
+        if self.front_end && !self.startup_first_frame_seen {
+            self.request_frontend_background();
+        }
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -115,6 +145,35 @@ impl ApplicationHandler<UserEvent> for App {
             crate::thread_activity::Task::Event,
         );
         match event {
+            UserEvent::SavedAccountsReady(result) => {
+                // An account edit (possibly a save) may have happened while
+                // the worker was enumerating. Never overwrite that newer UI
+                // state with a stale snapshot.
+                if self.account_editor.is_none() {
+                    match result {
+                        Ok(accounts) => {
+                            self.saved_accounts = accounts;
+                            self.account_credential_error = None;
+                        }
+                        Err(error) => self.account_credential_error = Some(error),
+                    }
+                    self.egui_repaint_requested = true;
+                }
+            }
+            UserEvent::FrontendSceneCacheReady { path, generation, image } => {
+                if self.frontend_scene_cache_generation == generation
+                    && self.frontend_scene_cache_path.as_ref() == Some(&path)
+                {
+                    self.frontend_stage.cache_pending = false;
+                    if let Some(image) = image {
+                        self.frontend_scene_texture = Some(self.egui_ctx.load_texture(
+                            "frontend-scene-snapshot", image, egui::TextureOptions::LINEAR,
+                        ));
+                        self.egui_repaint_requested = true;
+                    }
+                }
+            }
+            UserEvent::FrontendStagePresented(token) => self.on_frontend_stage_presented(token),
             UserEvent::GammaPrepared(generation) => self.on_gamma_prepared(generation),
             UserEvent::HardwareGamma(status) => self.on_hardware_gamma(status),
             UserEvent::ConsoleCommand(command) => {
@@ -132,6 +191,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::ScreenshotFinished(result) => {
                 match result {
+                    Ok(ScreenshotOutput::FrontendSceneSaved(path)) => {
+                        if self.frontend_scene_cache_path.as_ref() == Some(&path) {
+                            // Do not pop a just-created cache into the middle of
+                            // the cold-start black->live crossfade. It is ready
+                            // for the next time this scene is selected.
+                            self.push_console_line(format!(
+                                "^2MENU SCENE CACHE:^7 {}", path.display()
+                            ));
+                        }
+                    }
                     Ok(ScreenshotOutput::Saved(path)) => {
                         self.screenshot_catalog_loaded = false;
                         self.screenshot_preview_pending = None;
@@ -162,9 +231,23 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.publish_ui();
             }
-            UserEvent::HdrOutputChanged { status, active } => {
+            UserEvent::HdrOutputChanged { status, active, available_modes } => {
+                let was_native_hdr = self.hdr_output_active;
                 self.hdr_output_status = status;
                 self.hdr_output_active = active;
+                self.hdr_available_modes = available_modes;
+                self.hdr_modes_known = true;
+                self.demote_unsupported_hdr_output();
+                if self.hdr_output_active && self.video.gamma_method == crate::gamma::GammaMethod::Hardware {
+                    self.set_gamma_method(crate::gamma::GammaMethod::Shader);
+                }
+                // A live Windows HDR->SDR transition changes the format of an
+                // already allocated FP16 compositor. Rebuild once in SDR so
+                // no hidden output submission survives the capability loss.
+                if was_native_hdr && !active && !self.video_restart_in_flight() {
+                    self.restart_renderer_internal(false);
+                    return;
+                }
                 self.publish_ui();
             }
             UserEvent::RendererReady {
@@ -172,13 +255,29 @@ impl ApplicationHandler<UserEvent> for App {
                 wireframe_supported,
                 hdr_output_status,
                 hdr_output_active,
+                hdr_available_modes,
                 adapter_name,
                 adapter_type,
             } => {
+                crate::startup_timeline::mark(crate::startup_timeline::Milestone::RendererReady);
                 self.active_gpu_name = adapter_name;
                 self.active_gpu_type = adapter_type;
                 self.hdr_output_status = hdr_output_status;
                 self.hdr_output_active = hdr_output_active;
+                self.hdr_available_modes = hdr_available_modes;
+                self.hdr_modes_known = true;
+                self.demote_unsupported_hdr_output();
+                // A startup SDR fallback does not allocate the HDR compositor;
+                // the applied output must match the renderer, not the request.
+                if !self.hdr_output_active
+                    && self.applied_hdr_output != 0
+                    && self.hdr_available_modes & (1 << self.applied_hdr_output.min(3)) == 0
+                {
+                    self.applied_hdr_output = 0;
+                }
+                if self.hdr_output_active && self.video.gamma_method == crate::gamma::GammaMethod::Hardware {
+                    self.set_gamma_method(crate::gamma::GammaMethod::Shader);
+                }
                 self.supported_msaa = supported_msaa;
                 self.wireframe_supported = wireframe_supported;
                 if !self.supported_msaa.contains(&self.video.msaa_samples) {
@@ -201,17 +300,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.push_console_line(format!("^2{}", self.console_status));
                 self.publish_ui();
 
-                // The native window is created hidden so Windows never exposes an
-                // uninitialized swapchain while WGPU is still building. Do not wait
-                // for the first successful present to reveal it, though: a hidden
-                // HWND is allowed to make surface acquisition return Occluded, which
-                // would otherwise create a startup deadlock (hidden -> occluded -> no
-                // first frame -> still hidden). RendererReady means device/surface
-                // setup and the initial UI state are complete, so it is the correct
-                // point to make the window drawable.
+                // The native window is already visible during graphics startup.
+                // Request its first rendered frame once the renderer is ready.
                 if !self.startup_first_frame_seen {
                     if let Some(window) = &self.window {
-                        window.set_visible(true);
                         window.request_redraw();
                     }
                 }
@@ -240,6 +332,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::RendererFirstFrame => {
+                crate::startup_timeline::mark(crate::startup_timeline::Milestone::FirstPresent);
+                // The main HWND has now presented. Move the already-visible
+                // startup console behind it and release queued terminal output.
+                crate::startup_console::reveal();
+                crate::logging::activate_console_output();
                 self.sync_gamma_focus();
                 if self.startup_first_frame_seen {
                     if self.front_end || self.live_without_world || self.demo_without_world {
@@ -264,7 +361,17 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.front_end {
                     self.console_status = "MAIN MENU".into();
                     self.publish_ui();
-                    self.request_frontend_background();
+                    // Frontend prep was already requested in resumed(). Any
+                    // subsequent +map/+connect cancels the speculative request
+                    // through the existing monotonically increasing request ID.
+                    if self.video.skip_ui {
+                        // A developer who disabled the UI still needs a map;
+                        // in that case no egui-containing frame can arrive.
+                        self.startup_first_menu_frame_seen = true;
+                        if let Some(prepared) = self.deferred_frontend_map.take() {
+                            let _ = self.proxy.send_event(prepared);
+                        }
+                    }
                 } else {
                     let initial_source = self.initial_source.clone();
                     self.request_map(initial_source);
@@ -276,11 +383,25 @@ impl ApplicationHandler<UserEvent> for App {
                     self.append_console_commands(split_console_script(&command));
                 }
             }
+            UserEvent::RendererFirstMenuFrame => {
+                if !self.startup_first_menu_frame_seen {
+                    self.startup_first_menu_frame_seen = true;
+                    crate::startup_timeline::mark(crate::startup_timeline::Milestone::FirstMenuPresent);
+                    crate::startup_timeline::report("first_menu");
+                }
+                // Sending this back through the normal event path preserves all
+                // existing MapPrepared semantics and its request-id rejection.
+                if let Some(prepared) = self.deferred_frontend_map.take() {
+                    let _ = self.proxy.send_event(prepared);
+                }
+            }
             UserEvent::WaterSplashes(splashes) => self.play_water_splashes(&splashes),
             UserEvent::RenderStats(stats) => {
                 self.accumulate_perf_sample(&stats);
                 self.video.msaa_samples = stats.msaa_samples;
-                self.video.vsync = stats.vsync;
+                // Renderer statistics are asynchronous telemetry, not a settings
+                // acknowledgement. A queued sample can be older than a menu/cvar
+                // change, so never let it overwrite the requested VSync state.
                 let client = self
                     .game_session
                     .as_ref()
@@ -376,6 +497,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::RendererError(error) => {
+                // A failed renderer must reveal diagnostics even without a frame.
+                crate::startup_console::reveal();
+                crate::logging::activate_console_output();
                 self.restore_gamma_before_restart();
                 self.renderer_restart_started = None;
                 self.show_window_after_restart();
@@ -572,6 +696,32 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.publish_ui();
             }
+            UserEvent::ShaderRemapPrepared {
+                request_id, started, name, base_texture_count, result,
+            } => {
+                if request_id != self.latest_request_id || !self.shader_remap_upload {
+                    return; // superseded by a real map load or renderer restart
+                }
+                // A second command while the worker was resolving targets
+                // supersedes its result. Never install stale stage bindings.
+                if self.shader_remap_dirty {
+                    self.shader_remap_upload = false;
+                    if let Err(error) = self.rebuild_shader_remapped_world() {
+                        self.push_console_line(format!("^1shader remap: {error}"));
+                    }
+                    return;
+                }
+                match result {
+                    Ok(plan) => self.render_command(RenderCommand::RemapMap {
+                        request_id, started, name, plan, base_texture_count,
+                    }),
+                    Err(error) => {
+                        self.shader_remap_upload = false;
+                        self.push_console_line(format!("^1shader remap: {error}"));
+                        self.publish_ui();
+                    }
+                }
+            }
             UserEvent::MapPrepared {
                 request_id,
                 started,
@@ -584,6 +734,18 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let frontend_background =
                     self.front_end && self.frontend_background_request_id == Some(request_id);
+                if frontend_background {
+                    crate::startup_timeline::mark(crate::startup_timeline::Milestone::MapPrepared);
+                    if !self.startup_first_menu_frame_seen {
+                        // No GPU resource allocation/uploads before the first
+                        // usable menu frame. A later gameplay/map request
+                        // cancels this using latest_request_id as usual.
+                        self.deferred_frontend_map = Some(UserEvent::MapPrepared {
+                            request_id, started, name, map, fx_light_promotion,
+                        });
+                        return;
+                    }
+                }
                 let map_edit_preview = self.map_edit_preview_request_id == Some(request_id);
                 if !frontend_background && !map_edit_preview {
                     self.fx_light_promotion_catalog = Arc::clone(&fx_light_promotion);
@@ -933,6 +1095,7 @@ impl ApplicationHandler<UserEvent> for App {
                     session.weapon_fx.set_saber_marks(self.video.saber_marks);
                     if let Some(sound) = session.sound_presenter.as_mut() {
                         sound.set_steam_audio_map(acoustic_mesh, bake);
+                        sound.set_eal_map(&name);
                     }
                 }
                 self.third_person_camera.reset();
@@ -950,7 +1113,11 @@ impl ApplicationHandler<UserEvent> for App {
                         self.frontend_cinematic = Some(FrontendCinematic {
                             position,
                             yaw: spawn.yaw,
-                            started: Instant::now(),
+                            anim_started: Instant::now(),
+                            world_ready_at: None,
+                            model_visible_since: None,
+                            pose_hold_ms: None,
+                            pose_locked_at: None,
                             fade_started: None,
                         });
                     } else {
@@ -1104,6 +1271,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.render_command(RenderCommand::SetGrassEnabled(self.video.grass));
                 // Apply cg_waterwake gate on every map load / renderer restart,
                 // including archived settings loaded before session creation.
+                self.normalize_ocean_settings();
                 self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
                 self.render_command(RenderCommand::SetOceanEnabled(self.video.ocean));
                 self.render_command(RenderCommand::LoadMap {
@@ -1228,6 +1396,42 @@ impl ApplicationHandler<UserEvent> for App {
                 if request_id != self.latest_request_id {
                     return;
                 }
+                if self.shader_remap_upload {
+                    // A resident material-stage update is not a new world. In
+                    // particular do not print [MAP LOAD]/LOADED, restart demo
+                    // clocks, re-enter map physics, reconfigure UI, or publish
+                    // zero-filled BSP upload counters. The remap render command
+                    // remains synchronized to the next successful frame.
+                    if upload_timings.remap_full_fallback {
+                        // Rare material changes that introduce world geometry
+                        // still rebuild. The flag must be visible rather than
+                        // falsely claiming the resident path succeeded.
+                        self.coastal_debug_sent = None;
+                        self.coastal_live_sent = None;
+                        self.promoted_oceans = upload_timings.promoted_oceans.clone();
+                        self.promoted_ocean_overrides.clear();
+                        self.render_command(RenderCommand::SetPromotedOceanSettings(
+                            self.promoted_ocean_overrides.clone(),
+                        ));
+                        rverbose!(1,
+                            "[SHADER REMAP] full compatibility reconstruction {:.2} ms; first visible frame {:.2} ms",
+                            upload_ms, first_frame_ms,
+                        );
+                    } else {
+                        rverbose!(1,
+                            "[SHADER REMAP] resident update {:.2} ms; first visible frame {:.2} ms; no BSP upload",
+                            upload_ms, first_frame_ms,
+                        );
+                    }
+                    self.shader_remap_upload = false;
+                    self.publish_ui();
+                    if self.shader_remap_dirty {
+                        if let Err(error) = self.rebuild_shader_remapped_world() {
+                            self.push_console_line(format!("^1shader remap: {error}"));
+                        }
+                    }
+                    return;
+                }
                 // The renderer clears map-relative debug geometry on every
                 // upload, including reloads whose promoted descriptors match.
                 self.coastal_debug_sent = None;
@@ -1287,11 +1491,14 @@ impl ApplicationHandler<UserEvent> for App {
                 let frontend_background_first_frame =
                     self.frontend_background_request_id == Some(request_id);
                 if frontend_background_first_frame {
+                    crate::startup_timeline::mark(crate::startup_timeline::Milestone::FirstMapPresent);
+                    crate::startup_timeline::report("first_map");
                     self.frontend_background_request_id = None;
                     if let Some(cinematic) = self.frontend_cinematic.as_mut() {
-                        // WorldUploaded is emitted only after the renderer has
-                        // successfully presented the uploaded map once.
-                        cinematic.fade_started = Some(Instant::now());
+                        // The BSP has presented, but the requested Ghoul2 model
+                        // can still be an async fallback. Readiness is checked
+                        // after the real player presenter submits its geometry.
+                        cinematic.world_ready_at = Some(Instant::now());
                     }
                     self.egui_repaint_requested = true;
                 }
@@ -1347,7 +1554,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if crate::logging::renderer_verbose_enabled(1) {
                     self.push_console_line(format!(
-                        "^5[MAP LOAD]^7 {name} {:.1} ms first-frame | prep {:.1} | bsp {:.1} | collision {:.1} | shaders {:.1} | textures decode {:.1} | geometry {:.1} | render-upload {:.1} | workers {}",
+                        "^5[MAP LOAD]^7 {name} {:.1} ms first-frame | prep {:.1} | bsp {:.1} | collision {:.1} | shaders {:.1} | textures decode {:.1} | geometry {:.1} | renderer setup {:.1} | workers {}",
                         first_frame_ms,
                         timings.prepare_wall_ms,
                         timings.bsp_parse_ms,
@@ -1359,14 +1566,17 @@ impl ApplicationHandler<UserEvent> for App {
                         timings.worker_count,
                     ));
                 }
-                let post_upload_wait_ms =
+                // These spans come from different threads and can overlap.
+                // This residual includes handshake/event-loop/snapshot scheduling,
+                // not just GPU queue or swapchain presentation waits.
+                let first_frame_unattributed_ms =
                     (first_frame_ms - timings.prepare_wall_ms - upload_ms).max(0.0);
                 if crate::logging::renderer_verbose_enabled(2) {
                     self.push_console_line(format!(
-                        "^6[MAP FIRST FRAME]^7 prep {:.1} ms | render upload {:.1} ms | queue/present wait {:.1} ms",
+                        "^6[MAP FIRST FRAME]^7 prep wall {:.1} ms | renderer setup {:.1} ms | unaccounted/overlap {:.1} ms (includes connection/UI, NOT GPU wait)",
                         timings.prepare_wall_ms,
                         upload_ms,
-                        post_upload_wait_ms,
+                        first_frame_unattributed_ms,
                     ));
                 }
                 if crate::logging::renderer_verbose_enabled(2) {
@@ -1447,7 +1657,35 @@ impl ApplicationHandler<UserEvent> for App {
                         upload_timings.ocean_coarsest_spacing,
                     ));
                 }
+                if crate::logging::renderer_verbose_enabled(2) {
+                    self.push_console_line(format!(
+                        "^6[MAP CPU/GPU SPLIT]^7 vertex CPU {:.1} / wgpu calls {:.1} ms | material classify {:.1} | BC colour worker {:.1} (wait {:.1}) | BC lightmap worker {:.1} (wait {:.1}) | texture wgpu calls {:.1} | lightmap wgpu calls {:.1} ms; calls include driver CPU time, NOT GPU execution",
+                        upload_timings.vertex_cpu_ms,
+                        upload_timings.vertex_gpu_calls_ms,
+                        upload_timings.texture_classify_ms,
+                        upload_timings.texture_encode_cpu_ms,
+                        upload_timings.texture_encode_wait_ms,
+                        upload_timings.lightmap_encode_cpu_ms,
+                        upload_timings.lightmap_encode_wait_ms,
+                        upload_timings.texture_gpu_calls_ms,
+                        upload_timings.lightmap_gpu_calls_ms,
+                    ));
+                }
+                if crate::logging::renderer_verbose_enabled(2) {
+                    let texture_cpu_other_ms = (upload_timings.texture_upload_ms
+                        - upload_timings.skybox_average_ms
+                        - upload_timings.texture_encode_wait_ms
+                        - upload_timings.texture_gpu_calls_ms).max(0.0);
+                    self.push_console_line(format!(
+                        "^6[MAP SKYBOX AVERAGE]^7 CPU {:.1} ms | {} primary-sky face slot(s), {} unique image(s) | texture other CPU {:.1} ms",
+                        upload_timings.skybox_average_ms,
+                        upload_timings.skybox_face_references,
+                        upload_timings.skybox_unique_images,
+                        texture_cpu_other_ms,
+                    ));
+                }
                 let upload_accounted_ms = upload_timings.vertex_buffer_ms
+                    + upload_timings.texture_classify_ms
                     + upload_timings.texture_upload_ms
                     + upload_timings.lightmap_upload_ms
                     + upload_timings.reflection_probe_upload_ms
@@ -1596,6 +1834,23 @@ impl ApplicationHandler<UserEvent> for App {
             crate::thread_activity::Task::Input,
         );
 
+        // A focused Remap Editor text field owns *every* typed key before
+        // global shortcuts and Dev-bind dismissal. Otherwise a shader path
+        // containing a key bound to /dev (or the console toggle) would close
+        // the editor instead of entering the character. Escape remains the
+        // explicit menu-close key; without text focus Dev still means Back.
+        if self.overlay == OverlayMode::ShaderRemap
+            && self.egui_ctx.memory(|m| m.focused().is_some())
+            && matches!(
+                &event,
+                WindowEvent::KeyboardInput { event: key, .. }
+                    if key.physical_key != PhysicalKey::Code(KeyCode::Escape)
+            )
+        {
+            let _ = self.route_egui_window_event(&event);
+            return;
+        }
+
         // Alt+Enter is an application-level display shortcut. Handle it before
         // egui, chat, console, or any game overlay gets a chance to consume the
         // key event. Trigger once per physical press, not on OS key repeat.
@@ -1617,7 +1872,7 @@ impl ApplicationHandler<UserEvent> for App {
         // keyboard and mouse bindings ahead of egui, which otherwise consumes
         // them on these fullscreen/popup pages. A press only dismisses; it
         // must not also open the wheel or invoke a tool.
-        if matches!(self.overlay, OverlayMode::Trace | OverlayMode::EntityGraph) {
+        if matches!(self.overlay, OverlayMode::Trace | OverlayMode::EntityGraph | OverlayMode::ShaderRemap) {
             let dismiss = match &event {
                 WindowEvent::KeyboardInput { event: key, .. } => {
                     key.state == ElementState::Pressed
@@ -1634,6 +1889,35 @@ impl ApplicationHandler<UserEvent> for App {
             };
             if dismiss {
                 self.toggle_dev_radial(); // Context-sensitive Back; no wheel opens.
+                return;
+            }
+        }
+
+        // Both wheels own their mouse input before egui/gameplay. A category
+        // click stays in the same captured overlay; only a command click commits.
+        if self.overlay == OverlayMode::EmoteRadial {
+            if let WindowEvent::MouseInput { state, button, .. } = &event {
+                if *state == ElementState::Released && self.mouse_button_bound_to_emote(*button) {
+                    let number = match button {
+                        MouseButton::Left => Some(1),
+                        MouseButton::Right => Some(2),
+                        MouseButton::Middle => Some(3),
+                        MouseButton::Back => Some(4),
+                        MouseButton::Forward => Some(5),
+                        _ => None,
+                    };
+                    if let Some(number) = number {
+                        self.mouse_buttons_down.remove(&number);
+                        self.execute_binding_release(BindKey::Mouse(number));
+                    }
+                    self.close_emote_radial();
+                } else if *state == ElementState::Pressed && *button == MouseButton::Left
+                    && !self.mouse_button_bound_to_emote(*button)
+                {
+                    self.activate_emote_radial_selection();
+                } else if *state == ElementState::Pressed && *button == MouseButton::Right {
+                    self.emote_radial_back();
+                }
                 return;
             }
         }
@@ -1666,6 +1950,26 @@ impl ApplicationHandler<UserEvent> for App {
                 // Do not leak other buttons to egui or gameplay. In particular,
                 // clicking a non-selected region closes without attacking.
                 return;
+            }
+        }
+        // Placement is a camera-captured gameplay mode, not an egui dialog.
+        // Consume mouse actions before gameplay bindings (+attack / +altattack)
+        // and before spectator demo controls.
+        if self.overlay == OverlayMode::None && self.model_placement.active {
+            if let WindowEvent::MouseInput { state, button, .. } = &event {
+                match button {
+                    MouseButton::Left => {
+                        if *state == ElementState::Pressed && !self.model_placement.rotating {
+                            self.stamp_placement();
+                        }
+                        return;
+                    }
+                    MouseButton::Right => {
+                        self.model_placement.rotating = *state == ElementState::Pressed;
+                        return;
+                    }
+                    _ => {}
+                }
             }
         }
         if self.route_egui_window_event(&event) {
@@ -1772,6 +2076,19 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. }
+                if self.overlay == OverlayMode::None && self.model_placement.active =>
+            {
+                let amount = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32 / 120.0).clamp(-8.0, 8.0),
+                };
+                if amount.is_finite() && self.model_placement.kind == crate::app::egui_model_placement::PlacementKind::Md3 {
+                    self.model_placement.scale = (self.model_placement.scale
+                        * (amount * 0.085).exp()).clamp(0.01, 100.0);
+                    self.egui_repaint_requested = true;
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. }
                 if self.overlay == OverlayMode::None
                     && self.captured
                     && self.spectator_orbit_follow_active() =>
@@ -1834,6 +2151,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // Alt+Tab could leave a hidden/locked wheel stranded.
                 if !focused && self.overlay == OverlayMode::DevRadial {
                     self.close_dev_radial();
+                } else if !focused && self.overlay == OverlayMode::EmoteRadial {
+                    self.close_emote_radial();
                 }
                 self.sync_gamma_focus();
                 self.apply_audio_mix();
@@ -2104,6 +2423,29 @@ impl ApplicationHandler<UserEvent> for App {
                 // exclusive fullscreen. Capture the actual WGPU surface instead
                 // and replace the clipboard image, but do not write a screenshot
                 // file. /screenshot is the explicit file-writing path.
+                if self.overlay == OverlayMode::None && self.model_placement.active {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        match code {
+                            KeyCode::Escape => { self.cancel_placement(); return; }
+                            KeyCode::Tab => {
+                                if self.model_placement.kind == crate::app::egui_model_placement::PlacementKind::Bmodel {
+                                    self.open_bmodel_placement_picker();
+                                } else {
+                                    self.open_model_placement_picker();
+                                }
+                                return;
+                            }
+                            KeyCode::KeyZ if self.modifiers.control_key() => {
+                                self.undo_model_placement(); return;
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matches!(code, KeyCode::Escape | KeyCode::Tab)
+                        || (code == KeyCode::KeyZ && self.modifiers.control_key()) {
+                        return;
+                    }
+                }
                 if code == KeyCode::PrintScreen {
                     // Trigger on key-up so Windows has already performed its own
                     // PrintScreen clipboard update. Our worker writes the fresh
@@ -2146,6 +2488,7 @@ impl ApplicationHandler<UserEvent> for App {
                             | OverlayMode::Video
                             | OverlayMode::Trace
                             | OverlayMode::StrafeTrails
+                            | OverlayMode::ShaderRemap
                             | OverlayMode::RaceGhosts
                     )
                     && self.surface_inspector.is_some()
@@ -2205,6 +2548,30 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                         return;
                     }
+                    OverlayMode::ModelPicker | OverlayMode::BmodelPicker | OverlayMode::MapMods => {
+                        if event.state == ElementState::Pressed && !event.repeat
+                            && code == KeyCode::Escape {
+                            self.set_overlay(OverlayMode::None);
+                        }
+                        return;
+                    }
+                    OverlayMode::EmoteRadial => {
+                        if self.key_bound_to_emote(code) {
+                            if event.state == ElementState::Released {
+                                self.keys.remove(&code);
+                                self.execute_binding_release_from(
+                                    keybinds::bind_key_for_code(code),
+                                    BindKey::Keyboard(code),
+                                );
+                                self.close_emote_radial();
+                            }
+                        } else if code == KeyCode::Escape && event.state == ElementState::Pressed && !event.repeat {
+                            self.emote_radial_back();
+                        } else {
+                            self.handle_dev_wheel_gameplay_key(code, event.state, event.repeat);
+                        }
+                        return;
+                    }
                     OverlayMode::DevRadial => {
                         if self.key_bound_to_dev(code) {
                             if event.state == ElementState::Released {
@@ -2233,6 +2600,15 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     OverlayMode::StrafeTrails => {
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && code == KeyCode::Escape
+                        {
+                            self.set_overlay(OverlayMode::None);
+                        }
+                        return;
+                    }
+                    OverlayMode::ShaderRemap => {
                         if event.state == ElementState::Pressed
                             && !event.repeat
                             && code == KeyCode::Escape
@@ -2353,7 +2729,7 @@ impl ApplicationHandler<UserEvent> for App {
         if self.demo_video_export.is_some() {
             return;
         }
-        if self.overlay == OverlayMode::DevRadial {
+        if matches!(self.overlay, OverlayMode::DevRadial | OverlayMode::EmoteRadial) {
             if self.window_focused {
                 if let DeviceEvent::MouseMotion { delta } = event {
                     // Raw relative mouse movement drives a virtual stick.
@@ -2361,7 +2737,9 @@ impl ApplicationHandler<UserEvent> for App {
                     // building up an off-screen offset that makes switching
                     // segments feel like hunting for the selection again.
                     let dpi = self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32).max(0.25);
-                    let scale = 0.01 / dpi;
+                    // Shared Dev/Emote sensitivity. A small hand
+                    // movement can no longer fling the highlight across tools.
+                    let scale = 0.004 / dpi;
                     let x = self.dev_radial_offset[0] + delta.0 as f32 * scale;
                     let y = self.dev_radial_offset[1] + delta.1 as f32 * scale;
                     let length = x.hypot(y);
@@ -2369,6 +2747,27 @@ impl ApplicationHandler<UserEvent> for App {
                     self.dev_radial_offset = [x * adjust, y * adjust];
                     self.egui_repaint_requested = true;
                 }
+            }
+            return;
+        }
+        if self.model_placement.active && self.model_placement.rotating
+            && self.overlay == OverlayMode::None && self.window_focused {
+            if let DeviceEvent::MouseMotion { delta } = event {
+                // Blender-like constrained rotation: RMB+X = yaw, Shift+RMB
+                // = pitch, Alt+RMB = roll. Sensitivity is intentionally not
+                // coupled to the gameplay m_sensitivity cvar.
+                let degrees = delta.0 as f32 * 0.20;
+                if self.modifiers.alt_key() {
+                    self.model_placement.angles[2] += degrees;
+                } else if self.modifiers.shift_key() {
+                    self.model_placement.angles[0] -= delta.1 as f32 * 0.20;
+                } else {
+                    self.model_placement.angles[1] += degrees;
+                }
+                for angle in &mut self.model_placement.angles {
+                    *angle = angle.rem_euclid(360.0);
+                }
+                self.egui_repaint_requested = true;
             }
             return;
         }

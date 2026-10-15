@@ -471,7 +471,7 @@ fn create_snow_gpu_resources(
         module: &sim_shader,
         entry_point: Some("cs_main"),
         compilation_options: Default::default(),
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
 
     let render_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -585,7 +585,7 @@ fn create_snow_render_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 

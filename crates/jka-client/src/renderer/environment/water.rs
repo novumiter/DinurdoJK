@@ -25,6 +25,18 @@ impl Renderer {
             .then(|| usize::from(self.ocean_settings.mesh_quality.min(1)))
     }
 
+    /// Live A/B toggle. Source masks and coastal resources never change.
+    pub(in crate::renderer) fn set_ocean_sky_extend(&mut self, enabled: bool) {
+        if self.ocean_sky_extend == enabled { return; }
+        self.ocean_sky_extend = enabled;
+        // Reprime visibility so the first newly exposed ocean frame cannot
+        // inherit the old no-water occlusion/capture decision.
+        self.ocean_visibility.primed = false;
+        self.ocean_hidden_time = 0.0;
+        eprintln!("OCEAN SKY phase1: {} (render-only, r_coastal untouched)",
+            if enabled { "ON" } else { "OFF" });
+    }
+
     /// Keeps promoted-water geometry in sync with the live pool amplitude,
     /// camera distance, footprint and exact BSP visibility. Indices change only
     /// at an LOD threshold, a snapped-lattice crossing, or a BSP cluster change;
@@ -34,6 +46,17 @@ impl Renderer {
             return;
         }
         let quality = usize::from(self.ocean_settings.mesh_quality.min(1));
+        // Fresh water boxes: a stale submerged flag would flash missing outer rings
+        // for a frame when surfacing.
+        self.refresh_water_boxes(glam::Vec3::from_array(camera));
+        let cull_radius = self.world.as_ref().and_then(|world| {
+            crate::ocean::optics::submerged_cull_radius(
+                camera,
+                &self.water_boxes,
+                world.ocean_masks.as_ref(),
+                self.ocean_settings.optics.cull_distance(),
+            )
+        });
         let overrides = &self.promoted_ocean_overrides;
         let queue = &self.queue;
         let Some(world) = self.world.as_mut() else { return; };
@@ -42,7 +65,8 @@ impl Renderer {
         }
 
         let descriptors = &world.promoted_oceans;
-        let masks = &world.ocean_masks;
+        // Sky continuation never modifies the original outline or mask.
+        let masks = &world.ocean_base_masks;
         let global_spacing = world.ocean_coarsest_spacing;
         let pvs_cluster = if matches!(self.pvs_mode, PvsMode::Off) {
             None
@@ -81,28 +105,43 @@ impl Renderer {
                     .max(crate::ocean::appearance::MIN_PROMOTED_AMPLITUDE)
             };
             let half_cells = crate::ocean::promoted_clipmap_half_cells(amplitude);
-            let distance = crate::ocean::promoted_footprint_distance(
-                camera,
-                descriptor.surface,
-                masks,
-                descriptor.index,
-            );
-            let minimum_level = runtime
-                .layout
-                .minimum_level_for_distance(half_cells, distance);
-            let outer_spacing = runtime.layout.outer_spacing_for_half_cells(half_cells);
-            let centre = crate::ocean::promoted_footprint_clipmap_centre(
-                camera,
-                descriptor.surface,
-                global_spacing,
-                outer_spacing,
-                masks,
-                descriptor.index,
-            );
+            let sky = if self.ocean_sky_extend {
+                world.ocean_sky_regions[descriptor.index].as_ref()
+            } else { None };
+            let extension = sky.is_some();
+            let surface = descriptor.surface;
+            // The vertex buffer reserves enough levels for ON, but OFF uses
+            // the baseline extent and baseline LOD profile, not the larger one.
+            let mut active_layout = runtime.layout.clone();
+            active_layout.extent = if extension { f32::INFINITY } else {
+                (surface.maximum[0]-surface.minimum[0])
+                    .max(surface.maximum[1]-surface.minimum[1])
+            };
+            // The sky-connected clipmap follows the viewer horizontally;
+            // only ALTITUDE determines the minimum visible wave-detail LOD.
+            let distance = if extension { (camera[1]-surface.plane_height).abs() }
+                else { crate::ocean::promoted_footprint_distance(camera, surface, masks, descriptor.index) };
+            let minimum_level = active_layout.minimum_level_for_distance(half_cells, distance);
+            let outer_spacing = active_layout.outer_spacing_for_half_cells(half_cells);
+            let centre = if extension {
+                let snap = global_spacing.max(1.0);
+                let outer = outer_spacing.max(1.0);
+                [0, 2].map(|axis| ((camera[axis] / snap).round() * snap / outer).round() * outer)
+            } else {
+                crate::ocean::promoted_footprint_clipmap_centre(
+                    camera, surface, global_spacing, outer_spacing, masks, descriptor.index)
+            };
+            // Outer rings that start beyond the submerged cull radius are invisible.
+            let level_limit = cull_radius.map_or(u32::MAX, |radius| {
+                let offset = (camera[0] - centre[0]).hypot(camera[2] - centre[1]);
+                active_layout.levels_within(half_cells, offset, radius)
+            });
             if half_cells == runtime.current_half_cells
+                && level_limit == runtime.current_level_limit
                 && minimum_level == runtime.current_minimum_level
                 && centre == runtime.current_centre
                 && pvs_cluster == runtime.current_pvs_cluster
+                && extension == runtime.current_sky_extend
             {
                 continue;
             }
@@ -112,17 +151,12 @@ impl Renderer {
                 pvs_tiles = pvs_visible_batches
                     .map(|visible_batches| pvs_footprints.visible_tiles(visible_batches));
             }
-            let visible_tiles = pvs_tiles
-                .as_ref()
-                .and_then(|surfaces| surfaces[descriptor.index].as_ref());
-            let mut indices = runtime.layout.indices_for_footprint(
-                half_cells,
-                minimum_level,
-                centre,
-                descriptor.surface,
-                masks,
-                mask_slot,
-                visible_tiles,
+            let visible_tiles = if extension { None } else {
+                pvs_tiles.as_ref().and_then(|surfaces| surfaces[descriptor.index].as_ref())
+            };
+            let mut indices = active_layout.indices_for_footprint_with_sky(
+                half_cells, minimum_level, level_limit, centre, surface,
+                masks, mask_slot, visible_tiles, sky,
             );
             debug_assert!(indices.len() <= runtime.reserved_range.len());
             for index in &mut indices {
@@ -140,8 +174,10 @@ impl Renderer {
             runtime.active_range = runtime.reserved_range.start..end;
             runtime.current_half_cells = half_cells;
             runtime.current_minimum_level = minimum_level;
+            runtime.current_level_limit = level_limit;
             runtime.current_centre = centre;
             runtime.current_pvs_cluster = pvs_cluster;
+            runtime.current_sky_extend = extension;
             changed_ranges
                 .get_or_insert_with(Vec::new)
                 .push((runtime.slot, runtime.quality, runtime.active_range.clone()));

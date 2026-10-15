@@ -175,7 +175,9 @@ pub(in crate::scene) fn prepare_internal(
     let seed = seed.filter(|seed| inline_hash == Some(seed.map_hash));
     let mut reused = Vec::<&'static str>::new();
     // Collision and the acoustic mesh read only the BSP bytes.
-    let seed_collision = seed.and_then(|seed| seed.collision.clone());
+    let seed_collision = seed
+        .filter(|_| !options.visual_only)
+        .and_then(|seed| seed.collision.clone());
     let seed_acoustic = seed.and_then(|seed| seed.steam_audio_acoustic_mesh.clone());
     if seed_collision.is_some() {
         note_reused_stage(jobs, &mut reused, "collision", Task::MapCollision);
@@ -187,20 +189,20 @@ pub(in crate::scene) fn prepare_internal(
     // queued, so with a worker pool it is joined later (see below) instead of
     // stalling the loader right after the BSP parse.
     let mut collision_pending = None;
-    let (bsp, mesh, collision) = if let Some(jobs) = jobs {
+    let (bsp, (mesh, inline_visual), collision) = if let Some(jobs) = jobs {
         let parse_bytes = Arc::clone(&bytes);
         let parse = jobs.submit(Task::MapBspParse, move || {
             let started = Instant::now();
             let result = Bsp::parse(parse_bytes.as_slice())
                 .map_err(|error| error.to_string())
                 .and_then(|bsp| {
-                    let mesh = bsp.world_mesh(4).map_err(|error| error.to_string())?;
-                    Ok((Arc::new(bsp), Arc::new(mesh)))
+                    let (mesh, inline) = bsp.visual_meshes(f32::from_bits(options.patch_subdivisions_bits), options.patch_stitching).map_err(|error| error.to_string())?;
+                    Ok((Arc::new(bsp), (Arc::new(mesh), inline)))
                 });
             (result, started.elapsed().as_secs_f64() * 1000.0)
         })?;
 
-        if seed_collision.is_none() {
+        if !options.visual_only && seed_collision.is_none() {
             let collision_bytes = Arc::clone(&bytes);
             collision_pending = Some(jobs.submit(Task::MapCollision, move || {
                 let started = Instant::now();
@@ -212,7 +214,7 @@ pub(in crate::scene) fn prepare_internal(
         // While BSP/collision CPU work is running, keep the loader thread useful:
         // animation.cfg IO and shader-file reads overlap those worker jobs.
         let movement_stage = Instant::now();
-        let movement = load_movement(&mut assets, &mut warnings);
+        let movement = (!options.visual_only).then(|| load_movement(&mut assets, &mut warnings)).flatten();
         load_timings.movement_ms = movement_stage.elapsed().as_secs_f64() * 1000.0;
         let (library, library_debug) = materials::shader_library_with_jobs(
             &mut assets,
@@ -259,11 +261,14 @@ pub(in crate::scene) fn prepare_internal(
     } else {
         let stage = Instant::now();
         let bsp = Arc::new(Bsp::parse(bytes.as_slice()).map_err(|e| e.to_string())?);
-        let mesh = Arc::new(bsp.world_mesh(4).map_err(|e| e.to_string())?);
+        let (mesh, inline) = bsp.visual_meshes(f32::from_bits(options.patch_subdivisions_bits), options.patch_stitching).map_err(|e| e.to_string())?;
+        let mesh = (Arc::new(mesh), inline);
         load_timings.bsp_parse_ms = stage.elapsed().as_secs_f64() * 1000.0;
 
         let stage = Instant::now();
-        let collision = if let Some(hit) = seed_collision {
+        let collision = if options.visual_only {
+            None
+        } else if let Some(hit) = seed_collision {
             Some(hit)
         } else {
             match jka_movement::CollisionWorld::from_bsp(bytes.as_slice()) {
@@ -274,7 +279,9 @@ pub(in crate::scene) fn prepare_internal(
                 }
             }
         };
-        load_timings.collision_ms = stage.elapsed().as_secs_f64() * 1000.0;
+        if !options.visual_only {
+            load_timings.collision_ms = stage.elapsed().as_secs_f64() * 1000.0;
+        }
 
         if options.steam_audio {
             if let Some(hit) = seed_acoustic.clone() {
@@ -291,7 +298,7 @@ pub(in crate::scene) fn prepare_internal(
         }
 
         let stage = Instant::now();
-        let movement = load_movement(&mut assets, &mut warnings);
+        let movement = (!options.visual_only).then(|| load_movement(&mut assets, &mut warnings)).flatten();
         load_timings.movement_ms = stage.elapsed().as_secs_f64() * 1000.0;
         let (library, library_debug) =
             materials::shader_library(&mut assets, &mut warnings, options.pbr_materials)?;
@@ -301,6 +308,18 @@ pub(in crate::scene) fn prepare_internal(
         (bsp, mesh, (collision, movement, library, library_debug))
     };
     let (collision, movement, library, library_debug) = collision;
+    // Rapier/weather keep their original subdivision-4, unstitched geometry.
+    // Tessellate it on a worker while the loader queues textures; it is needed
+    // whenever collision loads, which is nearly always.
+    let stable_mesh_job = match jobs {
+        Some(jobs) if options.client_physics || !options.visual_only => {
+            let stable_bsp = Arc::clone(&bsp);
+            Some(jobs.submit(Task::MapPrepare, move || {
+                stable_bsp.world_mesh(4).map_err(|error| error.to_string())
+            })?)
+        }
+        _ => None,
+    };
     let map_hash = match hash_job {
         Some(job) => job.join()?,
         None => inline_hash.expect("map hash computed inline without a hash job"),
@@ -311,9 +330,7 @@ pub(in crate::scene) fn prepare_internal(
         .then(|| crate::steam_audio::cache_info(root, game, name, map_hash));
     let mut phase_clock = prepare_started;
     phase_lap(&mut load_timings, 0, &mut phase_clock);
-    let (inline_mesh, inline_batch_models) = bsp
-        .inline_models_mesh(4)
-        .map_err(|error| error.to_string())?;
+    let (inline_mesh, inline_batch_models) = inline_visual;
 
     // Which shaders (and so which textures) the map uses needs only the meshes and
     // the shader library. Queue texture reads and decodes on the workers right now
@@ -364,14 +381,20 @@ pub(in crate::scene) fn prepare_internal(
         collision
     };
 
+    let stable_mesh = if options.client_physics || collision.is_some() {
+        Some(match stable_mesh_job {
+            Some(job) => job.join()??,
+            None => bsp.world_mesh(4).map_err(|error| error.to_string())?,
+        })
+    } else { None };
     let physics_collision = if options.client_physics {
-        bsp_physics_collision_mesh(&bsp, &mesh)
+        bsp_physics_collision_mesh(&bsp, stable_mesh.as_ref().expect("physics mesh built"))
     } else {
         crate::cgame::ragdoll::PhysicsMapMesh::default()
     };
     let weather_occlusion = collision
         .as_ref()
-        .and_then(|_| bsp_weather_occlusion_source(&bsp, &mesh));
+        .and_then(|_| bsp_weather_occlusion_source(&bsp, stable_mesh.as_ref().expect("weather mesh built")));
     // R_MarkFragments reads the runtime shader's flags, so the scripts win over
     // the flags compiled into the BSP shader lump.
     let mark_shader_flags: Vec<(u32, u32)> = bsp
@@ -389,10 +412,8 @@ pub(in crate::scene) fn prepare_internal(
                 })
         })
         .collect();
-    let mark_surfaces = Arc::new(jka_assets::bsp::MarkSurfaces::from_bsp(
-        &bsp,
-        &mesh,
-        &mark_shader_flags,
+    let mark_surfaces = (!options.visual_only).then(|| Arc::new(
+        jka_assets::bsp::MarkSurfaces::from_bsp(&bsp, &mesh, &mark_shader_flags),
     ));
 
     let bsp_stats = BspMapStats {
@@ -864,15 +885,10 @@ pub(in crate::scene) fn prepare_internal(
                 || (options.planar_environment && has_environment_stage && planar_group.is_none()));
         let key = GroupKey {
             class,
-            // Existing world passes separate opaque/mask from transparent;
-            // within each class preserve explicit shader sorting. Untagged
-            // transparent materials default to TaystJK's SS_BLEND0 (14).
+            // TaystJK sorts complete authored shader chains first. Class is
+            // the next tie-breaker; stages are still emitted in authored order.
             // Fixed-point keeps GroupKey totally ordered without f32 NaNs.
-            sort_priority: (material.sort.unwrap_or(if class == DrawClass::Transparent {
-                14.0
-            } else {
-                3.0
-            }) * 1024.0) as i32,
+            sort_priority: super::material_batches::effective_material_sort(material),
             shader: batch.shader,
             lightmap,
             vertex_lit,
@@ -901,6 +917,9 @@ pub(in crate::scene) fn prepare_internal(
             WorldGeometryChunk {
                 vertices: geometry,
                 surface_ids,
+                patches: mesh.patches.iter().find(|p| p.surface == batch.surface && p.vertices.contains(&(mesh.indices[batch.indices.start] as usize))).into_iter().map(|p| super::PreparedPatchDraw {
+                    surface: p.surface, vertices: 0..batch.indices.len() as u32, lod: Arc::new(p.lod.clone()),
+                }).collect(),
             },
         ))
     };
@@ -921,7 +940,6 @@ pub(in crate::scene) fn prepare_internal(
                 .map_or(0, |shader| shader.surface_flags);
             let eligible = !material.hidden
                 && !material.sky
-                && shader_flags & jka_assets::bsp::SURF_NODLIGHT == 0
                 && !matches!(surface.kind, SurfaceKind::Flare);
             if !eligible {
                 return LegacyDlightSurface::default();
@@ -961,7 +979,9 @@ pub(in crate::scene) fn prepare_internal(
             };
 
             LegacyDlightSurface {
-                cull_kind: match surface.kind {
+                cull_kind: if shader_flags & jka_assets::bsp::SURF_NODLIGHT != 0 {
+                    0
+                } else { match surface.kind {
                     SurfaceKind::Planar
                         if plane[0] != 0.0 || plane[1] != 0.0 || plane[2] != 0.0 =>
                     {
@@ -969,7 +989,7 @@ pub(in crate::scene) fn prepare_internal(
                     }
                     SurfaceKind::Patch | SurfaceKind::Triangles | SurfaceKind::Planar => 2,
                     SurfaceKind::Flare => 0,
-                },
+                } },
                 plane,
                 bounds_min,
                 bounds_max,
@@ -1020,6 +1040,10 @@ pub(in crate::scene) fn prepare_internal(
             .by_pvs_signature
             .entry((signature, area_signature))
             .or_default();
+        let offset = chunk.vertices.len() as u32;
+        chunk.patches.extend(batch_geometry.patches.into_iter().map(|mut patch| {
+            patch.vertices.start += offset; patch.vertices.end += offset; patch
+        }));
         chunk.vertices.extend_from_slice(&batch_geometry.vertices);
         chunk
             .surface_ids
@@ -1042,11 +1066,18 @@ pub(in crate::scene) fn prepare_internal(
     };
     let order_time = order_started.elapsed();
     let mut vertices = Vec::new();
+    let mut patch_draws = Vec::new();
     let mut legacy_dlight_triangle_surfaces = Vec::new();
     let mut batches = Vec::new();
     let mut pvs_batches = Vec::new();
+    // Only a shader applied to a CONTENTS_WATER brush is a body of water that
+    // may become the FFT ocean. `surfaceparm water` alone is not enough: the
+    // shore-surf patches (costadelsol `seph_surf`) carry water contents but no
+    // brush uses them, so they keep their authored draw.
+    let water_volumes = jka_assets::bsp::bathymetry::water_volume_shaders(&bsp);
     for (key, ordered_pieces) in ordered_groups {
         let material = &surface_materials[key.shader];
+        let not_a_water_volume = material.water && !water_volumes.contains(&key.shader);
         let material_debug_index = bsp.shaders.get(key.shader).and_then(|shader| {
             let shader_name = String::from_utf8_lossy(&shader.name);
             material_debug
@@ -1071,6 +1102,9 @@ pub(in crate::scene) fn prepare_internal(
                 global_fog_num,
                 global_fog,
             );
+            patch_draws.extend(piece.patches.iter().cloned().map(|mut patch| {
+                patch.vertices.start += piece_start; patch.vertices.end += piece_start; patch
+            }));
             vertices.extend_from_slice(&piece.vertices);
             legacy_dlight_triangle_surfaces.extend_from_slice(&piece.surface_ids);
             let piece_end =
@@ -1110,6 +1144,12 @@ pub(in crate::scene) fn prepare_internal(
             recover_impossible_masked_depth_seed(
                 &mut pvs_batches[stage_start..], &piece.vertices,
             );
+            if not_a_water_volume {
+                for batch in &mut pvs_batches[stage_start..] {
+                    batch.water_primary = false;
+                    batch.water_overlay = true;
+                }
+            }
         }
 
         let coarse_end =
@@ -1140,6 +1180,12 @@ pub(in crate::scene) fn prepare_internal(
             &mut batches[stage_start..],
             &vertices[coarse_start as usize..coarse_end as usize],
         );
+        if not_a_water_volume {
+            for batch in &mut batches[stage_start..] {
+                batch.water_primary = false;
+                batch.water_overlay = true;
+            }
+        }
     }
     load_timings.geometry_detail_ms = [
         dlight_surfaces_ms,
@@ -1149,6 +1195,7 @@ pub(in crate::scene) fn prepare_internal(
         order_time.as_secs_f64() * 1000.0,
     ];
 
+    let mut inline_patch_draws = Vec::new();
     let mut inline_vertices = Vec::new();
     let mut inline_batches = Vec::new();
     let mut inline_models = Vec::new();
@@ -1160,22 +1207,29 @@ pub(in crate::scene) fn prepare_internal(
                 .iter()
                 .position(|&other| other != model)
                 .map_or(inline_mesh.batches.len(), |offset| start + offset);
-            let mut model_groups: BTreeMap<GroupKey, Vec<GpuVertex>> = BTreeMap::new();
+            let mut model_groups: BTreeMap<GroupKey, WorldGeometryChunk> = BTreeMap::new();
             for batch_index in start..end {
                 let batch = &inline_mesh.batches[batch_index];
                 if let Some((key, batch_geometry)) =
                     batch_geometry(&inline_mesh, batch_index, batch)
                 {
-                    model_groups
-                        .entry(key)
-                        .or_default()
-                        .extend_from_slice(&batch_geometry.vertices);
+                    let group = model_groups.entry(key).or_default();
+                    let offset = group.vertices.len() as u32;
+                    group.patches.extend(batch_geometry.patches.into_iter().map(|mut patch| {
+                        patch.vertices.start += offset; patch.vertices.end += offset; patch
+                    }));
+                    group.vertices.extend_from_slice(&batch_geometry.vertices);
                 }
             }
             let vertex_start = u32::try_from(inline_vertices.len())
                 .map_err(|_| "inline vertex count exceeds u32")?;
             let batch_start = inline_batches.len();
-            for (key, group_vertices) in model_groups {
+            for (key, group) in model_groups {
+                let offset = inline_vertices.len() as u32;
+                inline_patch_draws.extend(group.patches.into_iter().map(|mut patch| {
+                    patch.vertices.start += offset; patch.vertices.end += offset; patch
+                }));
+                let group_vertices = group.vertices;
                 let material = &surface_materials[key.shader];
                 let material_debug_index = bsp.shaders.get(key.shader).and_then(|shader| {
                     let shader_name = String::from_utf8_lossy(&shader.name);
@@ -1799,6 +1853,8 @@ pub(in crate::scene) fn prepare_internal(
     } else { None };
 
     Ok(PreparedMap {
+        patch_draws,
+        inline_patch_draws,
         coastal_bathymetry,
         world_flares,
         shader_library: Arc::new(library),
@@ -1808,12 +1864,19 @@ pub(in crate::scene) fn prepare_internal(
         authored_oceans,
         movement,
         collision,
-        mark_surfaces: Some(mark_surfaces),
+        mark_surfaces,
         static_models,
         physics_collision,
         weather_occlusion,
         vertices,
         legacy_dlight_triangle_surfaces,
+        bsp_compiled_model_surfaces: bsp.surfaces.iter().map(|surface| {
+            surface.kind == SurfaceKind::Triangles
+                && bsp.shaders.get(surface.shader).is_some_and(|shader| {
+                    String::from_utf8_lossy(&shader.name)
+                        .to_ascii_lowercase().starts_with("models/")
+                })
+        }).collect(),
         legacy_dlight_surfaces,
         batches,
         pvs_batches,

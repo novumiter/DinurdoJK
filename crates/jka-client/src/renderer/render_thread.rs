@@ -49,6 +49,72 @@ fn stop_for_device_loss(
     abandon_renderer(renderer, companions);
 }
 
+/// Quake/TaystJK r_speeds modes, adapted to what Unified can actually
+/// observe. WGPU multi-draw, GPU visibility and texture allocations do not
+/// expose the old OpenGL counters: label estimates rather than inventing them.
+fn print_r_speeds(
+    renderer: &Renderer,
+    camera: &crate::camera::Camera,
+    snapshot: &RenderSnapshot,
+    info: &FrameInfo,
+) {
+    let Some(world) = renderer.world.as_ref() else { return; };
+    match renderer.patch_speeds {
+        1 => {
+            let active = crate::renderer::active_batch_selection(world, renderer.pvs_mode);
+            let mask = crate::renderer::effective_area_mask(world, renderer.pvs_mode, snapshot.area_mask.as_ref());
+            let proj = camera.view_projection(renderer.config.width, renderer.config.height);
+            let mut candidates = 0u64;
+            let mut indices = 0u64;
+            let mut materials = std::collections::HashSet::new();
+            for &i in active.indices {
+                let batch = &active.batches[i];
+                if !crate::renderer::batch_area_visible(batch, mask)
+                    || crate::renderer::hidden_inline_batch(batch, &world.inline_models)
+                    || crate::renderer::hidden_bsp_model_surface(renderer.draw_bsp_model_surfaces, batch, &world.material_debug)
+                    || !crate::renderer::aabb_intersects_clip_frustum(batch.bounds_min, batch.bounds_max, proj)
+                { continue; }
+                let n = batch.indexed_range.end.saturating_sub(batch.indexed_range.start) as u64;
+                if n == 0 { continue; }
+                candidates += 1;
+                indices += n;
+                materials.insert(batch.source.pipeline);
+            }
+            println!("[r_speeds 1] {} material pipelines / {} visible world draw candidates, {} PVS/frustum tris ({} indices), {} world encoded batches, {} visible patches; MD3/GL overdraw/texture MB not included",
+                materials.len(), candidates, indices / 3, indices,
+                info.world_encoded_batches, info.patch_lod.visible_patches);
+        }
+        2 => {
+            println!("[r_speeds 2] patch visible={} tris={}/{} (selected/full), updates={}; sphere/box cull patch/MD3 counters not tracked by Unified",
+                info.patch_lod.visible_patches, info.patch_lod.selected_triangles,
+                info.patch_lod.full_triangles, info.patch_lod.lod_updates);
+        }
+        3 => {
+            let cluster = world.last_cluster.flatten().map_or(-1, |v| v as i64);
+            println!("viewcluster: {cluster}");
+        }
+        4 => {
+            if world.active_pipeline_variant.legacy_dlights {
+                let draws = &world.legacy_dlight.draws;
+                let triangles: u64 = draws.iter().map(|d| (d.indices.end - d.indices.start) as u64 / 3).sum();
+                println!("[r_speeds 4] legacy dlight draw groups={} static tris={} lit movers={} active light sources={}; culled-surface/vertex counters unavailable",
+                    draws.len(), triangles, world.legacy_dlight.inline_batches.len(), world.dynamic_lights.len());
+            } else {
+                println!("[r_speeds 4] legacy dlight pass not active (current mode {:?}); no compatible additive-pass counters", renderer.dynamic_lights_mode);
+            }
+        }
+        5 => println!("zFar: {:.0}", camera.far_distance()),
+        6 => println!("[r_speeds 6] world flares enabled={}; add/test/render counters not yet instrumented", renderer.world_flares_enabled),
+        7 => {
+            let vtx = world.vertex_buffer.size() as f64 / (1024.0 * 1024.0);
+            let idx = world.index_buffer.size() as f64 / (1024.0 * 1024.0);
+            println!("[r_speeds 7] BSP vertex/index GPU buffers {:.2}/{:.2} MiB; textures={} lightmaps={} (GPU texture allocations and total VRAM not tracked)",
+                vtx, idx, world.textures.len(), world.lightmaps.len());
+        }
+        _ => {},
+    }
+}
+
 pub struct RenderThread {
     pub(in crate::renderer) command_tx: Sender<RenderCommand>,
     /// Kept on the Winit/app side so auxiliary surfaces are created on the
@@ -424,6 +490,7 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.debug_volumes.triggers_enabled = initial_ui.video.draw_triggers;
     renderer.debug_volumes.clips_enabled = initial_ui.video.draw_clip_brushes;
     renderer.set_pvs_mode(initial_ui.video.pvs_mode);
+    renderer.set_face_plane_cull(initial_ui.video.face_plane_cull);
     let mut fps_cap = initial_ui.video.fps_cap;
     let mut input_latelatch = initial_ui.video.input_latelatch;
     // `inputdiag` force-enables GPU timestamps for the capture, because the CPU
@@ -561,6 +628,13 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.dynamic_model_renderer.model_state_cache = initial_ui.video.model_state_cache;
     renderer.dynamic_model_renderer.dynamic_batch_draws = initial_ui.video.dynamic_batch_draws;
     renderer.world_compact_min_draws = initial_ui.video.world_compact_min_draws;
+    renderer.patch_curve_error = initial_ui.video.lod_curve_error;
+    renderer.bsp_model_lod_scale = initial_ui.video.lod_scale;
+    renderer.bsp_model_lod_bias = initial_ui.video.ghoul2_lod_bias;
+    renderer.bsp_model_lod_debug = initial_ui.video.md3_lod_debug;
+    renderer.bsp_model_lod_enabled = initial_ui.video.md3_auto_lod && initial_ui.video.bsp_model_lod;
+    renderer.patch_no_curves = initial_ui.video.no_curves;
+    renderer.patch_speeds = initial_ui.video.speeds;
     if let Err(error) = renderer.dynamic_model_renderer.set_model_prepare_threads(initial_ui.video.model_prepare_threads) {
         eprintln!("Model packing workers: {error}");
     }
@@ -577,6 +651,7 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.texture_compression = initial_ui.video.texture_compression.min(2);
     renderer.set_draw_inline_models(initial_ui.video.draw_inline_models);
     renderer.set_fragment_shader_mode(initial_ui.video.fragment_shader_mode);
+    renderer.world_sort_mode = initial_ui.video.world_sort_mode.min(1);
     renderer.color_clear_mode = initial_ui.video.color_clear_mode.min(1);
     renderer.set_world_stage_debug(initial_ui.video.draw_bsp_model_surfaces, initial_ui.video.world_stage_probe);
     renderer.set_fast_sky(initial_ui.video.fast_sky);
@@ -628,11 +703,20 @@ pub(in crate::renderer) fn render_thread_main(
         "[RENDER INIT] ready after applying video state {:.1} ms total",
         renderer_init_started.elapsed().as_secs_f64() * 1000.0
     );
+    // The UI must see the same HDR capability verdict used to select the
+    // actual presentation format. Query even when SDR was requested.
+    let hdr_capabilities = renderer.surface.get_capabilities(&renderer.adapter);
+    let hdr_display_info = renderer.surface.display_hdr_info(&renderer.adapter);
+    let mut hdr_available_modes = super::hdr_output::available_modes(
+        &hdr_capabilities,
+        Some(&hdr_display_info),
+    );
     let _ = proxy.send_event(UserEvent::RendererReady {
         supported_msaa: renderer.supported_msaa.clone(),
         wireframe_supported: renderer.wireframe_supported,
         hdr_output_status: renderer.hdr_output.as_ref().map_or_else(|| "SDR".to_owned(), |o| o.status()),
         hdr_output_active: renderer.hdr_output.as_ref().is_some_and(|o| matches!(o.selection.encoding, 1 | 2)),
+        hdr_available_modes,
         adapter_name: renderer.adapter.get_info().name,
         adapter_type: format!("{:?}", renderer.adapter.get_info().device_type),
     });
@@ -645,6 +729,7 @@ pub(in crate::renderer) fn render_thread_main(
     let mut frame_pace_anchor = Instant::now();
     let mut stats_frames = 0_u64;
     let mut last_info = FrameInfo::default();
+    let mut last_r_speeds = Instant::now();
     let mut last_measured_input_sequence = 0_u64;
     let mut input_latency_samples = 0_u64;
     let mut input_latch_samples = 0_u64;
@@ -720,14 +805,45 @@ pub(in crate::renderer) fn render_thread_main(
     let mut shader_progress_polled_at = Instant::now() - Duration::from_millis(100);
     let mut gamma_preparation = None;
     let mut first_frame_notified = false;
+    let mut first_menu_frame_notified = false;
+    let mut last_stage_token: Option<u64> = None;
     let mut batch_timing: Option<RenderBatchTiming> = None;
 
     let mut deferred_load_map = None;
+    // Explicit type is needed: the first read (`take`) precedes the branch
+    // that assigns a `RemapMap`, so inference cannot discover the tuple's
+    // `PreparedRemapPlan` type from its field accesses alone.
+    let mut deferred_remap_map: Option<(
+        u64,
+        Instant,
+        String,
+        Box<crate::scene::PreparedRemapPlan>,
+        usize,
+    )> = None;
+    let mut hdr_capabilities_last_checked = Instant::now();
 
     loop {
-        if renderer.poll_hdr_display() {
-            let output = renderer.hdr_output.as_ref().unwrap();
-            let _ = proxy.send_event(UserEvent::HdrOutputChanged { status: output.status(), active: matches!(output.selection.encoding, 1 | 2) });
+        // HDR availability can change with Windows HDR or a display move,
+        // including while running in SDR. Never query per frame.
+        let hdr_output_changed = renderer.poll_hdr_display();
+        let mut hdr_capabilities_changed = false;
+        if hdr_capabilities_last_checked.elapsed() >= Duration::from_secs(2) {
+            hdr_capabilities_last_checked = Instant::now();
+            let caps = renderer.surface.get_capabilities(&renderer.adapter);
+            let info = renderer.surface.display_hdr_info(&renderer.adapter);
+            let available = super::hdr_output::available_modes(&caps, Some(&info));
+            if available != hdr_available_modes {
+                hdr_available_modes = available;
+                hdr_capabilities_changed = true;
+            }
+        }
+        if hdr_output_changed || hdr_capabilities_changed {
+            let output = renderer.hdr_output.as_ref();
+            let _ = proxy.send_event(UserEvent::HdrOutputChanged {
+                status: output.map_or_else(|| "SDR".to_owned(), |o| o.status()),
+                active: output.is_some_and(|o| matches!(o.selection.encoding, 1 | 2)),
+                available_modes: hdr_available_modes,
+            });
         }
         // Before any encoding, so the capture's first frames carry timestamps.
         let diag_recording = input_diagnostic.is_recording();
@@ -759,15 +875,21 @@ pub(in crate::renderer) fn render_thread_main(
                 let upload_timings = renderer.load_map(*map);
                 let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                 pending_world_uploaded = Some((
-                    request_id,
-                    started,
-                    name,
-                    triangles,
-                    batches,
-                    upload_ms,
-                    upload_timings,
-                    timings,
-                    bsp_stats,
+                    request_id, started, name, triangles, batches, upload_ms,
+                    upload_timings, timings, bsp_stats,
+                ));
+            }
+            if let Some((request_id, started, name, plan, base_texture_count)) = deferred_remap_map.take() {
+                let triangles = plan.base.triangles;
+                let batches = plan.batches.len();
+                let timings = plan.base.load_timings;
+                let bsp_stats = plan.base.bsp_stats.clone();
+                let upload_started = Instant::now();
+                let upload_timings = renderer.load_remapped_map(*plan, base_texture_count);
+                let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
+                pending_world_uploaded = Some((
+                    request_id, started, name, triangles, batches, upload_ms,
+                    upload_timings, timings, bsp_stats,
                 ));
             }
             let diag_command_drain_started = input_diagnostic.is_recording().then(Instant::now);
@@ -817,7 +939,14 @@ pub(in crate::renderer) fn render_thread_main(
                         }
                     }
                     Ok(RenderCommand::Resize(size)) => renderer.resize(size),
-                    Ok(RenderCommand::SetVsync(vsync)) => renderer.set_vsync(vsync),
+                    Ok(RenderCommand::SetVsync(vsync)) => {
+                        if renderer.vsync != vsync {
+                            renderer.set_vsync(vsync);
+                            // An ON/FIFO frame can block for a refresh interval.
+                            // Do not carry that old pacing deadline into OFF.
+                            frame_pace_anchor = Instant::now();
+                        }
+                    }
                     Ok(RenderCommand::SetMaxFrameLatency(latency)) => {
                         renderer.set_max_frame_latency(latency)
                     }
@@ -868,8 +997,10 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.debug_volumes.sun_ray_enabled = enabled;
                     }
                     Ok(RenderCommand::SetPvsMode(mode)) => renderer.set_pvs_mode(mode),
+                    Ok(RenderCommand::SetFacePlaneCull(enabled)) => renderer.set_face_plane_cull(enabled),
                     Ok(RenderCommand::SetDrawInlineModels(enabled)) => renderer.set_draw_inline_models(enabled),
                     Ok(RenderCommand::SetFragmentShaderMode(mode)) => renderer.set_fragment_shader_mode(mode),
+                    Ok(RenderCommand::SetWorldSortMode(mode)) => renderer.world_sort_mode = mode.min(1),
                     Ok(RenderCommand::SetColorClearMode(mode)) => renderer.color_clear_mode = mode.min(1),
                     Ok(RenderCommand::SetWorldStageDebug { draw_bsp_model_surfaces, probe }) => {
                         renderer.set_world_stage_debug(draw_bsp_model_surfaces, probe);
@@ -885,7 +1016,12 @@ pub(in crate::renderer) fn render_thread_main(
                         }
                         renderer.world_flares_enabled = enabled;
                     }
-                    Ok(RenderCommand::SetFpsCap(cap)) => fps_cap = cap,
+                    Ok(RenderCommand::SetFpsCap(cap)) => {
+                        if fps_cap != cap {
+                            fps_cap = cap;
+                            frame_pace_anchor = Instant::now();
+                        }
+                    },
                     Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
                     Ok(RenderCommand::SetGammaMethod(method)) => {
                         gamma_preparation = None;
@@ -944,6 +1080,9 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetSsrDebug(mode)) => renderer.ssr_debug = mode,
                     Ok(RenderCommand::SetOceanEnabled(enabled)) => {
                         renderer.set_ocean_enabled(enabled)
+                    }
+                    Ok(RenderCommand::SetOceanSkyExtend(enabled)) => {
+                        renderer.set_ocean_sky_extend(enabled)
                     }
                     Ok(RenderCommand::SetOceanSettings(settings)) => {
                         renderer.set_ocean_settings(settings)
@@ -1005,6 +1144,17 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetDynamicBatchDraws(enabled)) => {
                         renderer.dynamic_model_renderer.dynamic_batch_draws = enabled;
+                    }
+                    Ok(RenderCommand::SetBspModelLod { scale, bias, debug, enabled }) => {
+                        renderer.bsp_model_lod_scale = scale;
+                        renderer.bsp_model_lod_bias = bias;
+                        renderer.bsp_model_lod_debug = debug;
+                        renderer.bsp_model_lod_enabled = enabled;
+                    }
+                    Ok(RenderCommand::SetPatchLod { curve_error, no_curves, speeds }) => {
+                        renderer.patch_curve_error = curve_error;
+                        renderer.patch_no_curves = no_curves;
+                        renderer.patch_speeds = speeds;
                     }
                     Ok(RenderCommand::SetWorldCompactMinDraws(minimum)) => {
                         renderer.world_compact_min_draws = minimum.clamp(1, 2);
@@ -1202,6 +1352,7 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.request_screenshot(directory, metadata, format)
                     }
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
+                    Ok(RenderCommand::CaptureFrontendScene { path }) => renderer.request_frontend_scene_capture(path),
                     Ok(RenderCommand::CaptureVideoFrame { frame_index, depth }) => renderer.request_video_frame_capture(frame_index, depth),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
                     Ok(RenderCommand::SetExtensionHud(widgets)) => renderer.set_extension_hud(widgets),
@@ -1317,6 +1468,10 @@ pub(in crate::renderer) fn render_thread_main(
                         deferred_load_map = Some((request_id, started, name, map));
                         break;
                     }
+                    Ok(RenderCommand::RemapMap { request_id, started, name, plan, base_texture_count }) => {
+                        deferred_remap_map = Some((request_id, started, name, plan, base_texture_count));
+                        break;
+                    }
                     Ok(RenderCommand::Shutdown) => {
                         let teardown_started = Instant::now();
                         rverbose!(1, "[RENDER SHUTDOWN] command received; dropping renderer");
@@ -1339,6 +1494,7 @@ pub(in crate::renderer) fn render_thread_main(
                         for (_, mut companion) in companion_renderers.drain() {
                             companion.shutdown();
                         }
+                        crate::pipeline_cache::shutdown();
                         drop(renderer);
                         let _ = teardown_done.send(());
                         rverbose!(
@@ -1530,6 +1686,12 @@ pub(in crate::renderer) fn render_thread_main(
         }
         match render_result {
             Ok(info) => {
+                if renderer.patch_speeds > 0 && renderer.patch_speeds != 8
+                    && last_r_speeds.elapsed() >= Duration::from_secs(1)
+                {
+                    print_r_speeds(&renderer, &frame_camera, &snapshot, &info);
+                    last_r_speeds = Instant::now();
+                }
                 if perf_capture.as_mut().is_some_and(|capture| capture.record(&info, &renderer, &snapshot.client_perf)) {
                     if let Some(completed) = perf_capture.take() {
                         completed.finish();
@@ -1551,6 +1713,16 @@ pub(in crate::renderer) fn render_thread_main(
                 if !first_frame_notified {
                     first_frame_notified = true;
                     let _ = proxy.send_event(UserEvent::RendererFirstFrame);
+                }
+                if !first_menu_frame_notified && renderer.egui_active {
+                    first_menu_frame_notified = true;
+                    let _ = proxy.send_event(UserEvent::RendererFirstMenuFrame);
+                }
+                if let Some(token) = renderer.egui_present_token.filter(|_| renderer.egui_active) {
+                    if last_stage_token != Some(token) {
+                        last_stage_token = Some(token);
+                        let _ = proxy.send_event(UserEvent::FrontendStagePresented(token));
+                    }
                 }
                 let splashes = renderer.weather.rain.take_water_splashes();
                 if !splashes.is_empty() {
@@ -1762,6 +1934,7 @@ pub(in crate::renderer) fn render_thread_main(
                         last_info.world_specialized_binds,
                         last_info.world_general_binds,
                     ),
+                    world_shader_programs: last_info.world_shader_programs,
                     input_event_to_sim_ms: (input_latency_samples != 0)
                         .then(|| input_event_to_sim_sum_ms / input_latency_samples as f64),
                     input_sim_to_render_ms: (input_latency_samples != 0)
@@ -1839,7 +2012,7 @@ pub(in crate::renderer) fn render_thread_main(
             let grass_total_ms =
                 grass_total_gpu.map_or_else(|| "--".to_string(), |ms| format!("{ms:.4}"));
             println!(
-                "[JKA PERF] fps={:.1} cpu_frame={:.4}ms prep={:.4}ms acquire={:.4}ms encode={:.4}ms submit={:.4}ms present={:.4}ms dyn_prepare={:.4}ms g2_draws={}/{} batch={} world_batches[pvs={} frustum_reject={} encoded={} multidraw_groups={} multidraw_batches={}] hotpath=1",
+                "[JKA PERF] fps={:.1} cpu_frame={:.4}ms prep={:.4}ms acquire={:.4}ms encode={:.4}ms submit={:.4}ms present={:.4}ms dyn_prepare={:.4}ms g2_draws={}/{} batch={} world_batches[pvs={} frustum_reject={} ocean_cull={}b/{}t encoded={} multidraw_groups={} multidraw_batches={}] vsync={} mode={:?} queue={} fps_cap={} surface_gen={} hotpath=1",
                 trace_frames as f64 / elapsed,
                 trace_frame_ms / frames,
                 trace_prepare_ms / frames,
@@ -1853,10 +2026,28 @@ pub(in crate::renderer) fn render_thread_main(
                 renderer.dynamic_model_renderer.ghoul2_batch_draws.config_value(),
                 last_info.world_pvs_batches,
                 last_info.world_frustum_rejected,
+                last_info.world_ocean_culled,
+                last_info.world_ocean_culled_triangles,
                 last_info.world_encoded_batches,
                 last_info.world_multidraw_groups,
                 last_info.world_multidraw_batches,
+                renderer.vsync.label(),
+                renderer.config.present_mode,
+                renderer.config.desired_maximum_frame_latency,
+                fps_cap,
+                renderer.surface_config_generation,
             );
+            if renderer.world_sort_mode != 0 {
+                println!("[JKA WORLD SORT] mode={} eligible={} runs={} moved={} theoretical_binds={}->{} actual_base_binds={}spec/{}general",
+                    renderer.world_sort_mode,
+                    last_info.world_sort_candidates, last_info.world_sort_runs, last_info.world_sort_moved,
+                    last_info.world_sort_binds_before, last_info.world_sort_binds_after,
+                    last_info.world_specialized_binds, last_info.world_general_binds);
+            }
+            println!("[JKA WORLD PROGRAMS] requested={} active={} path={} binds[general={} specialized={} minimal={} shared={} generated={}]",
+                last_info.world_shader_programs.requested, last_info.world_shader_programs.active, last_info.world_path,
+                last_info.world_shader_programs.binds[0], last_info.world_shader_programs.binds[1],
+                last_info.world_shader_programs.binds[2], last_info.world_shader_programs.binds[3], last_info.world_shader_programs.binds[4]);
             // A/B line: which world renderer ran, plus the unified prepare split.
             // FastBaseline does not split its prepare stage, so those read 0.
             println!(

@@ -23,7 +23,7 @@ pub fn build_vertices(
     }
     let mut out = Vec::with_capacity(16_384);
     if ui.startup_splash {
-        build_splash_background(&mut out, width, height, splash_size);
+        build_splash_background(&mut out, width, height, splash_size.filter(|_| ui.startup_splash_art));
         return out;
     }
     if let Some(loading) = &ui.loading {
@@ -66,8 +66,13 @@ pub fn build_vertices(
         | OverlayMode::EntityGraph
         | OverlayMode::Trace
         | OverlayMode::DevRadial
+        | OverlayMode::ModelPicker
+        | OverlayMode::BmodelPicker
+        | OverlayMode::MapMods
+        | OverlayMode::EmoteRadial
         | OverlayMode::StrafeTrails
-        | OverlayMode::RaceGhosts => {}
+        | OverlayMode::RaceGhosts
+        | OverlayMode::ShaderRemap => {}
     }
     // The trace result panel used to be drawn here from `ui.surface_inspector`
     // (`build_surface_inspector`, a static non-interactive readout). It's now

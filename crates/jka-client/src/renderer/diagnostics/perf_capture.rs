@@ -15,7 +15,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 147] = [
+const FIELDS: [&str; 169] = [
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -36,6 +36,18 @@ const FIELDS: [&str; 147] = [
     "world_encoded_batches",
     "world_multidraw_groups",
     "world_multidraw_batches",
+    "world_sort_candidates",
+    "world_sort_runs",
+    "world_sort_moved",
+    "world_sort_theoretical_binds_before",
+    "world_sort_theoretical_binds_after",
+    "world_shader_mode_requested",
+    "world_shader_mode_active",
+    "world_general_program_binds",
+    "world_specialized_program_binds",
+    "world_minimal_program_binds",
+    "world_shared_program_binds",
+    "world_generated_program_binds",
     "primary_command_buffers",
     "frame_inline_render_passes_calls",
     "frame_inline_compute_passes_calls",
@@ -56,6 +68,10 @@ const FIELDS: [&str; 147] = [
     "world_cpu_compact_visible_members",
     "world_cpu_compact_singleton_groups",
     "world_cpu_compact_multistage_excluded_batches",
+    "world_face_plane_rejected_batches",
+    "world_face_plane_partial_batches",
+    "world_face_plane_rejected_triangles",
+    "world_face_plane_direct_draws",
     "ghoul2_prepared_instances",
     "ghoul2_prepared_draws",
     "cpu_model_prepared_ranges",
@@ -163,6 +179,12 @@ const FIELDS: [&str; 147] = [
     "inline_models_uninitialized",
     "inline_hidden_stage_batches_skipped",
     "inline_hidden_stage_triangle_equivalents_skipped",
+    "patch_visible_count",
+    "patch_full_triangles",
+    "patch_selected_triangles",
+    "patch_lod_updates",
+    "patch_index_upload_bytes",
+    "patch_cpu_lod_ms",
 ];
 
 #[derive(Clone)]
@@ -213,6 +235,18 @@ impl PerfRow {
                 f64::from(info.world_encoded_batches),
                 f64::from(info.world_multidraw_groups),
                 f64::from(info.world_multidraw_batches),
+                f64::from(info.world_sort_candidates),
+                f64::from(info.world_sort_runs),
+                f64::from(info.world_sort_moved),
+                f64::from(info.world_sort_binds_before),
+                f64::from(info.world_sort_binds_after),
+                f64::from(info.world_shader_programs.requested),
+                f64::from(info.world_shader_programs.active),
+                f64::from(info.world_shader_programs.binds[0]),
+                f64::from(info.world_shader_programs.binds[1]),
+                f64::from(info.world_shader_programs.binds[2]),
+                f64::from(info.world_shader_programs.binds[3]),
+                f64::from(info.world_shader_programs.binds[4]),
                 f64::from(info.perf_primary_command_buffers),
                 f64::from(info.perf_encode_calls.render_passes),
                 f64::from(info.perf_encode_calls.compute_passes),
@@ -233,6 +267,10 @@ impl PerfRow {
                 f64::from(info.world_cpu_compact_visible_members),
                 f64::from(info.world_cpu_compact_singleton_groups),
                 f64::from(info.world_cpu_compact_multistage_excluded_batches),
+                f64::from(info.world_face_plane_rejected_batches),
+                f64::from(info.world_face_plane_partial_batches),
+                f64::from(info.world_face_plane_rejected_triangles),
+                f64::from(info.world_face_plane_direct_draws),
                 f64::from(info.ghoul2_gpu_instances),
                 f64::from(info.ghoul2_gpu_draw_calls),
                 f64::from(models.draws.len() as u32),
@@ -340,6 +378,12 @@ impl PerfRow {
                 info.perf_inline_models_uninitialized as f64,
                 info.perf_inline_hidden_stage_batches as f64,
                 info.perf_inline_hidden_stage_indices as f64 / 3.0,
+                info.patch_lod.visible_patches as f64,
+                info.patch_lod.full_triangles as f64,
+                info.patch_lod.selected_triangles as f64,
+                info.patch_lod.lod_updates as f64,
+                info.patch_lod.index_upload_bytes as f64,
+                info.patch_lod.cpu_lod_ms,
             ],
         }
     }
@@ -392,7 +436,7 @@ impl PerfCapture {
             pvs_candidate_indices: vec![0; renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             main_view_stages: vec![crate::renderer::api::WorldStagePerf::default(); renderer.world.as_ref().map_or(0, |w| w.material_debug.entries.len())],
             fingerprint: format!(
-                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={};world_stage_probe={};fastsky={};inline_models={};bsp_model_surfaces={};early_submit={}",
+                "{}x{};present={:?};latency={};msaa={};gpu_timestamps={};pvs={:?};world={:?};ghoul2_batch={};model_state_cache={};dynamic_batch={};world_compact_min_draws={};fx_zero_alpha_discard={};gpu_driven={};hiz={};legacy_drawfog={};dynamic_lights={:?};model_prepare_threads={};model_index_upload_cache={};ghoul2_batch_key_cache={};md3_geometry_cache={};ocean_enabled={};ocean_effective={};model_render_bundles={};encoder_finish_threads={};world_stage_probe={};fastsky={};inline_models={};bsp_model_surfaces={};early_submit={};shader_mode={};world_sort={};active_world={};hdr_output={};present_copy={}",
                 renderer.config.width,
                 renderer.config.height,
                 renderer.config.present_mode,
@@ -423,6 +467,11 @@ impl PerfCapture {
                 renderer.draw_inline_models,
                 renderer.draw_bsp_model_surfaces,
                 renderer.early_submit_enabled,
+                renderer.fragment_shader_mode,
+                renderer.world_sort_mode,
+                renderer.world.as_ref().map(|w| w.active_pipeline_variant.short_label()).unwrap_or_default(),
+                renderer.hdr_output.as_ref().map_or(0, |h| h.requested),
+                renderer.present_copy_enabled,
             ),
         }
     }
@@ -610,7 +659,7 @@ impl PerfCapture {
             });
         }
         serde_json::to_string_pretty(&serde_json::json!({
-            "schema": "dinurdojk-cpu-renderperf-v8",
+            "schema": "dinurdojk-cpu-renderperf-v9",
             "sample_count": self.frames.len(),
             "warmup_seconds_before_frame_skip": 2,
             "warmup_skipped_frames": self.warmup_frames,

@@ -76,6 +76,12 @@ struct AutoLightRuntime {
 /// One live primitive (CParticle/CLine/CTail/... state).
 #[derive(Clone, Debug)]
 struct Primitive {
+    /// GPU candidate identity, assigned at birth only for semantically safe sprites.
+    gpu_id: Option<u64>,
+    /// Immutable birth parameters retained for rare CPU handback after an
+    /// already GPU-owned particle outlives a pipeline rebuild/toggle.
+    gpu_spawn: Option<super::gpu_sparks::GpuSparkSpawn>,
+    gpu_sleeping: bool,
     class: FxClass,
     kind: PrimType,
     auto_light: Option<AutoLightRuntime>,
@@ -234,6 +240,12 @@ pub struct FxBlade {
 #[derive(Default, Debug)]
 pub struct FxFrame {
     pub draws: Vec<FxDraw>,
+    /// Optional once-per-spawn GPU staging; the existing CPU draw path remains
+    /// authoritative until renderer material-stage eligibility is connected.
+    pub gpu_sparks: Option<super::gpu_sparks::GpuSparkCommands>,
+    /// `(draw_index, stable_particle_id)` for ordinary CPU sprite fallbacks.
+    /// The app promotes these by material and leaves every unaccepted draw intact.
+    pub gpu_sprite_draw_indices: Vec<(usize, u64)>,
     pub blades: Vec<FxBlade>,
     pub lights: Vec<FxLight>,
     /// Material-aware second-stage candidates for inferred lights. These are
@@ -271,6 +283,8 @@ pub struct FxShake {
 pub struct FxStats {
     pub registered: usize,
     pub active: usize,
+    /// Actual FX primitives skipping their CPU tick (not just GPU candidates).
+    pub gpu_offloaded: usize,
     pub scheduled: usize,
     pub dropped: u64,
     /// Primitive kinds that are parsed but not simulated/drawn yet.
@@ -361,6 +375,17 @@ pub struct FxSystem {
     failed: HashSet<String>,
     scheduled: Vec<Scheduled>,
     active: Vec<Primitive>,
+    // Stage-only transport for GPU particle ownership; disabled in production
+    // until the corresponding unified-renderer consumer has been validated.
+    gpu_staging: bool,
+    gpu_generation: u64,
+    gpu_next_id: u64,
+    gpu_pending_reset: bool,
+    gpu_pending_spawns: Vec<super::gpu_sparks::GpuSparkSpawn>,
+    /// Only IDs accepted by the material resolver AND compiled resident PSOs.
+    /// Set through the ordered FX worker command queue, not GPU readback.
+    gpu_owned: HashSet<u64>,
+    gpu_offloaded_last_frame: usize,
     sounds: Vec<FxSound>,
     shakes: Vec<FxShake>,
     /// FxRunner PlayEffect calls made while creating a primitive.
@@ -399,6 +424,13 @@ impl FxSystem {
             failed: HashSet::new(),
             scheduled: Vec::new(),
             active: Vec::new(),
+            gpu_staging: false,
+            gpu_generation: 0,
+            gpu_next_id: 0,
+            gpu_pending_reset: false,
+            gpu_pending_spawns: Vec::new(),
+            gpu_owned: HashSet::new(),
+            gpu_offloaded_last_frame: 0,
             sounds: Vec::new(),
             shakes: Vec::new(),
             runner_queue: Vec::new(),
@@ -461,10 +493,30 @@ impl FxSystem {
         }
     }
 
+    /// Backend integration switch, deliberately not registered as a user cvar
+    /// until a GPU resident renderer handles spawn/clear/material fallback.
+    /// Staging does not steal ownership from CPU simulation or drawing.
+    pub fn set_gpu_staging(&mut self, enabled: bool) {
+        if self.gpu_staging != enabled {
+            self.gpu_staging = enabled;
+            self.gpu_generation = self.gpu_generation.wrapping_add(1);
+            self.gpu_pending_reset = true;
+            self.gpu_pending_spawns.clear();
+            self.gpu_owned.clear();
+        }
+    }
+
+    /// Material- and pipeline-validated GPU ownership from presentation. A
+    /// missing ID always returns to the reference CPU evaluator next tick.
+    pub fn set_gpu_owned(&mut self, ids: HashSet<u64>) {
+        self.gpu_owned = if self.gpu_staging { ids } else { HashSet::new() };
+    }
+
     pub fn stats(&self) -> FxStats {
         FxStats {
             registered: self.effects.len(),
             active: self.active.len(),
+            gpu_offloaded: self.gpu_offloaded_last_frame,
             scheduled: self.scheduled.len(),
             dropped: self.dropped,
             unsupported_spawns: self.unsupported_spawns,
@@ -475,6 +527,11 @@ impl FxSystem {
 
     /// CFxScheduler::Clean: drop live and scheduled primitives (seek/restart).
     pub fn clear_active(&mut self) {
+        self.gpu_generation = self.gpu_generation.wrapping_add(1);
+        self.gpu_pending_reset = true;
+        self.gpu_pending_spawns.clear();
+        self.gpu_owned.clear();
+        self.gpu_offloaded_last_frame = 0;
         self.active.clear();
         self.scheduled.clear();
         self.sounds.clear();
@@ -681,6 +738,8 @@ impl FxSystem {
         let rng = &mut self.rng;
         let physics_mode = self.physics_mode;
         let collision = &mut self.collision;
+        let owned = &self.gpu_owned;
+        let mut gpu_offloaded = 0;
         self.active.retain_mut(|prim| {
             if time > prim.kill_time {
                 if prim.flags & FX_DEATH_RUNS_FX != 0 && prim.flags & FX_KILL_ON_IMPACT == 0 && prim.death_fx != 0 {
@@ -690,10 +749,44 @@ impl FxSystem {
                 }
                 return false;
             }
+            // Eligible resident sprites have no per-tick callbacks, collision,
+            // RNG draws or promoted lights. Once the renderer ACKs an ID, the
+            // GPU evaluates its transform/colour/lifetime and the worker skips
+            // update_primitive entirely (including the CPU sprite allocation).
+            let gpu_owned = prim.gpu_id.is_some_and(|id| owned.contains(&id))
+                && prim.gpu_spawn.as_ref().is_some_and(|spawn| {
+                    super::gpu_sparks::primitive_eligibility(
+                        prim.kind, prim.flags, physics_mode,
+                        prim.impact_fx, prim.death_fx, prim.emitter_fx,
+                        prim.auto_light.is_some(), spawn.values_finite(),
+                    ).is_ok()
+                });
+            if gpu_owned {
+                gpu_offloaded += 1;
+                prim.gpu_sleeping = true;
+                return true;
+            }
+            // Switching off, physics mode changes and pipeline invalidation
+            // all return the exact ID to the CPU path. Restore an analytic
+            // previous-frame state rather than resuming a frozen old origin.
+            if prim.gpu_sleeping {
+                if let Some(spawn) = &prim.gpu_spawn {
+                    let prev_ms = time.saturating_sub(frame_time).max(spawn.start_ms);
+                    let dt = (prev_ms - spawn.start_ms) as f32 * 0.001;
+                    prim.origin = std::array::from_fn(|i| spawn.origin[i]
+                        + spawn.velocity[i] * dt + 0.5 * spawn.acceleration[i] * dt * dt);
+                    prim.vel = std::array::from_fn(|i| spawn.velocity[i] + spawn.acceleration[i] * dt);
+                    prim.rotation = spawn.start_rotation + spawn.rotation_delta * (10.0 / 0.7)
+                        * (1.0 - (-0.7 * dt).exp());
+                    prim.rotation_delta = spawn.rotation_delta * (-0.7 * dt).exp();
+                }
+                prim.gpu_sleeping = false;
+            }
             let visible = saber_impact_fx || prim.class != FxClass::SaberImpact;
             let world = collision.as_deref_mut().map(|world| world as &mut dyn TraceWorld);
             update_primitive(prim, time, real_time, frame_time, rng, &mut out, &mut emits, visible, physics_mode, world)
         });
+        self.gpu_offloaded_last_frame = gpu_offloaded;
         for (id, origin, dir, class) in deaths {
             self.play_effect_dir_class(id, origin, dir, class);
         }
@@ -702,6 +795,14 @@ impl FxSystem {
         }
         while let Some((id, origin, axis, class)) = self.runner_queue.pop() {
             self.play_effect_class(id, origin, axis, class);
+        }
+        if self.gpu_staging {
+            out.gpu_sparks = Some(super::gpu_sparks::GpuSparkCommands {
+                generation: self.gpu_generation,
+                time_ms: self.time,
+                reset: std::mem::take(&mut self.gpu_pending_reset),
+                spawns: std::mem::take(&mut self.gpu_pending_spawns),
+            });
         }
         // Death/emitter effects spawned above are drawn from next frame on,
         // like OpenJK's FX_Add iterating a list that grows behind it.
@@ -894,7 +995,10 @@ impl FxSystem {
         let length = (fx.length_start.get(rng), fx.length_end.get(rng), parm(fx.length_parm.get(rng), FX_LENGTH_SHIFT));
         let alpha = (fx.alpha_start.get(rng), fx.alpha_end.get(rng), parm(fx.alpha_parm.get(rng), FX_ALPHA_SHIFT));
         let rgb_parm = parm(fx.rgb_parm.get(rng), FX_RGB_SHIFT);
-        let primitive = Primitive {
+        let mut primitive = Primitive {
+            gpu_id: None,
+            gpu_spawn: None,
+            gpu_sleeping: false,
             class,
             kind: fx.kind,
             auto_light,
@@ -935,6 +1039,44 @@ impl FxSystem {
         if self.active.len() >= MAX_ACTIVE {
             self.dropped += 1;
             return;
+        }
+        if self.gpu_staging {
+            // No silent promotion yet. This is intentionally a staging stream
+            // while the stock FX simulation and drawing remain unchanged.
+            let spawn = super::gpu_sparks::GpuSparkSpawn {
+                id: self.gpu_next_id,
+                generation: self.gpu_generation,
+                class: primitive.class,
+                shader: primitive.shader.clone().unwrap_or_default(),
+                start_ms: primitive.time_start,
+                end_ms: primitive.time_end,
+                origin: primitive.origin,
+                velocity: primitive.vel,
+                acceleration: primitive.accel,
+                start_rotation: primitive.rotation,
+                rotation_delta: primitive.rotation_delta,
+                rgb_start: primitive.rgb_start,
+                rgb_end: primitive.rgb_end,
+                alpha: primitive.alpha,
+                size: primitive.size,
+                rgb_parm: primitive.rgb_parm,
+                flags: primitive.flags,
+            };
+            self.gpu_next_id = self.gpu_next_id.wrapping_add(1);
+            if super::gpu_sparks::primitive_eligibility(
+                primitive.kind,
+                primitive.flags,
+                self.physics_mode,
+                primitive.impact_fx,
+                primitive.death_fx,
+                primitive.emitter_fx,
+                primitive.auto_light.is_some(),
+                spawn.values_finite(),
+            ).is_ok() {
+                primitive.gpu_id = Some(spawn.id);
+                primitive.gpu_spawn = Some(spawn.clone());
+                self.gpu_pending_spawns.push(spawn);
+            }
         }
         self.active.push(primitive);
     }
@@ -1044,6 +1186,9 @@ fn update_primitive(
                 PrimType::Particle => {
                     rotate(prim, frame_time);
                     if visible {
+                        if let Some(id) = prim.gpu_id {
+                            out.gpu_sprite_draw_indices.push((out.draws.len(), id));
+                        }
                         out.draws.push(FxDraw::Sprite { origin: prim.origin, radius, rotation: prim.rotation, rgba, shader });
                     }
                 }
@@ -1191,7 +1336,7 @@ fn impact_axis(normal: [f32; 3]) -> Axis {
 }
 
 /// The shared UpdateSize/RGB/Alpha/Length percentage: 1 at spawn, 0 at end.
-fn interpolation(flags: u32, parm: f32, start: i32, end: i32, time: i32, rng: &mut Rng) -> f32 {
+pub(super) fn interpolation(flags: u32, parm: f32, start: i32, end: i32, time: i32, rng: &mut Rng) -> f32 {
     let mut perc1 = 1.0f32;
     let mut perc2 = 1.0f32;
     let span = (end - start) as f32;
@@ -1506,6 +1651,99 @@ mod tests {
 
         fx.adjust_time(1200);
         assert!(fx.frame().draws.is_empty());
+    }
+
+    #[test]
+    fn gpu_ownership_sleep_and_cpu_handback_preserve_live_efx() {
+        let mut fx = FxSystem::new();
+        let id = fx.register("blaster/shot", &mut read_fixture(&[("effects/blaster/shot.efx", SHOT)]));
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.set_gpu_staging(true);
+        fx.play_effect_dir(id, [0.0; 3], [1.0, 0.0, 0.0]);
+        let birth = fx.frame();
+        let spark_id = birth.gpu_sparks.unwrap().spawns[0].id;
+        assert_eq!(birth.draws.len(), 2);
+        assert_eq!(birth.gpu_sprite_draw_indices.len(), 1);
+        fx.set_gpu_owned([spark_id].into_iter().collect());
+        fx.adjust_time(1032);
+        let owned = fx.frame();
+        assert_eq!(owned.draws.len(), 1, "only the Line stays on CPU");
+        assert!(owned.gpu_sprite_draw_indices.is_empty(), "owned sprite is not built");
+        assert_eq!(fx.stats().active, 2, "GPU ownership must not evict live FX slots");
+        let id_state = fx.active.iter().find(|p| p.gpu_id == Some(spark_id)).unwrap();
+        assert!(id_state.gpu_sleeping);
+        fx.adjust_time(1048);
+        let owned_again = fx.frame();
+        assert_eq!(owned_again.draws.len(), 1);
+        assert!(owned_again.gpu_sparks.unwrap().spawns.is_empty(), "upload at birth only");
+        fx.set_gpu_owned(HashSet::new());
+        fx.adjust_time(1064);
+        let resumed = fx.frame();
+        assert_eq!(resumed.draws.len(), 2, "cold PSO must restore CPU spark");
+        let FxDraw::Sprite { origin, .. } = &resumed.draws[1] else { panic!("missing CPU sprite") };
+        assert!(origin[0] > 0.0, "CPU state must be rehydrated, not frozen at spawn");
+        assert!(!fx.active.iter().find(|p| p.gpu_id == Some(spark_id)).unwrap().gpu_sleeping);
+        fx.adjust_time(1200);
+        assert!(fx.frame().draws.is_empty());
+        assert_eq!(fx.stats().active, 0);
+    }
+
+    #[test]
+    fn ownership_never_overrides_newly_required_collision() {
+        let mut fx = FxSystem::new();
+        // This authored visual has collision enabled but only traces at mode 3.
+        let fixture = "particle\n{\n life 100\n flags usePhysics\n shader\n [\n gfx/effects/whiteGlow\n ]\n }\n";
+        let mut read = |_path: &str| Some(fixture.as_bytes().to_vec());
+        let id = fx.register("fx/collision", &mut read);
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.set_gpu_staging(true);
+        fx.set_physics_mode(2);
+        fx.play_effect_dir(id, [0.0; 3], [1.0, 0.0, 0.0]);
+        let birth = fx.frame();
+        assert_eq!(birth.gpu_sparks.unwrap().spawns.len(), 1);
+        let spark_id = fx.active[0].gpu_id.unwrap();
+        fx.set_gpu_owned([spark_id].into_iter().collect());
+        fx.adjust_time(1032);
+        assert!(fx.frame().draws.is_empty(), "mode 2 can offload collisionless subset");
+        fx.set_physics_mode(3);
+        fx.adjust_time(1048);
+        assert_eq!(fx.frame().draws.len(), 1, "mode 3 must resume CPU physics");
+        assert!(!fx.active[0].gpu_sleeping);
+    }
+
+    #[test]
+    fn gpu_staging_emits_once_without_stealing_cpu_draws_and_resets_on_seek() {
+        let mut fx = FxSystem::new();
+        let id = fx.register("blaster/shot", &mut read_fixture(&[("effects/blaster/shot.efx", SHOT)]));
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.play_effect_dir(id, [0.0; 3], [1.0, 0.0, 0.0]);
+        assert!(fx.frame().gpu_sparks.is_none(), "disabled means zero staging cost");
+        fx.set_gpu_staging(true);
+        fx.play_effect_dir(id, [0.0; 3], [1.0, 0.0, 0.0]);
+        let first = fx.frame();
+        assert_eq!(first.draws.len(), 4, "staging is invisible to the CPU reference renderer");
+        let commands = first.gpu_sparks.expect("enabled staging clock");
+        assert!(commands.reset);
+        assert_eq!(commands.time_ms, 1016);
+        assert_eq!(commands.spawns.len(), 1, "only the collisionless sprite, not the line");
+        assert!(commands.spawns[0].values_finite());
+        assert_eq!(commands.spawns[0].generation, commands.generation);
+        fx.adjust_time(1032);
+        let second = fx.frame().gpu_sparks.expect("enabled staging clock");
+        assert!(!second.reset);
+        assert!(second.spawns.is_empty(), "no duplicate spawn uploads on repeated FX frames");
+        fx.adjust_time(500);
+        let seek = fx.frame().gpu_sparks.expect("seek must clear resident GPU states");
+        assert!(seek.reset);
+        assert!(seek.generation != commands.generation);
+        assert!(seek.spawns.is_empty());
+        fx.adjust_time(500);
+        let paused = fx.frame().gpu_sparks.expect("paused FX clock is sent every frame");
+        assert_eq!(paused.time_ms, 500);
+        assert!(!paused.reset);
     }
 
     #[test]

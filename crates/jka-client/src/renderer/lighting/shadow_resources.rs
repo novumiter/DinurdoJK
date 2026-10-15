@@ -109,7 +109,7 @@ pub(in crate::renderer) fn create_shadow_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: None,
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -167,7 +167,7 @@ pub(in crate::renderer) fn create_shadow_translucent_pipeline(
             targets: &[],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -210,7 +210,7 @@ pub(in crate::renderer) fn create_sky_admission_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: None,
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -271,7 +271,7 @@ pub(in crate::renderer) fn create_shadow_mask_pipeline(
             targets: &[],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 

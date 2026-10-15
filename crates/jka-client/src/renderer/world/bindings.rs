@@ -448,6 +448,14 @@ pub(in crate::renderer) fn create_world_bind_group(
 /// AUTO 4 batches share FULL's GPU resources: the first `auto4_variant_base`
 /// entries alias FULL 1:1 and each recipe uses its representative piece's
 /// bind state. Copy handles instead of creating a bind group per recipe.
+/// The FULL batch whose bind groups an AUTO batch mirrors.
+fn auto4_bind_source(index: usize, variant_base: usize, variant_members: &[Vec<usize>]) -> Option<usize> {
+    match index.checked_sub(variant_base) {
+        None => Some(index),
+        Some(variant) => variant_members.get(variant).and_then(|members| members.first().copied()),
+    }
+}
+
 pub(in crate::renderer) fn sync_auto4_bind_groups(world: &mut WorldGpu) {
     let WorldGpu {
         full_batches,
@@ -457,12 +465,7 @@ pub(in crate::renderer) fn sync_auto4_bind_groups(world: &mut WorldGpu) {
         ..
     } = world;
     for (index, batch) in auto4_batches.iter_mut().enumerate() {
-        let source = match index.checked_sub(*auto4_variant_base) {
-            None => Some(index),
-            Some(variant) => auto4_variant_members
-                .get(variant)
-                .and_then(|members| members.first().copied()),
-        };
+        let source = auto4_bind_source(index, *auto4_variant_base, auto4_variant_members);
         if let Some(full) = source.and_then(|source| full_batches.get(source)) {
             batch.bind_group = full.bind_group.clone();
             batch.fast_bind_group = full.fast_bind_group.clone();
@@ -649,7 +652,23 @@ pub(in crate::renderer) fn build_world_animation(
 /// Scan only world batches; static batches have no animation and do no work.
 pub(in crate::renderer) fn advance_world_animations(world: &mut WorldGpu, shader_time: f32) {
     let mut changed = false;
-    for batch in world.coarse_batches.iter_mut().chain(world.full_batches.iter_mut()) {
+    let animated = world.animated_batches.get_or_insert_with(|| {
+        let coarse = world.coarse_batches.iter().enumerate().map(|(i, b)| (false, i, b));
+        let full = world.full_batches.iter().enumerate().map(|(i, b)| (true, i, b));
+        let batches = coarse.chain(full)
+            .filter(|(_, _, batch)| batch.source.animation.is_some())
+            .map(|(set, i, _)| (set, i))
+            .collect();
+        let auto4 = (0..world.auto4_batches.len())
+            .filter_map(|index| {
+                let source = auto4_bind_source(index, world.auto4_variant_base, &world.auto4_variant_members)?;
+                world.full_batches.get(source)?.source.animation.is_some().then_some((index, source))
+            })
+            .collect();
+        super::types::AnimatedBatches { batches, auto4 }
+    });
+    for &(full, index) in &animated.batches {
+        let batch = if full { &mut world.full_batches[index] } else { &mut world.coarse_batches[index] };
         let Some(animation) = batch.animation.as_mut() else { continue };
         let Some(definition) = batch.source.animation.as_ref() else { continue };
         let time = jka_assets::shader::shader_time(shader_time, batch.source.shader_time_offset, batch.source.shader_clamp_time);
@@ -663,6 +682,12 @@ pub(in crate::renderer) fn advance_world_animations(world: &mut WorldGpu, shader
         changed = true;
     }
     if changed {
-        sync_auto4_bind_groups(world);
+        for &(index, source) in &animated.auto4 {
+            let full = &world.full_batches[source];
+            let batch = &mut world.auto4_batches[index];
+            batch.bind_group = full.bind_group.clone();
+            batch.fast_bind_group = full.fast_bind_group.clone();
+            batch.authored_glow_bind_group = full.authored_glow_bind_group.clone();
+        }
     }
 }

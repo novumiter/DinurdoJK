@@ -165,6 +165,9 @@ fn append_sub_bsp(map: &mut PreparedMap, mut child: PreparedMap) -> Result<(), S
         .checked_add(u32::try_from(child.vertices.len()).map_err(|_| "Inline vertices exceed u32")?)
         .ok_or("Inline vertices exceed u32")?;
     let batch_offset = map.inline_batches.len();
+    map.inline_patch_draws.extend(child.patch_draws.into_iter().map(|mut patch| {
+        patch.vertices.start += vertex_offset; patch.vertices.end += vertex_offset; patch
+    }));
     map.inline_vertices.append(&mut child.vertices);
     for batch in &mut child.batches {
         remap_batch(
@@ -201,6 +204,9 @@ fn append_sub_bsp(map: &mut PreparedMap, mut child: PreparedMap) -> Result<(), S
             debug_offset,
         )?;
     }
+    map.inline_patch_draws.extend(child.inline_patch_draws.into_iter().map(|mut patch| {
+        patch.vertices.start += vertex_offset; patch.vertices.end += vertex_offset; patch
+    }));
     map.inline_batches.append(&mut child.inline_batches);
     for mut model in child.inline_models {
         model.model += model_offset;
@@ -345,6 +351,71 @@ mod tests {
                 }
             },
         )
+    }
+
+    #[test]
+    fn menu_scenery_skips_gameplay_work_and_restores_collision_for_play() {
+        let root = std::env::temp_dir().join(format!(
+            "dinurdo-menu-scenery-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(root.join("maps")).unwrap();
+        std::fs::write(root.join("maps/menu.bsp"), render_bsp(1, "textures/menu", 1)).unwrap();
+        let options = MapPrepareOptions {
+            visual_only: true,
+            grass: false,
+            voxel_probe_gi: false,
+            ocean: false,
+            pbr_materials: false,
+            planar_reflections: false,
+            planar_environment: false,
+            ..Default::default()
+        };
+        let collision_jobs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = collision_jobs.clone();
+        let jobs = MapJobPool::new_with_progress(move |progress| {
+            if progress.task == crate::thread_activity::Task::MapCollision {
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }).unwrap();
+        for worker_pool in [false, true] {
+            let prepare = |options, seed: Option<&Arc<PreparedMap>>| {
+                if worker_pool {
+                    super::super::prepare_with_jobs_options(&root, None, "menu", &jobs, options, seed)
+                } else if let Some(seed) = seed {
+                    super::super::prepare_with_seed(&root, None, "menu", options, seed)
+                } else {
+                    super::super::prepare_with_options(&root, None, "menu", options)
+                }.unwrap()
+            };
+            let before = collision_jobs.load(std::sync::atomic::Ordering::Relaxed);
+            let menu = Arc::new(prepare(options, None));
+            assert!(!menu.vertices.is_empty(), "menu retains its render geometry");
+            assert!(menu.collision.is_none());
+            assert!(menu.movement.is_none());
+            assert!(menu.mark_surfaces.is_none());
+            assert!(menu.physics_collision.triangle_data().is_none());
+            assert!(menu.steam_audio_acoustic_mesh.is_none());
+            assert_eq!(menu.load_timings.collision_ms, 0.0);
+            assert_eq!(collision_jobs.load(std::sync::atomic::Ordering::Relaxed), before,
+                "menu must not queue the native collision/CM optimization job");
+
+            let gameplay = Arc::new(prepare(MapPrepareOptions { visual_only: false, ..options }, Some(&menu)));
+            assert!(gameplay.collision.is_some(), "entering play must build collision even from a menu seed");
+            assert!(gameplay.mark_surfaces.is_some());
+            assert_eq!(gameplay.vertices.len(), menu.vertices.len());
+            assert_eq!(gameplay.batches.len(), menu.batches.len());
+
+            let before = collision_jobs.load(std::sync::atomic::Ordering::Relaxed);
+            let menu_again = prepare(options, Some(&gameplay));
+            assert!(menu_again.collision.is_none(), "menu must not inherit gameplay collision");
+            assert!(menu_again.mark_surfaces.is_none());
+            assert_eq!(collision_jobs.load(std::sync::atomic::Ordering::Relaxed), before);
+        }
+        assert!(root.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

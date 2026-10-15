@@ -55,6 +55,29 @@ impl DynamicModelRenderer {
             }
             return true;
         }
+        if let Some(resident) = &sprites.resident {
+            // Carry GPU birth commands even when all eligible effects are
+            // temporarily hidden. No empty frame may lose a slot upload.
+            self.resident_fx_frame = Some(Arc::clone(&resident.frame));
+            if !resident.slots.is_empty() {
+                self.resident_fx_requested_modes |= 1u16 << surface.alpha_mode.index();
+                // Never drop FX while a lazy GPU shader/PSO is compiling.
+                // The packed ordinary instances are the visual fallback.
+                if self.resident_fx.as_ref().is_some_and(|backend| backend.ready(surface.alpha_mode)) {
+                    let first_instance = self.resident_fx_slots.len() as u32;
+                    self.resident_fx_slots.extend(resident.slots.iter().copied());
+                    self.resident_fx_draws.push(super::resident_fx::PreparedResidentFxDraw {
+                        entity_num: surface.entity_num,
+                        first_instance,
+                        instance_count: resident.slots.len() as u32,
+                        texture_key: texture_key.clone(),
+                        alpha_mode: surface.alpha_mode,
+                        authored_glow: surface.authored_glow,
+                    });
+                    return true;
+                }
+            }
+        }
         if sprites.instances.is_empty() {
             return true;
         }
@@ -81,6 +104,27 @@ impl DynamicModelRenderer {
         fx_sprite_instances: &[crate::renderer::FxGpuSpriteInstance],
         prepare_authored_glow: bool,
     ) {
+        // Request only modes actually referenced by this FX frame. Other
+        // unrelated renderer shaders remain cold; no startup compile cost.
+        if self.resident_fx_frame.is_some() {
+            let camera_layout = self.camera_layout.clone();
+            let texture_layout = self.texture_layout.clone();
+            let resident = self.resident_fx.get_or_insert_with(|| {
+                super::resident_fx::ResidentFxBackend::new(
+                    device, &camera_layout, &texture_layout,
+                )
+            });
+            for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
+                if self.resident_fx_requested_modes & (1u16 << alpha_mode.index()) != 0 {
+                    resident.ensure_pipeline(jobs, device, alpha_mode,
+                        self.fx_sprite_surface_format, self.fx_sprite_samples,
+                        self.legacy_fog_compiled, self.fx_zero_alpha_discard);
+                }
+            }
+            if let Some(frame) = self.resident_fx_frame.as_ref() {
+                resident.upload(device, queue, frame, &self.resident_fx_slots);
+            }
+        }
         if !self.fx_sprite_draws.is_empty() {
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
                 if self
@@ -144,6 +188,10 @@ impl DynamicModelRenderer {
         }
         self.draws.clear();
         self.fx_sprite_draws.clear();
+        self.resident_fx_draws.clear();
+        self.resident_fx_slots.clear();
+        self.resident_fx_frame = None;
+        self.resident_fx_requested_modes = 0;
         self.skin_draws.clear();
         self.skin_instance_entities.clear();
         self.frame_texture_keys.clear();
@@ -329,6 +377,13 @@ impl DynamicModelRenderer {
                     water_bands1: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.bands[4],p.bands[5],p.bands[6],p.bands[7]]),
                     water_base: self.entity_water.get(&surface.entity_num).map_or([0.0; 4], |p| [p.first_z, 0.0, 0.0, 1.0]),
                 };
+                let texture_binding_id = if self.ghoul2_batch_draws == Ghoul2BatchMode::Off {
+                    0
+                } else {
+                    texture_key.as_ref()
+                        .and_then(|key| self.textures.get(key))
+                        .map_or(0, |texture| texture.binding_id)
+                };
                 let mut pending = Ghoul2PendingDraw {
                     entity_num: surface.entity_num,
                     mesh_key,
@@ -337,18 +392,21 @@ impl DynamicModelRenderer {
                     wireframe_class: surface.wireframe_class,
                     authored_glow: surface.authored_glow,
                     source_material: source_material.is_some(),
+                    texture_binding_id,
                     uniform,
                     sequence: u32::try_from(skin_pending.len()).unwrap_or(u32::MAX),
                     batch_hash: None,
+                    batch_group_id: None,
                 };
                 if self.ghoul2_batch_key_cache && self.ghoul2_batch_draws != Ghoul2BatchMode::Off
                     && matches!(pending.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
                     && Some(pending.entity_num) != self.companion_excluded_entity
                 {
-                    let texture_id = pending.texture_key.as_ref()
-                        .and_then(|key| self.textures.get(key)).map_or(0, |texture| texture.binding_id);
-                    let (hash, hit) = mesh.batch_keys.resolve(&pending, texture_id, prepare_authored_glow);
-                    pending.batch_hash = Some(hash);
+                    let (id, hit) = mesh.batch_keys.resolve_group_id(
+                        &pending, texture_binding_id, prepare_authored_glow,
+                        &mut self.next_ghoul2_group_id,
+                    );
+                    pending.batch_group_id = Some(id);
                     if self.capture_prepare {
                         if hit { self.perf_prepare.batch_key_hits += 1; }
                         else { self.perf_prepare.batch_key_misses += 1; }
@@ -450,66 +508,54 @@ impl DynamicModelRenderer {
         if let Some(started) = pack_started { self.perf_prepare.cpu_pack_ms = started.elapsed().as_secs_f64() * 1000.0; }
         let group_started = self.capture_prepare.then(Instant::now);
         self.ghoul2_input_instances = u32::try_from(skin_pending.len()).unwrap_or(u32::MAX);
-        let batching_active = match self.ghoul2_batch_draws {
-            Ghoul2BatchMode::Off => false,
-            Ghoul2BatchMode::Adaptive => {
-                Self::should_adaptively_batch(&mut skin_pending, prepare_authored_glow)
-            },
-            Ghoul2BatchMode::Force => true,
+        // Fast path: per-mesh cached group IDs, one visible-instance bucket
+        // pass, and sorting only *unique* groups. All scratch allocations are
+        // retained. The older full-frame hash+sort remains an A/B fallback.
+        let mut group_lookup = std::mem::take(&mut self.scratch_group_lookup);
+        let mut frame_groups = std::mem::take(&mut self.scratch_frame_groups);
+        let mut group_sort = std::mem::take(&mut self.scratch_group_sort);
+        let mut group_order = std::mem::take(&mut self.scratch_group_order);
+        let cached_grouping = self.ghoul2_batch_key_cache
+            && self.ghoul2_batch_draws != Ghoul2BatchMode::Off;
+        let batching_active = if cached_grouping {
+            Self::prepare_cached_ghoul2_order(
+                &skin_pending, separate_wireframe_classes,
+                self.companion_excluded_entity, self.ghoul2_batch_draws,
+                &mut group_lookup, &mut frame_groups, &mut group_sort, &mut group_order,
+            )
+        } else {
+            match self.ghoul2_batch_draws {
+                Ghoul2BatchMode::Off => false,
+                Ghoul2BatchMode::Adaptive => {
+                    Self::should_adaptively_batch(
+                        &mut skin_pending, prepare_authored_glow,
+                        separate_wireframe_classes, self.companion_excluded_entity,
+                        &mut self.scratch_batch_counts,
+                    )
+                }
+                Ghoul2BatchMode::Force => true,
+            }
         };
-        if batching_active {
-            // Continue the adaptive probe rather than restarting it: sampled
-            // draws already carry their hash, and only the remaining draws are
-            // hashed here.  Force mode gets the same cheaper sort key.
+        if batching_active && !cached_grouping {
             for draw in &mut skin_pending {
-                if matches!(
-                    draw.alpha_mode,
-                    DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
-                ) && Some(draw.entity_num) != self.companion_excluded_entity
+                if matches!(draw.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
+                    && Some(draw.entity_num) != self.companion_excluded_entity
                     && draw.batch_hash.is_none()
                 {
                     draw.batch_hash = Some(Self::ghoul2_batch_hash(draw, prepare_authored_glow));
                 }
             }
-            let companion_excluded_entity = self.companion_excluded_entity;
-            skin_pending.sort_unstable_by(|a, b| {
-                let batchable_a = matches!(
-                    a.alpha_mode,
-                    DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
-                ) && Some(a.entity_num) != companion_excluded_entity;
-                let batchable_b = matches!(
-                    b.alpha_mode,
-                    DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
-                ) && Some(b.entity_num) != companion_excluded_entity;
-                match (batchable_a, batchable_b) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    (false, false) => a.sequence.cmp(&b.sequence),
-                    (true, true) => {
-                        let alpha_a = u8::from(matches!(a.alpha_mode, DynamicModelAlphaMode::Mask));
-                        let alpha_b = u8::from(matches!(b.alpha_mode, DynamicModelAlphaMode::Mask));
-                        let order = alpha_a.cmp(&alpha_b);
-                        let order = if separate_wireframe_classes {
-                            order.then_with(|| {
-                                a.wireframe_class
-                                    .mask_bit()
-                                    .cmp(&b.wireframe_class.mask_bit())
-                            })
-                        } else {
-                            order
-                        };
-                        order
-                            .then_with(|| a.batch_hash.cmp(&b.batch_hash))
-                            .then_with(|| a.mesh_key.as_ref().cmp(b.mesh_key.as_ref()))
-                            .then_with(|| a.texture_key.as_deref().cmp(&b.texture_key.as_deref()))
-                    }
-                }
-            });
+            Self::sort_ghoul2_pending(&mut skin_pending, prepare_authored_glow,
+                separate_wireframe_classes, self.companion_excluded_entity);
         }
+        // For an inactive adaptive frame, keep exact original submission order.
+        let ordered_index = |index: usize| -> usize {
+            if batching_active && cached_grouping { group_order[index] } else { index }
+        };
 
         let mut pending_index = 0usize;
         while pending_index < skin_pending.len() {
-            let pending = &skin_pending[pending_index];
+            let pending = &skin_pending[ordered_index(pending_index)];
             let candidate = batching_active
                 && matches!(
                     pending.alpha_mode,
@@ -519,7 +565,7 @@ impl DynamicModelRenderer {
             let mut group_end = pending_index + 1;
             if candidate {
                 while group_end < skin_pending.len() {
-                    let next = &skin_pending[group_end];
+                    let next = &skin_pending[ordered_index(group_end)];
                     if Some(next.entity_num) == self.companion_excluded_entity
                         || next.alpha_mode != pending.alpha_mode
                         // One instanced draw call is one pipeline, and a Source
@@ -542,7 +588,7 @@ impl DynamicModelRenderer {
             let instance_group = candidate
                 && match self.ghoul2_batch_draws {
                     Ghoul2BatchMode::Off => false,
-                    Ghoul2BatchMode::Adaptive => group_len >= 3,
+                    Ghoul2BatchMode::Adaptive => group_len >= 2,
                     Ghoul2BatchMode::Force => group_len >= 2,
                 };
 
@@ -561,7 +607,8 @@ impl DynamicModelRenderer {
 
             if instance_group {
                 let first_instance = u32::try_from(gpu_draw_data.len()).unwrap_or(u32::MAX);
-                for item in &skin_pending[pending_index..group_end] {
+                for index in pending_index..group_end {
+                    let item = &skin_pending[ordered_index(index)];
                     gpu_draw_data.push(item.uniform);
                     self.skin_instance_entities.push(item.entity_num);
                 }
@@ -577,7 +624,8 @@ impl DynamicModelRenderer {
                     instance_count: u32::try_from(group_len).unwrap_or(u32::MAX),
                 });
             } else {
-                for item in &skin_pending[pending_index..group_end] {
+                for index in pending_index..group_end {
+                    let item = &skin_pending[ordered_index(index)];
                     let first_instance = u32::try_from(gpu_draw_data.len()).unwrap_or(u32::MAX);
                     gpu_draw_data.push(item.uniform);
                     self.skin_instance_entities.push(item.entity_num);
@@ -596,6 +644,10 @@ impl DynamicModelRenderer {
             }
             pending_index = group_end;
         }
+        self.scratch_group_lookup = group_lookup;
+        self.scratch_frame_groups = frame_groups;
+        self.scratch_group_sort = group_sort;
+        self.scratch_group_order = group_order;
         self.ghoul2_encoded_draws = u32::try_from(self.skin_draws.len()).unwrap_or(u32::MAX);
         if let Some(started) = group_started { self.perf_prepare.ghoul2_group_ms = started.elapsed().as_secs_f64() * 1000.0; }
         let upload_started = self.capture_prepare.then(Instant::now);
@@ -709,7 +761,7 @@ impl DynamicModelRenderer {
                 let Some(pipeline) = pipeline else {
                     continue;
                 };
-                if self.model_render_bundles && !preserve_order
+                if alpha_mode != DynamicModelAlphaMode::Glass && self.model_render_bundles && !preserve_order
                     && super::bundles::eligible_pass(self.rt_prepared, excluded_entity, authored_glow_only)
                 {
                     if let Some((bundle, represented_draws, last_texture)) = self.model_bundles.executable(
@@ -775,6 +827,10 @@ impl DynamicModelRenderer {
                     };
                 if capture_calls { calls.set_pipeline += 1; }
                 pass.set_pipeline(pipeline);
+                if alpha_mode == DynamicModelAlphaMode::Glass {
+                    let Some(glass) = self.glass_bind_group.as_ref() else { continue; };
+                    pass.set_bind_group(2, glass, &[]);
+                }
                 // Track only this pipeline's bindings: subsequent pipelines,
                 // draw_phase invocations and passes always start afresh.
                 let mut current_texture = None;
@@ -874,6 +930,52 @@ impl DynamicModelRenderer {
             }
         }
 
+        // GPU-resident effects use the SAME material group as FX sprites but
+        // their independent group 2 binds persistent spawn data, draw slots and
+        // the demo/FX clock. They never borrow Ghoul2's group 2 or weather's.
+        if let Some(resident) = self.resident_fx.as_ref() {
+            let relevant = self.resident_fx_draws.iter().any(|draw| {
+                dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
+                    && Some(draw.entity_num) != excluded_entity
+                    && (!authored_glow_only || draw.authored_glow)
+            });
+            if relevant {
+                pass.set_bind_group(0, camera, &[]);
+                pass.set_bind_group(2, resident.bind_group(), &[]);
+                if capture_calls { calls.set_bind_group += 2; }
+                let mut last_pipeline = None;
+                let mut last_texture = None;
+                for draw in &self.resident_fx_draws {
+                    if dynamic_model_writes_depth(draw.alpha_mode) != depth_writing_phase
+                        || Some(draw.entity_num) == excluded_entity
+                        || (authored_glow_only && !draw.authored_glow)
+                    { continue; }
+                    // Stage `glow` replay is never promoted until it has an
+                    // independently-specialized FORCE_FOG_BLACK pipeline.
+                    if authored_glow_only || draw.authored_glow { continue; }
+                    let Some(pipeline) = resident.pipeline(draw.alpha_mode) else { continue; };
+                    if !last_pipeline.is_some_and(|mode| mode == draw.alpha_mode) {
+                        pass.set_pipeline(pipeline);
+                        last_pipeline = Some(draw.alpha_mode);
+                        last_texture = None;
+                        if capture_calls { calls.set_pipeline += 1; }
+                    }
+                    let bind_group = draw.texture_key.as_ref()
+                        .and_then(|key| self.textures.get(key))
+                        .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                    if !self.model_state_cache
+                        || !last_texture.is_some_and(|prior| std::ptr::eq(prior, bind_group))
+                    {
+                        pass.set_bind_group(1, bind_group, &[]);
+                        last_texture = Some(bind_group);
+                        if capture_calls { calls.set_bind_group += 1; }
+                    }
+                    pass.draw(0..6, draw.first_instance..draw.first_instance.saturating_add(draw.instance_count));
+                    if capture_calls { calls.fx_draw += 1; }
+                }
+            }
+        }
+
         if !self.skin_draws.is_empty() {
             if capture_calls { calls.set_bind_group += 1; }
             pass.set_bind_group(0, camera, &[]);
@@ -908,6 +1010,10 @@ impl DynamicModelRenderer {
                     pass.set_pipeline(pipeline);
                     if capture_calls { calls.set_bind_group += 1; }
                     pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                    if alpha_mode == DynamicModelAlphaMode::Glass {
+                        let Some(glass) = self.glass_bind_group.as_ref() else { continue; };
+                        pass.set_bind_group(3, glass, &[]);
+                    }
                     let mut current_texture = None;
                     let mut current_mesh = None;
                     for draw in self.skin_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {

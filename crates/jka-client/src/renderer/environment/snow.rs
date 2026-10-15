@@ -1,6 +1,6 @@
 //! Environment snow.
 use crate::renderer::{
-    aabb_intersects_clip_frustum, mpsc, Arc, BTreeMap, DrawBatch, DrawClass, Duration, GpuVertex,
+    aabb_intersects_clip_frustum, hidden_bsp_model_surface, mpsc, Arc, BTreeMap, DrawBatch, DrawClass, Duration, GpuVertex,
     HashMap, HashSet, Instant, Mat4, Mutex, PipelineKey, Vec2, Vec3, WorldGpu,
     WorldPipelineBinding, MATERIAL_SNOW,
     SNOW_SHELL_CHUNK_SIZE, SNOW_SHELL_DRAW_RADIUS, SNOW_SHELL_TESSELLATION,
@@ -530,6 +530,7 @@ pub(in crate::renderer) fn draw_snow_shell_fast<'a>(
     world: &'a WorldGpu,
     view_proj: Mat4,
     deform_center: Vec2,
+    draw_bsp_model_surfaces: bool,
     current_pipeline: &mut Option<PipelineKey>,
 ) {
     if world.snow_shell.chunks.is_empty() {
@@ -556,6 +557,9 @@ pub(in crate::renderer) fn draw_snow_shell_fast<'a>(
             let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
                 continue;
             };
+            if hidden_bsp_model_surface(draw_bsp_model_surfaces, batch, &world.material_debug) {
+                continue;
+            }
             if *current_pipeline != Some(batch.source.pipeline) {
                 pass.set_pipeline(&world.fast_pipelines[&batch.source.pipeline]);
                 *current_pipeline = Some(batch.source.pipeline);
@@ -576,6 +580,7 @@ pub(in crate::renderer) fn draw_snow_shell<'a>(
     pipelines: &'a BTreeMap<PipelineKey, wgpu::RenderPipeline>,
     view_proj: Mat4,
     deform_center: Vec2,
+    draw_bsp_model_surfaces: bool,
     current_pipeline: &mut Option<WorldPipelineBinding>,
 ) {
     if world.snow_shell.chunks.is_empty() {
@@ -602,6 +607,9 @@ pub(in crate::renderer) fn draw_snow_shell<'a>(
             let Some(batch) = world.coarse_batches.get(draw.coarse_batch_index) else {
                 continue;
             };
+            if hidden_bsp_model_surface(draw_bsp_model_surfaces, batch, &world.material_debug) {
+                continue;
+            }
             // Snow shells always use the general program.
             if *current_pipeline != Some((batch.source.pipeline, None)) {
                 pass.set_pipeline(&pipelines[&batch.source.pipeline]);

@@ -567,6 +567,7 @@ fn nodraw_terrain_patch_is_bed_and_triangle_wall_seals_the_face() {
             lightmap_styles: [0; 4],
             vertex_styles: [0; 4],
             patch_size: [3, 3],
+            patch_lod_bounds: [[0.0;3];2],
         }],
         models: vec![Model {
             mins: [0., 0., -10.],
@@ -656,4 +657,75 @@ fn sparse_l_tiles_skip_the_empty_envelope_corner_and_stitch_open_faces() {
         Boundary::Open
     );
     assert_eq!(lower_left.faces_y[ny * nx + 8].boundary, Boundary::Open);
+}
+
+#[test]
+fn water_volume_shaders_keep_brush_and_top_plane_sheets_only() {
+    use crate::bsp::{Brush, BrushSide, Model, Shader};
+    let shader = |name: &[u8], contents| Shader { name: name.to_vec(), surface_flags: 0, contents };
+    let solid = box_solid([-100., -100., -128.], [100., 100., -16.]);
+    let bsp = Bsp {
+        collision: None,
+        visibility: None,
+        shaders: vec![
+            shader(b"caulk_water", CONTENTS_WATER),
+            shader(b"oceanwater", CONTENTS_WATER),
+            // seph_surf: water contents in the table, never on a brush.
+            shader(b"seph_surf", CONTENTS_WATER),
+            shader(b"rock", CONTENTS_SOLID),
+            // Water-contents sheet lying exactly on the brush top (z = -16).
+            shader(b"lakewater", CONTENTS_WATER),
+        ],
+        fogs: vec![],
+        vertices: [-16., -16., -16., -14., -14., -14.]
+            .into_iter()
+            .enumerate()
+            .map(|(i, z)| crate::bsp::Vertex {
+                position: [(i % 3) as f32 * 40., (i % 3) as f32 * 10., z],
+                texcoord: [0.; 2],
+                lightmap_uv: [[0.; 2]; 4],
+                normal: [0., 0., 1.],
+                color: [[255; 4]; 4],
+            })
+            .collect(),
+        indices: vec![],
+        // lakewater on the top plane; seph_surf two units above it.
+        surfaces: [(4usize, 0usize..3usize), (2, 3..6)]
+            .into_iter()
+            .map(|(shader, vertices)| crate::bsp::Surface {
+                shader,
+                fog_num: -1,
+                kind: crate::bsp::SurfaceKind::Patch,
+                flare: None,
+                vertices,
+                indices: 0..0,
+                lightmaps: [-1; 4],
+                lightmap_styles: [255; 4],
+                vertex_styles: [255; 4],
+                patch_size: [0; 2],
+                patch_lod_bounds: [[0.; 3]; 2],
+            })
+            .collect(),
+        models: vec![Model {
+            mins: [-100., -100., -128.],
+            maxs: [100., 100., 0.],
+            surfaces: 0..0,
+            brushes: 0..2,
+        }],
+        planes: solid.planes,
+        brushes: vec![
+            Brush { sides: 0..6, shader: 0 },
+            // A solid brush's sides never make a shader a water volume.
+            Brush { sides: 0..6, shader: 3 },
+        ],
+        brush_sides: (0..6)
+            .map(|plane| BrushSide { plane, shader: if plane == 4 { 1 } else { 0 } })
+            .collect(),
+        entities: vec![],
+        lightmaps: vec![],
+        light_grid: None,
+    };
+    let volume = water_volume_shaders(&bsp);
+    // 0/1 are on a water brush, 4 lies on its top plane; seph_surf (2) floats above it.
+    assert_eq!(volume.into_iter().collect::<Vec<_>>(), vec![0, 1, 4]);
 }

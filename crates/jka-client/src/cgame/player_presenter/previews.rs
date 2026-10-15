@@ -33,6 +33,55 @@ impl PlayerPresenter {
         )
     }
 
+    /// `TurretClientRun` from TaystJK. This is deliberately separate from
+    /// `present_static_glm`: the pickup remains a static registration while
+    /// deployed (bolt1) ET_GENERAL entities animate on their own clock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn present_turret_glm(
+        &mut self,
+        entity_num: u16,
+        model_qpath: &str,
+        origin: [f32; 3],
+        axis: [[f32; 3]; 3],
+        rgba: [f32; 4],
+        started_at: i32,
+        current_time: i32,
+        hinge_angles: [f32; 3],
+        muzzle_flash: bool,
+    ) -> Result<(Vec<DynamicModelSurface>, Option<([f32; 3], [f32; 3])>), String> {
+        let model = self.load_static_glm(model_qpath, None, model_qpath)?;
+        let mut animator = Ghoul2Animator::new(&model.animation_gla);
+        // Exactly CG_TurretClientRun's model_root clip, not a generic GLM idle.
+        animator.set_bone_anim(&model.animation_gla, "model_root", 0, 11,
+            BONE_ANIM_OVERRIDE_FREEZE, 0.8, started_at, None, 0)?;
+        for bone in ["bone_gback", "bone_barrel"] {
+            animator.set_bone_angles_postmult(&model.animation_gla, bone,
+                [0.0; 3], jka_movement::G2_POSITIVE_Y,
+                jka_movement::G2_POSITIVE_Z, jka_movement::G2_POSITIVE_X)?;
+        }
+        animator.set_bone_angles_replace(&model.animation_gla, "bone_hinge",
+            hinge_angles, jka_movement::G2_NEGATIVE_Y,
+            jka_movement::G2_NEGATIVE_Z, jka_movement::G2_NEGATIVE_X)?;
+        let pose_started = Instant::now();
+        let pose = model.bind_animation_pose(
+            animator.evaluate_pose_openjk_root(&model.animation_gla, current_time)?)?;
+        record_pose_eval(&mut self.perf, pose_started);
+        // CG_TurretClientRun takes the origin and NEGATIVE_X of *flash02.
+        let muzzle = if muzzle_flash {
+            model_bolt_matrix_timed(&mut self.perf, &model.glm, &model.gla, &pose, "*flash02")?
+                .map(|bolt| {
+                    let local = [bolt[0][3], bolt[1][3], bolt[2][3]];
+                    let dir = [-bolt[0][0], -bolt[1][0], -bolt[2][0]];
+                    (transform_jka_model_point(local, axis, origin),
+                     transform_jka_model_vector(dir, axis))
+                })
+        } else { None };
+        let draws = self.render_glm_surfaces(entity_num, model_qpath,
+            &model.glm, &model.gla, &model.surfaces, None, &pose,
+            0, axis, origin, rgba, None, true)?;
+        Ok((draws, muzzle))
+    }
+
     /// Submit a Ghoul2 model in its default pose as one refEntity: `axis` may
     /// carry a non-uniform scale (CG_Item's 1.5x weapons), `rgba` is the
     /// RF_RGB_TINT/RF_FORCE_ENT_ALPHA shaderRGBA and `custom_shader` replaces

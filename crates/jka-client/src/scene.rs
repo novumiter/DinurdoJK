@@ -35,7 +35,7 @@ pub(crate) use cache::FoldHasher;
 pub(crate) use shader_remap::{
     apply_shader_remaps, apply_shader_remaps_in_place, apply_reverse_lightmap_collapse_in_place,
     expand_additive_stage_fusion_in_place, fuse_additive_stage_fusion_in_place,
-    canonical_shader_name, ShaderRemapState,
+    canonical_shader_name, prepare_remap_plan, ShaderRemapState,
 };
 use cache::{map_content_hash, static_bsp_ao_cache_info, StageFingerprint};
 pub use cache::{PrepStageKeys, StaticBspAoCacheInfo};
@@ -203,9 +203,9 @@ pub enum BlendMode {
 
 /// A single policy for the two zero-extra-pass legacy RGB implementations.
 /// The exact fused recipe can blend known texture inputs in encoded sRGB;
-/// independently blended additive stages can only encode the source before
-/// the existing linear scene target's fixed-function blend. The latter is an
-/// intentional, measured approximation of the original framebuffer operation.
+/// independently blended additive stages can correct the source texture
+/// modulation, but cannot reproduce legacy destination-dependent blending
+/// exactly without reading the prior framebuffer color.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegacyRgbCompositing {
     Linear,
@@ -286,14 +286,30 @@ pub struct DrawBatch {
     /// Two packed u32s keep this developer metadata to 8 bytes per draw batch.
     pub material_debug_index: u32,
     pub surface_material: u8,
+    /// First and only pass of an explicitly authored Glass material.
+    pub glass_primary: bool,
+    pub glass_tint: [f32; 3],
+    pub glass_reflectance: f32,
     /// Map-load classification: all stages of an opaque, depth-seeding
     /// material must finish before fullscreen cloud attenuation. A blended
     /// sibling stage does not make the *whole* material transparent.
     pub opaque_composite_before_clouds: bool,
+    /// Alpha overlay on an already lit opaque surface (see
+    /// `lit_overlay_trailing_stages`): drawn behind the cloud multiplier, but
+    /// still part of the surface for ocean absorption, so it must not be
+    /// deferred past the underwater optics capture.
+    pub lit_overlay: bool,
+    /// `sort additive` shader whose first stage is a depth-writing cutout
+    /// (underwater seaweed and fish). The late sort keeps its stages behind the
+    /// water, but when the ocean optics run they must be part of the scene the
+    /// capture absorbs and refracts.
+    pub late_depth_seed: bool,
     /// Explicit TaystJK shader sort at/after SS_SEE_THROUGH (including
     /// `sort additive`). The complete stage chain, even an alpha-tested
     /// depth-writing base, must be presented in the late-sorted world queue.
     pub late_sorted_material: bool,
+    /// Complete authored shader sort, fixed-point. Used only for safe reorder bounds.
+    pub authored_sort_priority: i32,
     /// Image index when this stage samples a regular texture.
     pub texture: Option<usize>,
     /// For a safely fused authored lightmap/diffuse/vertex-alpha overlay, the
@@ -399,6 +415,11 @@ pub struct DrawBatch {
     pub light_filter: bool,
     /// First authored stage used as the promoted-water replacement draw.
     pub water_primary: bool,
+    /// A water-material sheet that is not itself a body of water (a shore-surf
+    /// or foam overlay that fades to zero, or `surfaceparm water` with no water
+    /// brush behind it). It is never promoted, and is hidden while it lies over
+    /// a promoted ocean, which supplies its own surf and foam.
+    pub water_overlay: bool,
     pub authored_ocean: Option<usize>,
     /// A `tcGen environment` stage whose source geometry is sufficiently planar
     /// to be promoted to the exact planar-reflection path when requested.
@@ -804,6 +825,9 @@ pub struct MapLoadTimings {
 
 /// Labels for `MapLoadTimings::phase_ms`, in execution order. Together they
 /// cover the whole of `prepare_internal`, so they sum to `prepare_wall_ms`.
+/// `authored_sort_priority` of TaystJK SS_OPAQUE (3); lower sorts draw before opaque.
+pub const SS_OPAQUE_SORT_PRIORITY: i32 = 3 * 1024;
+
 pub const PREP_PHASES: [&str; 16] = [
     "startup (index/parse/shaders)",
     "tex submit+collision+meshes+fog",
@@ -831,6 +855,12 @@ fn phase_lap(timings: &mut MapLoadTimings, phase: usize, clock: &mut Instant) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapPrepareOptions {
+    /// BSP scenery only: skip player collision, movement timings and mark indices.
+    /// Gameplay loads must use false, even when reusing a menu scene as a seed.
+    pub visual_only: bool,
+    /// Float bits keep the map-preparation cache key Eq without rounding the cvar.
+    pub patch_subdivisions_bits: u32,
+    pub patch_stitching: bool,
     /// Renderer upload policy captured with the prepared world so changing
     /// classic `r_picmip` can use the normal Apply Video Settings/map-reload
     /// path without pretending the old GPU textures already changed.
@@ -878,6 +908,9 @@ pub struct MapPrepareOptions {
 impl Default for MapPrepareOptions {
     fn default() -> Self {
         Self {
+            visual_only: false,
+            patch_subdivisions_bits: 4.0_f32.to_bits(),
+            patch_stitching: true,
             picmip: 0,
             grass: true,
             voxel_probe_gi: true,
@@ -1415,8 +1448,45 @@ pub struct WorldFlare {
     pub clusters: Vec<usize>,
 }
 
+/// Material/stage-only replacement. A remap never owns or copies the BSP
+/// vertex/index, collision, probe, lightmap, texture or PVS source allocations.
+/// The pristine Arc also enables a faithful full-load fallback ONLY when
+/// genuinely new geometry is required by the replacement shader.
+pub struct PreparedRemapPlan {
+    pub base: Arc<PreparedMap>,
+    pub batches: Vec<DrawBatch>,
+    pub pvs_batches: Vec<DrawBatch>,
+    pub inline_batches: Vec<DrawBatch>,
+    pub inline_models: Vec<InlineModelGeometry>,
+    pub portal_draw_plan: PreparedPortalDrawPlan,
+    pub replacement_textures: Vec<TextureData>,
+    pub replacement_texture_hashes: Vec<u64>,
+    pub replacement_videos: Vec<materials::VideoSource>,
+    pub warnings: Vec<String>,
+}
+
+impl PreparedRemapPlan {
+    /// Rare fallback for material changes that generate physical geometry.
+    pub fn into_full_map(self) -> PreparedMap {
+        let mut map = (*self.base).clone();
+        map.batches = self.batches;
+        map.pvs_batches = self.pvs_batches;
+        map.inline_batches = self.inline_batches;
+        map.inline_models = self.inline_models;
+        map.portal_draw_plan = self.portal_draw_plan;
+        map.textures.extend(self.replacement_textures);
+        map.texture_hashes.extend(self.replacement_texture_hashes);
+        map.videos.extend(self.replacement_videos);
+        map.warnings.extend(self.warnings);
+        map.load_timings = MapLoadTimings::default();
+        map
+    }
+}
+
 #[derive(Clone)]
 pub struct PreparedMap {
+    pub patch_draws: Vec<PreparedPatchDraw>,
+    pub inline_patch_draws: Vec<PreparedPatchDraw>,
     /// Background static coastal geometry; never waited on by map loading or rendering.
     pub coastal_bathymetry: Option<Arc<crate::ocean::bathymetry::Job>>,
     /// Parsed renderer shader table retained on the CPU so runtime
@@ -1447,6 +1517,10 @@ pub struct PreparedMap {
     pub world_flares: Vec<WorldFlare>,
     /// Original BSP surface for every static-world source triangle.
     pub legacy_dlight_triangle_surfaces: Vec<u32>,
+    /// True only for original BSP MST_TRIANGLE_SOUP surfaces using a models/
+    /// shader. A models/ material name alone does not establish mesh provenance;
+    /// the actual surface type must also match. Source-.map worlds leave this empty.
+    pub bsp_compiled_model_surfaces: Vec<bool>,
     /// OpenJK-style coarse dlight rejection metadata, indexed by BSP surface.
     pub legacy_dlight_surfaces: Vec<LegacyDlightSurface>,
     /// Coarse material/lightmap batches used by OFF and MINIMAL PVS modes.
@@ -1549,6 +1623,14 @@ pub struct PreparedMap {
     pub stage_keys: PrepStageKeys,
     /// Per-texture decode hashes aligned with `textures` (0 = not a plain decode).
     pub texture_hashes: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedPatchDraw {
+    pub surface: usize,
+    /// Load-time triangle-list range after material/PVS packing.
+    pub vertices: Range<u32>,
+    pub lod: Arc<jka_assets::bsp::patch::PatchLod>,
 }
 
 const LEGACY_FOOTPRINT_SHADERS: [&str; 2] = ["footstep_l", "footstep_r"];

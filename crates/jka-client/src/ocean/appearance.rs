@@ -233,16 +233,14 @@ fn promoted_water_color(color: [f32; 3]) -> [f32; 3] {
 
 impl PromotedOcean {
     pub fn settings(&self, mut shared: super::OceanSettings) -> super::OceanSettings {
+        // Promotion supplies only what the map knows: the base amplitude, the
+        // water colour (below), an authored roughness and the swell heading.
+        // Wavelength, speed, choppiness, wind chop, foam, spray and roughness
+        // follow the amplitude through the ocean links (see `surface_settings`).
         shared.authored.amplitude = self.heuristic.amplitude;
-        shared.authored.wavelength = self.heuristic.wavelength;
-        shared.authored.speed = 48.0;
-        shared.authored.steepness = self.heuristic.chop;
-        shared.authored.slosh = DEFAULT_PROMOTED_FFT_BLEND;
         if let Some(direction) = self.swell_direction {
             shared.authored.direction = direction;
         }
-        shared.authored.wind_chop = self.heuristic.chop;
-        shared.authored.foam = self.heuristic.foam;
         // Keep the global normal-strength setting rather than weakening promoted water.
         shared.water_color = promoted_water_color(self.color);
         shared.roughness = self.roughness.unwrap_or(shared.roughness);
@@ -280,6 +278,10 @@ pub fn surface_settings(
     settings.authored.foam_lifetime = shared.authored.foam_lifetime;
     settings.bounds = None;
     settings.authored.amplitude = settings.authored.amplitude.max(MIN_PROMOTED_AMPLITUDE);
+    // Locked controls follow this pool's amplitude, whether it is automatic or
+    // a local override. A shader-authored roughness stays authoritative.
+    settings.links = shared.links;
+    settings.apply_links(descriptor.roughness.is_some());
     settings.sanitize()
 }
 
@@ -527,9 +529,45 @@ pub(super) mod tests {
 
     #[test]
     fn promoted_water_defaults_to_fft_dominant_cross_sea() {
-        let settings = pool(0, 0.0).settings(super::super::OceanSettings::default());
+        let shared = super::super::OceanSettings::default();
+        let settings = pool(0, 0.0).settings(shared);
         assert_eq!(settings.authored.amplitude, MIN_PROMOTED_AMPLITUDE);
-        assert_eq!(settings.authored.slosh, DEFAULT_PROMOTED_FFT_BLEND);
+        // Promotion supplies the amplitude and colour only; the cross-sea blend
+        // is the shared (upstream, pure FFT) value.
+        assert_eq!(settings.authored.slosh, shared.authored.slosh);
+        assert_eq!(settings.authored.wavelength, shared.authored.wavelength);
+        assert_eq!(settings.authored.steepness, shared.authored.steepness);
+    }
+
+    #[test]
+    fn promoted_water_follows_its_own_amplitude_through_the_links() {
+        let shared = super::super::OceanSettings::default();
+        let calm = surface_settings(shared, &pool(0, 0.0), None);
+        // The shader-authored roughness (pool() sets one) is kept, the rest is derived.
+        assert_eq!(calm.roughness, 0.4);
+        let d = super::super::authoring::derive_from_amplitude(calm.authored.amplitude);
+        assert_eq!(calm.authored.wavelength, d.wavelength);
+        assert_eq!(calm.authored.foam, d.foam);
+        assert!(calm.authored.wavelength < shared.authored.wavelength);
+        // An unlocked control keeps the value the pool started with.
+        let mut unlocked = shared;
+        unlocked.links &= !super::super::links::WAVELENGTH;
+        assert_eq!(surface_settings(unlocked, &pool(0, 0.0), None).authored.wavelength, shared.authored.wavelength);
+    }
+
+    #[test]
+    fn amplitude_links_equal_upstream_at_the_default_sea_and_scale_monotonically() {
+        use super::super::authoring::derive_from_amplitude as derive;
+        let d = derive(128.0);
+        assert_eq!((d.wavelength, d.speed, d.steepness, d.wind_chop, d.foam, d.spray, d.roughness),
+            (1400.0, 180.0, 0.65, 1.0, 1.0, 1.0, 0.2));
+        let (small, large) = (derive(10.0), derive(400.0));
+        assert!(small.roughness < d.roughness && d.roughness < large.roughness);
+        assert!(small.wavelength < d.wavelength && d.wavelength < large.wavelength);
+        assert!(small.foam < d.foam && small.steepness < d.steepness);
+        let mut defaults = super::super::OceanSettings::default();
+        defaults.apply_links(false);
+        assert_eq!(defaults, super::super::OceanSettings::default());
     }
 
     #[test]

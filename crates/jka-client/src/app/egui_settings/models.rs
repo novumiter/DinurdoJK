@@ -91,12 +91,12 @@ impl App {
         theme::row(
             ui,
             "Model LOD scale",
-            "OpenJK/TaystJK r_lodscale for Ghoul2 and MD3 LODs (default 5). Larger keeps higher-detail meshes at greater distances; r_lodbias is added afterward.",
-            theme::Reset::None,
+            "OpenJK/TaystJK r_lodscale for Ghoul2, MD3 and compiled BSP-model LODs (default 5). Larger keeps higher-detail meshes at greater distances; r_lodbias is added afterward. Medium, High and Ultra presets use the supported maximum of 100.",
+            theme::Reset::Video(ui::VIDEO_ROW_MODEL_LOD_SCALE),
             |ui| {
                 let mut scale = self.video.lod_scale;
                 if ui
-                    .add(egui::DragValue::new(&mut scale).range(0.5..=20.0).speed(0.1).update_while_editing(false))
+                    .add(egui::DragValue::new(&mut scale).range(crate::fx::LOD_SCALE_MIN..=crate::fx::LOD_SCALE_MAX).speed(0.1).update_while_editing(false))
                     .changed()
                 {
                     let _ = self.set_console_cvar("r_lodScale", &scale.to_string());
@@ -111,7 +111,7 @@ impl App {
         if let Some(index) = quality_table_row(
             ui,
             "Model detail",
-            "r_lodbias. Higher values bias Ghoul2 and MD3 models toward cheaper LODs after projected-size selection, exactly like TaystJK. Highest (0) is the default.",
+            "r_lodbias. Higher values bias Ghoul2, MD3 and baked BSP models toward cheaper LODs after projected-size selection, exactly like TaystJK. Highest (0) is the default.",
             theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_LOD_BIAS),
             self.video.ghoul2_lod_bias,
             &MODEL_DETAIL,
@@ -122,12 +122,12 @@ impl App {
 
         theme::row(
             ui,
-            "Generate MD3 LODs",
-            "If authored _1/_2.md3 variants are missing, simplify on a background worker with meshoptimizer and cache by original MD3 content hash. Authored variants always take priority. Default off for A/B testing.",
+            "Generate missing model LODs",
+            "Automatic LOD for both entity MD3 models and eligible map-compiled BSP model surfaces (default On). MD3s generate missing levels on a cached worker; authored _1/_2.md3 variants always take priority. BSP simplification uses separate index ranges prepared at map load. Off draws full-detail baked models while retaining authored MD3 LODs. r_bspModelLod is a separate developer A/B override.",
             theme::Reset::None,
             |ui| {
                 let mut enabled = self.video.md3_auto_lod;
-                if ui.checkbox(&mut enabled, "Auto (cached)").changed() {
+                if ui.checkbox(&mut enabled, "On").changed() {
                     let _ = self.set_console_cvar("r_md3AutoLod", if enabled { "1" } else { "0" });
                 }
             },

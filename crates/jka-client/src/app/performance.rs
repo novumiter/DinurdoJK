@@ -25,6 +25,7 @@ impl App {
             frame_ms: Vec::new(),
             gpu_ms: Vec::new(),
             world_program_binds: (0, 0),
+            world_shader_programs: Default::default(),
         });
     }
 
@@ -43,6 +44,7 @@ impl App {
             sample.gpu_ms.push(gpu);
         }
         sample.world_program_binds = stats.world_program_binds;
+        sample.world_shader_programs = stats.world_shader_programs;
         if sample.started.elapsed() < sample.duration {
             return;
         }
@@ -54,7 +56,7 @@ impl App {
         let max = sample.fps.iter().copied().fold(0.0, f64::max);
         let position = self.camera.position;
         let line = format!(
-            "[JKA PERF SAMPLE] label={} fps_avg={:.1} fps_min={:.1} fps_max={:.1} cpu_frame_avg={:.3}ms gpu_frame_avg={} windows={} view=({:.0} {:.0} {:.0}) yaw={:.1} pitch={:.1} world_programs={}spec/{}gen",
+            "[JKA PERF SAMPLE] label={} fps_avg={:.1} fps_min={:.1} fps_max={:.1} cpu_frame_avg={:.3}ms gpu_frame_avg={} windows={} view=({:.0} {:.0} {:.0}) yaw={:.1} pitch={:.1} world_programs={}spec/{}gen shader_mode={}/{} binds[general={} specialized={} minimal={} shared={} generated={}]",
             sample.label,
             mean(&sample.fps).unwrap_or(0.0),
             min,
@@ -69,6 +71,9 @@ impl App {
             -self.camera.pitch.to_degrees(),
             sample.world_program_binds.0,
             sample.world_program_binds.1,
+            sample.world_shader_programs.requested, sample.world_shader_programs.active,
+            sample.world_shader_programs.binds[0], sample.world_shader_programs.binds[1],
+            sample.world_shader_programs.binds[2], sample.world_shader_programs.binds[3], sample.world_shader_programs.binds[4],
         );
         self.push_console_line(line);
     }

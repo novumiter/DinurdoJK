@@ -181,6 +181,7 @@ try {
     $runtimeBase = Join-Path $runtimeDirectory 'base'
     New-Item -ItemType Directory -Force -Path $runtimeBase | Out-Null
     Copy-Item -LiteralPath $rainGlassPackagePath -Destination (Join-Path $runtimeBase 'dinurdo-assets.pk3') -Force
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'scripts\shader_modes_ab.cfg') -Destination (Join-Path $runtimeBase 'shader_modes_ab.cfg') -Force
     Write-Host "`nBuilt ($buildMode): $executable"
     if ($Fast) { Write-Host '(-Fast: ThinLTO + incremental; about 2% below a full release build in FPS)' }
     if ($Faster) { Write-Host '(-Faster: LTO off; quickest rebuilds but about 23% below release FPS - do not benchmark with it)' }

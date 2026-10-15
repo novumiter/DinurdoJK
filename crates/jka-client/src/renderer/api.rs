@@ -40,13 +40,15 @@ pub enum DynamicModelAlphaMode {
     Modulate2x,
     /// GL_ZERO GL_ONE_MINUS_SRC_COLOR.
     Darken,
+    /// Promoted `q3map_material Glass`, sampled from the opaque scene capture.
+    Glass,
 }
 
 impl DynamicModelAlphaMode {
-    pub(in crate::renderer) const COUNT: usize = 13;
+    pub(in crate::renderer) const COUNT: usize = 14;
 
     /// Dense index for per-alpha-mode pipeline tables and draw bitmasks.
-    pub(in crate::renderer) const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         match self {
             Self::Opaque => 0,
             Self::Mask => 1,
@@ -61,11 +63,12 @@ impl DynamicModelAlphaMode {
             Self::Darken => 10,
             Self::BlendDepthWrite => 11,
             Self::BlendUnlitDepthWrite => 12,
+            Self::Glass => 13,
         }
     }
 }
 
-pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 13] = [
+pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 14] = [
     DynamicModelAlphaMode::Opaque,
     DynamicModelAlphaMode::Mask,
     DynamicModelAlphaMode::BlendDepthWrite,
@@ -76,6 +79,7 @@ pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode;
     DynamicModelAlphaMode::Modulate2x,
     DynamicModelAlphaMode::Darken,
     DynamicModelAlphaMode::Blend,
+    DynamicModelAlphaMode::Glass,
     DynamicModelAlphaMode::BlendUnlit,
     DynamicModelAlphaMode::AdditiveOne,
     DynamicModelAlphaMode::Additive,
@@ -361,12 +365,37 @@ pub struct FxGpuSpriteInstance {
 #[derive(Clone)]
 pub struct FxGpuSprites {
     pub instances: Arc<Vec<FxGpuSpriteInstance>>,
+    /// Optional GPU-resident spark draw request. `instances` is the
+    /// known-correct CPU-generated fallback used during lazy PSO compilation.
+    pub resident: Option<FxGpuResidentSprites>,
     /// Instances are player blob-shadow requests, not billboards. The renderer
     /// clips the rendered floor into each request (`Renderer::build_blob_shadow_marks`,
     /// OpenJK R_MarkFragments) and draws the resulting polygons as one ordinary
     /// dynamic mesh. origin = center on the collision plane (w = shade), left/up =
     /// in-plane half axes of length `radius` (left.w = entity number).
     pub blob_shadow: bool,
+}
+
+/// One material-stage draw against stable resident slot IDs. Each surface
+/// holds an Arc to the once-per-frame spawn delta; the backend applies it only
+/// once, irrespective of the number of shader stages.
+#[derive(Clone)]
+pub struct FxGpuResidentSprites {
+    pub frame: Arc<FxGpuResidentFrame>,
+    pub slots: Arc<Vec<u32>>,
+}
+
+#[derive(Clone, Default)]
+pub struct FxGpuResidentFrame {
+    pub reset: bool,
+    pub time_ms: i32,
+    pub show_saber_impact: bool,
+    /// New or reused slots only; every GPU record is uploaded once per birth.
+    pub writes: Arc<Vec<(u32, crate::fx::gpu_sparks::GpuSparkGpuState)>>,
+    /// The renderer publishes *actually compiled* resident alpha pipelines here.
+    /// Never infer readiness from a requested compilation job. The shared mask
+    /// is cleared on pipeline rebuild or on disabling GPU residency.
+    pub ready_modes: Arc<std::sync::atomic::AtomicU16>,
 }
 
 /// Presentation provenance. This is diagnostic metadata, not material state.
@@ -447,6 +476,9 @@ pub struct InlineModelInstance {
     pub origin: [f32; 3],
     /// AnglesToAxis(lerpAngles): forward, left, up.
     pub axis: [[f32; 3]; 3],
+    /// TaystJK entityState_t.isPortalEnt: this *instance*, not its shared BSP
+    /// model handle, is eligible for CG_DrawSkyBoxPortal's entity pass.
+    pub is_portal_entity: bool,
 }
 
 impl InlineModelInstance {
@@ -456,6 +488,7 @@ impl InlineModelInstance {
             model,
             origin: [0.0; 3],
             axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            is_portal_entity: false,
         }
     }
 
@@ -471,10 +504,19 @@ impl InlineModelInstance {
     }
 
     pub(in crate::renderer) fn transform_normal(&self, render: [f32; 3]) -> [f32; 3] {
-        scene::render_position(self.rotate(scene::jka_position(render)))
+        // Local editor instances may carry uniform scale in the axis vectors.
+        // Normals must remain unit-length regardless of the placement scale.
+        let rotated = scene::render_position(self.rotate(scene::jka_position(render)));
+        let length_sq = rotated.iter().map(|value| value * value).sum::<f32>();
+        if length_sq > 1.0e-20 {
+            let inv = length_sq.sqrt().recip();
+            rotated.map(|component| component * inv)
+        } else {
+            rotated
+        }
     }
 
-    pub(in crate::renderer) fn rotate(&self, v: [f32; 3]) -> [f32; 3] {
+    pub(crate) fn rotate(&self, v: [f32; 3]) -> [f32; 3] {
         std::array::from_fn(|i| {
             self.axis[0][i] * v[0] + self.axis[1][i] * v[1] + self.axis[2][i] * v[2]
         })
@@ -679,8 +721,8 @@ pub struct PostEffects {
     pub hdr: bool,
     pub hdr_paper_white: f32,
     pub hdr_peak: f32,
-    pub auto_exposure: bool,
-    pub tone_mapping: bool,
+    pub auto_exposure: f32,
+    pub tone_mapping: f32,
     pub glow: GlowMode,
     pub halation: bool,
     pub ssao: bool,
@@ -804,6 +846,10 @@ pub struct EguiRenderData {
     pub paint_jobs: Vec<egui::ClippedPrimitive>,
     pub textures_delta: egui::TexturesDelta,
     pub pixels_per_point: f32,
+    /// When set, the render thread reports back (once per distinct token) after
+    /// presenting a frame that carried this paint data. Menu fades key their
+    /// clock off that event instead of CPU-side frame construction time.
+    pub present_token: Option<u64>,
 }
 
 impl Drop for EguiRenderData {
@@ -936,10 +982,12 @@ pub enum RenderCommand {
     /// Draw a beam from the sun to the camera (player head) while sun angles are edited.
     SetSunRayPreview(bool),
     SetPvsMode(PvsMode),
+    SetFacePlaneCull(bool),
     SetWorldFlares(bool),
     SetDrawInlineModels(bool),
     /// r_fragmentShaderMode: 0 general world fragment program, 1 per-material specialized.
     SetFragmentShaderMode(u8),
+    SetWorldSortMode(u8),
     /// r_colorClearMode: 0 always clear, 1 skip when the sky box covers the background.
     SetColorClearMode(u8),
     /// Render-only controls for compiled model-path world stages and GPU A/B stage isolation.
@@ -973,6 +1021,8 @@ pub enum RenderCommand {
     SetContactShadowDebug(u8),
     SetSsrDebug(u8),
     SetOceanEnabled(bool),
+    /// Phase-1 render-only clipmap continuation at qualifying BSP sky walls.
+    SetOceanSkyExtend(bool),
     SetOceanSettings(crate::ocean::OceanSettings),
     SetPromotedOceanSettings(Vec<(usize, crate::ocean::OceanSettings)>),
     SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),
@@ -988,6 +1038,9 @@ pub enum RenderCommand {
     SetModelStateCache(bool),
     SetDynamicBatchDraws(bool),
     SetWorldCompactMinDraws(u32),
+    SetPatchLod { curve_error: f32, no_curves: bool, speeds: i32 },
+    /// Shared MD3 `r_lodScale` / `r_lodbias` settings for baked BSP models.
+    SetBspModelLod { scale: f32, bias: i32, debug: bool, enabled: bool },
     SetModelPrepareThreads(u32),
     SetMd3GeometryCache(bool),
     SetModelRenderBundles(bool),
@@ -1049,6 +1102,8 @@ pub enum RenderCommand {
         format: ScreenshotFormat,
     },
     CopyFrameToClipboard,
+    /// One-shot scene-only readback, before egui/HUD layers.
+    CaptureFrontendScene { path: PathBuf },
     CaptureVideoFrame { frame_index: u64, depth: bool },
     SetUi(UiSnapshot),
     /// Small independent overlay update; avoids rebuilding the full UiSnapshot.
@@ -1113,6 +1168,15 @@ pub enum RenderCommand {
         name: String,
         map: Box<PreparedMap>,
     },
+    /// Same prepared-world pipeline as LoadMap, but reuse safe immutable GPU
+    /// images/PSOs from the current map when their cache keys match. Remap only.
+    RemapMap {
+        request_id: u64,
+        started: Instant,
+        name: String,
+        plan: Box<crate::scene::PreparedRemapPlan>,
+        base_texture_count: usize,
+    },
     /// Open a settings batch (quality preset): world pipeline-variant
     /// activation is deferred and per-setting render-thread cost is recorded.
     BatchBegin(String),
@@ -1165,6 +1229,7 @@ pub(in crate::renderer) struct WorldStagePerf {
 
 #[derive(Default)]
 pub(in crate::renderer) struct FrameInfo {
+    pub(in crate::renderer) patch_lod: super::world::patch_lod::PatchLodStats,
     pub(in crate::renderer) frame_ms: f64,
     pub(in crate::renderer) cpu_prepare_ms: f64,
     pub(in crate::renderer) cpu_acquire_ms: f64,
@@ -1200,6 +1265,11 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) world_cpu_compact_visible_members: u32,
     pub(in crate::renderer) world_cpu_compact_singleton_groups: u32,
     pub(in crate::renderer) world_cpu_compact_multistage_excluded_batches: u32,
+    /// Face-plane rejection in the primary CPU world pass (counts stage submissions).
+    pub(in crate::renderer) world_face_plane_rejected_batches: u32,
+    pub(in crate::renderer) world_face_plane_partial_batches: u32,
+    pub(in crate::renderer) world_face_plane_rejected_triangles: u32,
+    pub(in crate::renderer) world_face_plane_direct_draws: u32,
     /// Which world renderer produced this frame ("fast-baseline" / "unified").
     pub(in crate::renderer) world_path: &'static str,
     /// Advanced-path breakdown of `cpu_prepare_ms`. All zero on FastBaseline,
@@ -1233,10 +1303,21 @@ pub(in crate::renderer) struct FrameInfo {
     /// OpenJK-style BSP/PVS + frustum rejection prevents command-encoder blowup.
     pub(in crate::renderer) world_pvs_batches: u32,
     pub(in crate::renderer) world_frustum_rejected: u32,
+    /// Batches dropped because water absorption hides them (r_oceanUnderwaterCull).
+    pub(in crate::renderer) world_ocean_culled: u32,
+    pub(in crate::renderer) world_ocean_culled_triangles: u32,
     pub(in crate::renderer) world_encoded_batches: u32,
     /// Main world pass base-program binds: specialized (r_fragmentShaderMode 1) vs general.
     pub(in crate::renderer) world_specialized_binds: u32,
     pub(in crate::renderer) world_general_binds: u32,
+    pub(in crate::renderer) world_shader_programs: crate::runtime::WorldShaderPrograms,
+    /// Sort A/B: estimated pipeline transitions for eligible runs only.
+    /// These are NOT actual bind counts (compaction/fog may change them).
+    pub(in crate::renderer) world_sort_candidates: u32,
+    pub(in crate::renderer) world_sort_runs: u32,
+    pub(in crate::renderer) world_sort_moved: u32,
+    pub(in crate::renderer) world_sort_binds_before: u32,
+    pub(in crate::renderer) world_sort_binds_after: u32,
     pub(in crate::renderer) world_multidraw_groups: u32,
     pub(in crate::renderer) world_multidraw_batches: u32,
     /// Main-camera authored world stages surviving CPU area/frustum/optical

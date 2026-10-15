@@ -20,15 +20,21 @@ enum DevTool {
     EntityViewer,
     RemapShader,
     ShaderComplexity,
+    ModelPlacement,
+    BmodelPlacement,
+    MapMods,
 }
 
 impl DevTool {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 8] = [
         Self::Trace,
         Self::DrawEntities,
         Self::EntityViewer,
         Self::RemapShader,
         Self::ShaderComplexity,
+        Self::ModelPlacement,
+        Self::BmodelPlacement,
+        Self::MapMods,
     ];
 
     fn label(self) -> &'static str {
@@ -38,6 +44,9 @@ impl DevTool {
             Self::EntityViewer => "ENTITY VIEWER",
             Self::RemapShader => "REMAP SHADER",
             Self::ShaderComplexity => "SHADER COST",
+            Self::ModelPlacement => "PLACE MODEL",
+            Self::BmodelPlacement => "PLACE BMODEL",
+            Self::MapMods => "MAP MODS",
         }
     }
 
@@ -47,9 +56,12 @@ impl DevTool {
             Self::DrawEntities if entities_enabled => "OVERLAY ON",
             Self::DrawEntities => "OVERLAY OFF",
             Self::EntityViewer => "GRAPH EDITOR",
-            Self::RemapShader => "COMING SOON",
+            Self::RemapShader => "MAP MATERIAL EDITOR",
             Self::ShaderComplexity if complexity_enabled => "HEATMAP ON",
             Self::ShaderComplexity => "HEATMAP OFF",
+            Self::ModelPlacement => "MD3 WORLD EDITOR",
+            Self::BmodelPlacement => "INLINE BSP EDITOR",
+            Self::MapMods => ".ENT IMPORT/EXPORT",
         }
     }
 }
@@ -91,7 +103,10 @@ impl App {
                     self.console_status = error;
                 }
             }
-            DevTool::RemapShader => {}
+            DevTool::RemapShader => self.open_shader_remap(None),
+            DevTool::ModelPlacement => self.open_model_placement_picker(),
+            DevTool::BmodelPlacement => self.open_bmodel_placement_picker(),
+            DevTool::MapMods => self.open_map_mods(),
         }
     }
 
@@ -115,7 +130,7 @@ impl App {
             let start = angle - SECTOR_ANGLE * 0.5 + WHEEL_GAP;
             let end = angle + SECTOR_ANGLE * 0.5 - WHEEL_GAP;
             let highlighted = selected == tool;
-            let planned = tool == DevTool::RemapShader;
+            let planned = false;
             let fill = if highlighted {
                 egui::Color32::from_rgba_unmultiplied(38, 94, 151, 240)
             } else if planned {
@@ -186,7 +201,7 @@ impl App {
     }
 }
 
-fn paint_annular_sector(
+pub(super) fn paint_annular_sector(
     painter: &egui::Painter,
     center: egui::Pos2,
     inner: f32,
@@ -212,7 +227,7 @@ fn paint_annular_sector(
     painter.add(egui::Shape::mesh(mesh));
 }
 
-fn paint_arc(
+pub(super) fn paint_arc(
     painter: &egui::Painter,
     center: egui::Pos2,
     radius: f32,
@@ -277,6 +292,33 @@ fn paint_tool_icon(painter: &egui::Painter, center: egui::Pos2, tool: DevTool, c
             let rect = egui::Rect::from_center_size(center, egui::vec2(24.0, 20.0));
             painter.rect_stroke(rect, egui::CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
             painter.line_segment([center + egui::vec2(-9.0, 5.0), center + egui::vec2(9.0, -5.0)], stroke);
+        }
+        DevTool::MapMods => {
+            painter.rect_stroke(egui::Rect::from_center_size(center, egui::vec2(22.0, 26.0)),
+                egui::CornerRadius::same(1), stroke, egui::StrokeKind::Inside);
+            for y in [-7.0, 0.0, 7.0] {
+                painter.line_segment([center+egui::vec2(-7.0,y), center+egui::vec2(7.0,y)], stroke);
+            }
+        }
+        DevTool::BmodelPlacement => {
+            let half = 11.0;
+            let v = [egui::vec2(-half, -half), egui::vec2(half, -half),
+                egui::vec2(half, half), egui::vec2(-half, half)];
+            for i in 0..4 {
+                painter.line_segment([center + v[i], center + v[(i + 1) % 4]], stroke);
+            }
+            painter.line_segment([center + v[0], center + v[2]], stroke);
+            painter.line_segment([center + v[1], center + v[3]], stroke);
+        }
+        DevTool::ModelPlacement => {
+            let points = [
+                egui::vec2(-12.0, -6.0), egui::vec2(0.0, -12.0),
+                egui::vec2(12.0, -6.0), egui::vec2(12.0, 8.0),
+                egui::vec2(0.0, 14.0), egui::vec2(-12.0, 8.0),
+            ];
+            for (a,b) in [(0,1),(1,2),(2,3),(3,4),(4,5),(5,0),(1,4),(0,3),(2,5)] {
+                painter.line_segment([center + points[a], center + points[b]], stroke);
+            }
         }
         DevTool::ShaderComplexity => {
             for (offset, height) in [(-12.0, 8.0), (-6.0, 15.0), (0.0, 21.0), (6.0, 12.0), (12.0, 17.0)] {

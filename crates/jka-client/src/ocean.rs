@@ -22,11 +22,12 @@ pub mod interaction;
 pub mod surfaces;
 pub mod bathymetry;
 pub mod coastal;
+pub mod sky_extend;
 mod footprint_index;
 #[cfg(test)]
 #[path = "ocean/footprint_perf_tests.rs"]
 mod footprint_perf_tests;
-pub use authoring::{AtmosphericWind, OceanAuthoring, OceanWind};
+pub use authoring::{links, AtmosphericWind, OceanAuthoring, OceanWind};
 pub const OCEAN_CASCADES: usize = 3;
 pub const OCEAN_DEFAULT_MAP_SIZE: u32 = 1024;
 pub const OCEAN_MAX_SURFACES: usize = 8;
@@ -247,6 +248,13 @@ impl PromotedClipmapLayout {
         self.base_spacing * (1u32 << levels.saturating_sub(1)) as f32
     }
 
+    /// Conservative XY half-width of this finite camera-following grid.
+    pub fn coverage_radius(&self, half_cells: i32) -> f32 {
+        let level = self.levels_for_half_cells(half_cells).saturating_sub(1);
+        self.base_spacing * (1u32 << level) as f32
+            * promoted_level_half_cells(level, half_cells) as f32
+    }
+
     /// Select the finest level worth drawing from the shortest 3D distance to
     /// the water footprint. This is the piece the old camera-centred clipmap
     /// missed: altitude (JKA Z / renderer Y) must count just like horizontal
@@ -267,6 +275,22 @@ impl PromotedClipmapLayout {
             level += 1;
         }
         level
+    }
+
+    /// How many levels (counted from level 0) can contain anything within
+    /// `radius` horizontally of a viewer who is `offset` from the clipmap centre.
+    /// Level `n` starts where level `n - 1` ends.
+    pub fn levels_within(&self, half_cells: i32, offset: f32, radius: f32) -> u32 {
+        let levels = self.levels_for_half_cells(half_cells);
+        for level in 1..levels {
+            let previous = level - 1;
+            let reach = self.base_spacing * (1u32 << previous) as f32
+                * promoted_level_half_cells(previous, half_cells) as f32;
+            if reach - offset >= radius {
+                return level;
+            }
+        }
+        levels
     }
 
     fn index_count_for(&self, half_cells: i32, minimum_level: u32) -> usize {
@@ -342,9 +366,31 @@ impl PromotedClipmapLayout {
         mask_slot: Option<usize>,
         pvs_tiles: Option<&OceanPvsTileMask>,
     ) -> Vec<u32> {
+        self.indices_for_footprint_with_sky(
+            half_cells, minimum_level, u32::MAX, centre, surface, masks, mask_slot, pvs_tiles, None)
+    }
+
+    /// The sky mode reuses the same uploaded grids and indexed draw, but its
+    /// snapped centre follows the camera outside the BSP and isn't clamped to
+    /// the original water. No per-frame mesh or GPU buffer allocation occurs.
+    pub fn indices_for_footprint_with_sky(
+        &self,
+        half_cells: i32,
+        minimum_level: u32,
+        // Draw no level past this one (counted from 0): outer rings that water
+        // absorption already hides. The lattice (`outer_spacing`) is unchanged.
+        level_limit: u32,
+        centre: [f32; 2],
+        surface: OceanSurface,
+        masks: &OceanMasks,
+        mask_slot: Option<usize>,
+        pvs_tiles: Option<&OceanPvsTileMask>,
+        sky: Option<&sky_extend::SkyExtension>,
+    ) -> Vec<u32> {
         let levels = self.levels_for_half_cells(half_cells);
         let first = minimum_level.min(levels.saturating_sub(1));
         let outer_spacing = self.base_spacing * (1u32 << (levels.saturating_sub(1))) as f32;
+        let levels = levels.min(level_limit.max(first + 1));
         let mut indices = Vec::with_capacity(self.index_count_for(half_cells, minimum_level));
         let mut previous_half = 0i32;
         for level in first..levels {
@@ -366,10 +412,11 @@ impl PromotedClipmapLayout {
                     offset[0] = (offset[0] / parent).round() * parent;
                     offset[1] = (offset[1] / parent).round() * parent;
                 }
-                [
-                    (centre[0] + offset[0]).clamp(surface.minimum[0], surface.maximum[0]),
-                    (centre[1] + offset[1]).clamp(surface.minimum[1], surface.maximum[1]),
-                ]
+                let p = [centre[0] + offset[0], centre[1] + offset[1]];
+                if sky.is_some() { p } else {
+                    [p[0].clamp(surface.minimum[0], surface.maximum[0]),
+                     p[1].clamp(surface.minimum[1], surface.maximum[1])]
+                }
             };
             for row in -spacing_half..spacing_half {
                 for column in -spacing_half..spacing_half {
@@ -398,7 +445,17 @@ impl PromotedClipmapLayout {
                     if hi[0] - lo[0] <= 1.0e-4 || hi[1] - lo[1] <= 1.0e-4 {
                         continue;
                     }
-                    if mask_slot.is_some_and(|slot| !masks.rect_may_contain(slot, lo, hi)) {
+                    if mask_slot.is_some_and(|slot| {
+                        if let Some(sky) = sky {
+                            // The source AABB remains the baseline footprint.
+                            // For rectangular unmasked water, do NOT treat the
+                            // entire infinite plane as covered by that pool.
+                            let source_may_contain = (0..2).all(|axis|
+                                hi[axis] >= surface.minimum[axis] && lo[axis] <= surface.maximum[axis])
+                                && (!masks.is_masked(slot) || masks.rect_may_contain(slot, lo, hi));
+                            !source_may_contain && !sky.rect_may_contain(lo, hi)
+                        } else { !masks.rect_may_contain(slot, lo, hi) }
+                    }) {
                         continue;
                     }
                     if pvs_tiles.is_some_and(|tiles| {
@@ -818,6 +875,9 @@ pub struct OceanMasks {
     /// uniform; they guide clipmap centering, LOD distance, and index pruning.
     pub footprints: [Option<std::sync::Arc<WaterFootprint>>; OCEAN_MAX_SURFACES],
     footprint_indices: [Option<std::sync::Arc<footprint_index::FootprintIndex>>; OCEAN_MAX_SURFACES],
+    /// Shoreline and hole-rim segments `[x0, z0, x1, z1]` per masked slot, for
+    /// the CPU-only water culling queries. Not uploaded.
+    boundaries: [Option<std::sync::Arc<Vec<[f32; 4]>>>; OCEAN_MAX_SURFACES],
 }
 
 /// CPU twin of the promoted vertex shader's two-stage centre snapping. The
@@ -912,8 +972,55 @@ impl Default for OceanMasks {
             triangles: Vec::new(),
             footprints: std::array::from_fn(|_| None),
             footprint_indices: std::array::from_fn(|_| None),
+            boundaries: std::array::from_fn(|_| None),
         }
     }
+}
+
+/// Outline edges used by exactly one triangle: the shoreline and hole rims. An
+/// edge split by a T-junction reads as extra boundary, which can only make the
+/// derived clearance smaller, never larger.
+fn outline_boundary(triangles: &[MaskTriangle]) -> Vec<[f32; 4]> {
+    let key = |p: [f32; 2]| ((p[0] * 8.0).round() as i32, (p[1] * 8.0).round() as i32);
+    let mut edges = std::collections::HashMap::<_, (u32, [f32; 4])>::new();
+    for t in triangles {
+        for i in 0..3 {
+            let (a, b) = (t[i], t[(i + 1) % 3]);
+            let (ka, kb) = (key(a), key(b));
+            if ka == kb {
+                continue;
+            }
+            let entry = edges
+                .entry(if ka < kb { (ka, kb) } else { (kb, ka) })
+                .or_insert((0, [a[0], a[1], b[0], b[1]]));
+            entry.0 += 1;
+        }
+    }
+    edges.into_values().filter(|(uses, _)| *uses == 1).map(|(_, edge)| edge).collect()
+}
+
+fn segment_touches_rect(edge: [f32; 4], lo: [f32; 2], hi: [f32; 2]) -> bool {
+    let (mut t0, mut t1) = (0.0_f32, 1.0_f32);
+    for axis in 0..2 {
+        let origin = edge[axis];
+        let delta = edge[axis + 2] - origin;
+        if delta.abs() < 1.0e-9 {
+            if origin < lo[axis] || origin > hi[axis] {
+                return false;
+            }
+            continue;
+        }
+        let (mut near, mut far) = ((lo[axis] - origin) / delta, (hi[axis] - origin) / delta);
+        if near > far {
+            std::mem::swap(&mut near, &mut far);
+        }
+        t0 = t0.max(near);
+        t1 = t1.min(far);
+        if t0 > t1 {
+            return false;
+        }
+    }
+    true
 }
 
 const MASK_TILE_BOUNDARY: u32 = 0;
@@ -1083,6 +1190,7 @@ impl OceanMasks {
             triangles, minimum, maximum,
         );
         self.ranges[slot] = [(self.triangles.len() / 2) as f32, triangles.len() as f32, 0.0, 0.0];
+        self.boundaries[slot] = Some(std::sync::Arc::new(outline_boundary(triangles)));
         for t in triangles {
             self.triangles.push([t[0][0], t[0][1], t[1][0], t[1][1]]);
             self.triangles.push([t[2][0], t[2][1], 0.0, 0.0]);
@@ -1093,6 +1201,23 @@ impl OceanMasks {
     /// Whether `slot` carries a real outline. Unmasked slots fill their box.
     pub fn is_masked(&self, slot: usize) -> bool {
         slot < OCEAN_MAX_SURFACES && self.ranges[slot][1] > 0.0
+    }
+
+    /// Whether the whole xz rectangle lies on the outline (no rim crosses or
+    /// touches it). An unmasked slot fills its box, so the caller's box test
+    /// decides; this returns true.
+    pub fn rect_inside(&self, slot: usize, lo: [f32; 2], hi: [f32; 2]) -> bool {
+        if !self.is_masked(slot) {
+            return true;
+        }
+        let corners = [[lo[0], lo[1]], [hi[0], lo[1]], [lo[0], hi[1]], [hi[0], hi[1]]];
+        if !corners.iter().all(|&corner| self.contains(slot, corner)) {
+            return false;
+        }
+        self.boundaries
+            .get(slot)
+            .and_then(Option::as_deref)
+            .is_some_and(|edges| !edges.iter().any(|&edge| segment_touches_rect(edge, lo, hi)))
     }
 
     /// CPU twin of `ocean_mask_contains` in bsp.wgsl, rain_sim.wgsl and
@@ -1286,6 +1411,18 @@ pub struct OceanSettings {
     pub updates_per_second: f32,
     pub water_color: [f32; 3],
     pub foam_color: [f32; 3],
+    // Optical A/B tests; all default to the pre-test rendering path.
+    pub foam_detail_mode: u8, // 0 keep foam only (normals LOD out), 1 upstream cascade sampling
+    pub foam_activity_mode: u8, // 0 existing promoted gates, 1 skip heuristic, 2 skip amplitude, 3 skip both
+    pub foam_gain: f32,
+    pub color_mode: u8, // 0 existing, 1 ignore authored tint, 2 opaque body, 3 both
+    pub foam_brightness: f32,
+    pub sun_gain: f32,
+    pub foam_debug: u8, // 0 regular, 1 raw foam, 2 gated foam, 3 final foam
+    pub visual_fixes: u8, // 0 untouched, 1 balanced, 2 Godot-leaning ocean appearance
+    pub foam_source_mode: u8, // 0 original Jacobian, 1 mild, 2 strong grow/crest threshold
+    /// Bitmask of `links::*`: swell controls (and roughness) that follow the amplitude.
+    pub links: u8,
     pub roughness: f32,
     pub normal_strength: f32,
     pub sea_spray: bool,
@@ -1321,8 +1458,21 @@ impl Default for OceanSettings {
             // sRGB to linear before the shader; the BSP shader does the same.
             water_color: [0.1, 0.15, 0.18],
             foam_color: [0.73, 0.67, 0.62],
-            // mat_water.tres overrides the shader's 0.4 default to 0.65.
-            roughness: 0.65,
+            // Keep every FFT cascade's normals and foam at any distance, and no extra
+            // exponential foam fade: far water must not smooth out into a flat mirror.
+            foam_detail_mode: 1,
+            foam_activity_mode: 0,
+            foam_gain: 1.0,
+            color_mode: 0,
+            foam_brightness: 1.0,
+            sun_gain: 1.0,
+            foam_debug: 0,
+            visual_fixes: 0,
+            foam_source_mode: 0,
+            links: links::ALL,
+            // Follows the swell amplitude (links::ROUGHNESS); this is the value at
+            // the default 128u sea. Upstream's 0.65 is not used, see derive_from_amplitude.
+            roughness: 0.2,
             normal_strength: 1.0,
             sea_spray: true,
             simulate_when_hidden: false,
@@ -1337,6 +1487,15 @@ impl Default for OceanSettings {
 }
 
 impl OceanSettings {
+    /// Recomputes every linked control from the swell amplitude. Roughness is
+    /// skipped when `keep_roughness` (a map shader authored its own).
+    pub fn apply_links(&mut self, keep_roughness: bool) {
+        self.authored.apply_links(self.links);
+        if self.links & links::ROUGHNESS != 0 && !keep_roughness {
+            self.roughness = authoring::derive_from_amplitude(self.authored.amplitude).roughness;
+        }
+    }
+
     pub fn sanitize(mut self) -> Self {
         self.interaction_strength = if self.interaction_strength.is_finite() { self.interaction_strength.max(0.0) } else { 1.0 };
         self.interaction_splash_mode = self.interaction_splash_mode.min(5);
@@ -1359,6 +1518,16 @@ impl OceanSettings {
         for value in self.water_color.iter_mut().chain(self.foam_color.iter_mut()) {
             *value = value.clamp(0.0, 1.0);
         }
+        self.foam_detail_mode = self.foam_detail_mode.min(1);
+        self.foam_activity_mode = self.foam_activity_mode.min(3);
+        self.foam_gain = if self.foam_gain.is_finite() { self.foam_gain.clamp(0.0, 16.0) } else { 1.0 };
+        self.color_mode = self.color_mode.min(3);
+        self.foam_brightness = if self.foam_brightness.is_finite() { self.foam_brightness.clamp(0.0, 8.0) } else { 1.0 };
+        self.sun_gain = if self.sun_gain.is_finite() { self.sun_gain.clamp(0.0, 8.0) } else { 1.0 };
+        self.foam_debug = self.foam_debug.min(3);
+        self.visual_fixes = self.visual_fixes.min(2);
+        self.foam_source_mode = self.foam_source_mode.min(2);
+        self.links &= links::ALL;
         self.roughness = self.roughness.clamp(0.0, 1.0);
         self.normal_strength = self.normal_strength.clamp(0.0, 1.0);
         for cascade in &mut self.cascades {
@@ -1452,6 +1621,14 @@ pub struct OceanRenderUniform {
     pub mask_bounds: [[f32; 4]; OCEAN_MAX_SURFACES], // min xz, max xz for tile lookup
     pub mask_tiles: [[u32; 4]; OCEAN_MAX_SURFACES], // 2-bit 8x8 classification
     pub mask_triangles: [[f32; 4]; OCEAN_MASK_VEC4S], // per triangle: a.xy b.xy / c.xy
+    // Per-promoted-view only: up to four contacted sky-wall spans on each side.
+    // Appended to preserve ALL offsets read by spray, coastal and optics shaders.
+    pub sky_segments: [[f32; 4]; sky_extend::SEGMENTS_PER_POOL],
+    // Append only: older spray/optics shaders consume just the common prefix.
+    pub appearance_a: [f32; 4], // detail mode, promoted foam gate mode, foam gain, foam fade rate
+    pub appearance_b: [f32; 4], // color mode, foam brightness, sun gain, foam debug
+    pub appearance_c: [f32; 4], // visual fixes bundle (x); yzw reserved
+
 }
 
 struct PromotedRenderSurface {
@@ -1463,6 +1640,8 @@ struct PromotedRenderSurface {
 }
 
 pub struct OceanGpu {
+    sky_extend_enabled: bool,
+    sky_extend_regions: [Option<sky_extend::SkyExtension>; OCEAN_MAX_SURFACES],
     promoted_centres: [Option<[f32; 2]>; OCEAN_MAX_SURFACES],
     pub coastal: Option<coastal::Gpu>,
     coastal_render: std::sync::Arc<coastal::RenderResources>,
@@ -1581,7 +1760,7 @@ pub(crate) fn create_spray_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -1799,7 +1978,7 @@ impl OceanGpu {
             module: &windrow_shader,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
         let windrow_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Ocean wind foam streak parameters"),
@@ -1836,7 +2015,7 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { sky_extend_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view:displacement_view, render_normal_view:normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
@@ -1894,8 +2073,43 @@ impl OceanGpu {
             if let Some(centre)=self.promoted_centres[surface.descriptor.index] {
                 local.clipmap[0]=centre[0];local.clipmap[1]=centre[1];
             }
+            if self.sky_extend_enabled {
+                if let Some(region) = self.sky_extend_regions[surface.descriptor.index] {
+                    local.sky_segments = region.segments;
+                    // 1 = existing promoted pool; 2 = promoted pool with a
+                    // render-only sky continuation. All pre-existing promoted
+                    // shader tests use > 0.5, so they retain their semantics.
+                    // The continuation shade can now tell source water from
+                    // background water without a second material or draw.
+                    local.authored_plane[3] = 2.0;
+                    local.mask_ranges[surface.descriptor.index][2] = region.count as f32;
+                    // Rectangular original water needs no triangle mask, but
+                    // its source AABB is needed for the sky continuation test.
+                    local.mask_bounds[surface.descriptor.index] = region.bounds;
+                    let spacing = if surface.settings.mesh_quality > 0 {
+                        OCEAN_HIGH_MESH_SPACING_UNITS
+                    } else { OCEAN_LOW_MESH_SPACING_UNITS };
+                    local.wind_motion[3] = promoted_clipmap_outer_spacing(
+                        spacing, f32::INFINITY, surface.settings.authored.amplitude);
+                }
+            }
             queue.write_buffer(&surface.buffer,0,bytemuck::bytes_of(&local));
         }
+    }
+
+    /// Runtime A/B switch; never mutates coastal fields or FFT simulation.
+    pub fn set_sky_extension(&mut self, queue: &wgpu::Queue, enabled: bool,
+        regions: &[Option<sky_extend::SkyExtension>]) {
+        let mut selected = [None; OCEAN_MAX_SURFACES];
+        for (index, region) in regions.iter().enumerate().take(OCEAN_MAX_SURFACES) {
+            selected[index] = *region;
+        }
+        if self.sky_extend_enabled == enabled && self.sky_extend_regions == selected {
+            return;
+        }
+        self.sky_extend_enabled = enabled;
+        self.sky_extend_regions = selected;
+        self.write_render_uniform(queue);
     }
 
     pub fn render_bind_group_for(&self, index: usize) -> &wgpu::BindGroup {
@@ -2187,11 +2401,24 @@ impl OceanGpu {
                 s.displacement_scale * authored.amplitude / 128.0 * authored.slosh
                     / (authored.wavelength / 1400.0) * authored.steepness / 0.65
             };
+            // The source of whitecaps is the FFT displacement Jacobian.
+            // Restyling an all-zero foam texture in the pixel shader cannot
+            // create whitecaps. This CVar tests source generation separately.
+            // It is intentionally uniform across all cascades, and changes
+            // only foam thresholds/growth -- never the wave spectrum/FFT.
+            let foam_source = self.settings.foam_source_mode.max(self.settings.visual_fixes);
+            let (whitecap_bias, grow_multiplier) = match foam_source {
+                1 => (0.10, 1.3),
+                2.. => (0.20, 1.6),
+                _ => (0.0, 1.0),
+            };
             *gpu_param=CascadeGpu {
                 tile:[s.tile_length[0],s.tile_length[1],derivative_scale,0.0],
                 spectrum:[jonswap_alpha(wind,fetch),jonswap_peak(wind,fetch),wind,(direction + 180.0).to_radians()],
                 shape:[DEPTH_METERS,s.swell,s.detail,s.spread],
-                foam:[s.whitecap + wind_strength * 0.15,delta*s.foam_amount*7.5*authored.foam*(0.25+wind_strength),delta/authored.foam_lifetime,0.0],
+                foam:[s.whitecap + wind_strength * 0.15 + whitecap_bias,
+                    delta*s.foam_amount*7.5*authored.foam*(0.25+wind_strength)*grow_multiplier,
+                    delta/authored.foam_lifetime,0.0],
                 seed:[authored.seed,authored.seed ^ (i as u32).wrapping_mul(0x9e3779b9),0,0], time:[self.times[i],0.0,0.0,0.0]
             };
         }
@@ -2437,6 +2664,13 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         mask_bounds: [[0.0; 4]; OCEAN_MAX_SURFACES],
         mask_tiles: [[0; 4]; OCEAN_MAX_SURFACES],
         mask_triangles: [[0.0; 4]; OCEAN_MASK_VEC4S],
+        sky_segments: [[0.0;4]; sky_extend::SEGMENTS_PER_POOL],
+        // Shader detail modes are 1 (foam kept) / 2 (full cascades); w is unused.
+        appearance_a: [settings.foam_detail_mode as f32 + 1.0, settings.foam_activity_mode as f32,
+            settings.foam_gain, 0.0],
+        appearance_b: [settings.color_mode as f32, settings.foam_brightness,
+            settings.sun_gain, settings.foam_debug as f32],
+        appearance_c: [settings.visual_fixes as f32, 0.0, 0.0, 0.0],
     }
 }
 
@@ -2458,6 +2692,15 @@ fn make_promoted_render_uniform(
     local.sun_direction_intensity = shared.sun_direction_intensity;
     local.sun_color = shared.sun_color;
     local.sky_ambient = shared.sky_ambient;
+    // Shared optical comparison controls apply to all promoted pools, including manual overrides.
+    // A/B color override must use the user-facing shared color, not the
+    // texture-derived per-pool heuristic which normally replaces it.
+    if shared.appearance_b[0] == 1.0 || shared.appearance_b[0] >= 2.5 {
+        local.water_color = shared.water_color;
+    }
+    local.appearance_a = shared.appearance_a;
+    local.appearance_b = shared.appearance_b;
+    local.appearance_c = shared.appearance_c;
     let base_spacing = if settings.mesh_quality > 0 {
         OCEAN_HIGH_MESH_SPACING_UNITS
     } else {
@@ -2482,6 +2725,9 @@ fn make_promoted_render_uniform(
     local.spray_info[0] = 1.0;
     local.spray_info[1] = (32768 / surface_count.max(1)) as f32;
     let s = descriptor.surface;
+    // Promoted clipmap vertices use this render-only bounds field. Keep
+    // spray_bounds[0] as the source-water extent for coastal/spray semantics.
+    local.authored_bounds = [s.minimum[0], s.minimum[1], s.maximum[0], s.maximum[1]];
     local.spray_bounds[0] = [s.minimum[0], s.minimum[1], s.maximum[0], s.maximum[1]];
     local.spray_planes[0] = [
         s.plane_height,
@@ -2522,6 +2768,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ocean_optical_ab_defaults_keep_distance_detail() {
+        let s = OceanSettings::default();
+        assert_eq!(s.foam_detail_mode, 1);
+        assert_eq!(s.foam_activity_mode, 0);
+        assert_eq!(s.color_mode, 0);
+        assert_eq!(s.foam_debug, 0);
+        assert_eq!(s.visual_fixes, 0);
+        assert_eq!(s.foam_source_mode, 0);
+        let u = make_render_uniform(true, &s);
+        assert_eq!(u.appearance_a, [2.0, 0.0, 1.0, 0.0]);
+        assert_eq!(u.appearance_b, [0.0, 1.0, 1.0, 0.0]);
+        assert_eq!(u.appearance_c, [0.0; 4]);
+    }
+
+    #[test]
+    fn ocean_optical_ab_reaches_promoted_uniform_without_fft_changes() {
+        let mut shared = OceanSettings::default();
+        let baseline = make_render_uniform(true, &shared);
+        shared.foam_detail_mode = 1;
+        shared.foam_activity_mode = 3;
+        shared.foam_gain = 8.0;
+        shared.color_mode = 3;
+        shared.foam_brightness = 1.7;
+        shared.sun_gain = 2.0;
+        shared.foam_debug = 1;
+        shared.visual_fixes = 2;
+        shared.foam_source_mode = 1;
+        shared.water_color = [0.01, 0.5, 0.95];
+        let edited = make_render_uniform(true, &shared);
+        assert_eq!(edited.map_scales, baseline.map_scales);
+        assert_eq!(edited.appearance_a, [2.0, 3.0, 8.0, 0.0]);
+        assert_eq!(edited.appearance_b, [3.0, 1.7, 2.0, 1.0]);
+        assert_eq!(edited.appearance_c, [2.0, 0.0, 0.0, 0.0]);
+        let pool = appearance::tests::pool(0,0.0);
+        let local = pool.settings(shared);
+        let promoted = make_promoted_render_uniform(&edited, &local, &pool, false, 1);
+        assert_eq!(promoted.appearance_a, edited.appearance_a);
+        assert_eq!(promoted.appearance_b, edited.appearance_b);
+        assert_eq!(promoted.appearance_c, edited.appearance_c);
+        assert_eq!(promoted.water_color, edited.water_color);
+    }
+
+    #[test]
+    fn ocean_optical_ab_sanitizes_invalid_values() {
+        let mut s = OceanSettings::default();
+        s.foam_detail_mode = 255;
+        s.foam_activity_mode = 255;
+        s.foam_gain = f32::NAN;
+        s.color_mode = 255;
+        s.foam_brightness = f32::INFINITY;
+        s.sun_gain = f32::NEG_INFINITY;
+        s.foam_debug = 255;
+        s.visual_fixes = 255;
+        s.foam_source_mode = 255;
+        let s = s.sanitize();
+        assert_eq!(s.foam_detail_mode, 1);
+        assert_eq!(s.foam_activity_mode, 3);
+        assert_eq!(s.foam_gain, 1.0);
+        assert_eq!(s.color_mode, 3);
+        assert_eq!(s.foam_brightness, 1.0);
+        assert_eq!(s.sun_gain, 1.0);
+        assert_eq!(s.foam_debug, 3);
+        assert_eq!(s.visual_fixes, 2);
+        assert_eq!(s.foam_source_mode, 2);
+    }
+
+    #[test]
     fn promoted_water_amplitude_controls_all_displacement_and_spray_views() {
         let shared = OceanSettings::default();
         let mut context = make_render_uniform(true,&shared);
@@ -2529,6 +2842,8 @@ mod tests {
         context.mask_ranges[3] = [2.0,1.0,0.0,0.0];
         let pool = appearance::tests::pool(3,0.0);
         let mut settings = pool.settings(shared);
+        // A little authored swell (cross-sea blend < 1) so the swell terms are non-zero.
+        settings.authored.slosh = appearance::DEFAULT_PROMOTED_FFT_BLEND;
         let calm = make_promoted_render_uniform(&context,&settings,&pool,false,2);
         assert!(calm.swell[3] > 0.0 && calm.map_scales[0][2] > 0.0);
         settings.authored.amplitude *= 2.0;
@@ -2612,6 +2927,18 @@ mod tests {
         // A slot that was never pushed contains everything.
         assert!(masks.contains(5, [50.0, 50.0]));
         assert!(!masks.is_masked(5));
+    }
+
+    #[test]
+    fn outline_rect_containment_respects_the_hollow() {
+        let masks = donut_masks();
+        // Rects: inside one slab, across the hollow rim, wholly in the hollow.
+        assert!(masks.rect_inside(2, [5.0, 5.0], [95.0, 25.0]));
+        assert!(!masks.rect_inside(2, [5.0, 5.0], [95.0, 45.0]));
+        assert!(!masks.rect_inside(2, [45.0, 45.0], [55.0, 55.0]));
+        // A rect enclosing the whole hollow has all corners wet but the rim inside it.
+        assert!(!masks.rect_inside(2, [10.0, 10.0], [90.0, 90.0]));
+        assert!(masks.rect_inside(7, [0.0, 0.0], [1.0, 1.0]));
     }
 
     #[test]
@@ -2913,6 +3240,33 @@ mod tests {
 
         // Horizontal separation uses the same shortest 3D distance metric.
         assert_eq!(promoted_surface_distance([30_000.0, 0.0, 0.0], surface), 10_000.0);
+    }
+
+    #[test]
+    fn level_limit_drops_only_rings_beyond_the_radius() {
+        let (minimum, maximum) = ([-20_000.0; 2], [20_000.0; 2]);
+        let runtime = build_runtime_promoted_clipmap(
+            OCEAN_HIGH_MESH_SPACING_UNITS, 0.0, minimum, maximum, None, appearance::MIN_PROMOTED_AMPLITUDE);
+        let surface = OceanSurface { plane_height: 0.0, minimum, maximum };
+        let masks = OceanMasks::default();
+        let half = promoted_clipmap_half_cells(appearance::MIN_PROMOTED_AMPLITUDE);
+        let layout = &runtime.layout;
+        let all = layout.levels_within(half, 0.0, f32::INFINITY);
+        assert!(all > 2);
+        // A tiny radius needs only the finest level; each level end is a threshold.
+        assert_eq!(layout.levels_within(half, 0.0, 1.0), 1);
+        let reach0 = layout.base_spacing * promoted_level_half_cells(0, half) as f32;
+        assert_eq!(layout.levels_within(half, 0.0, reach0 + 1.0), 2);
+        // A viewer off the centre can see further rings.
+        assert!(layout.levels_within(half, reach0, reach0 + 1.0) >= 2);
+        // Capping removes the outer indices and keeps a strict prefix of the cells.
+        let full = layout.indices_for_footprint_with_sky(half, 0, u32::MAX, [0.0; 2], surface, &masks, None, None, None);
+        let capped = layout.indices_for_footprint_with_sky(half, 0, 2, [0.0; 2], surface, &masks, None, None, None);
+        assert!(capped.len() < full.len());
+        assert_eq!(&full[..capped.len()], &capped[..]);
+        // The finest level is never dropped, even for a limit below it.
+        let floor = layout.indices_for_footprint_with_sky(half, 0, 0, [0.0; 2], surface, &masks, None, None, None);
+        assert!(!floor.is_empty());
     }
 
     #[test]

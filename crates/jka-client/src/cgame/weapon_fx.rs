@@ -110,6 +110,8 @@ enum FxWorkerCommand {
     ResetTime(i32),
     /// `fx_physics` mode (see `crate::fx::FX_PHYSICS_*`).
     SetPhysics(u32),
+    SetGpuStaging(bool),
+    SetGpuOwned(std::collections::HashSet<u64>),
     /// `fx_lod` mode and `fx_countScale` (see `crate::fx::FX_LOD_*`).
     SetLod { mode: u32, count_scale: f32, lod_scale: f32 },
     /// Render view for LOD: origin and projected pixels per unit at depth 1.
@@ -146,6 +148,8 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
             FxWorkerCommand::AdjustTime(time) => worker.fx.adjust_time(time),
             FxWorkerCommand::ResetTime(time) => worker.fx.reset_time(time),
             FxWorkerCommand::SetPhysics(mode) => worker.fx.set_physics_mode(mode),
+            FxWorkerCommand::SetGpuStaging(enabled) => worker.fx.set_gpu_staging(enabled),
+            FxWorkerCommand::SetGpuOwned(ids) => worker.fx.set_gpu_owned(ids),
             FxWorkerCommand::SetLod { mode, count_scale, lod_scale } => worker.fx.set_lod(mode, count_scale, lod_scale),
             FxWorkerCommand::SetLodView { origin, px_per_unit } => worker.fx.set_lod_view(origin, px_per_unit),
             FxWorkerCommand::SetCollision(world) => {
@@ -693,14 +697,14 @@ struct Beam {
 /// One `CG_Chunks` LE_FRAGMENT before it is added to the scene.
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkSpec {
-    qpath: String,
-    origin: [f32; 3],
-    velocity: [f32; 3],
-    angles: [f32; 3],
-    angle_velocity: [f32; 3],
-    life_ms: i32,
-    bounce_factor: f32,
-    scale: f32,
+    pub(crate) qpath: String,
+    pub(crate) origin: [f32; 3],
+    pub(crate) velocity: [f32; 3],
+    pub(crate) angles: [f32; 3],
+    pub(crate) angle_velocity: [f32; 3],
+    pub(crate) life_ms: i32,
+    pub(crate) bounce_factor: f32,
+    pub(crate) scale: f32,
 }
 
 /// A live fragment: `pos` is TR_GRAVITY from (`base`, `trajectory_time`) until it
@@ -708,6 +712,9 @@ pub(crate) struct ChunkSpec {
 #[derive(Clone, Debug)]
 struct Chunk {
     spec: ChunkSpec,
+    /// Event-owned fragments may be promoted to Rapier, independently for gibs
+    /// and world debris. Never promote unrelated local entities.
+    physics_candidate: Option<ChunkPhysicsKind>,
     start_time: i32,
     end_time: i32,
     base: [f32; 3],
@@ -718,6 +725,9 @@ struct Chunk {
     last_time: i32,
     stationary: bool,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkPhysicsKind { Debris, Gib }
 
 /// The refEntity a fragment submits this frame.
 #[derive(Clone, Debug, PartialEq)]
@@ -761,20 +771,22 @@ impl SmallRng {
 /// One glass shard from `CG_DoGlassQuad` (an FX_AddPoly with FX_APPLY_PHYSICS).
 #[derive(Clone, Debug)]
 pub(crate) struct ShardSpec {
-    positions: [[f32; 3]; 4],
-    uvs: [[f32; 2]; 4],
-    velocity: [f32; 3],
-    accel_z: f32,
+    pub(crate) positions: [[f32; 3]; 4],
+    pub(crate) uvs: [[f32; 2]; 4],
+    pub(crate) velocity: [f32; 3],
+    pub(crate) accel_z: f32,
     /// Degrees per second, pitch and yaw only.
-    rotation: [f32; 2],
-    bounce: f32,
+    pub(crate) rotation: [f32; 2],
+    pub(crate) bounce: f32,
     /// Ticks the shard stays put before it starts to move.
-    delay_ms: i32,
+    pub(crate) delay_ms: i32,
 }
 
 #[derive(Clone, Debug)]
 struct Shard {
     spec: ShardSpec,
+    /// Index into the current frame's pending glass specs, if eligible.
+    physics_candidate: Option<usize>,
     centre0: [f32; 3],
     centre: [f32; 3],
     velocity: [f32; 3],
@@ -821,6 +833,8 @@ pub struct WeaponFx {
     fx_fps_scope: u32,
     /// Mirrors the worker's `fx_physics` mode (worker starts at the default).
     fx_physics: u32,
+    gpu_staging: bool,
+    gpu_owned: std::collections::HashSet<u64>,
     /// Mirrors the worker's `fx_lod` mode and `fx_countScale`.
     fx_lod: (u32, f32, f32),
     runner_rng: Rng,
@@ -831,6 +845,10 @@ pub struct WeaponFx {
     puffs: Vec<Puff>,
     beams: Vec<Beam>,
     chunks: Vec<Chunk>,
+    /// EV_DEBRIS spawn specifications queued for the shared Rapier world.
+    pending_debris: Vec<ChunkSpec>,
+    pending_gibs: Vec<ChunkSpec>,
+    pending_glass: Vec<ShardSpec>,
     plums: Vec<Plum>,
     last_plum_z: f32,
     score_plums: bool,
@@ -906,12 +924,17 @@ impl WeaponFx {
             continuous_fx_fps: crate::fx::FX_FPS_DEFAULT,
             fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
             fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
+            gpu_staging: false,
+            gpu_owned: std::collections::HashSet::new(),
             fx_lod: (crate::fx::FX_LOD_DEFAULT, 1.0, crate::fx::LOD_SCALE_DEFAULT),
             runner_rng: Rng::new(0x4658_5255_4E4E_4552),
             saber_renderer_rng: Rng::new(0x5341_4245_525F_474C),
             puffs: Vec::new(),
             beams: Vec::new(),
             chunks: Vec::new(),
+            pending_debris: Vec::new(),
+            pending_gibs: Vec::new(),
+            pending_glass: Vec::new(),
             plums: Vec::new(),
             last_plum_z: 0.0,
             score_plums: true,
@@ -1024,6 +1047,25 @@ impl WeaponFx {
             .send(FxWorkerCommand::SetLightPromotionCatalog(catalog));
     }
 
+    /// Enable spawn-time GPU candidates. Normal CPU rendering is preserved
+    /// until the material resolver accepts a candidate for GPU submission.
+    pub fn set_gpu_staging(&mut self, enabled: bool) {
+        if self.gpu_staging != enabled {
+            self.gpu_staging = enabled;
+            self.gpu_owned.clear();
+            let _ = self.worker_tx.send(FxWorkerCommand::SetGpuStaging(enabled));
+        }
+    }
+
+    /// Called after the Unified renderer's material and compiled-pipeline
+    /// gates. Send only changes, not an entire ID set every presentation tick.
+    pub fn set_gpu_owned(&mut self, ids: std::collections::HashSet<u64>) {
+        if self.gpu_owned != ids {
+            self.gpu_owned = ids.clone();
+            let _ = self.worker_tx.send(FxWorkerCommand::SetGpuOwned(ids));
+        }
+    }
+
     /// `fx_physics`: stock TaystJK particle physics on the CM world.
     pub fn set_fx_physics(&mut self, mode: u32) {
         let mode = mode.min(crate::fx::FX_PHYSICS_ALL);
@@ -1087,6 +1129,9 @@ impl WeaponFx {
         self.puffs.clear();
         self.beams.clear();
         self.chunks.clear();
+        self.pending_debris.clear();
+        self.pending_gibs.clear();
+        self.pending_glass.clear();
         self.foot_marks.clear();
         self.plums.clear();
         self.shards.clear();
@@ -1115,7 +1160,10 @@ impl WeaponFx {
         if time < self.time {
             self.puffs.clear();
             self.beams.clear();
-        self.chunks.clear();
+            self.chunks.clear();
+            self.pending_debris.clear();
+            self.pending_gibs.clear();
+            self.pending_glass.clear();
             self.entity_fx.clear();
             self.missile_fx.clear();
             self.saber_trail_history.clear();
@@ -1287,6 +1335,10 @@ impl WeaponFx {
     }
 
     fn add_chunks(&mut self, specs: &[ChunkSpec]) {
+        self.add_chunks_with_kind(specs, None);
+    }
+
+    fn add_chunks_with_kind(&mut self, specs: &[ChunkSpec], kind: Option<ChunkPhysicsKind>) {
         for spec in specs {
             if self.chunks.len() >= MAX_CHUNKS {
                 self.chunks.remove(0);
@@ -1301,8 +1353,51 @@ impl WeaponFx {
                 axis: scale_axis(angles_to_axis(spec.angles), spec.scale),
                 last_time: self.time,
                 stationary: false,
+                physics_candidate: kind,
                 spec: spec.clone(),
             });
+        }
+    }
+
+    /// Take the server-derived spawn specs without deleting legacy models until
+    /// the shared Rapier world explicitly accepts the corresponding event.
+    pub(crate) fn take_debris_spawns(&mut self) -> Vec<ChunkSpec> {
+        std::mem::take(&mut self.pending_debris)
+    }
+
+    pub(crate) fn take_gib_spawns(&mut self) -> Vec<ChunkSpec> {
+        std::mem::take(&mut self.pending_gibs)
+    }
+
+    pub(crate) fn take_glass_spawns(&mut self) -> Vec<ShardSpec> {
+        std::mem::take(&mut self.pending_glass)
+    }
+
+    fn resolve_chunk_promotion(&mut self, kind: ChunkPhysicsKind, promoted: bool) {
+        if promoted {
+            self.chunks.retain(|chunk| chunk.physics_candidate != Some(kind));
+        }
+        for chunk in &mut self.chunks {
+            if chunk.physics_candidate == Some(kind) {
+                chunk.physics_candidate = None;
+            }
+        }
+    }
+
+    pub(crate) fn resolve_debris_promotion(&mut self, promoted: bool) {
+        self.resolve_chunk_promotion(ChunkPhysicsKind::Debris, promoted);
+    }
+
+    pub(crate) fn resolve_gib_promotion(&mut self, promoted: bool) {
+        self.resolve_chunk_promotion(ChunkPhysicsKind::Gib, promoted);
+    }
+
+    /// Rapier can accept a subset of very large panes. Every remaining quad
+    /// continues down the unchanged legacy trajectory instead of vanishing.
+    pub(crate) fn resolve_glass_promotion(&mut self, promoted_count: usize) {
+        self.shards.retain(|shard| !shard.physics_candidate.is_some_and(|i| i < promoted_count));
+        for shard in &mut self.shards {
+            shard.physics_candidate = None;
         }
     }
 
@@ -1689,6 +1784,12 @@ impl WeaponFx {
             runtime.next_time = self.time.saturating_add(period);
         }
         self.play("mp/itemcone", origin, [0.0, 0.0, 1.0]);
+    }
+
+    /// TaystJK TurretClientRun: server fireflag transitions play the muzzle
+    /// effect at Ghoul2's *flash02 bolt, along its NEGATIVE_X direction.
+    pub fn turret_muzzle(&mut self, origin: [f32; 3], direction: [f32; 3]) {
+        self.play("turret/muzzle_flash", origin, direction);
     }
 
     /// OpenJK CG_FX: consume the fx_runner state carried by an ET_FX snapshot.
@@ -2746,12 +2847,15 @@ impl WeaponFx {
                     return Some(EventDispatchResult::Handled("FX_GLASS_SHARDS"));
                 }
                 let specs = glass_shards(event, *model, &self.inline_model_bounds);
-                for spec in specs {
+                let offset = self.pending_glass.len();
+                self.pending_glass.extend(specs.iter().cloned());
+                for (index, spec) in specs.into_iter().enumerate() {
                     if self.shards.len() >= MAX_SHARDS {
                         self.shards.remove(0);
                     }
                     let centre = std::array::from_fn(|axis| spec.positions.iter().map(|p| p[axis]).sum::<f32>() * 0.25);
                     self.shards.push(Shard {
+                        physics_candidate: Some(offset + index),
                         centre0: centre,
                         centre,
                         velocity: spec.velocity,
@@ -2769,13 +2873,15 @@ impl WeaponFx {
                 if specs.is_empty() || self.repeated_time {
                     return Some(EventDispatchResult::Handled("FX_GIBS"));
                 }
-                self.add_chunks(&specs);
+                self.pending_gibs.extend(specs.iter().cloned());
+                self.add_chunks_with_kind(&specs, Some(ChunkPhysicsKind::Gib));
                 Some(EventDispatchResult::Handled("FX_GIBS"))
             }
             PreparedFxEvent::Chunks(specs) => {
                 if self.repeated_time {
                     return Some(EventDispatchResult::Handled("FX_CHUNKS"));
                 }
+                self.pending_debris.extend(specs.iter().cloned());
                 for spec in specs {
                     if self.chunks.len() >= MAX_CHUNKS {
                         self.chunks.remove(0);
@@ -2790,6 +2896,7 @@ impl WeaponFx {
                         axis: scale_axis(angles_to_axis(spec.angles), spec.scale),
                         last_time: self.time,
                         stationary: false,
+                        physics_candidate: Some(ChunkPhysicsKind::Debris),
                         spec: spec.clone(),
                     });
                 }
@@ -3516,6 +3623,11 @@ fn scale_axis(axis: [[f32; 3]; 3], scale: f32) -> [[f32; 3]; 3] {
     axis.map(|row| row.map(|value| value * scale))
 }
 
+/// The Rapier debris body starts with the exact rendered LE_FRAGMENT basis.
+pub(crate) fn rapier_debris_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
+    angles_to_axis(angles)
+}
+
 fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
     let (sp, cp) = angles[0].to_radians().sin_cos();
     let (sy, cy) = angles[1].to_radians().sin_cos();
@@ -4163,6 +4275,90 @@ mod event_beam_tests {
         assert!(later.iter().zip(&first).all(|(a, b)| a.origin != b.origin));
         fx.begin_frame(3_300);
         assert!(fx.chunk_models().is_empty(), "fragments live at most 2.2 s");
+    }
+
+    #[test]
+    fn debris_promotion_is_atomic_and_does_not_promote_gibs() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        let specs = vec![ChunkSpec {
+            qpath: "models/chunks/rock/rock1_1.md3".into(),
+            origin: [0.0, 0.0, 32.0], velocity: [50.0, 0.0, 0.0],
+            angles: [0.0; 3], angle_velocity: [0.0; 3],
+            life_ms: 1500, bounce_factor: 0.2, scale: 1.0,
+        }];
+        let event = event(EntityEvent::EV_DEBRIS, 0, &[]);
+        fx.begin_frame(1000);
+        fx.entity_event_prepared(&event, &PreparedFxEvent::Chunks(specs.clone()));
+        assert_eq!(fx.take_debris_spawns().len(), 1);
+        fx.resolve_debris_promotion(false); // no map collider yet
+        assert_eq!(fx.chunk_models().len(), 1);
+        assert!(fx.take_debris_spawns().is_empty());
+
+        fx.begin_frame(1100);
+        fx.entity_event_prepared(&event, &PreparedFxEvent::Chunks(specs));
+        assert_eq!(fx.take_debris_spawns().len(), 1);
+        fx.resolve_debris_promotion(true);
+        assert_eq!(fx.chunk_models().len(), 1, "fallback from previous frame is kept");
+        assert!(fx.chunks.iter().all(|chunk| chunk.physics_candidate.is_none()));
+
+        fx.add_chunks(&[ChunkSpec {
+            qpath: "models/chunks/gib.md3".into(),
+            origin: [0.0; 3], velocity: [0.0; 3],
+            angles: [0.0; 3], angle_velocity: [0.0; 3],
+            life_ms: 1000, bounce_factor: 0.5, scale: 1.0,
+        }]);
+        assert_eq!(fx.chunk_models().len(), 2, "non-EV_DEBRIS chunks stay legacy");
+    }
+
+    #[test]
+    fn gib_and_breakable_promotion_are_independent() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.set_gib_level(2);
+        fx.begin_frame(2000);
+        let debris = event(EntityEvent::EV_DEBRIS, 0, &[]);
+        let chunk = ChunkSpec {
+            qpath: "models/chunks/rock/rock1_1.md3".into(),
+            origin: [0.0, 0.0, 30.0], velocity: [1.0, 2.0, 3.0],
+            angles: [0.0; 3], angle_velocity: [0.0; 3], life_ms: 1500,
+            bounce_factor: 0.3, scale: 1.0,
+        };
+        fx.entity_event_prepared(&debris, &PreparedFxEvent::Chunks(vec![chunk]));
+        let gibs = event(EntityEvent::EV_GIB_PLAYER, 0, &[]);
+        fx.entity_event_prepared(&gibs, &PreparedFxEvent::Gibs {
+            origin: [0.0, 0.0, 30.0], seed: 12345,
+        });
+        assert_eq!(fx.take_debris_spawns().len(), 1);
+        assert_eq!(fx.take_gib_spawns().len(), 10);
+        fx.resolve_debris_promotion(true);
+        assert_eq!(fx.chunks.len(), 10);
+        fx.resolve_gib_promotion(false);
+        assert_eq!(fx.chunk_models().len(), 10);
+    }
+
+    #[test]
+    fn glass_promotion_keeps_unaccepted_shards_and_preserves_uvs() {
+        let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
+        let mut fx = WeaponFx::new(assets);
+        fx.begin_frame(1234);
+        let specs = vec![ShardSpec {
+            positions: [[1.0, 2.0, 3.0]; 4], uvs: [[0.0, 0.0]; 4],
+            velocity: [0.0; 3], accel_z: -600.0, rotation: [0.0; 2],
+            bounce: 0.2, delay_ms: 20,
+        }; 3];
+        for (index, spec) in specs.iter().cloned().enumerate() {
+            fx.shards.push(Shard {
+                spec, physics_candidate: Some(index), centre0: [1.0, 2.0, 3.0],
+                centre: [1.0, 2.0, 3.0], velocity: [0.0; 3], angles: [0.0; 2],
+                start_time: 1234, last_time: 1254, stationary: false,
+            });
+        }
+        fx.pending_glass.extend(specs);
+        assert_eq!(fx.take_glass_spawns().len(), 3);
+        fx.resolve_glass_promotion(2);
+        assert_eq!(fx.shards.len(), 1);
+        assert_eq!(fx.shards[0].physics_candidate, None);
     }
 
     #[test]

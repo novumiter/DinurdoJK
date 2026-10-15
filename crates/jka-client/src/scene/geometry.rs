@@ -12,6 +12,7 @@ pub(in crate::scene) struct Geometry {
 
 #[derive(Default)]
 pub(in crate::scene) struct WorldGeometryChunk {
+    pub(in crate::scene) patches: Vec<super::PreparedPatchDraw>,
     pub(in crate::scene) vertices: Vec<GpuVertex>,
     pub(in crate::scene) surface_ids: Vec<u32>,
 }
@@ -32,11 +33,12 @@ pub(in crate::scene) struct GrassWorkerPatchKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::scene) struct GroupKey {
-    pub(in crate::scene) class: DrawClass,
-    /// Sort before shader index: transparent world materials honor TaystJK's
-    /// `sort additive` (SS_BLEND1) instead of BSP shader-table order.
+    /// TaystJK orders whole shaders by authored sort then sorted shader index.
+    /// Sky normally sorts at 2, opaque at 3, explicit late sorts afterward.
+    /// Stage pipeline class is NOT a primary ordering dimension.
     pub(in crate::scene) sort_priority: i32,
     pub(in crate::scene) shader: usize,
+    pub(in crate::scene) class: DrawClass,
     pub(in crate::scene) lightmap: Option<usize>,
     pub(in crate::scene) vertex_lit: bool,
     pub(in crate::scene) color_slot: u8,

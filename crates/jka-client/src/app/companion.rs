@@ -401,6 +401,7 @@ impl App {
                 paint_jobs,
                 textures_delta,
                 pixels_per_point,
+                present_token: None,
             },
         });
         companion.last_frame = Instant::now();

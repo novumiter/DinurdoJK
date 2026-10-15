@@ -292,7 +292,7 @@ pub(in crate::renderer) fn create_companion_blit_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -828,6 +828,8 @@ impl Renderer {
             return None;
         }
 
+        // Evaluate the ocean-sky flag before mutably borrowing the companion targets.
+        let sky_horizon_flag = self.ocean_sky_horizon_flag();
         let target = self.companion_scene_targets.get_mut(&request.id)?;
         if target.last_render_at.elapsed() < COMPANION_SCENE_FRAME_INTERVAL {
             return None;
@@ -847,7 +849,8 @@ impl Renderer {
                 time,
             ],
             clip_plane: [0.0; 4],
-            render_flags: [0, (u32::from(static_bsp_ao) | (u32::from(self.sky_fractal_override) << 1)), classic_flags, 0],
+            render_flags: [0, (u32::from(static_bsp_ao) | (u32::from(self.sky_fractal_override) << 1)
+                | sky_horizon_flag), classic_flags, 0],
             camera_forward: request.camera.forward().extend(0.0).to_array(),
             unjittered_view_proj: view_proj.to_cols_array_2d(),
             previous_unjittered_view_proj: view_proj.to_cols_array_2d(),

@@ -254,11 +254,9 @@ mod compat {
             self.entries[index].assigned = None;
         }
 
-        pub fn list_assigned(&self) -> impl Iterator<Item = usize> + '_ {
-            self.entries
-                .iter()
-                .enumerate()
-                .filter_map(|(i, e)| if e.is_assigned() { Some(i) } else { None })
+        /// DinurdoJK patch: called on every draw; scan from the end.
+        pub fn last_assigned(&self) -> Option<usize> {
+            self.entries.iter().rposition(|e| e.is_assigned())
         }
 
         pub fn list_active(&self) -> impl Iterator<Item = usize> + '_ {
@@ -451,7 +449,7 @@ impl Binder {
     }
 
     pub(super) fn last_assigned_index(&self) -> Option<usize> {
-        self.manager.list_assigned().last()
+        self.manager.last_assigned()
     }
 
     pub(super) fn list_active(&self) -> impl Iterator<Item = &Arc<BindGroup>> + '_ {

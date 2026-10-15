@@ -3,7 +3,7 @@ use crate::app::{
     config, egui_pages, hitch, mpsc, normalize_anti_aliasing, quality, scene, server_browser,
     spawn_map_loader, ui, ui_catalog, App, Arc, AssetFilter, BTreeMap, BindKey, Bindings,
     BrowserUiState, Camera, ChatLogRangeFilter, ChatMode, ClientInfo, ConsoleSize,
-    DemoConsoleFilter, DemoViewMode, EntityGraphUi, EventLoopProxy, ForcedPlayerModels,
+    DemoConsoleFilter, DemoViewMode, EntityGraphUi, ShaderRemapUi, EventLoopProxy, ForcedPlayerModels,
     FrontendPage, HashMap, HashSet, Instant, KeyCode, MapLoadingState, ModifiersState, OverlayMode,
     PathBuf, PerfStats, PhysicsMapMesh, SpectatorCameraState, ThirdPersonCameraState,
     UserEvent, VecDeque, VideoSection, VideoSettings, ViewLatchMode,
@@ -24,6 +24,7 @@ impl App {
         let extensions = crate::extensions::Manager::spawn(base.join("extensions"))?;
         // External LUTs must be listed before the saved r_colorLut is parsed.
         crate::color_lut::scan_external(&base, game.as_deref());
+        crate::startup_timeline::mark(crate::startup_timeline::Milestone::LutScanReady);
         let config_path = settings_dir.join("DinurdoJK.cfg");
         let mut video = config::load_video_settings(&config_path);
         crate::logging::set_developer_level(video.developer_level);
@@ -58,6 +59,7 @@ impl App {
         if bindings.get(tab).is_none() {
             bindings.set(tab, "+scores");
         }
+        crate::startup_timeline::mark(crate::startup_timeline::Milestone::ConfigReady);
         let fps_cap_input = video.fps_cap.to_string();
         let default_video = VideoSettings::default();
         let sun_custom_initialized = video.sun_override
@@ -82,6 +84,7 @@ impl App {
         let (race_ghost_web_tx, race_ghost_web_rx) = mpsc::channel();
         let ui_catalog = ui_catalog::UiCatalog::spawn()?;
         let background_jobs = super::background_jobs::BackgroundJobs::spawn()?;
+        crate::startup_timeline::mark(crate::startup_timeline::Milestone::WorkersReady);
         let (background_result_tx, background_result_rx) = mpsc::channel();
         let mut strafe_trails =
             crate::strafe_trail::Manager::spawn(presentation.strafe_trail.clone())?;
@@ -103,10 +106,21 @@ impl App {
                 config_dirty = true;
             }
         }
-        let (saved_accounts, account_credential_error) = match crate::credential_store::list() {
-            Ok(entries) => (entries, None),
-            Err(error) => (Vec::new(), Some(error)),
-        };
+        // Windows Credential Manager enumeration is optional startup UI data.
+        // Do not block window creation on this potentially slow OS call.
+        let accounts_proxy = proxy.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("credential-catalog".to_owned())
+            .spawn(move || {
+                let result = crate::credential_store::list();
+                crate::startup_timeline::mark(crate::startup_timeline::Milestone::CredentialsReady);
+                let _ = accounts_proxy.send_event(UserEvent::SavedAccountsReady(result));
+            })
+        {
+            eprintln!("Could not start saved-account enumeration: {error}");
+        }
+        let saved_accounts = Vec::new();
+        let account_credential_error = None;
         let mut app = Self {
             extensions,
             base,
@@ -334,6 +348,12 @@ impl App {
             pending_frontend_map_launch: false,
             frontend_background_request_id: None,
             frontend_cinematic: None,
+            frontend_scene_cache_path: None,
+            frontend_scene_texture: None,
+            frontend_scene_cache_generation: 0,
+            frontend_stage: Default::default(),
+            deferred_frontend_map: None,
+            startup_first_menu_frame_seen: false,
             proxy,
             loader_tx,
             window: None,
@@ -439,6 +459,8 @@ impl App {
             overlay_before_console: OverlayMode::Game,
             dev_radial_return_overlay: OverlayMode::Game,
             dev_radial_offset: [0.0; 2],
+            model_placement: Default::default(),
+            emote_radial_category: None,
             console_input: String::new(),
             console_cursor: 0,
             console_status: if front_end {
@@ -528,6 +550,7 @@ impl App {
             ocean_settings_target: -1,
             promoted_oceans: Vec::new(),
             promoted_ocean_overrides: Vec::new(),
+            ocean_sky_extend: true,
             coastal_debug_mode: 0,
             coastal_enabled: false,
             coastal_pool: 0,
@@ -553,6 +576,8 @@ impl App {
             applied_hdr_output: video.hdr_output,
             hdr_output_status: "Initializing display output...".to_owned(),
             hdr_output_active: false,
+            hdr_available_modes: 1,
+            hdr_modes_known: false,
             applied_resolution: video.resolution,
             applied_grass: video.grass,
             applied_ocean: video.ocean,
@@ -582,6 +607,9 @@ impl App {
             sun_custom_initialized,
             latest_request_id: 0,
             latest_prepare_options: scene::MapPrepareOptions {
+                visual_only: false,
+                patch_subdivisions_bits: video.patch_subdivisions.to_bits(),
+                patch_stitching: video.patch_stitching,
                 picmip: video.picmip,
                 grass: video.grass,
                 voxel_probe_gi: video.voxel_probe_gi,
@@ -604,6 +632,7 @@ impl App {
             shader_remaps: scene::ShaderRemapState::default(),
             shader_remap_upload: false,
             shader_remap_dirty: false,
+            shader_remap_ui: ShaderRemapUi::default(),
             physics_mesh_label: None,
             display_transition_until: None,
             loading: initial_loading,

@@ -34,6 +34,7 @@ pub struct RenderStats {
     pub cull_area_rejected: u32,
     /// Main world pass program binds last frame: specialized, general.
     pub world_program_binds: (u32, u32),
+    pub world_shader_programs: WorldShaderPrograms,
     pub input_event_to_sim_ms: Option<f64>,
     pub input_sim_to_render_ms: Option<f64>,
     pub input_event_to_latch_ms: Option<f64>,
@@ -45,6 +46,15 @@ pub struct RenderStats {
     pub msaa_samples: u32,
     pub vsync: VsyncMode,
     pub threads: Arc<[ThreadActivitySample]>,
+}
+
+/// Program binds are actual main-pass state changes, not estimated sort savings.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WorldShaderPrograms {
+    pub requested: u8,
+    pub active: u8,
+    /// General, specialized, mode-2 minimal, shared, generated.
+    pub binds: [u32; 5],
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +85,30 @@ pub struct SurfaceInspectorInfo {
 
 #[derive(Debug, Clone, Default)]
 pub struct WorldUploadTimings {
+    /// A remap requested new geometry and required the compatibility full-world path.
+    pub remap_full_fallback: bool,
     pub vertex_buffer_ms: f64,
+    /// Indexed-geometry CPU preparation and patch LOD generation.
+    pub vertex_cpu_ms: f64,
+    /// WGPU buffer creation and queue submission on the calling thread.
+    pub vertex_gpu_calls_ms: f64,
+    /// Material-usage classification before world upload (small CPU cost).
+    pub texture_classify_ms: f64,
+    /// Skybox image CPU averaging, before texture WGPU calls.
+    pub skybox_average_ms: f64,
+    /// Number of primary skybox face slots sampled (0 or 6, never PVS-dependent).
+    pub skybox_face_references: usize,
+    /// Number of distinct skybox texture indices averaged/cached.
+    pub skybox_unique_images: usize,
+    /// Worker compute time; can overlap the vertex stage, not additive to load time.
+    pub texture_encode_cpu_ms: f64,
+    /// Actual render-thread time awaiting the colour/companion BC worker.
+    pub texture_encode_wait_ms: f64,
+    /// WGPU image creation/queue API time; NOT measured GPU execution.
+    pub texture_gpu_calls_ms: f64,
+    pub lightmap_encode_cpu_ms: f64,
+    pub lightmap_encode_wait_ms: f64,
+    pub lightmap_gpu_calls_ms: f64,
     pub texture_upload_ms: f64,
     pub lightmap_upload_ms: f64,
     pub reflection_probe_upload_ms: f64,
@@ -114,6 +147,7 @@ pub struct WorldUploadTimings {
 #[derive(Debug)]
 pub enum ScreenshotOutput {
     Saved(PathBuf),
+    FrontendSceneSaved(PathBuf),
     Clipboard,
     VideoFrame {
         frame_index: u64,
@@ -125,22 +159,33 @@ pub enum ScreenshotOutput {
 }
 
 pub enum UserEvent {
+    /// Credential Manager enumeration completes on a separate thread; the main
+    /// window must not wait for it to show its first interactive frame.
+    SavedAccountsReady(Result<Vec<crate::credential_store::SavedAccount>, String>),
     ConsoleCommand(String),
     GammaPrepared(u64),
     HardwareGamma(crate::display_gamma::Status),
     ScreenshotFinished(Result<ScreenshotOutput, String>),
-    HdrOutputChanged { status: String, active: bool },
+    HdrOutputChanged { status: String, active: bool, available_modes: u8 },
     RendererReady {
         supported_msaa: Vec<u32>,
         wireframe_supported: bool,
         hdr_output_status: String,
         hdr_output_active: bool,
+        hdr_available_modes: u8,
         adapter_name: String,
         adapter_type: String,
     },
     CompanionReady { id: u32 },
     CompanionError { id: u32, error: String },
     RendererFirstFrame,
+    /// Emitted only after a frame with egui has successfully presented.
+    RendererFirstMenuFrame,
+    /// The renderer presented a frame whose egui paint data carried this token.
+    /// Sent once per distinct token; drives the menu stage fade clock.
+    FrontendStagePresented(u64),
+    /// An asynchronously decoded placeholder (not the live 3D scene).
+    FrontendSceneCacheReady { path: PathBuf, generation: u64, image: Option<egui::ColorImage> },
     /// Footsteps and landings the renderer found in standing water; the game
     /// thread plays the engine's own splash effects for them.
     WaterSplashes(Vec<crate::weather::wake::WaterSplash>),
@@ -174,6 +219,15 @@ pub enum UserEvent {
         map_name: String,
         result: Result<crate::steam_audio::SteamAudioBakeData, String>,
         elapsed_ms: f64,
+    },
+    /// A worker-resolved remap stage plan. Not a map load: no BSP, collision,
+    /// or texture source allocations were cloned while preparing this message.
+    ShaderRemapPrepared {
+        request_id: u64,
+        started: Instant,
+        name: String,
+        base_texture_count: usize,
+        result: Result<Box<crate::scene::PreparedRemapPlan>, String>,
     },
     MapPrepared {
         request_id: u64,

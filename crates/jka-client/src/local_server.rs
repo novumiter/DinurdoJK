@@ -376,12 +376,6 @@ impl LocalServer {
         self.map_player_time(self.player.presentation_time())
     }
 
-    /// Fractional camera clock, with the same local-to-server time offset as
-    /// presentation_time(), but without rounding to whole milliseconds.
-    pub fn presentation_time_precise(&self) -> f64 {
-        self.player.presentation_time_precise() + self.player_time_offset as f64
-    }
-
     pub fn subframe_view_angles(&self) -> [f32; 3] {
         self.player.subframe_view_angles()
     }

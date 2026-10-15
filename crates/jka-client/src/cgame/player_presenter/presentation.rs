@@ -379,6 +379,14 @@ impl PlayerPresenter {
         draws
     }
 
+    /// True only after the requested model or its terminal OpenJK fallback has
+    /// resolved, rather than while a temporary async placeholder is visible.
+    pub fn player_model_settled(&self, entity_number: u16) -> bool {
+        self.entities
+            .get(&entity_number)
+            .is_some_and(|runtime| runtime.model_settled)
+    }
+
     /// Present one local/followed player through the same Ghoul2/model/animation
     /// path used for snapshot players. This is deliberately not a second
     /// third-person renderer.

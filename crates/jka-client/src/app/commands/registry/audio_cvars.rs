@@ -926,6 +926,39 @@ app_cvars! {
         ]
     }
 
+    APP_S_EAL {
+        runtime: CvarDef::new(
+                "s_eal", "", "0..1",
+                "Use authored map .eal EAX reverb through optional OpenAL Soft, preserving Steam Audio direct sound.",
+                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_s_eal(app)),
+                |app, value| App::cvar_set_s_eal(app, APP_S_EAL.entry.name, &value.to_string()),
+            ).with_text_setter(App::cvar_set_s_eal, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _name, value| {
+                settings.eal_enabled = parse_bool(value).unwrap_or(settings.eal_enabled);
+            }),
+            archive: Some((430, |state| format!("{}", u8::from(state.audio.eal_enabled)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_s_eal(&self) -> String { bool_value(self.audio.eal_enabled) }
+                fn cvar_set_s_eal(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = Self::parse_cvar_bool(name, value)?;
+                    self.audio.eal_enabled = enabled;
+                    if let Some(sound) = self.game_session.as_mut()
+                        .and_then(|session| session.sound_presenter.as_mut()) {
+                        sound.set_eal_enabled(enabled);
+                    }
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_S_STEAMAUDIO {
         runtime: CvarDef::new(
                 "s_steamAudio",

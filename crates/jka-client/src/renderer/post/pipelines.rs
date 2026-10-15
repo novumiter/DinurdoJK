@@ -32,7 +32,7 @@ pub(in crate::renderer) fn create_planar_debug_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -65,7 +65,7 @@ pub(in crate::renderer) fn create_gamma_post_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -97,7 +97,7 @@ pub(in crate::renderer) fn create_dof_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -130,7 +130,7 @@ pub(in crate::renderer) fn create_bloom_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -162,7 +162,7 @@ pub(in crate::renderer) fn create_ssao_temporal_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -224,7 +224,7 @@ pub(in crate::renderer) fn create_ssr_visibility_resources(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA SSR frontmost visibility bind group"),
@@ -278,7 +278,7 @@ pub(in crate::renderer) fn create_ssr_temporal_pipeline(
             ],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -327,7 +327,7 @@ pub(in crate::renderer) fn create_cloud_pass_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -360,7 +360,7 @@ pub(in crate::renderer) fn create_post_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -393,7 +393,7 @@ pub(in crate::renderer) fn create_rain_post_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -434,7 +434,7 @@ pub(in crate::renderer) fn create_taa_post_pipeline(
             ],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -491,7 +491,7 @@ pub(in crate::renderer) fn create_cull_debug_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -552,7 +552,7 @@ pub(in crate::renderer) fn create_wireframe_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -615,6 +615,6 @@ pub(in crate::renderer) fn create_cloud_shadow_opaque_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     })
 }

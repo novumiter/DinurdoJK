@@ -3,6 +3,9 @@ use crate::app::egui_menu::{
     menu_action, theme, App, FrontendPage, OverlayMode, RenderCommand, CONTENT_MAX_W,
     FRONTEND_SCENE_FADE_IN_SECS, GUTTER, SETUP_TAB_VIDEO,
 };
+use crate::app::frontend_scene_cache::{
+    smoothstep01, FRONTEND_CHROME_FADE_IN_SECS, FRONTEND_STAGE_FADE_IN_SECS,
+};
 
 impl App {
     pub(in crate::app::egui_menu) fn build_egui_frontend_menu(&mut self, ui: &mut egui::Ui) {
@@ -17,6 +20,29 @@ impl App {
             self.egui_frontend_body(ui);
         }
         self.egui_disconnect_notice(ui);
+        self.egui_frontend_2d_fade(ui);
+    }
+
+    /// Fade the 2D chrome in on the shared stage clock (see `FrontendStage`).
+    /// The UI remains interactive as the scrim is just a paint layer, not a
+    /// hit-testable Area or blocking loading overlay. Until the renderer has
+    /// presented the first dark frame the scrim is fully opaque.
+    fn egui_frontend_2d_fade(&self, ui: &egui::Ui) {
+        let ctx = ui.ctx();
+        let now = std::time::Instant::now();
+        let shown = self.frontend_stage.brightness(now, FRONTEND_CHROME_FADE_IN_SECS);
+        if shown >= 1.0 { return; }
+        let alpha = ((1.0 - shown) * 255.0).round() as u8;
+        ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("frontend_2d_initial_fade_scrim"),
+        ))
+        .rect_filled(
+            ctx.content_rect(),
+            egui::CornerRadius::ZERO,
+            egui::Color32::from_black_alpha(alpha),
+        );
+        ctx.request_repaint();
     }
 
     /// jaPRO/stock JKA show a kick/ban/drop reason as a popup over the main menu
@@ -51,10 +77,16 @@ impl App {
         }
     }
 
-    /// Paint a black scrim *under* the menu chrome but over the 3D renderer.
-    /// Before duel3 is available it is fully opaque, so startup is black rather
-    /// than the renderer's no-world clear color. Once the cinematic is ready,
-    /// the scrim eases away and the BSP appears to brighten from 0 -> 1.
+    /// Paint the menu's 3D stage under the chrome: the cached photograph (while
+    /// the live scene is not yet shown) and a black scrim over both.
+    ///
+    /// Two independent quantities, one clock each, never stacked:
+    /// * `handoff` (live-3D readiness, `fade_started`) cross-fades the cached
+    ///   image out. It is evaluated even when the scrim is fully opaque.
+    /// * `darkness` is the startup brightness. With a cached image it follows the
+    ///   presentation-driven stage clock; with none (cold start) the live scene
+    ///   itself fades in from black on the same handoff.
+    /// The scrim is painted after the image and the live scene, before the chrome.
     pub(in crate::app::egui_menu) fn egui_frontend_scene_fade(&self, root: &mut egui::Ui) {
         if matches!(
             self.frontend_page,
@@ -62,26 +94,51 @@ impl App {
         ) {
             return;
         }
-        let brightness = self
+        let now = std::time::Instant::now();
+        let handoff = self
             .frontend_cinematic
             .and_then(|cinematic| cinematic.fade_started)
             .map_or(0.0, |started| {
-                let t = started.elapsed().as_secs_f32() / FRONTEND_SCENE_FADE_IN_SECS;
-                let t = t.clamp(0.0, 1.0);
-                // Smoothstep avoids a visible pop in slope at either end of the fade.
-                t * t * (3.0 - 2.0 * t)
+                smoothstep01(now.saturating_duration_since(started).as_secs_f32()
+                    / FRONTEND_SCENE_FADE_IN_SECS)
             });
-        let blackout = 1.0 - brightness;
-        if blackout <= 0.001 {
-            return;
+        let image_expected =
+            self.frontend_scene_texture.is_some() || self.frontend_stage.cache_pending;
+        let darkness = if image_expected {
+            1.0 - self.frontend_stage.brightness(now, FRONTEND_STAGE_FADE_IN_SECS)
+        } else {
+            1.0 - handoff
+        };
+        let image_alpha = 1.0 - handoff;
+        let rect = root.max_rect();
+        let mut painted_image = false;
+        if let Some(image) = &self.frontend_scene_texture {
+            if image_alpha > 0.001 {
+                // Cover/crop, not stretch: resizing the window should never
+                // deform the levelshot, even when the cached aspect differs.
+                let size = image.size_vec2();
+                let cover = (rect.width() / size.x).max(rect.height() / size.y);
+                let visible = egui::vec2(
+                    rect.width() / (size.x * cover),
+                    rect.height() / (size.y * cover),
+                );
+                let uv = egui::Rect::from_center_size(egui::pos2(0.5, 0.5), visible);
+                root.painter().image(
+                    image.id(), rect, uv,
+                    crate::renderer::egui_alpha_tint(image_alpha),
+                );
+                painted_image = true;
+            }
         }
-
-        let alpha = (blackout * 255.0).round() as u8;
-        root.painter().rect_filled(
-            root.max_rect(),
-            egui::CornerRadius::ZERO,
-            egui::Color32::from_rgba_premultiplied(0, 0, 0, alpha),
-        );
+        if darkness > 0.001 {
+            root.painter().rect_filled(
+                rect, egui::CornerRadius::ZERO,
+                egui::Color32::from_black_alpha((darkness * 255.0).round() as u8),
+            );
+        }
+        if darkness > 0.001 || painted_image && handoff > 0.0 && handoff < 1.0 {
+            root.ctx().request_repaint();
+        }
     }
 
     pub(in crate::app::egui_menu) fn egui_frontend_header(&mut self, root: &mut egui::Ui) {

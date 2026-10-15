@@ -41,7 +41,8 @@ impl App {
         current: bool,
     ) {
         theme::row(ui, label, tip, theme::Reset::Video(row), |ui| {
-            if theme::switch(ui, current).is_some() {
+            let preview = theme::preview_toggle_value(ui.ctx(), theme::Reset::Video(row), current);
+            if theme::switch(ui, preview).is_some() {
                 self.video_selected = row;
                 self.change_video_setting(1);
             }
@@ -57,7 +58,8 @@ impl App {
         current: bool,
     ) {
         theme::row(ui, label, tip, theme::Reset::Environment(row), |ui| {
-            if theme::switch(ui, current).is_some() {
+            let preview = theme::preview_toggle_value(ui.ctx(), theme::Reset::Environment(row), current);
+            if theme::switch(ui, preview).is_some() {
                 self.environment_selected = row;
                 self.change_environment_setting(1);
             }

@@ -5,7 +5,8 @@
 //! ownership boundary, but replaces Broadsword's renderer-side solver with
 //! Rapier.  Network snapshots and OpenJK pmove remain authoritative.
 
-use crate::cgame::PresentedEntity;
+use crate::cgame::{weapon_fx::{ChunkModel, ChunkSpec, ShardSpec}, PresentedEntity};
+use crate::fx::system::FxDraw;
 use jka_assets::ghoul2::{multiply_3x4, GlaAnimation, Matrix3x4};
 use rapier3d::{
     math::{Matrix, Pose, Rotation, Vector},
@@ -31,6 +32,9 @@ pub struct RagdollConfig {
     pub max_substeps: u32,
     pub ccd: bool,
     pub sleeping: bool,
+    pub debris_enabled: bool,
+    pub max_debris: u32,
+    pub debris_lifetime_seconds: f32,
     pub max_ragdolls: u32,
     pub lifetime_seconds: f32,
     /// OpenJK cg_dismember semantics: 0 off, 1 limbs only, 2 full (head/waist too).
@@ -54,6 +58,9 @@ impl Default for RagdollConfig {
             max_substeps: 4,
             ccd: true,
             sleeping: true,
+            debris_enabled: false,
+            max_debris: 192,
+            debris_lifetime_seconds: 10.0,
             max_ragdolls: 8,
             lifetime_seconds: 20.0,
             dismemberment: 0,
@@ -79,6 +86,12 @@ pub struct PhysicsMapMesh {
 }
 
 impl PhysicsMapMesh {
+    #[cfg(test)]
+    pub(crate) fn triangle_data(&self) -> Option<(Vec<[f32; 3]>, Vec<[u32; 3]>)> {
+        let mesh = self.shape.as_ref()?.as_trimesh()?;
+        Some((mesh.vertices().iter().map(|v| [v.x, v.y, v.z]).collect(), mesh.indices().to_vec()))
+    }
+
     pub fn from_jka_mesh(
         vertices: Vec<[f32; 3]>,
         triangles: Vec<[u32; 3]>,
@@ -261,6 +274,28 @@ struct DetachedLimbBody {
     spawned_at: i32,
 }
 
+/// One server-authored EV_DEBRIS model, simulated in the existing Rapier
+/// world. No server entity or gameplay collision is created.
+#[derive(Debug)]
+struct DebrisBody {
+    body: RigidBodyHandle,
+    qpath: String,
+    scale: f32,
+    expires_at: i32,
+}
+
+/// Glass is still rendered as the original FX quad. Only its transform is
+/// driven by Rapier. A delayed shard has no body until the TaystJK start time.
+#[derive(Debug)]
+struct GlassBody {
+    body: Option<RigidBodyHandle>,
+    spec: ShardSpec,
+    centre: [f32; 3],
+    born_at: i32,
+    activate_at: i32,
+    expires_at: i32,
+}
+
 pub struct RagdollWorld {
     config: RagdollConfig,
     pipeline: PhysicsPipeline,
@@ -277,6 +312,8 @@ pub struct RagdollWorld {
     previous_body_poses: HashMap<RigidBodyHandle, Pose>,
     instances: HashMap<u16, RagdollInstance>,
     detached_limbs: HashMap<u16, DetachedLimbBody>,
+    debris: Vec<DebrisBody>,
+    glass: Vec<GlassBody>,
     living_recoveries: HashMap<u16, LivingRagdollRecovery>,
     retired: HashMap<u16, (String, CorpseGeneration)>,
     last_time: Option<i32>,
@@ -309,6 +346,8 @@ impl RagdollWorld {
             previous_body_poses: HashMap::new(),
             instances: HashMap::new(),
             detached_limbs: HashMap::new(),
+            debris: Vec::new(),
+            glass: Vec::new(),
             living_recoveries: HashMap::new(),
             retired: HashMap::new(),
             last_time: None,
@@ -330,11 +369,16 @@ impl RagdollWorld {
         self.config.physics_enabled && self.config.dismemberment != 0 && self.static_world_ready
     }
 
+    fn debris_active(&self) -> bool {
+        self.config.physics_enabled && self.config.debris_enabled && self.static_world_ready
+    }
+
     fn world_active(&self) -> bool {
         // Do not step an otherwise-unused Rapier world merely because
         // cg_dismember is enabled. The first detached body is seeded after the
         // presentation prepass and starts integrating on the following frame.
         self.active() || (self.detached_physics_active() && !self.detached_limbs.is_empty())
+            || (self.debris_active() && (!self.debris.is_empty() || self.glass.iter().any(|g| g.body.is_some())))
     }
 
     pub fn debug_enabled(&self) -> bool {
@@ -357,6 +401,8 @@ impl RagdollWorld {
     pub fn reset_dynamic_for_seek(&mut self) {
         self.clear_instances();
         self.clear_detached_limbs();
+        self.clear_debris();
+        self.clear_glass();
         self.previous_body_poses.clear();
         self.living_recoveries.clear();
         self.last_time = None;
@@ -365,6 +411,8 @@ impl RagdollWorld {
 
     pub fn set_config(&mut self, config: RagdollConfig) {
         let was_enabled = self.config.enabled;
+        let debris_was_enabled = self.debris_active();
+        let rebuild_debris = self.config.ccd != config.ccd || self.config.sleeping != config.sleeping;
         let physics_was_enabled = self.config.physics_enabled;
         let debug_was = self.config.debug;
         let rebuild_ragdolls = self.config.enabled
@@ -381,6 +429,8 @@ impl RagdollWorld {
             hz: config.hz.clamp(30, 240),
             max_substeps: config.max_substeps.clamp(1, 16),
             max_ragdolls: config.max_ragdolls.min(64),
+            max_debris: config.max_debris.min(768),
+            debris_lifetime_seconds: config.debris_lifetime_seconds.clamp(1.0, 300.0),
             lifetime_seconds: config.lifetime_seconds.clamp(0.0, 300.0),
             dismemberment: config.dismemberment.min(2),
             max_detached_limbs: config.max_detached_limbs.min(128),
@@ -428,8 +478,13 @@ impl RagdollWorld {
         if self.config.dismemberment == 0 {
             self.clear_detached_limbs();
         }
+        if debris_was_enabled && (!self.debris_active() || rebuild_debris) {
+            self.clear_debris();
+            self.clear_glass();
+        }
         self.trim_to_budget();
         self.trim_detached_to_budget();
+        self.trim_debris_to_budget();
     }
 
     /// Replace the fixed Rapier world collider for a newly loaded map.
@@ -470,16 +525,14 @@ impl RagdollWorld {
         let Some(previous) = self.last_time.replace(current_time) else {
             return;
         };
-        if !self.world_active() {
-            self.accumulator = 0.0;
-            return;
-        }
         if current_time < previous {
             // Demo seeking/reverse playback invalidates every integrated pose.
             // The next ET_BODY presentation will seed each corpse from the
             // authoritative snapshot/death animation pose at the new time.
             self.clear_instances();
             self.clear_detached_limbs();
+            self.clear_debris();
+            self.clear_glass();
             self.accumulator = 0.0;
             return;
         }
@@ -490,6 +543,13 @@ impl RagdollWorld {
         }
 
         self.sleep_expired(current_time);
+        self.expire_debris(current_time);
+        self.expire_glass(current_time);
+        self.activate_glass(current_time);
+        if !self.world_active() {
+            self.accumulator = 0.0;
+            return;
+        }
 
         // The presentation clock can jump while loading/fast-forwarding. Never
         // try to pay back an arbitrarily large physics debt in one frame.
@@ -527,10 +587,12 @@ impl RagdollWorld {
         {
             self.last_stats_print = Some(current_time);
             println!(
-                "RAPIER STATS: active={} ragdolls={} detachedLimbs={} bodies={} colliders={} joints={} steps={} accumulatorMs={:.2}",
+                "RAPIER STATS: active={} ragdolls={} detachedLimbs={} debris={} glass={} bodies={} colliders={} joints={} steps={} accumulatorMs={:.2}",
                 self.world_active(),
                 self.instances.len(),
                 self.detached_limbs.len(),
+                self.debris.len(),
+                self.glass.len(),
                 self.bodies.len(),
                 self.colliders.len(),
                 self.impulse_joints.len(),
@@ -1253,6 +1315,18 @@ impl RagdollWorld {
                     .insert(detached.body, body.position().clone());
             }
         }
+        for debris in &self.debris {
+            if let Some(body) = self.bodies.get(debris.body) {
+                self.previous_body_poses.insert(debris.body, body.position().clone());
+            }
+        }
+        for glass in &self.glass {
+            if let Some(handle) = glass.body {
+                if let Some(body) = self.bodies.get(handle) {
+                    self.previous_body_poses.insert(handle, body.position().clone());
+                }
+            }
+        }
     }
 
     fn interpolation_alpha(&self) -> f32 {
@@ -1563,6 +1637,257 @@ impl RagdollWorld {
         );
     }
 
+    /// Accept an EV_DEBRIS spray into the same rigid-body/CCD solver as corpses
+    /// and severed limbs. Returns false when the stock ballistic fallback is
+    /// required (physics off or static collision not ready yet).
+    pub(crate) fn spawn_debris(&mut self, specs: &[ChunkSpec], now: i32) -> bool {
+        if !self.debris_active() || self.config.max_debris == 0 {
+            return false;
+        }
+        // Keep the authoritative spawn distribution/materials. Only the
+        // fragment motion and retention are optional client presentation.
+        for spec in specs {
+            if !spec.origin.iter().chain(spec.velocity.iter()).chain(spec.angles.iter())
+                .chain(spec.angle_velocity.iter()).all(|v| v.is_finite())
+                || !spec.scale.is_finite() || spec.scale <= 0.0
+            {
+                continue;
+            }
+            let basis = crate::cgame::weapon_fx::rapier_debris_axis(spec.angles);
+            let rotation = Rotation::from_mat3(&Matrix::from_cols(
+                Vector::from_array(basis[0]),
+                Vector::from_array(basis[1]),
+                Vector::from_array(basis[2]),
+            )).normalize();
+            let position = Vector::from_array(spec.origin) * JKA_TO_RAPIER;
+            let velocity = Vector::from_array(spec.velocity) * JKA_TO_RAPIER;
+            let angular_velocity = Vector::new(
+                spec.angle_velocity[0].to_radians(),
+                spec.angle_velocity[1].to_radians(),
+                spec.angle_velocity[2].to_radians(),
+            );
+            let body = self.bodies.insert(
+                RigidBodyBuilder::dynamic()
+                    .pose(Pose::from_parts(position, rotation))
+                    .linvel(velocity)
+                    .angvel(angular_velocity)
+                    .linear_damping(0.30)
+                    .angular_damping(0.9)
+                    .ccd_enabled(self.config.ccd)
+                    .can_sleep(self.config.sleeping),
+            );
+            if let Some(rigid) = self.bodies.get(body) {
+                self.previous_body_poses.insert(body, rigid.position().clone());
+            }
+            // The collision shape is deliberately a cheap proxy. MD3 fragments
+            // retain their original rendered geometry, without expensive hull
+            // extraction during a burst. GROUP_2 can contact the world, while
+            // enabling debris-debris contacts without forcing ragdoll coupling.
+            let radius = (3.0 * spec.scale).clamp(0.5, 12.0) * JKA_TO_RAPIER;
+            let groups = InteractionGroups::new(
+                Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2,
+                InteractionTestMode::default(),
+            );
+            self.colliders.insert_with_parent(
+                ColliderBuilder::ball(radius)
+                    .mass(0.3)
+                    .friction(0.8)
+                    .restitution(spec.bounce_factor.clamp(0.0, 1.0))
+                    .collision_groups(groups),
+                body,
+                &mut self.bodies,
+            );
+            self.debris.push(DebrisBody {
+                body,
+                qpath: spec.qpath.clone(),
+                scale: spec.scale,
+                expires_at: now.saturating_add((self.config.debris_lifetime_seconds * 1000.0) as i32),
+            });
+            self.trim_debris_to_budget();
+        }
+        true
+    }
+
+    /// Returns the prefix actually accepted; unaccepted quads remain legacy
+    /// FX polys, including when physics/collision is unavailable.
+    pub(crate) fn spawn_glass(&mut self, specs: &[ShardSpec], now: i32) -> usize {
+        if !self.debris_active() || self.config.max_debris == 0 {
+            return 0;
+        }
+        let count = specs.len().min(self.config.max_debris as usize);
+        // A prefix count is unambiguous only if every accepted spec is valid.
+        if specs.iter().take(count).any(|spec| {
+            spec.positions.iter().flatten().chain(spec.velocity.iter())
+                .chain(spec.rotation.iter()).any(|v| !v.is_finite())
+                || !spec.bounce.is_finite() || !spec.accel_z.is_finite()
+        }) {
+            return 0;
+        }
+        for spec in specs.iter().take(count) {
+            let centre = std::array::from_fn(|axis| {
+                spec.positions.iter().map(|p| p[axis]).sum::<f32>() * 0.25
+            });
+            self.glass.push(GlassBody {
+                body: None,
+                spec: spec.clone(),
+                centre,
+                born_at: now,
+                activate_at: now.saturating_add(spec.delay_ms.max(0)),
+                expires_at: now.saturating_add((self.config.debris_lifetime_seconds * 1000.0) as i32),
+            });
+        }
+        self.trim_debris_to_budget();
+        count
+    }
+
+    fn activate_glass(&mut self, now: i32) {
+        for glass in &mut self.glass {
+            if glass.body.is_some() || now < glass.activate_at {
+                continue;
+            }
+            let min = std::array::from_fn::<_, 3, _>(|axis| glass.spec.positions.iter()
+                .map(|point| point[axis]).fold(f32::INFINITY, f32::min));
+            let max = std::array::from_fn::<_, 3, _>(|axis| glass.spec.positions.iter()
+                .map(|point| point[axis]).fold(f32::NEG_INFINITY, f32::max));
+            // Axis-aligned at spawn: each pane is planar, with minimal thickness
+            // along its normal. The original quad remains the rendered surface.
+            let half = std::array::from_fn::<_, 3, _>(|axis| {
+                ((max[axis] - min[axis]) * 0.5).max(0.45).min(128.0) * JKA_TO_RAPIER
+            });
+            let body = self.bodies.insert(
+                RigidBodyBuilder::dynamic()
+                    .translation(Vector::from_array(glass.centre) * JKA_TO_RAPIER)
+                    .linvel(Vector::from_array(glass.spec.velocity) * JKA_TO_RAPIER)
+                    .angvel(Vector::new(glass.spec.rotation[0].to_radians(), glass.spec.rotation[1].to_radians(), 0.0))
+                    .gravity_scale((-glass.spec.accel_z / JKA_GRAVITY).clamp(0.1, 2.0))
+                    .linear_damping(0.22)
+                    .angular_damping(0.55)
+                    .ccd_enabled(self.config.ccd)
+                    .can_sleep(self.config.sleeping),
+            );
+            if let Some(rigid) = self.bodies.get(body) {
+                self.previous_body_poses.insert(body, rigid.position().clone());
+            }
+            self.colliders.insert_with_parent(
+                ColliderBuilder::cuboid(half[0], half[1], half[2])
+                    .mass(0.12)
+                    .friction(0.65)
+                    .restitution(glass.spec.bounce.clamp(0.0, 1.0))
+                    .collision_groups(InteractionGroups::new(
+                        Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2,
+                        InteractionTestMode::default(),
+                    )),
+                body,
+                &mut self.bodies,
+            );
+            glass.body = Some(body);
+        }
+    }
+
+    /// Tessellated UVs/transparency/shader are preserved. Rapier supplies only
+    /// an interpolated rigid transform around the original shard centre.
+    pub(crate) fn glass_draws(&self, now: i32) -> Vec<FxDraw> {
+        self.glass.iter().filter_map(|glass| {
+            if now < glass.born_at || now >= glass.expires_at { return None; }
+            let duration = (glass.expires_at - glass.born_at).max(1);
+            let life = (now - glass.born_at) as f32 / duration as f32;
+            let alpha = if life < 0.85 { 0.15 } else { (0.15 - (life - 0.85)).max(0.0) };
+            if alpha <= 0.0 { return None; }
+            let positions = if let Some(handle) = glass.body {
+                let body = self.bodies.get(handle)?;
+                let pose = body.position();
+                let previous = self.previous_body_poses.get(&handle).unwrap_or(pose);
+                let display = interpolate_pose(previous, pose, self.interpolation_alpha());
+                let centre = display.translation * RAPIER_TO_JKA;
+                glass.spec.positions.map(|point| {
+                    let relative = Vector::from_array(std::array::from_fn(|axis| point[axis] - glass.centre[axis]));
+                    let p = centre + display.rotation * relative;
+                    [p.x, p.y, p.z]
+                })
+            } else {
+                glass.spec.positions
+            };
+            Some(FxDraw::Quad {
+                positions, uvs: glass.spec.uvs,
+                rgba: [255, 255, 255, (alpha * 255.0) as u8],
+                shader: "gfx/misc/test_crackle".to_owned(),
+            })
+        }).collect()
+    }
+
+    fn expire_glass(&mut self, now: i32) {
+        let mut i = 0;
+        while i < self.glass.len() {
+            if self.glass[i].expires_at <= now {
+                let glass = self.glass.remove(i);
+                if let Some(handle) = glass.body { self.remove_body(handle); }
+            } else { i += 1; }
+        }
+    }
+
+    fn clear_glass(&mut self) {
+        let old = std::mem::take(&mut self.glass);
+        for glass in old {
+            if let Some(handle) = glass.body { self.remove_body(handle); }
+        }
+    }
+
+    pub(crate) fn debris_models(&self, now: i32) -> Vec<ChunkModel> {
+        const FADE_MS: i32 = 2000;
+        self.debris.iter().filter_map(|fragment| {
+            let rigid = self.bodies.get(fragment.body)?;
+            let pose = rigid.position();
+            let previous = self.previous_body_poses.get(&fragment.body).unwrap_or(pose);
+            let display = interpolate_pose(previous, pose, self.interpolation_alpha());
+            let basis = [Vector::X, Vector::Y, Vector::Z].map(|axis| {
+                let v = display.rotation * axis * fragment.scale;
+                [v.x, v.y, v.z]
+            });
+            let p = display.translation * RAPIER_TO_JKA;
+            Some(ChunkModel {
+                qpath: fragment.qpath.clone(),
+                origin: [p.x, p.y, p.z],
+                axis: basis,
+                alpha: ((fragment.expires_at.saturating_sub(now)) as f32 / FADE_MS as f32).clamp(0.0, 1.0),
+            })
+        }).collect()
+    }
+
+    fn expire_debris(&mut self, now: i32) {
+        let mut index = 0;
+        while index < self.debris.len() {
+            if self.debris[index].expires_at <= now {
+                let fragment = self.debris.remove(index);
+                self.remove_body(fragment.body);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn trim_debris_to_budget(&mut self) {
+        while self.debris.len() + self.glass.len() > self.config.max_debris as usize {
+            // Oldest visual fragments give way to new sprays; both visual
+            // formats use the same rigid-body limit, not separate budgets.
+            if !self.debris.is_empty() && (self.glass.is_empty()
+                || self.debris[0].expires_at <= self.glass[0].expires_at)
+            {
+                let fragment = self.debris.remove(0);
+                self.remove_body(fragment.body);
+            } else {
+                let glass = self.glass.remove(0);
+                if let Some(handle) = glass.body { self.remove_body(handle); }
+            }
+        }
+    }
+
+    fn clear_debris(&mut self) {
+        let debris = std::mem::take(&mut self.debris);
+        for fragment in debris {
+            self.remove_body(fragment.body);
+        }
+    }
+
     fn reset_world(&mut self) {
         self.pipeline = PhysicsPipeline::new();
         self.integration = IntegrationParameters::default();
@@ -1578,6 +1903,8 @@ impl RagdollWorld {
         self.previous_body_poses.clear();
         self.instances.clear();
         self.detached_limbs.clear();
+        self.debris.clear();
+        self.glass.clear();
         self.living_recoveries.clear();
         self.retired.clear();
         self.last_time = None;
@@ -1815,6 +2142,82 @@ fn pose_to_matrix(pose: &Pose) -> Matrix3x4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debris_uses_existing_rapier_world_and_respects_budgets_and_expiry() {
+        let mut world = RagdollWorld::new();
+        let spec = ChunkSpec {
+            qpath: "models/chunks/rock/rock1_1.md3".into(),
+            origin: [0.0, 0.0, 48.0], velocity: [24.0, 0.0, 20.0],
+            angles: [0.0; 3], angle_velocity: [180.0, 30.0, 0.0],
+            life_ms: 1500, bounce_factor: 0.3, scale: 1.0,
+        };
+        assert!(!world.spawn_debris(&[spec.clone()], 1000));
+        world.set_config(RagdollConfig {
+            physics_enabled: true, debris_enabled: true,
+            max_debris: 2, debris_lifetime_seconds: 2.0,
+            ..RagdollConfig::default()
+        });
+        let mesh = PhysicsMapMesh::from_jka_mesh(
+            vec![[-128.0, -128.0, 0.0], [128.0, -128.0, 0.0],
+                 [128.0, 128.0, 0.0], [-128.0, 128.0, 0.0]],
+            vec![[0, 1, 2], [0, 2, 3]],
+        ).unwrap();
+        world.set_map_mesh(&mesh).unwrap();
+        assert!(world.spawn_debris(&[spec.clone(), spec.clone(), spec], 1000));
+        assert_eq!(world.debris.len(), 2, "oldest debris is evicted");
+        let models = world.debris_models(1000);
+        assert_eq!(models.len(), 2);
+        // At spawn, the optional solver must preserve the same model basis
+        // that the legacy JKA LE_FRAGMENT path would have drawn.
+        let basis = crate::cgame::weapon_fx::rapier_debris_axis([0.0; 3]);
+        for row in 0..3 {
+            for col in 0..3 {
+                assert!((models[0].axis[row][col] - basis[row][col]).abs() < 1.0e-4);
+            }
+        }
+        world.begin_frame(1000);
+        world.begin_frame(1050);
+        assert_eq!(world.debris_models(1050).len(), 2);
+        world.begin_frame(3001);
+        assert!(world.debris.is_empty(), "expired bodies leave the shared world");
+        assert_eq!(world.bodies.len(), 0);
+    }
+
+    #[test]
+    fn glass_delays_activation_keeps_original_quad_and_releases_on_time() {
+        let mut world = RagdollWorld::new();
+        let spec = ShardSpec {
+            positions: [[0.0, 0.0, 48.0], [12.0, 0.0, 48.0],
+                        [12.0, 0.0, 60.0], [0.0, 0.0, 60.0]],
+            uvs: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            velocity: [4.0, 0.0, 0.0], accel_z: -650.0,
+            rotation: [15.0, -30.0], bounce: 0.2, delay_ms: 100,
+        };
+        assert_eq!(world.spawn_glass(&[spec.clone()], 1000), 0);
+        world.set_config(RagdollConfig {
+            physics_enabled: true, debris_enabled: true,
+            max_debris: 2, debris_lifetime_seconds: 6.0,
+            ..RagdollConfig::default()
+        });
+        let mesh = PhysicsMapMesh::from_jka_mesh(
+            vec![[-128.0, -128.0, 0.0], [128.0, -128.0, 0.0],
+                 [128.0, 128.0, 0.0], [-128.0, 128.0, 0.0]],
+            vec![[0, 1, 2], [0, 2, 3]],
+        ).unwrap();
+        world.set_map_mesh(&mesh).unwrap();
+        assert_eq!(world.spawn_glass(&[spec.clone(), spec.clone(), spec], 1000), 2);
+        assert_eq!(world.glass.len(), 2);
+        assert!(world.glass.iter().all(|g| g.body.is_none()));
+        assert_eq!(world.glass_draws(1000).len(), 2);
+        world.begin_frame(1000);
+        world.begin_frame(1050);
+        assert!(world.glass.iter().all(|g| g.body.is_none()));
+        world.begin_frame(1100);
+        assert!(world.glass.iter().all(|g| g.body.is_some()));
+        world.reset_dynamic_for_seek();
+        assert!(world.glass.is_empty());
+    }
 
     #[test]
     fn native_jk2_ragdoll_digits_and_toes_follow_their_physical_limbs() {

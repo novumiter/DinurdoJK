@@ -185,6 +185,13 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) promote_fx_lights: bool,
     /// This frame's FX primitives, tessellated once the final camera is known.
     pub(in crate::app) fx_draws: Vec<crate::fx::system::FxDraw>,
+    pub(in crate::app) gpu_commands: Option<crate::fx::gpu_sparks::GpuSparkCommands>,
+    pub(in crate::app) gpu_draw_indices: Vec<(usize, u64)>,
+    pub(in crate::app) gpu_pool: crate::fx::gpu_sparks::GpuSparkPool,
+    /// Per-ID GPU ownership acknowledged to the worker for next frame.
+    pub(in crate::app) gpu_owned: std::collections::HashSet<u64>,
+    /// Latest renderer-acknowledged resident pipeline readiness, by alpha mode.
+    pub(in crate::app) gpu_ready_modes: Arc<std::sync::atomic::AtomicU16>,
     /// RE_AddLightToScene-style FX lights in renderer coordinates.
     pub(in crate::app) fx_lights: Arc<Vec<TransientLight>>,
     /// Lit saber blades in renderer coordinates; clouds are kept off them.

@@ -75,7 +75,7 @@ impl DynamicModelRenderer {
                 module: &shader,
                 entry_point: Some("cs_main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             });
             let vertex_capacity = 4096;
             let index_capacity = 4096;
@@ -274,6 +274,10 @@ impl DynamicModelRenderer {
         raw_colors.clear();
         self.draws.clear();
         self.fx_sprite_draws.clear();
+        self.resident_fx_draws.clear();
+        self.resident_fx_slots.clear();
+        self.resident_fx_frame = None;
+        self.resident_fx_requested_modes = 0;
         let mut fx_sprite_instances = std::mem::take(&mut self.scratch_fx_sprite_instances);
         fx_sprite_instances.clear();
         self.skin_draws.clear();

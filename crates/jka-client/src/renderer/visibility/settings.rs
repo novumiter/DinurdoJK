@@ -137,6 +137,7 @@ impl Renderer {
                     | (u32::from(self.world_stage_probe == 1) << 3)
                     | (u32::from(self.world_stage_probe == 2) << 4)
                     | (u32::from(self.fast_sky != 0) << 5)
+                    | (u32::from(self.face_plane_cull) << 6)
                     // Bits 8..11 encode selective blend and water/non-water A/B.
                     | (u32::from(self.world_stage_probe) << 8),
             ],

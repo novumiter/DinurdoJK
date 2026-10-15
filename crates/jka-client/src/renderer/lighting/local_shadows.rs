@@ -1,6 +1,6 @@
 //! Lighting local shadows.
 use crate::renderer::{
-    draw_world_batch, hidden_inline_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode, DynamicShadowsMode,
+    hidden_inline_batch, scene, BlendMode, Camera, DrawClass, DynamicLightsMode, DynamicShadowsMode,
     GpuPointLight, LocalShadowCacheEntry, LocalShadowResources, Mat4, Renderer,
     ShadowCasterUniform, Vec3, WorldGpu, DEPTH_FORMAT, LOCAL_SHADOW_CACHE_SLOTS,
     LOCAL_SHADOW_HYSTERESIS, LOCAL_SHADOW_MAP_SIZE, LOCAL_SHADOW_NEAR,
@@ -281,7 +281,7 @@ impl Renderer {
                                     pass.set_pipeline(&self.shadow_resources.pipeline);
                                     mask_pipeline_active = false;
                                 }
-                                draw_world_batch(&mut pass, batch, 0..1, None);
+                                crate::renderer::draw_world_batch_secondary(&mut pass, batch, 0..1, None);
                             }
                             DrawClass::Mask if batch.source.alpha_cutoff != 0.0 => {
                                 if !mask_pipeline_active {
@@ -289,7 +289,7 @@ impl Renderer {
                                     mask_pipeline_active = true;
                                 }
                                 pass.set_bind_group(1, &batch.bind_group, &[]);
-                                draw_world_batch(&mut pass, batch, 0..1, None);
+                                crate::renderer::draw_world_batch_secondary(&mut pass, batch, 0..1, None);
                             }
                             _ => {}
                         }

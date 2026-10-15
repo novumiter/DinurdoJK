@@ -141,7 +141,7 @@ impl App {
         if let Some(target) = segmented_row(
             ui,
             "FX geometry",
-            "View-dependent EFX geometry. CPU is the exact current reference path. CPU workers uses the same authored particles/materials and exact same CPU geometry, but parallelizes tessellation over Rayon. GPU keeps FX simulation on the dedicated jka-fx CPU thread and moves EFX Particle billboard expansion/submission to compact WGPU instances; non-sprite primitives remain on CPU. Hardware RT lighting/shadows currently fall back to CPU workers for this mode.",
+            "View-dependent EFX geometry. CPU is the exact current reference path. CPU workers uses the same authored particles/materials and exact same CPU geometry, but parallelizes tessellation over Rayon. GPU keeps FX simulation on the dedicated jka-fx CPU thread and packs Particle, OrientedParticle, Line, Tail and legacy SaberGlow geometry into compact WGPU instances (including under RT lighting/shadows). Animated tcMod stages and complex primitives remain on CPU. This is geometry acceleration, not GPU-resident particle simulation.",
             theme::Reset::Video(ui::VIDEO_ROW_FX_GEOMETRY),
             self.video.fx_geometry,
             &FX_GEOMETRY,

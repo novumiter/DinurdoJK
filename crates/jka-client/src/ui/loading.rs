@@ -204,12 +204,12 @@ pub(in crate::ui) fn build_loading_screen(
         h,
     );
 
-    // Preparation finishing is not the end of the load: the renderer still has
-    // to upload the world and present its first frame. That runs on the render
-    // thread with no measurable progress, so show it as a final row that stays
-    // WORKING (and keeps the total below 100%) until the loading screen closes.
+    // Renderer setup includes CPU index/patch work, texture compression,
+    // wgpu uploads, pipeline compilation, and the first rendered frame. It is
+    // NOT a measured GPU transfer progress bar. Keep it indeterminate rather
+    // than falsely reporting completion percentages.
     let upload_bar = MapLoadingBar {
-        label: "GPU UPLOAD",
+        label: "RENDERER SETUP",
         completed: 0,
         total: 1,
         skipped: false,

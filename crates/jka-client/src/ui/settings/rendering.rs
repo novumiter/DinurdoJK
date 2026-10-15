@@ -949,6 +949,16 @@ pub const VIDEO_ROW_PROMOTE_SHADER_EMISSIVE: usize = 101;
 /// Separate from the standard RBSP flare switch (VIDEO_ROW_FLARES).
 pub const VIDEO_ROW_SABER_FLARES: usize = 102;
 
+/// r_ext_compress_textures; available under Display & Graphics / Image Quality.
+pub const VIDEO_ROW_TEXTURE_COMPRESSION: usize = 104;
+
+pub const VIDEO_ROW_PATCH_SUBDIVISIONS: usize = 105;
+pub const VIDEO_ROW_PATCH_LOD_ERROR: usize = 106;
+pub const VIDEO_ROW_PATCH_STITCHING: usize = 107;
+pub const VIDEO_ROW_DRAW_CURVES: usize = 108;
+pub const VIDEO_ROW_PATCH_STATS: usize = 109;
+pub const VIDEO_ROW_MODEL_LOD_SCALE: usize = 110;
+
 pub const ENV_ROW_WEATHER_WIND_SPEED: usize = 8;
 
 pub const ENV_ROW_WEATHER_WIND_DIRECTION: usize = 9;

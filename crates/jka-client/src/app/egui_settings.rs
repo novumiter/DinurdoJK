@@ -8,12 +8,18 @@ mod effects;
 mod extensions;
 mod fog;
 mod game;
+mod geometry;
+mod glass;
 mod image;
 mod interface;
 mod lighting;
 mod mod_options;
 mod models;
 mod physics;
+mod preset_preview;
+// Shared with quality::apply_quality_preset_to_page; keeps the cvar-to-page
+// ownership mapping in one place.
+pub(in crate::app) use preset_preview::preset_cvar_section;
 mod post;
 mod reflections;
 mod reset;
@@ -117,7 +123,7 @@ const OCEAN_WIND_FOAM: u8 = 8;
 
 fn pending_video_reset(key: &str) -> Option<theme::Reset> {
     Some(match key {
-        "hdr_output" | "cvar:r_hdroutput" => theme::Reset::Color("r_hdrOutput"),
+        "hdr_output" | "cvar:r_hdr" => theme::Reset::Video(ui::VIDEO_ROW_HDR),
         "render_backend" => theme::Reset::Video(ui::VIDEO_ROW_RENDER_BACKEND),
         "gpu_adapter" => theme::Reset::Video(ui::VIDEO_ROW_GPU_ADAPTER),
         "display_mode" => theme::Reset::Video(ui::VIDEO_ROW_FULLSCREEN),
@@ -126,11 +132,14 @@ fn pending_video_reset(key: &str) -> Option<theme::Reset> {
         "gen_normal_maps" => theme::Reset::Video(ui::VIDEO_ROW_GEN_NORMAL_MAPS),
         "float_lightmap" => theme::Reset::Video(ui::VIDEO_ROW_FLOAT_LIGHTMAP),
         "picmip" => theme::Reset::Video(ui::VIDEO_ROW_PICMIP),
+        "patch_subdivisions" | "cvar:r_subdivisions" => theme::Reset::Video(ui::VIDEO_ROW_PATCH_SUBDIVISIONS),
+        "patch_stitching" => theme::Reset::Video(ui::VIDEO_ROW_PATCH_STITCHING),
         "reflections" => theme::Reset::Video(ui::VIDEO_ROW_SSR),
         "pbr" => theme::Reset::Video(ui::VIDEO_ROW_PBR),
         "asset_overrides" => theme::Reset::Video(ui::VIDEO_ROW_ASSET_OVERRIDES),
         "grass" => theme::Reset::Environment(ui::ENV_ROW_GRASS),
         "ocean" => theme::Reset::Environment(ui::ENV_ROW_OCEAN),
+        "glass_promotion" | "cvar:r_glasspromotion" | "cvar:r_glassPromotion" => theme::Reset::Glass("r_glassPromotion"),
         _ => return None,
     })
 }
@@ -163,9 +172,11 @@ pub(super) fn segmented_row<T: Copy + PartialEq>(
     options: &[(T, &str)],
 ) -> Option<T> {
     theme::row(ui, label, tip, reset, |ui| {
+        let preview_label = theme::preset_preview_target_label(ui.ctx(), reset);
         let mut selected = None;
         for (value, text) in options.iter().copied() {
-            if theme::chip(ui, text, value == current).clicked() && value != current {
+            let show_selected = preview_label.as_deref().map_or(value == current, |label| label == text);
+            if theme::chip(ui, text, show_selected).clicked() && value != current {
                 selected = Some(value);
             }
             ui.add_space(3.0);
@@ -191,10 +202,32 @@ fn optional_quality_table_row<T: Copy + PartialEq>(
             .position(|(candidate, _)| *candidate == value)
     });
     let labels: Vec<&str> = options.iter().map(|(_, text)| *text).collect();
+    let display_index = theme::preview_index_for_labels(ui.ctx(), reset, &labels, index);
     theme::row(ui, label, tip, reset, |ui| {
         let width = theme::track_width(ui);
-        theme::quality_meter_optional(ui, index, &labels, width, "Custom")
+        theme::quality_meter_optional(ui, display_index, &labels, width, "Custom")
     })
+}
+
+/// Returns the clicked and hovered quality preset separately. Hover alone must
+/// never call any cvar setter or update the active preset.
+fn preview_quality_preset_row(
+    ui: &mut egui::Ui,
+    current: Option<QualityPreset>,
+    options: &[(QualityPreset, &str)],
+) -> (Option<usize>, Option<usize>) {
+    let selected = current.and_then(|value| options.iter().position(|(p, _)| *p == value));
+    let labels: Vec<&str> = options.iter().map(|(_, name)| *name).collect();
+    theme::row(ui, "Quality preset",
+        "Hover over a preset level to preview changes in the rows below. Click to apply. \
+         Hover never changes live settings or compiles shaders. The preset leaves \
+         monitor, backend, vsync, FPS cap and debug preferences alone.",
+        theme::Reset::Video(ui::VIDEO_ROW_QUALITY_PRESET), |ui| {
+            let mut hovered = None;
+            let width = theme::track_width(ui);
+            let clicked = theme::quality_meter_optional_preview(ui, selected, &labels, width, &mut hovered);
+            (clicked, hovered)
+        })
 }
 
 /// Ordered options: quality meter driven by the table's own order.
@@ -209,7 +242,8 @@ fn quality_table_row<T: Copy + PartialEq>(
 ) -> Option<usize> {
     let index = index_of(options, current, fallback);
     let labels: Vec<&str> = options.iter().map(|(_, text)| *text).collect();
-    quality_row(ui, label, tip, reset, index, &labels)
+    let display_index = theme::preview_index_for_labels(ui.ctx(), reset, &labels, Some(index)).unwrap_or(index);
+    quality_row(ui, label, tip, reset, display_index, &labels)
 }
 
 fn quality_row(
@@ -220,9 +254,10 @@ fn quality_row(
     current: usize,
     labels: &[&str],
 ) -> Option<usize> {
+    let display_current = theme::preview_index_for_labels(ui.ctx(), reset, labels, Some(current)).unwrap_or(current);
     theme::row(ui, label, tip, reset, |ui| {
         let width = theme::track_width(ui);
-        theme::quality_meter(ui, current, labels, width)
+        theme::quality_meter(ui, display_current, labels, width)
     })
 }
 
@@ -237,10 +272,11 @@ fn mode_row<T: Copy + PartialEq>(
 ) -> Option<usize> {
     let index = mode_index(options, current);
     let labels: Vec<&str> = options.iter().map(|(_, text, _)| *text).collect();
-    let note = options.get(index).map(|(_, _, note)| *note).unwrap_or("");
+    let display_index = theme::preview_index_for_labels(ui.ctx(), reset, &labels, Some(index)).unwrap_or(index);
+    let note = options.get(display_index).map(|(_, _, note)| *note).unwrap_or("");
     theme::row_with_note(ui, label, tip, reset, note, |ui| {
         let width = theme::track_width(ui);
-        theme::quality_meter(ui, index, &labels, width)
+        theme::quality_meter(ui, display_index, &labels, width)
     })
 }
 
@@ -265,6 +301,37 @@ fn color_row(
             12.5,
             theme::TEXT_FAINT,
         );
+    });
+}
+
+/// A slider that follows the swell amplitude while its padlock is closed.
+/// Unlocking leaves the current value in place, so it never changes the picture.
+#[allow(clippy::too_many_arguments)]
+fn linked_ocean_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    bit: u8,
+    links: &mut u8,
+    changed: &mut bool,
+) {
+    theme::row(ui, label, tip, theme::Reset::None, |ui| {
+        let locked = *links & bit != 0;
+        let mut local = *value;
+        let readout = format!("{local:.3}");
+        let moved = ui
+            .add_enabled_ui(!locked, |ui| theme::slider(ui, &mut local, range, &readout))
+            .inner;
+        ui.add_space(8.0);
+        if let Some(now_locked) = theme::lock_toggle(ui, locked) {
+            if now_locked { *links |= bit } else { *links &= !bit }
+            *changed = true;
+        } else if moved {
+            *value = local;
+            *changed = true;
+        }
     });
 }
 

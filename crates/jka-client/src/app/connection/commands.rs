@@ -227,16 +227,51 @@ impl App {
                     self.live_input.queue_generic_command(value); return true;
                 }
             }
+            Some(GameCommand::InventoryFree) => {
+                if let Some(ps) = self.live_player_state().cloned() {
+                    if let Some(generic) = self.live_input.use_first_inventory(&ps) {
+                        self.live_input.queue_generic_command(generic);
+                    }
+                }
+                return true;
+            }
+            Some(action @ (GameCommand::InventoryNext | GameCommand::InventoryPrev)) => {
+                if let Some(ps) = self.live_player_state().cloned() {
+                    self.live_input.cycle_inventory(&ps, matches!(action, GameCommand::InventoryNext));
+                }
+                return true;
+            }
             Some(action @ (GameCommand::WeaponNext | GameCommand::WeaponPrev |
+                GameCommand::WeaponLast | GameCommand::WeaponClean | GameCommand::ToggleFireMode |
                 GameCommand::ForceNext | GameCommand::ForcePrev | GameCommand::Weapon)) => {
                 if let Some(ps) = self.live_player_state().cloned() {
                     match action {
                         GameCommand::WeaponNext => self.live_input.cycle_weapon(&ps, true),
                         GameCommand::WeaponPrev => self.live_input.cycle_weapon(&ps, false),
+                        GameCommand::WeaponLast => self.live_input.select_last_weapon(&ps),
+                        GameCommand::ToggleFireMode => {
+                            self.live_input.toggle_single_fire(&ps);
+                            self.redirect_held_singlefire();
+                        },
+                        GameCommand::WeaponClean => if let Some(arg) = words.get(1) {
+                            if self.live_input.select_weapon_clean(&ps, arg) {
+                                self.live_input.queue_generic_command(1); // sv_saberswitch
+                            }
+                        },
                         GameCommand::ForceNext | GameCommand::ForcePrev => {
-                            self.live_input.cycle_force(&ps, matches!(action, GameCommand::ForceNext));
-                            self.force_select_until = Some(Instant::now() + Duration::from_millis(1400));
-                            self.publish_transient_ui();
+                            let forward = matches!(action, GameCommand::ForceNext);
+                            // TaystJK: force cycling becomes inventory cycling
+                            // while USE is held or there are no usable powers.
+                            if self.live_buttons.contains("+use")
+                                || self.live_buttons.contains("+button5")
+                                || !crate::net::LiveInput::has_selectable_force(&ps)
+                            {
+                                self.live_input.cycle_inventory(&ps, forward);
+                            } else {
+                                self.live_input.cycle_force(&ps, forward);
+                                self.force_select_until = Some(Instant::now() + Duration::from_millis(1400));
+                                self.publish_transient_ui();
+                            }
                         }
                         GameCommand::Weapon => if let Some(slot) = words.get(1) { self.live_input.select_weapon_slot(&ps, slot); },
                         _ => unreachable!(),

@@ -8,6 +8,7 @@ struct CullRecord {
     maximum: vec4<f32>,
     draw: vec4<u32>,
     compact: vec4<u32>,
+    face_plane: vec4<f32>,
 };
 
 struct DrawIndexedIndirectArgs {
@@ -41,6 +42,18 @@ fn corner(record: CullRecord, index: u32) -> vec3<f32> {
         select(record.minimum.y, record.maximum.y, (index & 2u) != 0u),
         select(record.minimum.z, record.maximum.z, (index & 4u) != 0u),
     );
+}
+
+// Face culling on the packed draw as a whole: eligible only when every BSP
+// surface in that draw shares one plane. Bit 6 toggles r_facePlaneCull.
+fn outside_face_plane(record: CullRecord) -> bool {
+    if ((settings.viewport_mips_flags.w & 64u) == 0u ||
+        (record.draw.w & 1u) != 0u ||
+        all(record.face_plane.xyz == vec3<f32>(0.0))) {
+        return false;
+    }
+    return dot(camera.camera_pos_time.xyz, record.face_plane.xyz)
+        < record.face_plane.w - 8.0;
 }
 
 fn outside_frustum(record: CullRecord) -> bool {
@@ -167,6 +180,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (excluded_inline(record)) {
         visible = false;
         reason = 3u;
+    } else if (outside_face_plane(record)) {
+        visible = false;
+        reason = 3u;
     } else if (record.draw.z == 0u && outside_frustum(record)) {
         visible = false;
         reason = 1u;
@@ -235,6 +251,7 @@ fn cs_early(@builtin(global_invocation_id) gid: vec3<u32>) {
     let draw_it = !excluded_inline(record)
         && draws[index].instance_count != 0u
         && record.draw.z == 0u
+        && !outside_face_plane(record)
         && !outside_frustum(record);
     early_draws[index].index_count = select(0u, record.draw.x, draw_it);
     early_draws[index].instance_count = select(0u, 1u, draw_it);

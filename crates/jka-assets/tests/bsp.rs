@@ -132,6 +132,32 @@ fn quadratic_patch_reaches_analytic_midpoint_and_preserves_attributes() {
 }
 
 #[test]
+fn visual_patch_metadata_uses_authored_lod_bounds_and_keeps_fixed_mesh_stable() {
+    let mut data = fixture(true);
+    let surface = offset(&data, 13);
+    for (i,value) in [-100.0,20.0,30.0,100.0,60.0,70.0].into_iter().enumerate() {
+        float(&mut data,surface+104+i*4,value);
+    }
+    let map = Bsp::parse(&data).unwrap();
+    let fixed_before = map.world_mesh(4).unwrap();
+    for sub in [0.0,1.0,4.0,12.0,80.0] {for stitching in [false,true] {
+        let visual = map.world_visual_mesh(sub,stitching).unwrap();
+        assert_eq!(visual.patches.len(),1);
+        let patch=&visual.patches[0];
+        assert_eq!(patch.lod.lod_origin,[0.0,40.0,50.0]);
+        assert!((patch.lod.lod_radius-10800.0_f32.sqrt()).abs()<0.0001);
+        assert_eq!(patch.lod.width_lod_error.len(),patch.lod.width);
+        assert_eq!(patch.lod.height_lod_error.len(),patch.lod.height);
+        let fixed_after = map.world_mesh(4).unwrap();
+        assert_eq!(fixed_before.indices,fixed_after.indices);
+        assert!(fixed_before.vertices.iter().zip(&fixed_after.vertices).all(|(a,b)| a.position==b.position&&a.normal==b.normal&&a.texcoord==b.texcoord&&a.color==b.color));
+    }}
+    for sub in [f32::NAN,f32::INFINITY,-1.0,81.0] {assert!(map.world_visual_mesh(sub,true).is_err());}
+    float(&mut data,surface+116,f32::NAN);
+    assert!(Bsp::parse(&data).is_err(),"nonfinite authored LOD bounds must be rejected");
+}
+
+#[test]
 fn rejects_truncated_files_at_every_byte_boundary() {
     let data = fixture(true);
     for end in 0..data.len() {

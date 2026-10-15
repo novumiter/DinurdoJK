@@ -62,11 +62,13 @@ impl Renderer {
         let cloud_history_changed = self.cloud_history_key.as_ref() != Some(&cloud_history_key);
         self.cloud_history_key = Some(cloud_history_key);
         self.hdr_enabled = effects.hdr || self.hdr_output.is_some();
-        self.tone_mapping_enabled = effects.tone_mapping;
+        self.tone_mapping_strength = effects.tone_mapping.clamp(0.0, 1.0);
+        self.tone_mapping_enabled = self.tone_mapping_strength > 0.0;
         if let Some(output) = self.hdr_output.as_mut() {
-            output.write_settings(&self.queue, effects.hdr_paper_white, effects.hdr_peak, effects.tone_mapping);
+            output.write_settings(&self.queue, effects.hdr_paper_white, effects.hdr_peak, self.tone_mapping_strength);
         }
-        self.auto_exposure_enabled = effects.auto_exposure;
+        self.auto_exposure_strength = effects.auto_exposure.clamp(0.0, 1.0);
+        self.auto_exposure_enabled = self.auto_exposure_strength > 0.0;
         let auto_exposure_effective =
             self.hdr_enabled && self.tone_mapping_enabled && self.auto_exposure_enabled;
         if old_auto_exposure_effective != auto_exposure_effective || !auto_exposure_effective {

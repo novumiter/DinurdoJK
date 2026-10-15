@@ -64,6 +64,7 @@ pub(in crate::renderer) fn make_cull_record(
             0,
         ],
         compact: [u32::MAX, 0, 0, 0],
+        face_plane: [0.0; 4],
     }
 }
 

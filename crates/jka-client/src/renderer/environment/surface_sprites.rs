@@ -196,7 +196,7 @@ impl SurfaceSpriteEffectRenderer {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             })
         });
     }
@@ -304,7 +304,7 @@ impl SurfaceSpriteEffectRenderer {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::get().as_ref(),
             })
         });
     }

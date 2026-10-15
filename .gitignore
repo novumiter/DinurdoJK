@@ -6,3 +6,6 @@
 *.zip
 /tools/
 /docs/
+/artifacts/
+/target-glass-check/
+/glass-preview-base/

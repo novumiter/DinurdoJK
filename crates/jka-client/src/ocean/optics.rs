@@ -7,28 +7,23 @@ pub fn linear_color(rgb: [f32; 3]) -> [f32; 3] {
     rgb.map(|c| if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) })
 }
 
-/// Cull only rays guaranteed to stay inside one convex water volume. A blanket
-/// underwater far plane would incorrectly remove the sky/shore through the surface.
-/// Volumes with an outline mask (`minimum[v][3] != 0`) are not convex, so they never cull.
-pub fn cull_submerged(eye: [f32; 3], min: [f32; 3], max: [f32; 3], volumes: &Uniform, cutoff: f32, wave_margin: f32) -> bool {
-    if cutoff <= 0.0 { return false; }
-    let distance_squared: f32 = (0..3).map(|i| (eye[i] - eye[i].clamp(min[i], max[i])).powi(2)).sum();
-    if distance_squared < cutoff * cutoff { return false; }
-    (0..volumes.params[3] as usize).any(|v| {
-        volumes.minimum[v][3] == 0.0 && (0..3).all(|i| eye[i] >= volumes.minimum[v][i] && eye[i] <= volumes.maximum[v][i]
-            && min[i] >= volumes.minimum[v][i] && max[i] <= volumes.maximum[v][i])
-            && eye[1].max(max[1]) < volumes.maximum[v][1] - wave_margin
-    })
-}
+mod cull;
+pub use cull::{submerged_cull_radius, WaterCull};
+
+/// Absorption distances of water before culling may remove anything. Blue light
+/// is 5% transmitted after 1 absorption distance, 0.2% after 2, 0.007% after 3.
+pub const MIN_CULL_MULTIPLE: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Settings {
     pub fog_color: [f32; 3],
-    pub fog_distance: f32,
     pub transparency: f32,
     pub depth_darkening: f32,
     pub refraction: f32,
     pub caustics: f32,
+    /// Water-hidden geometry cull, as a multiple of the absorption distance: the
+    /// distance past which a submerged view sees nothing, and the water depth that
+    /// hides a batch from above. Zero disables. See `cull.rs`.
     pub underwater_cull: f32,
     /// Skip the whole capture when the camera is dry and no ocean clipmap
     /// survived this frame's culling. The capture is read only by the ocean
@@ -51,7 +46,7 @@ pub struct Settings {
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { fog_color: [20.0 / 255.0, 40.0 / 255.0, 50.0 / 255.0], fog_distance: 384.0, transparency: 6.0,
+        Self { fog_color: [20.0 / 255.0, 40.0 / 255.0, 50.0 / 255.0], transparency: 2304.0,
             depth_darkening: 1.0, refraction: 0.1, caustics: 1.0, underwater_cull: 3.0,
             // The scissor is off by default: measured on a real map, a promoted
             // surface's bounds surround the camera, so there is no tight screen
@@ -67,15 +62,32 @@ impl Settings {
         }
         let d = Self::default();
         for i in 0..3 { self.fog_color[i] = valid(self.fog_color[i], d.fog_color[i], 0.0, 1.0); }
-        self.fog_distance = valid(self.fog_distance, d.fog_distance, 1.0, 65536.0);
-        self.transparency = valid(self.transparency, d.transparency, 0.1, 16.0);
+        self.transparency = valid(self.transparency, d.transparency, 1.0, 65536.0);
         self.depth_darkening = valid(self.depth_darkening, d.depth_darkening, 0.01, 32.0);
         self.refraction = valid(self.refraction, d.refraction, 0.0, 0.15);
         self.caustics = valid(self.caustics, d.caustics, 0.0, 8.0);
         self.underwater_cull = valid(self.underwater_cull, d.underwater_cull, 0.0, 32.0);
         self
     }
-    pub fn absorption_distance(self) -> f32 { self.fog_distance * self.transparency }
+    pub fn absorption_distance(self) -> f32 { self.transparency }
+    /// Distance (in water) past which geometry is culled, or 0 when disabled. The
+    /// multiple is floored at `MIN_CULL_MULTIPLE`: below it the cull would remove
+    /// geometry that is still plainly visible through the water.
+    pub fn cull_distance(self) -> f32 {
+        if self.underwater_cull <= 0.0 { 0.0 }
+        else { self.absorption_distance() * self.underwater_cull.max(MIN_CULL_MULTIPLE) }
+    }
+}
+
+/// Render-only ocean continuation. No finite XZ bound or added coastal volume.
+/// Every segment represents one sky-contact half-strip; the four corner bits
+/// admit quadrants only when both adjoining contacted sky edges meet there.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Default)]
+pub struct SkyFogRegion {
+    pub bounds: [f32; 4],
+    pub plane: [f32; 4], // top Y, segment count, corner bitmask, enabled
+    pub segments: [[f32; 4]; 16],
 }
 
 #[repr(C)]
@@ -88,6 +100,9 @@ pub struct Uniform {
     pub params: [f32; 4], // darkening distance, refraction, caustics, volume count
     pub minimum: [[f32; 4]; 8],
     pub maximum: [[f32; 4]; 8],
+    // Only populated for r_oceanSkyExtend and qualifying map sky contacts.
+    pub sky_regions: [SkyFogRegion; 8],
+    pub sky_info: [f32; 4], // active continuation count; zero for OFF
 }
 
 pub fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -97,18 +112,24 @@ fn make_layout(device: &wgpu::Device, capture: bool, msaa: bool) -> wgpu::BindGr
     let entry = |binding, ty| wgpu::BindGroupLayoutEntry {
         binding, visibility: wgpu::ShaderStages::FRAGMENT, ty, count: None,
     };
+    let mut entries = vec![
+        entry(0, wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: !(capture && msaa) },
+            view_dimension: wgpu::TextureViewDimension::D2, multisampled: capture && msaa,
+        }),
+        entry(1, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+        entry(2, wgpu::BindingType::Texture { sample_type: if capture { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable: false } }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: capture && msaa }),
+        entry(3, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+    ];
+    if !capture {
+        entries.push(entry(4, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }));
+        for binding in [5, 6, 7] {
+            entries.push(entry(binding, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }));
+        }
+    }
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("Ocean optics capture/sampling layout"),
-        entries: &[
-            entry(0, wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: !(capture && msaa) },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: capture && msaa,
-            }),
-            entry(1, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-            entry(2, wgpu::BindingType::Texture { sample_type: if capture { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable: false } }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: capture && msaa }),
-            entry(3, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
-        ],
+        entries: &entries,
     })
 }
 
@@ -116,9 +137,21 @@ pub struct Resources {
     pub key: (u32, u32, u32, wgpu::TextureFormat),
     pub bind_group: wgpu::BindGroup,
     pub uniform: wgpu::Buffer,
+    pub glass_uniform: wgpu::Buffer,
+    pub edges: crate::glass::edges::Resources,
+    capture_color: wgpu::TextureView,
+    background: wgpu::TextureView,
+    background_ready: bool,
+    color: wgpu::TextureView,
+    background_capture: wgpu::RenderPipeline,
+    blur_first: wgpu::RenderPipeline,
+    blur_next: wgpu::RenderPipeline,
+    blur_groups: Vec<wgpu::BindGroup>,
+    blur_layout: wgpu::BindGroupLayout,
+    blur_inputs: Vec<wgpu::TextureView>,
+    blur_outputs: Vec<wgpu::TextureView>,
     capture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    color: wgpu::TextureView,
     depth: wgpu::TextureView,
     capture: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
@@ -132,28 +165,118 @@ impl Resources {
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
         }).create_view(&Default::default());
-        let color = target(format, "Ocean pre-surface color");
+        // Keep premultiplied blur validity precise near excluded foregrounds.
+        let optical_format = wgpu::TextureFormat::Rgba16Float;
+        let mip_count = (width.max(height).ilog2() + 1).min(7);
+        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Shared optical scene / Gaussian blur pyramid"), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: mip_count, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: optical_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+        });
+        let color = color_texture.create_view(&Default::default());
+        let mip_view = |mip| color_texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: mip, mip_level_count: Some(1), ..Default::default() });
+        let capture_color = mip_view(0);
         let depth = target(wgpu::TextureFormat::R32Float, "Ocean pre-surface linear depth");
+        let background = background_target(device, 1, 1);
+        let edges = crate::glass::edges::Resources::new(device, width, height, samples, &depth);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Ocean clamp sampler"), mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear, ..Default::default()
+            min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Linear, ..Default::default()
         });
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Ocean optical volume uniform"), contents: bytemuck::bytes_of(&Uniform::zeroed()),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let bind_group = bind(device, output_layout, &color, &depth, &sampler, &uniform);
+        let glass_uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Live glass settings"),
+            contents: bytemuck::bytes_of(&crate::glass::settings().uniform([0.1; 3])),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bind_group = bind(device, output_layout, &color, &depth, &sampler, &uniform, Some((&glass_uniform, &edges.field, &edges.mask, &background)));
         let capture_layout = make_layout(device, true, samples > 1);
         let capture_source = shader_source(samples > 1);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Ocean optical capture"), source: wgpu::ShaderSource::Wgsl(capture_source.into()),
         });
-        let capture = pipeline(device, &shader, &[&capture_layout, ocean_layout], "fs_capture", &[format, wgpu::TextureFormat::R32Float], 1);
+        let capture = pipeline(device, &shader, &[&capture_layout, ocean_layout], "fs_capture", &[optical_format, wgpu::TextureFormat::R32Float], 1);
+        let background_capture = pipeline(device, &shader, &[&capture_layout, ocean_layout], "fs_glass_background", &[optical_format], 1);
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Ocean optical composite"), source: wgpu::ShaderSource::Wgsl(include_str!("../ocean_composite.wgsl").into()),
         });
         let blit = pipeline(device, &blit_shader, &[output_layout], "fs_main", &[format], samples);
-        Self { key, bind_group, uniform, capture_layout, sampler, color, depth, capture, blit }
+        let texture_entry = |binding, filterable| wgpu::BindGroupLayoutEntry {
+            binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false,
+            }, count: None,
+        };
+        let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("Glass Gaussian pyramid inputs"), entries: &[
+            texture_entry(0, true), wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            texture_entry(2, false), texture_entry(3, false), texture_entry(4, false),
+            wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+        ] });
+        let blur_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Foreground-safe glass blur"), source: wgpu::ShaderSource::Wgsl(include_str!("../glass_blur.wgsl").into()) });
+        let blur_first = pipeline(device, &blur_shader, &[&blur_layout], "fs_first", &[optical_format], 1);
+        let blur_next = pipeline(device, &blur_shader, &[&blur_layout], "fs_next", &[optical_format], 1);
+        let mut blur_groups = Vec::new();
+        let mut blur_inputs = Vec::new();
+        let mut blur_outputs = Vec::new();
+        for mip in 1..mip_count {
+            let input = mip_view(mip-1);
+            blur_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Glass Gaussian pyramid level"), layout: &blur_layout, entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&input) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&depth) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&edges.mask) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&background) },
+                wgpu::BindGroupEntry { binding: 5, resource: glass_uniform.as_entire_binding() },
+            ] }));
+            blur_inputs.push(input);
+            blur_outputs.push(mip_view(mip));
+        }
+        Self { key, bind_group, uniform, glass_uniform, edges, capture_color, background,
+            background_ready: false, color, background_capture, blur_first, blur_next, blur_groups,
+            blur_layout, blur_inputs, blur_outputs, capture_layout, sampler, depth, capture, blit }
+    }
+
+    /// Disabled recovery keeps only a 1x1 binding placeholder. Toggle allocation
+    /// and bindings without rebuilding shaders or resetting optical uniforms.
+    pub fn configure_background(&mut self, device: &wgpu::Device, output_layout: &wgpu::BindGroupLayout, enabled: bool) {
+        if self.background_ready == enabled { return; }
+        self.background = if enabled { background_target(device, self.key.0, self.key.1) }
+            else { background_target(device, 1, 1) };
+        self.background_ready = enabled;
+        self.bind_group = bind(device, output_layout, &self.color, &self.depth, &self.sampler,
+            &self.uniform, Some((&self.glass_uniform, &self.edges.field, &self.edges.mask, &self.background)));
+        self.blur_groups = self.blur_inputs.iter().map(|input| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Glass Gaussian pyramid recovery bindings"), layout: &self.blur_layout, entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.depth) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.edges.mask) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.background) },
+                wgpu::BindGroupEntry { binding: 5, resource: self.glass_uniform.as_entire_binding() },
+            ],
+        })).collect();
+    }
+
+    /// Save the world before opaque models obscure it. Model-behind-glass color
+    /// still comes from the later full capture; only foreground holes use this.
+    pub fn capture_background(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup) {
+        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Glass background before opaque models"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.background, depth_slice: None, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })], ..Default::default()
+        });
+        pass.set_pipeline(&self.background_capture);
+        pass.set_bind_group(0, &input, &[]);
+        pass.set_bind_group(1, ocean, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// `scissor` is `(x, y, width, height)` in pixels, or `None` for the whole
@@ -164,8 +287,8 @@ impl Resources {
     pub fn capture(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
         scissor: Option<(u32, u32, u32, u32)>) {
-        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform);
-        let attachments = [&self.color, &self.depth].map(|view| Some(wgpu::RenderPassColorAttachment {
+        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None);
+        let attachments = [&self.capture_color, &self.depth].map(|view| Some(wgpu::RenderPassColorAttachment {
             view, depth_slice: None, resolve_target: None,
             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
         }));
@@ -183,6 +306,19 @@ impl Resources {
         }
         pass.draw(0..3, 0..1);
     }
+    pub fn blur(&self, encoder: &mut wgpu::CommandEncoder) {
+        for (index, (group, output)) in self.blur_groups.iter().zip(&self.blur_outputs).enumerate() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Glass Gaussian pyramid"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: output, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })], ..Default::default()
+            });
+            pass.set_pipeline(if index == 0 { &self.blur_first } else { &self.blur_next });
+            pass.set_bind_group(0, group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
     pub fn composite(&self, encoder: &mut wgpu::CommandEncoder, color: &wgpu::TextureView, resolve: Option<&wgpu::TextureView>) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Ocean optical composite"), color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -195,15 +331,32 @@ impl Resources {
         pass.draw(0..3, 0..1);
     }
 }
+fn background_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Optional glass world background"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    }).create_view(&Default::default())
+}
 fn bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, color: &wgpu::TextureView,
-    depth: &wgpu::TextureView, sampler: &wgpu::Sampler, uniform: &wgpu::Buffer) -> wgpu::BindGroup {
+    depth: &wgpu::TextureView, sampler: &wgpu::Sampler, uniform: &wgpu::Buffer, glass: Option<(&wgpu::Buffer, &wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView)>) -> wgpu::BindGroup {
+    let mut entries = vec![
+        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color) },
+        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth) },
+        wgpu::BindGroupEntry { binding: 3, resource: uniform.as_entire_binding() },
+    ];
+    if let Some((uniform, field, mask, background)) = glass {
+        entries.push(wgpu::BindGroupEntry { binding: 4, resource: uniform.as_entire_binding() });
+        entries.push(wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(field) });
+        entries.push(wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(mask) });
+        entries.push(wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(background) });
+    }
     device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Ocean optics bindings"), layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth) },
-            wgpu::BindGroupEntry { binding: 3, resource: uniform.as_entire_binding() },
-        ],
+        entries: &entries,
     })
 }
 fn pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule, layouts: &[&wgpu::BindGroupLayout], entry: &str,
@@ -218,7 +371,7 @@ fn pipeline(device: &wgpu::Device, shader: &wgpu::ShaderModule, layouts: &[&wgpu
         multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
         fragment: Some(wgpu::FragmentState { module: shader, entry_point: Some(entry), compilation_options: Default::default(),
             targets: &formats.iter().map(|&format| Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })).collect::<Vec<_>>() }),
-        multiview_mask: None, cache: None,
+        multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
     })
 }
 
@@ -297,28 +450,21 @@ mod tests {
     }
 
     #[test]
-    fn culling_preserves_surface_and_dry_exit_rays() {
-        let mut volume = Uniform::zeroed();
-        volume.params[3] = 1.0;
-        volume.minimum[0] = [-10000.0, -10000.0, -10000.0, 0.0];
-        volume.maximum[0] = [10000.0, 0.0, 10000.0, 0.0];
-        let eye = [0.0, -1000.0, 0.0];
-        assert!(cull_submerged(eye, [4000.0,-1200.0,0.0], [4100.0,-800.0,100.0], &volume, 3600.0, 512.0));
-        assert!(!cull_submerged(eye, [4000.0,-1200.0,0.0], [4100.0,10.0,100.0], &volume, 3600.0, 512.0));
-        assert!(!cull_submerged(eye, [4000.0,-1200.0,0.0], [11000.0,-800.0,100.0], &volume, 3600.0, 512.0));
-        assert!(!cull_submerged(eye, [40.0,-1200.0,0.0], [100.0,-800.0,100.0], &volume, 3600.0, 512.0));
-        assert!(!cull_submerged(eye, [4000.0,-1200.0,0.0], [4100.0,-800.0,100.0], &volume, 0.0, 512.0));
-        // A holed (masked) volume is not convex, so nothing inside it may be culled.
-        volume.minimum[0][3] = 1.0;
-        assert!(!cull_submerged(eye, [4000.0,-1200.0,0.0], [4100.0,-800.0,100.0], &volume, 3600.0, 512.0));
+    fn invalid_settings_are_finite_and_bounded() {
+        let settings = Settings { transparency: -1.0, refraction: f32::INFINITY, ..Default::default() }.sanitize();
+        assert_eq!(settings.transparency, 1.0);
+        assert_eq!(settings.refraction, 0.1);
     }
 
     #[test]
-    fn invalid_settings_are_finite_and_bounded() {
-        let settings = Settings { transparency: f32::NAN, fog_distance: -1.0, refraction: f32::INFINITY, ..Default::default() }.sanitize();
-        assert_eq!(settings.fog_distance, 1.0);
-        assert_eq!(settings.transparency, 6.0);
-        assert_eq!(settings.refraction, 0.1);
+    fn cull_distance_follows_transparency_with_a_visibility_floor() {
+        let s = Settings { transparency: 2000.0, underwater_cull: 3.0, ..Default::default() };
+        assert_eq!(s.cull_distance(), 6000.0);
+        // Below 2 absorption distances geometry is still visible: clamp up.
+        assert_eq!(Settings { underwater_cull: 0.07, ..s }.cull_distance(), 4000.0);
+        assert_eq!(Settings { underwater_cull: 0.0, ..s }.cull_distance(), 0.0);
+        // Murkier water culls sooner.
+        assert_eq!(Settings { transparency: 500.0, ..s }.cull_distance(), 1500.0);
     }
 
     #[test]

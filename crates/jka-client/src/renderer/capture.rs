@@ -16,6 +16,7 @@ pub(in crate::renderer) enum ScreenshotDestination {
         format: ScreenshotFormat,
     },
     Clipboard,
+    FrontendScene { path: PathBuf },
     VideoFrame { frame_index: u64, depth: bool },
 }
 
@@ -319,6 +320,22 @@ pub(in crate::renderer) fn encode_screenshot_job(
             );
             Ok(ScreenshotOutput::Saved(path))
         }
+        ScreenshotDestination::FrontendScene { path } => {
+            let (jpeg, _) = encode_screenshot_jpeg(
+                &job.pixels,
+                job.width,
+                job.height,
+                job.padded_bytes_per_row,
+                job.pixel_format,
+            )?;
+            let parent = path.parent().ok_or("invalid frontend scene cache path")?;
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            // Avoid corrupting an existing cache on an interrupted write.
+            let temp = path.with_extension("jpg.tmp");
+            std::fs::write(&temp, jpeg).map_err(|e| e.to_string())?;
+            std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
+            Ok(ScreenshotOutput::FrontendSceneSaved(path))
+        }
         ScreenshotDestination::VideoFrame { frame_index, depth: _ } => {
             let row_bytes = job.width as usize * 4;
             let padded = job.padded_bytes_per_row as usize;
@@ -417,6 +434,13 @@ impl Renderer {
             metadata,
             format,
         });
+    }
+
+    pub(in crate::renderer) fn request_frontend_scene_capture(&mut self, path: PathBuf) {
+        // A user-requested screenshot has priority over opportunistic caching.
+        if self.screenshot_requested.is_none() {
+            self.request_screenshot_capture(ScreenshotDestination::FrontendScene { path });
+        }
     }
 
     pub(in crate::renderer) fn request_clipboard_capture(&mut self) {

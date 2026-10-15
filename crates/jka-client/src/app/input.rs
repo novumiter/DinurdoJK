@@ -20,7 +20,7 @@ impl App {
         // A focus regain, left click, or set_overlay(None) must not re-lock the
         // cursor while a map/download modal is open over live gameplay.
         let captured = captured
-            && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial)
+            && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial | OverlayMode::EmoteRadial)
             && self.window_focused
             && !self.connection_modal_active();
         if !captured {
@@ -45,7 +45,7 @@ impl App {
                 window.set_cursor_visible(false);
                 self.captured = true;
                 self.mouse_grab_mode = grab_mode;
-            } else if self.overlay == OverlayMode::DevRadial {
+            } else if matches!(self.overlay, OverlayMode::DevRadial | OverlayMode::EmoteRadial) {
                 // No cursor even if the platform cannot lock/confine it; raw
                 // motion still drives the wheel while the window has focus.
                 window.set_cursor_visible(false);
@@ -150,8 +150,8 @@ impl App {
         // solo command clock, or interrupt a locally held movement key.
         let wheel_gameplay_transition = matches!(
             (previous_overlay, overlay),
-            (OverlayMode::None, OverlayMode::DevRadial)
-                | (OverlayMode::DevRadial, OverlayMode::None)
+            (OverlayMode::None, OverlayMode::DevRadial | OverlayMode::EmoteRadial)
+                | (OverlayMode::DevRadial | OverlayMode::EmoteRadial, OverlayMode::None)
         );
         if !wheel_gameplay_transition {
             if let Some(player) = &mut self.local_server {
@@ -159,7 +159,7 @@ impl App {
             }
         }
         if wheel_gameplay_transition {
-            if overlay == OverlayMode::DevRadial {
+            if matches!(overlay, OverlayMode::DevRadial | OverlayMode::EmoteRadial) {
                 self.set_capture(true);
             } else if self.demo_playback_active() {
                 self.sync_demo_camera_capture();
@@ -200,7 +200,7 @@ impl App {
                 self.close_trace_overlay();
                 return;
             }
-            OverlayMode::EntityGraph => {
+            OverlayMode::EntityGraph | OverlayMode::ShaderRemap | OverlayMode::ModelPicker | OverlayMode::BmodelPicker | OverlayMode::MapMods => {
                 self.set_overlay(OverlayMode::None);
                 return;
             }
@@ -211,7 +211,10 @@ impl App {
         } else {
             self.overlay
         };
-        self.dev_radial_offset = [0.0; 2];
+        // Keep Trace selected on open without letting a one-count mouse
+        // twitch swing the wheel to a different sector. This is a virtual
+        // stick anchor, not a visible cursor or an input dead zone.
+        self.dev_radial_offset = [0.0, -0.28];
         self.set_overlay(OverlayMode::DevRadial);
         // Also capture when invoked from the console/menu, where a normal
         // overlay transition intentionally released gameplay input.
@@ -365,6 +368,20 @@ impl App {
             .find(|word| word.starts_with("@bind:"))
             .map(str::to_owned);
 
+        // TaystJK CG_ZoomDown/Up: while Disruptor alternate singlefire
+        // is selected, +zoom is a held altattack, not an FOV change.
+        if plus_verb == "+zoom" {
+            let redirect_source = format!("@bind:disruptorzoom:{}", source.as_deref().unwrap_or("@manual"));
+            if !is_down {
+                self.execute_input_button_command(&format!("-altattack {redirect_source}"));
+            } else if self.live_input.single_fire_alt
+                && self.current_player_state().and_then(|ps| ps.field_i32("weapon")) == Some(6)
+            {
+                self.execute_input_button_command(&format!("+altattack {redirect_source}"));
+                return true;
+            }
+        }
+
         // Demo mouse attack bindings are POV controls in this client. Keep the
         // behavior, but execute it at Cbuf time so `wait` also orders it.
         if self.demo_playback_active() && is_down {
@@ -434,6 +451,100 @@ impl App {
         true
     }
 
+    /// TaystJK CG_SingleFireDown/Up, CG_NorollDown/Up, and CG_GrappleDown/Up.
+    /// All synthesized held buttons use separate bind owners so releasing a
+    /// helper cannot release the player's actual attack/crouch/use key.
+    pub(in crate::app) fn tayst_special_button(&mut self, command: &str) {
+        let mut parts = command.split_whitespace();
+        let Some(verb) = parts.next() else { return; };
+        let verb = verb.to_ascii_lowercase();
+        let source = parts.find(|part| part.starts_with("@bind:"))
+            .unwrap_or("@manual");
+        let kind = verb.trim_start_matches(['+', '-']);
+        let owner = format!("@bind:{kind}:{source}");
+        let down = verb.starts_with('+');
+        match kind {
+            "singlefire" => {
+                if down {
+                    let ps = self.current_player_state();
+                    let disruptor = ps.and_then(|ps| ps.field_i32("weapon")) == Some(6);
+                    let dead = ps.is_some_and(|ps| ps.stats[0] <= 0);
+                    let button = if self.live_input.single_fire_alt && !disruptor && !dead {
+                        "+altattack"
+                    } else {
+                        "+attack"
+                    };
+                    self.execute_input_button_command(&format!("{button} {owner}"));
+                } else {
+                    self.execute_input_button_command(&format!("-attack {owner}"));
+                    self.execute_input_button_command(&format!("-altattack {owner}"));
+                }
+            }
+            "duck" => {
+                let restricted = self.japro_do_restricted() || self.japro_do_race_restricted();
+                let commands = if down {
+                    if restricted {
+                        vec![format!("+speed {owner}"), "wait 2".into(),
+                             "-moveup".into(), format!("+movedown {owner}"),
+                             format!("-speed {owner}")]
+                    } else {
+                        vec![format!("+speed {owner}"), "-moveup".into(),
+                             "wait 1".into(), format!("+movedown {owner}"),
+                             format!("-speed {owner}")]
+                    }
+                } else if restricted {
+                    vec![format!("-movedown {owner}"), format!("-speed {owner}")]
+                } else {
+                    vec!["wait 1".into(), format!("-movedown {owner}"),
+                         format!("-speed {owner}")]
+                };
+                self.insert_console_commands_front(commands);
+            }
+            "grapple" => {
+                self.execute_input_button_command(&format!("{}button12 {owner}", if down { "+" } else { "-" }));
+                if !down && self.active_server_mod() == crate::net::mod_support::ServerMod::Japlus {
+                    // JA+ release intentionally sends a brief USE pulse.
+                    self.insert_console_commands_front(vec![
+                        format!("+use {owner}"), "wait 1".into(), format!("-use {owner}"),
+                    ]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// TaystJK CG_Lowjump_f: one cg frame of +moveup, or a two-frame
+    /// legacy wait sequence on jaPRO race / RESTRICT_DO servers.
+    pub(in crate::app) fn tayst_lowjump(&mut self) {
+        let frames = if self.japro_do_restricted() || self.japro_do_race_restricted() { 2 } else { 1 };
+        self.insert_console_commands_front(vec![
+            "+moveup @bind:lowjump".into(), format!("wait {frames}"),
+            "-moveup @bind:lowjump".into(),
+        ]);
+    }
+
+    /// CG_ToggleSingleFire_f redirects a currently held singlefire binding
+    /// to the other fire button without stealing independently held buttons.
+    pub(in crate::app) fn redirect_held_singlefire(&mut self) {
+        let sources = ["+attack", "+altattack"].into_iter()
+            .filter_map(|button| self.live_button_sources.get(button))
+            .flat_map(|owners| owners.iter())
+            .filter(|source| source.starts_with("@bind:singlefire:"))
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let disruptor = self.current_player_state()
+            .and_then(|ps| ps.field_i32("weapon")) == Some(6);
+        let dead = self.current_player_state().is_some_and(|ps| ps.stats[0] <= 0);
+        let next = if self.live_input.single_fire_alt && !disruptor && !dead {
+            "+altattack"
+        } else { "+attack" };
+        for source in sources {
+            self.execute_input_button_command(&format!("-attack {source}"));
+            self.execute_input_button_command(&format!("-altattack {source}"));
+            self.execute_input_button_command(&format!("{next} {source}"));
+        }
+    }
+
     /// Whether `code` is currently bound to the `trace` command, so
     /// `route_egui_window_event` can let it fall through to the raw keybind
     /// dispatch instead of being swallowed as "a menu is open" input while
@@ -445,6 +556,48 @@ impl App {
                 self.spectator_binding_context(),
             )
             .is_some_and(|binding| keybinds::binding_contains_command(binding, "trace"))
+    }
+
+    /// `/emote` uses precisely the same press/release treatment as `/dev`.
+    pub(in crate::app) fn toggle_emote_radial(&mut self) {
+        if self.overlay == OverlayMode::EmoteRadial {
+            self.close_emote_radial();
+            return;
+        }
+        self.dev_radial_return_overlay = if self.overlay == OverlayMode::Console {
+            self.overlay_after_console()
+        } else {
+            self.overlay
+        };
+        self.emote_radial_category = None;
+        self.dev_radial_offset = [0.0, -0.28];
+        self.set_overlay(OverlayMode::EmoteRadial);
+        self.set_capture(true);
+    }
+
+    pub(in crate::app) fn close_emote_radial(&mut self) {
+        self.emote_radial_category = None;
+        self.set_overlay(self.dev_radial_return_overlay);
+    }
+
+    pub(in crate::app) fn key_bound_to_emote(&self, code: KeyCode) -> bool {
+        self.bindings
+            .get_resolved(keybinds::bind_key_for_code(code), self.spectator_binding_context())
+            .is_some_and(|binding| keybinds::binding_contains_command(binding, "emote"))
+    }
+
+    pub(in crate::app) fn mouse_button_bound_to_emote(&self, button: MouseButton) -> bool {
+        let number = match button {
+            MouseButton::Left => 1,
+            MouseButton::Right => 2,
+            MouseButton::Middle => 3,
+            MouseButton::Back => 4,
+            MouseButton::Forward => 5,
+            _ => return false,
+        };
+        self.bindings
+            .get_resolved(BindKey::Mouse(number), self.spectator_binding_context())
+            .is_some_and(|binding| keybinds::binding_contains_command(binding, "emote"))
     }
 
     /// The same key used to open `/dev` must be able to close it while egui

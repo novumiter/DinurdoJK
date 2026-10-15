@@ -2,7 +2,7 @@
 use crate::renderer::{
     gpu_vertex_key, mpsc, thread, world_blend_probe_bucket, Arc, AtomicBool, BTreeMap, DrawBatch, DrawClass,
     DrawIndexedIndirectArgs, GpuCullRecord, GpuVertex, JoinHandle, Ordering,
-    PreparedPortalDrawPlan, PreparedPortalPlanBatchRef, Receiver, WorldBatch, WorldGpu,
+    PreparedPortalDrawPlan, PreparedPortalPlanBatchRef, Receiver, WorldBatch, WorldGpu, merged_face_plane, merged_face_runs,
     AUTO4_COLLAPSE_QUEUE_DEPTH,
 };
 
@@ -422,6 +422,26 @@ pub(in crate::renderer) fn instantiate_portal_draw_plans(
         })
         .collect::<Vec<_>>();
 
+    // A precomputed AUTO-4 draw spans multiple FULL pieces. Apply the plane
+    // test only if *every* piece has one matching eligible plane; never
+    // inherit the representative's plane for mixed geometry. Depends only on
+    // the geometry, so it is merged once and shared by its variants.
+    let empty_runs: Arc<[crate::renderer::FacePlaneRun]> = Arc::from([]);
+    let geometry_faces = plan
+        .geometries
+        .iter()
+        .map(|geometry| {
+            if geometry.members.iter().all(|&member| world_piece(member) && member < full_batches.len()) {
+                (
+                    merged_face_plane(geometry.members.iter().map(|&member| &full_batches[member].face_cull_plane)),
+                    Arc::from(merged_face_runs(geometry.members.iter().map(|&member| &full_batches[member]))),
+                )
+            } else {
+                ([0.0; 4], Arc::clone(&empty_runs))
+            }
+        })
+        .collect::<Vec<_>>();
+
     let mut batches = full_batches.to_vec();
     let variant_base = batches.len();
     let mut geometry_variants = vec![Vec::new(); plan.geometries.len()];
@@ -433,7 +453,13 @@ pub(in crate::renderer) fn instantiate_portal_draw_plans(
             0
         };
         let mut batch = full_batches[representative].clone();
+        (batch.face_cull_plane, batch.face_cull_runs) = geometry_faces
+            .get(variant.geometry)
+            .cloned()
+            .unwrap_or(([0.0; 4], Arc::clone(&empty_runs)));
         batch.indexed_range = geometry_ranges[variant.geometry].clone().unwrap_or(0..0);
+        batch.full_indexed_range = batch.indexed_range.clone();
+        batch.patch_geometry = None;
         batch.source.pvs_signature.clear();
         batch.source.area_signature = variant.area_signature;
         batch.is_inline_entity = false;
@@ -469,6 +495,7 @@ pub(in crate::renderer) fn instantiate_portal_draw_plans(
                 0,
             ],
             compact: [u32::MAX, 0, 0, 0],
+            face_plane: batch.face_cull_plane,
         });
         initial_indirect.push(DrawIndexedIndirectArgs {
             index_count,
@@ -547,6 +574,7 @@ pub(in crate::renderer) fn auto4_upload_variant_record(
                 | (u32::from(batch.source.water) << 8),
         ],
         compact: [u32::MAX, 0, 0, 0],
+        face_plane: batch.face_cull_plane,
     };
     queue.write_buffer(
         &world.cull_records_buffer,
@@ -626,7 +654,7 @@ pub(in crate::renderer) fn auto4_evict_lru_geometry(
 pub(in crate::renderer) fn auto4_accept_collapse(
     queue: &wgpu::Queue,
     world: &mut WorldGpu,
-    result: Auto4CollapseResult,
+    mut result: Auto4CollapseResult,
     plan_id: usize,
 ) {
     let geometry = result.geometry;
@@ -659,15 +687,32 @@ pub(in crate::renderer) fn auto4_accept_collapse(
         world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Deferred;
         return;
     };
-    queue.write_buffer(
-        &world.index_buffer,
-        u64::from(range.start) * std::mem::size_of::<u32>() as u64,
-        bytemuck::cast_slice(&result.indices),
-    );
+    if world.bsp_model_lod.has_recipe(geometry) {
+        result.indices.clear();
+        let members = &world.auto4_geometry_members[geometry];
+        for &member in members {
+            let batch = &world.full_batches[member];
+            if world.patch_lod.append_batch_indices(batch, &mut result.indices) { continue; }
+            if world.bsp_model_lod.append_batch_indices(&batch.full_indexed_range, &mut result.indices) { continue; }
+            let original = world.bsp_model_lod.source_indices().expect("BSP LOD immutable indices");
+            result.indices.extend_from_slice(&original[batch.full_indexed_range.start as usize..batch.full_indexed_range.end as usize]);
+        }
+    } else {
+        world.patch_lod.collapse(geometry, &world.auto4_geometry_members[geometry], &world.full_batches, &mut result.indices);
+    }
+    if !result.indices.is_empty() {
+        queue.write_buffer(
+            &world.index_buffer,
+            u64::from(range.start) * std::mem::size_of::<u32>() as u64,
+            bytemuck::cast_slice(&result.indices),
+        );
+    }
+    let active_range = range.start..range.start+result.indices.len() as u32;
+    world.patch_lod.note_collapse(geometry,range.clone(),result.indices.len() as u64*4);
     world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Ready {
         range: range.clone(),
         last_used_frame: world.auto4_collapse_cache.frame,
     };
     world.auto4_collapse_cache.completed = world.auto4_collapse_cache.completed.saturating_add(1);
-    auto4_set_geometry_range(queue, world, geometry, range);
+    auto4_set_geometry_range(queue, world, geometry, active_range);
 }

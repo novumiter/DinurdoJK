@@ -334,6 +334,11 @@ impl GameSession {
         self.weapon_fx.reset_for_seek(0);
         self.player_presenter.reset_for_seek();
         self.fx_draws.clear();
+        self.gpu_commands = None;
+        self.gpu_draw_indices.clear();
+        self.gpu_pool = crate::fx::gpu_sparks::GpuSparkPool::default();
+        self.gpu_owned.clear();
+        self.weapon_fx.set_gpu_owned(std::collections::HashSet::new());
         self.water_wake.clear();
         self.fx_lights = Arc::new(Vec::new());
         self.fx_blades = Arc::new(Vec::new());
@@ -876,16 +881,11 @@ impl App {
                 }
             }
             if self.live_buttons.contains("+zoom") {
-                // TaystJK CG_OffsetThirdPersonView: +zoom changes chase-camera
-                // range directly using the integer cg_zoomFov value.
-                let zoom = self.japro_zoom_fov_integer();
-                third_person.range = if zoom < 1 {
-                    third_person.range * third_person.range
-                } else if zoom > 176 {
-                    third_person.range * third_person.range / 176.0
-                } else {
-                    third_person.range * third_person.range / zoom as f32
-                };
+                // Keep zoom relative to the same baseline as first-person FOV.
+                // TaystJK squares cg_thirdPersonRange here, which shifts the
+                // chase camera even when cg_fov == cg_zoomFov. Using cg_fov as
+                // the reference preserves 1:1 framing for equal FOV settings.
+                third_person.range = self.japro_zoom_third_person_range(third_person.range);
             }
             if sample.policy.vehicle_num != 0 {
                 // OpenJK bypasses ordinary target/location damping while riding
@@ -1003,14 +1003,7 @@ impl App {
                     }
                 }
                 if self.live_buttons.contains("+zoom") {
-                    let zoom = self.japro_zoom_fov_integer();
-                    third_person.range = if zoom < 1 {
-                        third_person.range * third_person.range
-                    } else if zoom > 176 {
-                        third_person.range * third_person.range / 176.0
-                    } else {
-                        third_person.range * third_person.range / zoom as f32
-                    };
+                    third_person.range = self.japro_zoom_third_person_range(third_person.range);
                 }
                 if let Some(world) = self.map_collision.as_mut() {
                     let view = offset_third_person_view(
@@ -1468,6 +1461,9 @@ impl App {
                 max_substeps: self.video.client_physics_max_substeps,
                 ccd: self.video.client_physics_ccd,
                 sleeping: self.video.client_physics_sleeping,
+                debris_enabled: self.video.physics_debris,
+                max_debris: self.video.physics_debris_max,
+                debris_lifetime_seconds: self.video.physics_debris_lifetime,
                 max_ragdolls: self.video.ragdoll_max,
                 lifetime_seconds: self.video.ragdoll_lifetime,
                 dismemberment: self.video.dismemberment,
@@ -1511,6 +1507,9 @@ impl App {
             playback.player_presenter.set_local_global_cosmetics(
                 &self.network.global_hat, &self.network.global_cape);
             playback.race_ghost_alpha = self.race_ghost_alpha;
+            playback.weapon_fx.set_gpu_staging(
+                self.video.fx_particle_simulation && self.video.fx_geometry == FxGeometryMode::Gpu
+            );
             let (advance, sample) = if playback.local {
                 let Some((server_time, angles)) = local_frame else {
                     return Err("LOCAL SESSION HAS NO SERVER AUTHORITY".into());
@@ -2033,7 +2032,119 @@ impl App {
                 }
             }
 
-            let fx_surfaces = match self.video.fx_geometry {
+            // GPU residency is a second independent switch: r_fxGeometry gpu
+            // continues to work unchanged when this experimental path is off.
+            let mut resident_fx_surfaces = Vec::new();
+            if self.video.fx_particle_simulation && self.video.fx_geometry == FxGeometryMode::Gpu {
+                if let Some(commands) = playback.gpu_commands.take() {
+                    let writes = playback.gpu_pool.update(&commands, 1800);
+                    let resident_frame = Arc::new(crate::renderer::FxGpuResidentFrame {
+                        reset: writes.clear,
+                        time_ms: commands.time_ms,
+                        show_saber_impact: self.video.saber_impact_fx,
+                        writes: Arc::new(crate::fx::gpu_sparks::encode_gpu_writes(&writes)),
+                        ready_modes: Arc::clone(&playback.gpu_ready_modes),
+                    });
+                    // The worker no longer emits a sprite for acknowledged GPU
+                    // owners. Reconstruct *only the candidate*, from its
+                    // already resident birth record. This also supplies a real
+                    // reference sprite if a compiled pipeline gets invalidated.
+                    let cpu_ids: std::collections::HashSet<u64> = playback.gpu_draw_indices
+                        .iter().map(|&(_, id)| id).collect();
+                    let can_reside = |spawn: &crate::fx::gpu_sparks::GpuSparkSpawn| {
+                        crate::fx::gpu_sparks::primitive_eligibility(
+                            crate::fx::template::PrimType::Particle,
+                            spawn.flags, self.video.fx_physics,
+                            0, 0, 0, false, spawn.values_finite(),
+                        ).is_ok()
+                    };
+                    let ready = playback.gpu_ready_modes.load(
+                        std::sync::atomic::Ordering::Acquire);
+                    // Cache readiness per authored shader, not per particle.
+                    // Different flesh, wall and smoke effects use different
+                    // blends; waiting for every possible PSO would needlessly
+                    // re-run the CPU reference interpolator forever.
+                    let mut material_ready = std::collections::HashMap::<String, bool>::new();
+                    let synthetic: Vec<_> = playback.gpu_pool.iter()
+                        .filter(|(_, spawn)| playback.gpu_owned.contains(&spawn.id)
+                            && !cpu_ids.contains(&spawn.id)
+                            && can_reside(spawn)
+                            && (self.video.saber_impact_fx
+                                || spawn.class != crate::fx::system::FxClass::SaberImpact))
+                        .map(|(slot, spawn)| {
+                            let is_ready = *material_ready
+                                .entry(spawn.shader.to_ascii_lowercase())
+                                .or_insert_with(|| {
+                                    let stages = entity_presenter.fx_material_stages(&spawn.shader);
+                                    crate::fx::draw::resident_material_pipelines_ready(&stages, ready)
+                                });
+                            // Warm shader: no position, angle, color or alpha
+                            // calculations on CPU; only the material key is
+                            // needed to append an existing resident slot.
+                            let draw = if is_ready {
+                                crate::fx::system::FxDraw::Sprite {
+                                    origin: [0.0; 3], radius: 0.0, rotation: 0.0,
+                                    rgba: [0; 4], shader: spawn.shader.clone(),
+                                }
+                            } else { spawn.reference_draw_at(commands.time_ms) };
+                            (spawn.id, slot, draw)
+                        })
+                        .collect();
+                    let mut candidate_ids: Vec<(usize, u32, u64)> = playback.gpu_draw_indices
+                        .iter()
+                        .filter_map(|(index, id)| playback.gpu_pool.slot_for_id(*id)
+                            .map(|slot| (*index, slot, *id)))
+                        .collect();
+                    for (id, slot, draw) in synthetic {
+                        let index = playback.fx_draws.len();
+                        playback.fx_draws.push(draw);
+                        candidate_ids.push((index, slot, id));
+                    }
+                    let candidates: Vec<_> = candidate_ids.iter()
+                        .filter_map(|(index, slot, _)| playback.fx_draws.get(*index)
+                            .map(|draw| (*index, *slot, draw)))
+                        .collect();
+                    let (surfaces, accepted, warm) = crate::fx::draw::tessellate_resident_sprites(
+                        &candidates, resident_frame, &view,
+                        &mut |shader| entity_presenter.fx_material_stages(shader),
+                    );
+                    resident_fx_surfaces = surfaces;
+                    // A worker is only told to sleep once *every stage* has a
+                    // compatible, actually compiled pipeline. Hidden saber
+                    // effects keep their owner until they expire, so paused
+                    // demo toggles don't accidentally resurrect CPU sprites.
+                    let warm: std::collections::HashSet<_> = warm.into_iter().collect();
+                    let mut next_owned: std::collections::HashSet<u64> = candidate_ids
+                        .iter().filter(|(index, _, _)| warm.contains(index))
+                        .map(|&(_, _, id)| id).collect();
+                    if !self.video.saber_impact_fx {
+                        for (_, spawn) in playback.gpu_pool.iter() {
+                            if spawn.class == crate::fx::system::FxClass::SaberImpact
+                                && playback.gpu_owned.contains(&spawn.id) && can_reside(spawn) {
+                                next_owned.insert(spawn.id);
+                            }
+                        }
+                    }
+                    playback.weapon_fx.set_gpu_owned(next_owned.clone());
+                    playback.gpu_owned = next_owned;
+                    if !accepted.is_empty() {
+                        let accepted: std::collections::HashSet<_> = accepted.into_iter().collect();
+                        let mut index = 0;
+                        playback.fx_draws.retain(|_| {
+                            let keep = !accepted.contains(&index);
+                            index += 1;
+                            keep
+                        });
+                    }
+                }
+            } else {
+                playback.gpu_commands = None;
+                playback.gpu_pool = crate::fx::gpu_sparks::GpuSparkPool::default();
+                playback.gpu_owned.clear();
+                playback.weapon_fx.set_gpu_owned(std::collections::HashSet::new());
+                playback.gpu_ready_modes.store(0, std::sync::atomic::Ordering::Release);
+            }
+            let mut fx_surfaces = match self.video.fx_geometry {
                 FxGeometryMode::Cpu => {
                     crate::fx::draw::tessellate(&playback.fx_draws, &view, &mut |shader| {
                         entity_presenter.fx_material_stages(shader)
@@ -2044,25 +2155,16 @@ impl App {
                         entity_presenter.fx_material_stages(shader)
                     })
                 }
-                FxGeometryMode::Gpu
-                    if !matches!(self.video.dynamic_shadows, DynamicShadowsMode::RayTraced)
-                        && self.video.dynamic_lights != DynamicLightsMode::RayTracedHardware =>
-                {
-                    crate::fx::draw::tessellate_gpu_particles(
-                        &playback.fx_draws,
-                        &view,
-                        &mut |shader| entity_presenter.fx_material_stages(shader),
-                    )
-                }
-                // The hardware-RT dynamic preparation owns a separate shared vertex/index
-                // stream and does not consume the instanced FX buffer yet. Preserve all RT
-                // paths until FX sprites get a dedicated integration there.
-                FxGeometryMode::Gpu => {
-                    crate::fx::draw::tessellate_workers(&playback.fx_draws, &view, &mut |shader| {
-                        entity_presenter.fx_material_stages(shader)
-                    })
-                }
+                // Both raster and RT model preparation now consume FX instanced
+                // surfaces (prepare_fx_surface + upload_prepared_fx_sprites).
+                // Do not silently regress to CPU tessellation under RT lights.
+                FxGeometryMode::Gpu => crate::fx::draw::tessellate_gpu_particles(
+                    &playback.fx_draws,
+                    &view,
+                    &mut |shader| entity_presenter.fx_material_stages(shader),
+                ),
             };
+            fx_surfaces.extend(resident_fx_surfaces);
             playback.client_perf.fx_render_surfaces =
                 u32::try_from(fx_surfaces.len()).unwrap_or(u32::MAX);
             playback.client_perf.fx_cpu_geom_surfaces = 0;

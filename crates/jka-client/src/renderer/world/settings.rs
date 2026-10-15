@@ -484,6 +484,13 @@ impl Renderer {
         self.pvs_mode = mode;
     }
 
+    pub(in crate::renderer) fn set_face_plane_cull(&mut self, enabled: bool) {
+        if self.face_plane_cull != enabled {
+            self.face_plane_cull = enabled;
+            self.update_gpu_cull_settings();
+        }
+    }
+
     pub(in crate::renderer) fn set_gamma(&mut self, gamma: f32) {
         if !gamma.is_finite() {
             return;
@@ -602,6 +609,7 @@ impl Renderer {
             dynamic_light_debug: self.dynamic_light_debug,
             material_specialization: self.fragment_shader_mode >= 1,
             minimal_entries: self.fragment_shader_mode == 2,
+            program_mode: super::programs::WorldProgramMode::from_console(self.fragment_shader_mode),
             sky_debug: self.sky_debug_shader_needed(),
         }
     }
@@ -684,7 +692,7 @@ impl Renderer {
     /// r_fragmentShaderMode. The specialized programs are compiled in the
     /// background like any other variant; the switch happens once they are ready.
     pub(in crate::renderer) fn set_fragment_shader_mode(&mut self, mode: u8) {
-        let mode = mode.min(2);
+        let mode = mode.min(4);
         if self.fragment_shader_mode == mode {
             return;
         }

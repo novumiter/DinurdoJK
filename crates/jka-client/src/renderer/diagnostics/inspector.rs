@@ -1209,8 +1209,13 @@ impl Renderer {
             );
         }
 
+        let patch_report=world.patch_lod.describe(triangle_start);
+        if let Some(report)=&patch_report {
+            lines.extend(report.iter().cloned());
+            sections.push(SurfaceInspectorSection {title:"PATCH LOD".into(),lines:report.clone()});
+        }
         Some(SurfaceInspectorInfo {
-            kind: "WORLD SURFACE".into(),
+            kind: if patch_report.is_some() {"PATCH SURFACE"} else {"WORLD SURFACE"}.into(),
             title,
             summary,
             sections,

@@ -610,6 +610,14 @@ impl NetClient {
 
 // ---------------------------------------------------------------- input --
 
+/// Resolve the server's STAT_HOLDABLE_ITEM itemlist index into the
+/// holdable tag carried in `usercmd.invensel`. This queries the vendored
+/// OpenJK BG item table instead of hardcoding item indices.
+fn inventory_tag_for_item_index(index: i32) -> Option<u8> {
+    let item = jka_movement::bg_item(index)?;
+    (item.item_type == 6 && (1..12).contains(&item.tag)).then_some(item.tag as u8)
+}
+
 /// CL_CreateCmd state that persists between frames (cl.viewangles,
 /// cg.weaponSelect/forceSelect, pending generic command).
 #[derive(Debug, Clone, Default)]
@@ -618,6 +626,10 @@ pub struct LiveInput {
     pub weapon_select: u8,
     pub force_select: u8,
     pub inventory_select: u8,
+    /// TaystJK cg.lastWeaponSelect, updated when /weaplast is used.
+    last_weapon_select: [u8; 2],
+    /// cg.singlefireAlt. Choosing a new weapon resets this by CG_SetFireMode.
+    pub single_fire_alt: bool,
     generic_command: Option<u8>,
     was_pressed: i32,
     weapon_initialized: bool,
@@ -668,9 +680,13 @@ impl LiveInput {
             .map(|field| ps.field_i32(field).unwrap_or(0));
         let spawn_count = ps.persistant[4];
         if !self.weapon_initialized || spawn_count != self.last_spawn_count {
-            self.weapon_select = ps.field_i32("weapon").unwrap_or(0).clamp(0, 18) as u8;
+            self.set_selected_weapon(ps.field_i32("weapon").unwrap_or(0).clamp(0, 18) as u8);
+            self.last_weapon_select = [0, 0];
             let force = ps.field_i32("fd.forcePowerSelected").unwrap_or(0);
             self.force_select = force.clamp(0, 17) as u8;
+            // cg.itemSelect tracks a holdable tag, not a bg_itemlist index.
+            // The snapshot uses STAT_HOLDABLE_ITEM = 1 (an itemlist index).
+            self.inventory_select = inventory_tag_for_item_index(ps.stats[1]).unwrap_or(0);
             self.weapon_initialized = true;
             self.last_spawn_count = spawn_count;
         }
@@ -756,6 +772,94 @@ impl LiveInput {
         cmd
     }
 
+    /// CG_SetFireMode: initial alternate fire for bowcaster/flechette,
+    /// standard primary fire on all other weapons.
+    pub fn set_selected_weapon(&mut self, weapon: u8) {
+        self.weapon_select = weapon;
+        self.single_fire_alt = matches!(weapon, 7 | 10); // WP_BOWCASTER / WP_FLECHETTE
+    }
+
+    /// CG_ToggleSingleFire_f. Thermal detonator never toggles to alternate.
+    pub fn toggle_single_fire(&mut self, ps: &PlayerState) {
+        if ps.field_i32("weapon") == Some(12) { // WP_THERMAL
+            self.single_fire_alt = false;
+        } else {
+            self.single_fire_alt = !self.single_fire_alt;
+        }
+    }
+
+    /// CG_LastWeapon_f, including its first-use highest-owned fallback.
+    pub fn select_last_weapon(&mut self, ps: &PlayerState) {
+        if !Self::can_select(ps) || ps.persistant[3] == 3 { // PERS_TEAM / TEAM_SPECTATOR
+            return;
+        }
+        let equipped = ps.field_i32("weapon").unwrap_or(0).clamp(0, 18) as u8;
+        if self.last_weapon_select[0] == 0 {
+            self.last_weapon_select[0] = equipped;
+        }
+        if self.last_weapon_select[1] == 0 {
+            self.last_weapon_select[1] = equipped;
+        }
+        if self.last_weapon_select[0] == self.last_weapon_select[1] {
+            for candidate in (1..=16).rev() {
+                if candidate != i32::from(self.weapon_select) && Self::selectable(ps, candidate) {
+                    self.last_weapon_select[1] = candidate as u8;
+                    break;
+                }
+            }
+        }
+        if self.last_weapon_select[0] != self.weapon_select {
+            self.last_weapon_select[1] = self.last_weapon_select[0];
+            self.last_weapon_select[0] = self.weapon_select;
+        }
+        let previous = self.last_weapon_select[1];
+        if Self::selectable(ps, i32::from(previous)) {
+            self.set_selected_weapon(previous);
+        }
+    }
+
+    /// CG_WeaponClean_f: raw WP_* index, not the remapped `/weapon` slot.
+    /// Returns true only when an already-equipped saber should toggle holster.
+    pub fn select_weapon_clean(&mut self, ps: &PlayerState, argument: &str) -> bool {
+        const WP_STUN_BATON: i32 = 1;
+        const WP_MELEE: i32 = 2;
+        const WP_SABER: i32 = 3;
+        const WP_BRYAR_PISTOL: i32 = 4;
+        const WP_THERMAL: i32 = 12;
+        const WP_DET_PACK: i32 = 14;
+        const WP_BRYAR_OLD: i32 = 16;
+        if !Self::can_select(ps) { return false; }
+        let mut num = atoi(argument.as_bytes());
+        if !(1..=16).contains(&num) { return false; }
+        let current = ps.field_i32("weapon").unwrap_or(0);
+        if num == 1 && current == WP_SABER {
+            return ps.field_i32("weaponTime").unwrap_or(0) < 1;
+        }
+        let owned = ps.stats[4];
+        if num == WP_BRYAR_PISTOL && owned & (1 << WP_BRYAR_OLD) != 0 {
+            if current == WP_BRYAR_PISTOL || owned & (1 << WP_BRYAR_PISTOL) == 0 {
+                num = WP_BRYAR_OLD;
+            } else if current == WP_BRYAR_OLD {
+                num = WP_BRYAR_PISTOL;
+            }
+        }
+        if num == WP_STUN_BATON {
+            num = if owned & (1 << WP_SABER) != 0 { WP_SABER } else { WP_MELEE };
+        }
+        if (WP_THERMAL..=WP_DET_PACK).contains(&num) {
+            let mut next = if (WP_THERMAL..=WP_DET_PACK).contains(&current) { current + 1 } else { WP_THERMAL };
+            for _ in 0..=4 {
+                if next > WP_DET_PACK { next = WP_THERMAL; }
+                if Self::selectable(ps, next) { num = next; break; }
+                next += 1;
+            }
+        }
+        if Self::selectable(ps, num) {
+            self.set_selected_weapon(num as u8);
+        }
+        false
+    }
+
     /// CG_WeaponSelectable against the predicted state.
     fn selectable(ps: &PlayerState, weapon: i32) -> bool {
         if weapon <= 0 {
@@ -817,7 +921,7 @@ impl LiveInput {
                 weapon = WP_NUM_WEAPONS - 1;
             }
             if Self::selectable(ps, weapon) {
-                self.weapon_select = weapon as u8;
+                self.set_selected_weapon(weapon as u8);
                 return;
             }
         }
@@ -838,7 +942,7 @@ impl LiveInput {
                 continue;
             }
             if weapon != old_weapon && Self::selectable(ps, weapon) {
-                self.weapon_select = weapon as u8;
+                self.set_selected_weapon(weapon as u8);
                 return;
             }
         }
@@ -860,7 +964,7 @@ impl LiveInput {
             _ => better,
         };
         if allowed && (0..19).contains(&tag) {
-            self.weapon_select = tag as u8;
+            self.set_selected_weapon(tag as u8);
         }
     }
 
@@ -903,6 +1007,74 @@ impl LiveInput {
             self.force_select = power as u8;
             return;
         }
+    }
+
+    /// TaystJK CG_NoUseableForce, excluding jaPRO race-mode special handling
+    /// (which remains in the caller's server-specific command path).
+    pub fn has_selectable_force(ps: &PlayerState) -> bool {
+        const INVALID_FORCE_MASK: i32 = (1 << 1) | (1 << 15) | (1 << 16) | (1 << 17);
+        let known = ps.field_i32("fd.forcePowersKnown").unwrap_or(0);
+        ps.stats[0] > 0 && (known & !INVALID_FORCE_MASK) != 0
+    }
+
+    /// TaystJK BG_CycleInven / CG_NextInventory_f / CG_PrevInventory_f.
+    /// STAT_HOLDABLE_ITEMS (2) is a bitmask by holdable tag, while
+    /// STAT_HOLDABLE_ITEM (1) stores an index into bg_itemlist.  Wire
+    /// `usercmd.invensel` transmits the selected *tag* (not the item index).
+    pub fn cycle_inventory(&mut self, ps: &PlayerState, forward: bool) {
+        const HI_NUM_HOLDABLE: i32 = 12;
+        if !Self::can_select_inventory(ps) {
+            return;
+        }
+        let owned = ps.stats[2];
+        let current = if self.inventory_select > 0 && self.inventory_select < HI_NUM_HOLDABLE as u8 {
+            i32::from(self.inventory_select)
+        } else {
+            i32::from(inventory_tag_for_item_index(ps.stats[1]).unwrap_or(0))
+        };
+        // BG_CycleInven wraps 1..HI_NUM_HOLDABLE-1 and ignores the
+        // health/ammo dispensers and jetpack, per BG_IsItemSelectable.
+        let mut tag = current;
+        for _ in 0..(HI_NUM_HOLDABLE - 1) {
+            tag = if forward {
+                if tag >= HI_NUM_HOLDABLE - 1 { 1 } else { tag + 1 }
+            } else if tag <= 1 { HI_NUM_HOLDABLE - 1 } else { tag - 1 };
+            if owned & (1 << tag) != 0 && !matches!(tag, 7 | 8 | 9) {
+                self.inventory_select = tag as u8;
+                return;
+            }
+        }
+        // No other owned, selectable item: leave current selection alone.
+    }
+
+    /// TaystJK CG_InvUseAvailable: pick the lowest owned non-jetpack tag,
+    /// then send its normal GENCMD_USE_* value (including dispensers).
+    pub fn use_first_inventory(&mut self, ps: &PlayerState) -> Option<u8> {
+        if !Self::can_select_inventory(ps) {
+            return None;
+        }
+        let tag = (1..12).find(|&tag| tag != 7 && ps.stats[2] & (1 << tag) != 0)?;
+        self.inventory_select = tag as u8;
+        match tag {
+            1 => Some(14), // HI_SEEKER -> GENCMD_USE_SEEKER
+            2 => Some(15), // HI_SHIELD -> GENCMD_USE_FIELD
+            3 => Some(16), // HI_MEDPAC -> GENCMD_USE_BACTA
+            4 => Some(21), // HI_MEDPAC_BIG -> GENCMD_USE_BACTABIG
+            5 => Some(17), // HI_BINOCULARS -> GENCMD_USE_ELECTROBINOCULARS
+            6 => Some(19), // HI_SENTRY_GUN -> GENCMD_USE_SENTRY
+            8 => Some(22), // HI_HEALTHDISP
+            9 => Some(23), // HI_AMMODISP
+            10 => Some(24), // HI_EWEB
+            11 => Some(25), // HI_CLOAK
+            _ => None,
+        }
+    }
+
+    fn can_select_inventory(ps: &PlayerState) -> bool {
+        const PMF_FOLLOW: i32 = 4096;
+        const PM_SPECTATOR: i32 = 4;
+        ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0
+            && ps.field_i32("pm_type").unwrap_or(0) != PM_SPECTATOR
     }
 
     /// Vanilla CG_Weapon_f. Returns true when it turned into sv_saberswitch.
@@ -950,7 +1122,7 @@ impl LiveInput {
             }
         }
         if Self::selectable(ps, num) {
-            self.weapon_select = num as u8;
+            self.set_selected_weapon(num as u8);
         }
         false
     }
@@ -1295,13 +1467,22 @@ pub fn adjust_position_for_mover(
 fn provisional_presentation_state(tentative: &PlayerState, committed: &PlayerState) -> PlayerState {
     let mut display = committed.clone();
     for field in [
-        "commandTime", "viewheight", "bobCycle",
+        "commandTime", "bobCycle",
         "origin[0]", "origin[1]", "origin[2]",
         "velocity[0]", "velocity[1]", "velocity[2]",
         "viewangles[0]", "viewangles[1]", "viewangles[2]",
     ] {
         if let Some(bits) = tentative.field_bits(field) {
             display.set_field_bits(field, bits);
+        }
+    }
+    // Viewheight is a stance change, not a continuous movement component.
+    // Do not lower/raise the camera for an animation transition whose pose we
+    // deliberately have not committed yet. Within an accepted animation the
+    // native height remains useful (e.g. meditate-end suppressing crouch).
+    if tentative.field_bits("legsAnim") == committed.field_bits("legsAnim") {
+        if let Some(bits) = tentative.field_bits("viewheight") {
+            display.set_field_bits("viewheight", bits);
         }
     }
     display
@@ -2780,6 +2961,50 @@ mod tests {
     }
 
     #[test]
+    fn provisional_animation_transitions_keep_the_committed_stance_height() {
+        // The captured meditate exit displayed standing flags/the old emote
+        // with the speculative crouch height. Other taunts and ordinary stance
+        // changes must obey the same presentation boundary.
+        for name in ["BOTH_MEDITATE", "BOTH_BOW", "BOTH_GESTURE1", "BOTH_SHOWOFF_FAST", "BOTH_STAND1"] {
+            let anim = jka_assets::animation::animation_index(name).unwrap() as u32;
+            let crouch = jka_assets::animation::animation_index("BOTH_CROUCH1IDLE").unwrap() as u32;
+            let mut standing = PlayerState::default();
+            standing.set_field_bits("legsAnim", anim);
+            standing.set_field_bits("viewheight", 36);
+            let mut ducked = standing.clone();
+            ducked.set_field_bits("legsAnim", crouch);
+            ducked.set_field_bits("viewheight", 12);
+            ducked.set_field_bits("pm_flags", 1);
+            ducked.set_field_bits("origin[0]", 123.5_f32.to_bits());
+            for (committed, tentative) in [(&standing, &ducked), (&ducked, &standing)] {
+                let display = provisional_presentation_state(tentative, committed);
+                for field in ["legsAnim", "viewheight", "pm_flags"] {
+                    assert_eq!(display.field_bits(field), committed.field_bits(field), "{name}: {field}");
+                }
+                assert_eq!(display.field_bits("origin[0]"), tentative.field_bits("origin[0]"));
+            }
+        }
+    }
+
+    #[test]
+    fn provisional_height_can_recover_inside_an_accepted_animation() {
+        // First recorded meditate-cancel step is crouched. The following
+        // native step stays in MEDITATE_END and restores standing height.
+        let mut committed = PlayerState::default();
+        let end = jka_assets::animation::animation_index("BOTH_MEDITATE_END").unwrap() as u32;
+        committed.set_field_bits("legsAnim", end);
+        committed.set_field_bits("viewheight", 12);
+        committed.set_field_bits("pm_flags", 1);
+        let mut tentative = committed.clone();
+        tentative.set_field_bits("viewheight", 36);
+        tentative.set_field_bits("pm_flags", 0);
+        let display = provisional_presentation_state(&tentative, &committed);
+        assert_eq!(display.field_i32("viewheight"), Some(36));
+        assert_eq!(display.field_i32("pm_flags"), Some(1));
+        assert_eq!(committed.field_i32("viewheight"), Some(12));
+    }
+
+    #[test]
     fn provisional_pmove_renders_continuous_state_without_committing_discrete_state() {
         use jka_protocol::entity_event::EntityEvent;
         for style in [1, 2, 3, 4, 5] {
@@ -2865,6 +3090,43 @@ mod tests {
     }
 
     #[test]
+    fn tayst_firemode_switch_follows_selected_weapon() {
+        let mut input = LiveInput::default();
+        input.set_selected_weapon(7); // Bowcaster: alt fire preferred.
+        assert!(input.single_fire_alt);
+        input.set_selected_weapon(10); // Flechette: alt fire preferred.
+        assert!(input.single_fire_alt);
+        input.set_selected_weapon(6); // Disruptor: primary fire preferred.
+        assert!(!input.single_fire_alt);
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("weapon", 6);
+        input.toggle_single_fire(&ps);
+        assert!(input.single_fire_alt);
+        ps.set_field_bits("weapon", 12);
+        input.toggle_single_fire(&ps);
+        assert!(!input.single_fire_alt, "thermal cannot toggle alternate fire");
+    }
+
+    #[test]
+    fn tayst_weaponclean_uses_raw_weapon_numbers_and_weaplast_toggles() {
+        let mut ps = PlayerState::default();
+        ps.stats[4] = (1 << 3) | (1 << 7) | (1 << 10);
+        // weapon 7 and 10 require ammo; setting the ammo alone is enough
+        // to exercise direct raw selection without stock weapon-slot offsets.
+        for ammo in &mut ps.ammo { *ammo = 999; }
+        ps.set_field_bits("weapon", 3);
+        let mut input = LiveInput::default();
+        input.sync_selection(&ps);
+        assert!(!input.select_weapon_clean(&ps, "7"));
+        assert_eq!(input.weapon_select, 7);
+        assert!(input.single_fire_alt);
+        input.select_last_weapon(&ps);
+        assert_eq!(input.weapon_select, 3);
+        input.select_last_weapon(&ps);
+        assert_eq!(input.weapon_select, 7);
+    }
+
+    #[test]
     fn generic_commands_are_one_shot() {
         let mut input = LiveInput::default();
         input.queue_generic_command(generic_command("force_throw").unwrap());
@@ -2938,6 +3200,48 @@ mod tests {
         let buttons = CommandButtons { active: &none, forced_moveup: false, any_key: false, talking: false };
         assert_eq!(input.create_cmd(&buttons).generic_command, 5);
         assert!(input.emote_tx.is_none());
+    }
+
+    #[test]
+    fn inventory_cycle_wraps_and_skips_unselectable_tags() {
+        let mut ps = PlayerState::default();
+        ps.stats[2] = (1 << 1) | (1 << 4) | (1 << 7) | (1 << 8) | (1 << 9);
+        let mut input = LiveInput::default();
+        input.cycle_inventory(&ps, true);
+        assert_eq!(input.inventory_select, 1);
+        input.cycle_inventory(&ps, true);
+        assert_eq!(input.inventory_select, 4);
+        input.cycle_inventory(&ps, true);
+        assert_eq!(input.inventory_select, 1, "must wrap past jetpack/dispensers");
+        input.cycle_inventory(&ps, false);
+        assert_eq!(input.inventory_select, 4);
+    }
+
+    #[test]
+    fn inventory_selection_ignores_spectators_and_followers() {
+        let mut ps = PlayerState::default();
+        ps.stats[2] = 1 << 1;
+        let mut input = LiveInput::default();
+        ps.set_field_bits("pm_type", 4);
+        input.cycle_inventory(&ps, true);
+        assert_eq!(input.inventory_select, 0);
+        ps.set_field_bits("pm_type", 0);
+        ps.set_field_bits("pm_flags", 4096);
+        input.cycle_inventory(&ps, true);
+        assert_eq!(input.inventory_select, 0);
+    }
+
+    #[test]
+    fn invfree_uses_first_nonjetpack_holdable_and_no_force_fallback() {
+        let mut ps = PlayerState::default();
+        ps.stats[0] = 100;
+        ps.stats[2] = (1 << 7) | (1 << 5) | (1 << 6);
+        let mut input = LiveInput::default();
+        assert_eq!(input.use_first_inventory(&ps), Some(17));
+        assert_eq!(input.inventory_select, 5);
+        assert!(!LiveInput::has_selectable_force(&ps));
+        ps.set_field_bits("fd.forcePowersKnown", (1 << 1) | (1 << 0));
+        assert!(LiveInput::has_selectable_force(&ps));
     }
 
     #[test]

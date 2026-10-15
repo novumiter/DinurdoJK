@@ -1007,6 +1007,7 @@ fn surface_bone_matrix<'a>(
 pub struct Ghoul2Animator {
     bone_anims: Vec<Ghoul2BoneAnim>,
     bone_angle_postmult: Vec<Option<Matrix3x4>>,
+    bone_angle_replace: Vec<Option<Matrix3x4>>,
 }
 
 impl Ghoul2Animator {
@@ -1014,6 +1015,7 @@ impl Ghoul2Animator {
         Self {
             bone_anims: (0..gla.num_bones()).map(Ghoul2BoneAnim::inactive).collect(),
             bone_angle_postmult: vec![None; gla.num_bones()],
+            bone_angle_replace: vec![None; gla.num_bones()],
         }
     }
 
@@ -1051,10 +1053,51 @@ impl Ghoul2Animator {
             &gla.skeleton[bone_index].base_pose_inv,
         )?;
         self.bone_angle_postmult[bone_index] = Some(generated);
+        self.bone_angle_replace[bone_index] = None;
+        Ok(())
+    }
+
+    /// OpenJK `G2_Generate_Matrix` for `BONE_ANGLES_REPLACE`.
+    /// Unlike POSTMULT this replaces the local animation matrix, but inherits
+    /// the parent's transform. The orientation is an authored basis permutation,
+    /// not an arbitrary yaw offset or world-space rotation.
+    pub fn set_bone_angles_replace(
+        &mut self,
+        gla: &GlaAnimation,
+        bone_name: &str,
+        angles: [f32; 3],
+        up: i32,
+        left: i32,
+        forward: i32,
+    ) -> Result<(), String> {
+        let bone_index = Self::bone_index(gla, bone_name)
+            .ok_or_else(|| format!("Ghoul2 bone {bone_name:?} not found"))?;
+        let mut permutation = [[0.0; 4]; 3];
+        for (column, direction) in [forward, left, up].into_iter().enumerate() {
+            let (row, sign) = match direction {
+                G2_POSITIVE_X => (0, 1.0), G2_NEGATIVE_X => (0, -1.0),
+                G2_POSITIVE_Y => (1, 1.0), G2_NEGATIVE_Y => (1, -1.0),
+                G2_POSITIVE_Z => (2, 1.0), G2_NEGATIVE_Z => (2, -1.0),
+                _ => return Err(format!("unsupported Ghoul2 orientation {direction}")),
+            };
+            permutation[row][column] = sign;
+        }
+        // OpenJK adds 180 degrees to pitch for a POSITIVE_Y left axis.
+        let mut angles = angles;
+        if left == G2_POSITIVE_Y { angles[0] += 180.0; }
+        let axis = q3_angles_to_axis(angles);
+        let created = [
+            [axis[0][0], axis[1][0], axis[2][0], 0.0],
+            [axis[0][1], axis[1][1], axis[2][1], 0.0],
+            [axis[0][2], axis[1][2], axis[2][2], 0.0],
+        ];
+        self.bone_angle_replace[bone_index] = Some(multiply_3x4(&created, &permutation));
+        self.bone_angle_postmult[bone_index] = None;
         Ok(())
     }
 
     pub fn clear_bone_angle_overrides(&mut self) {
+        self.bone_angle_replace.fill(None);
         self.bone_angle_postmult.fill(None);
     }
 
@@ -1421,10 +1464,26 @@ impl Ghoul2Animator {
             local = lerp_matrix(local, old_blend_matrix, calc.blend_lerp, blend_frontlerp);
         }
 
-        out[bone_index] = if parent < 0 {
+        // OpenJK tr_ghoul2.cpp G2_TransformBone: BONE_ANGLES_REPLACE does NOT
+        // replace the local bone transform. It takes the *animated, parented*
+        // bone, moves it into bind space to preserve the authored hinge pivot,
+        // substitutes the orientation there, then moves it back through the
+        // inverse bind matrix. Dropping the animation translation detaches
+        // children such as the portable sentry's gun assembly.
+        let first_pass = if parent < 0 {
             multiply_3x4(&root_matrix, &local)
         } else {
             multiply_3x4(&out[parent as usize], &local)
+        };
+        out[bone_index] = if let Some(replace) = self.bone_angle_replace[bone_index] {
+            replace_bone_angles_openjk(
+                &first_pass,
+                &gla.skeleton[bone_index].base_pose,
+                &gla.skeleton[bone_index].base_pose_inv,
+                &replace,
+            )
+        } else {
+            first_pass
         };
         // Exact OpenJK `G2_TransformBone` POSTMULT ordering: the normal
         // animation/parent result is post-multiplied by the BasePose-conjugated
@@ -1437,6 +1496,28 @@ impl Ghoul2Animator {
         complete[bone_index] = true;
         Ok(())
     }
+}
+
+/// OpenJK `G2_TransformBone`, non-ragdoll `BONE_ANGLES_REPLACE`, no blend.
+/// `animated_world` includes parent transform and animation before replacing
+/// the rotation; the bind-space translation must survive the replacement.
+fn replace_bone_angles_openjk(
+    animated_world: &Matrix3x4,
+    base_pose: &Matrix3x4,
+    base_pose_inv: &Matrix3x4,
+    rotation: &Matrix3x4,
+) -> Matrix3x4 {
+    let mut bind_world = multiply_3x4(animated_world, base_pose);
+    // OpenJK VectorLength((float*)&temp) is the length of its first 3x3 row.
+    let scale = (bind_world[0][0] * bind_world[0][0]
+        + bind_world[0][1] * bind_world[0][1]
+        + bind_world[0][2] * bind_world[0][2]).sqrt();
+    for row in 0..3 {
+        for col in 0..3 {
+            bind_world[row][col] = rotation[row][col] * scale;
+        }
+    }
+    multiply_3x4(&bind_world, base_pose_inv)
 }
 
 fn validate_anim_range(start_frame: i32, end_frame: i32, num_frames: i32) -> Result<(), String> {
@@ -1888,6 +1969,39 @@ mod tests {
             out[offset..offset + 2].copy_from_slice(&encoded.to_le_bytes());
         }
         out
+    }
+
+    #[test]
+    fn bone_angles_replace_keeps_animated_hinge_pivot() {
+        // Animated hinge has already been positioned by its parent/clip.
+        let animated = [
+            [0.0, -1.0, 0.0, 14.0],
+            [1.0,  0.0, 0.0, -4.0],
+            [0.0,  0.0, 1.0, 6.0],
+        ];
+        let base = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 7.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let base_inv = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, -7.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let desired = [
+            [0.0, 1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let updated = replace_bone_angles_openjk(&animated, &base, &base_inv, &desired);
+        let old_pivot = transform_point(&animated, [0.0, 7.0, 0.0]);
+        let new_pivot = transform_point(&updated, [0.0, 7.0, 0.0]);
+        for i in 0..3 {
+            assert!((old_pivot[i] - new_pivot[i]).abs() < 0.00001,
+                "hinge pivot axis {i}: {old_pivot:?} vs {new_pivot:?}");
+        }
+        assert_ne!(updated, animated, "hinge must still rotate");
     }
 
     #[test]

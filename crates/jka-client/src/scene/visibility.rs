@@ -147,7 +147,8 @@ pub(crate) fn draw_batches_share_state(a: &DrawBatch, b: &DrawBatch) -> bool {
     {
         return false;
     }
-    a.pipeline == b.pipeline
+    a.authored_sort_priority == b.authored_sort_priority
+        && a.pipeline == b.pipeline
         && a.texture == b.texture
         && a.legacy_srgb_overlay == b.legacy_srgb_overlay
         && a.animation == b.animation

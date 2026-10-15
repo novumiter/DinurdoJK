@@ -409,7 +409,7 @@ impl ComputeResources {
             module: &shader,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
         Self {
             input_layout,
@@ -768,7 +768,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         module: &shader,
         entry_point: Some("main"),
         compilation_options: Default::default(),
-        cache: None,
+        cache: crate::pipeline_cache::get().as_ref(),
     });
     let output = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,

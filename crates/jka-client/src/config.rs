@@ -182,6 +182,8 @@ pub struct AudioSettings {
     /// Master gate for Valve Steam Audio integration. Off preserves the legacy
     /// OpenJK-compatible mixer and skips all acoustic scene/bake preparation.
     pub steam_audio: bool,
+    /// Opt-in authored EAGLE/EAX reverb on maps with valid .eal.
+    pub eal_enabled: bool,
     /// Live Steam Audio HRTF rendering for positional sounds.
     pub steam_audio_binaural: bool,
     /// Steam Audio HRTF direction interpolation: 0 = nearest, 1 = bilinear.
@@ -201,6 +203,7 @@ impl Default for AudioSettings {
             separation: 0.5,
             mute_when_unfocused: true,
             steam_audio: false,
+            eal_enabled: false,
             steam_audio_binaural: true,
             steam_audio_hrtf_interpolation: 0,
             steam_audio_environmental: true,
@@ -1138,7 +1141,6 @@ mod tests {
                 "seta cg_thirdPersonAlpha \"0.375\"\n",
                 "seta cg_thirdPersonAngle \"25\"\n",
                 "seta cg_thirdPersonCameraDamp \"0.42\"\n",
-                "seta cg_cameraFPS \"144\"\n",
                 "seta cg_thirdPersonHorzOffset \"7\"\n",
                 "seta cg_thirdPersonPitchOffset \"-4\"\n",
                 "seta cg_thirdPersonRange \"128\"\n",
@@ -1180,7 +1182,6 @@ mod tests {
         assert!((loaded.third_person.alpha - 0.375).abs() < 1e-6);
         assert!((loaded.third_person.angle - 25.0).abs() < 1e-6);
         assert!((loaded.third_person.camera_damp - 0.42).abs() < 1e-6);
-        assert_eq!(loaded.third_person.camera_fps, 144);
         assert!((loaded.third_person.horz_offset - 7.0).abs() < 1e-6);
         assert!((loaded.third_person.pitch_offset + 4.0).abs() < 1e-6);
         assert!((loaded.third_person.range - 128.0).abs() < 1e-6);
@@ -1236,7 +1237,6 @@ mod tests {
         presentation.third_person.alpha = 0.25;
         presentation.third_person.angle = 15.0;
         presentation.third_person.camera_damp = 0.8;
-        presentation.third_person.camera_fps = 144;
         presentation.third_person.horz_offset = 6.0;
         presentation.third_person.pitch_offset = -3.0;
         presentation.third_person.range = 96.0;
@@ -1290,7 +1290,6 @@ mod tests {
         assert!(text.contains("seta cg_thirdPersonAlpha \"0.250\""));
         assert!(text.contains("seta cg_thirdPersonAngle \"15.000\""));
         assert!(text.contains("seta cg_thirdPersonCameraDamp \"0.800\""));
-        assert!(text.contains("seta cg_cameraFPS \"144\""));
         assert!(text.contains("seta cg_thirdPersonHorzOffset \"6.000\""));
         assert!(text.contains("seta cg_thirdPersonPitchOffset \"-3.000\""));
         assert!(text.contains("seta cg_thirdPersonRange \"96.000\""));
@@ -1327,7 +1326,6 @@ mod tests {
         assert!((settings.third_person.alpha - 1.0).abs() < 1e-6);
         assert!((settings.third_person.angle - 0.0).abs() < 1e-6);
         assert!((settings.third_person.camera_damp - 1.0).abs() < 1e-6);
-        assert_eq!(settings.third_person.camera_fps, 125);
         assert!((settings.third_person.horz_offset - 0.0).abs() < 1e-6);
         assert!((settings.third_person.pitch_offset - 0.0).abs() < 1e-6);
         assert!((settings.third_person.range - 100.0).abs() < 1e-6);

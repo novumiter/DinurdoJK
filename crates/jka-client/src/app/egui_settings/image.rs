@@ -79,13 +79,36 @@ impl App {
             self.change_video_setting(target as i32 - current as i32);
         }
 
+        // Existing r_ext_compress_textures setting; no second setting/state.
+        // Texture uploads are compressed on map load, not mid-frame.
+        const TEXTURE_COMPRESSION: [(u8, &str); 3] = [
+            (0, "Off"),
+            (1, "BC1/BC3"),
+            (2, "BC + lightmaps"),
+        ];
+        if let Some(target) = segmented_row(
+            ui,
+            "Texture compression",
+            "0 keeps original 8-bit textures; 1 uses BC1/BC3 for eligible color textures; 2 also compresses 8-bit lightmaps. Saves VRAM, but BC formats are lossy. Applies when loading the next map or after vid_restart.",
+            theme::Reset::Video(ui::VIDEO_ROW_TEXTURE_COMPRESSION),
+            self.video.texture_compression.min(2),
+            &TEXTURE_COMPRESSION,
+        ) {
+            self.video_selected = ui::VIDEO_ROW_TEXTURE_COMPRESSION;
+            let _ = self.set_console_cvar("r_ext_compress_textures", &target.to_string());
+        }
+
         theme::row(
             ui,
             "Detail textures",
             "Adds textures/japro/detail/* to eligible opaque BSP materials using neutral 2× modulation. Authored detail stages are unchanged.",
             theme::Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
             |ui| {
-                let mut enabled = self.video.detail_textures;
+                let mut enabled = theme::preview_toggle_value(
+                    ui.ctx(),
+                    theme::Reset::Video(ui::VIDEO_ROW_DETAIL_TEXTURES),
+                    self.video.detail_textures,
+                );
                 if ui.checkbox(&mut enabled, "Enabled").changed() {
                     self.video_selected = ui::VIDEO_ROW_DETAIL_TEXTURES;
                     self.video.detail_textures = enabled;

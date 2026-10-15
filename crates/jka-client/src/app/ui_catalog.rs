@@ -30,6 +30,7 @@ pub(super) struct DecodedImage {
 
 pub(super) enum CatalogRequest {
     AssetViewer,
+    ModelThumbnail { qpath: String },
     ConsoleFiles,
     DemoGames { token: u64 },
     Demos { token: u64 },
@@ -42,6 +43,8 @@ pub(super) enum CatalogRequest {
     ProfileIcon { key: String, model: String, skin: String },
     /// `gfx/2d/crosshair*` thumbnail for the settings picker, by `cg_crosshairImage`.
     CrosshairImage { index: u8 },
+    ShaderNames,
+    ShaderThumbnail { map_label: String, source: String, image_path: String },
     ScreenshotCatalog,
     ScreenshotImage { path: PathBuf },
 }
@@ -50,6 +53,7 @@ type ProfileCatalog = (Vec<ProfileModelEntry>, Vec<ProfileSaberEntry>);
 
 pub(super) enum CatalogPayload {
     AssetViewer(Result<Vec<AssetEntry>, String>),
+    ModelThumbnail { qpath: String, image: Option<DecodedImage> },
     ConsoleFiles(Result<frontend::ConsoleFileCatalog, String>),
     DemoGames { token: u64, games: Result<Vec<String>, String> },
     Demos { token: u64, game: Option<PathBuf>, demos: Result<Vec<frontend::DemoEntry>, String> },
@@ -61,6 +65,8 @@ pub(super) enum CatalogPayload {
     Levelshot { source: bool, map_name: String, image: Option<DecodedImage> },
     ProfileIcon { key: String, image: Option<DecodedImage> },
     CrosshairImage { index: u8, image: Option<DecodedImage> },
+    ShaderNames(Vec<String>),
+    ShaderThumbnail { map_label: String, source: String, image: Option<DecodedImage> },
     ScreenshotCatalog(Result<Vec<crate::screenshot::ScreenshotEntry>, String>),
     ScreenshotImage { path: PathBuf, image: Result<DecodedImage, String> },
 }
@@ -258,6 +264,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     let error = error.to_string();
                     let payload = match job.request {
                         CatalogRequest::AssetViewer => Some(CatalogPayload::AssetViewer(Err(error.clone()))),
+                        CatalogRequest::ModelThumbnail { qpath } => Some(CatalogPayload::ModelThumbnail { qpath, image: None }),
                         CatalogRequest::ConsoleFiles => Some(CatalogPayload::ConsoleFiles(Err(error))),
                         CatalogRequest::DemoGames { .. } | CatalogRequest::Demos { .. } => unreachable!("demo requests handled before VFS"),
                         // Handled before VFS open above.
@@ -273,6 +280,10 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                         }
                         CatalogRequest::CrosshairImage { index } => {
                             Some(CatalogPayload::CrosshairImage { index, image: None })
+                        }
+                        CatalogRequest::ShaderNames => Some(CatalogPayload::ShaderNames(Vec::new())),
+                        CatalogRequest::ShaderThumbnail { map_label, source, .. } => {
+                            Some(CatalogPayload::ShaderThumbnail { map_label, source, image: None })
                         }
                         CatalogRequest::ScreenshotCatalog | CatalogRequest::ScreenshotImage { .. } => unreachable!("filesystem-only screenshot request reached VFS open"),
                     };
@@ -293,6 +304,12 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                 "console files",
                 CatalogPayload::ConsoleFiles(Ok(frontend::scan_console_files(assets))),
             ),
+            CatalogRequest::ModelThumbnail { qpath } => {
+                let image = assets.read(&qpath, 32 * 1024 * 1024).ok().flatten()
+                    .and_then(|file| jka_assets::md3::parse(&file.bytes).ok())
+                    .and_then(|model| raster_md3_thumbnail(&model));
+                ("model thumbnail", CatalogPayload::ModelThumbnail { qpath, image })
+            }
             CatalogRequest::AssetViewer => (
                 "asset viewer",
                 CatalogPayload::AssetViewer(frontend::scan_asset_viewer_assets(assets)),
@@ -327,6 +344,36 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                     .and_then(|asset| decode(asset, &format!("Crosshair image {index}")));
                 ("crosshair image", CatalogPayload::CrosshairImage { index, image })
             }
+            CatalogRequest::ShaderNames => {
+                let mut names: Vec<String> = assets.names().filter_map(|name| {
+                    let lower = name.to_ascii_lowercase();
+                    [".tga", ".jpg", ".jpeg", ".png"]
+                        .iter().find_map(|ext| lower.strip_suffix(ext))
+                        .map(str::to_owned)
+                }).collect();
+                names.sort_unstable();
+                names.dedup();
+                ("shader names", CatalogPayload::ShaderNames(names))
+            }
+            CatalogRequest::ShaderThumbnail { map_label, source, image_path } => {
+                // The UI worker owns VFS reads and decoding. Bound previews
+                // to 96px so a map with thousands of materials stays cheap.
+                let mut decoded = None;
+                let stem = crate::scene::canonical_shader_name(&image_path);
+                for ext in ["tga", "png", "jpg", "jpeg"] {
+                    if let Ok(Some(asset)) = assets.read(&format!("{stem}.{ext}"), 8 * 1024 * 1024) {
+                        if let Ok(raw) = image::load_from_memory(&asset.bytes) {
+                            let preview = raw.thumbnail(96, 96).to_rgba8();
+                            decoded = Some(DecodedImage {
+                                size: [preview.width() as usize, preview.height() as usize],
+                                rgba: preview.into_raw(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                ("shader thumbnail", CatalogPayload::ShaderThumbnail { map_label, source, image: decoded })
+            }
             CatalogRequest::ScreenshotCatalog | CatalogRequest::ScreenshotImage { .. } => unreachable!("filesystem-only screenshot request reached VFS scan"),
         };
         // Bulk scans are the interesting ones; per-image jobs are too chatty.
@@ -335,6 +382,7 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
             CatalogPayload::Levelshot { .. }
                 | CatalogPayload::ProfileIcon { .. }
                 | CatalogPayload::CrosshairImage { .. }
+                | CatalogPayload::ShaderThumbnail { .. }
         ) {
             devprintln!(
                 2,
@@ -344,4 +392,83 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
         }
         let _ = results.send(CatalogResult { generation: job.generation, payload });
     }
+}
+
+
+/// Software thumbnail of real MD3 frame-zero mesh geometry. The catalog worker
+/// handles all triangles and the UI receives just a small RGBA icon; no GPU
+/// allocations or asset disk reads happen while scrolling the picker. Thumbs
+/// deliberately use neutral material so a missing image cannot hide geometry.
+fn raster_md3_thumbnail(model: &jka_assets::md3::Model) -> Option<DecodedImage> {
+    const W: usize = 96;
+    const H: usize = 96;
+    let (yaw, elevation) = (0.65_f32, 0.43_f32);
+    let (sy,cy) = yaw.sin_cos();
+    let (sp,cp) = elevation.sin_cos();
+    let project = |p: [f32; 3]| -> [f32; 3] {
+        let sideways = sy*p[0] + cy*p[1];
+        [cy*p[0] - sy*p[1], -sp*sideways + cp*p[2], cp*sideways + sp*p[2]]
+    };
+    let mut range_min = [f32::MAX; 2];
+    let mut range_max = [f32::MIN; 2];
+    let mut any = false;
+    for surface in &model.surfaces {
+        for vertex in &surface.vertices {
+            let p = project(vertex.position);
+            if !p.iter().all(|v| v.is_finite()) { continue; }
+            for a in 0..2 {
+                range_min[a] = range_min[a].min(p[a]);
+                range_max[a] = range_max[a].max(p[a]);
+            }
+            any = true;
+        }
+    }
+    if !any { return None; }
+    let center = [(range_min[0]+range_max[0])*0.5, (range_min[1]+range_max[1])*0.5];
+    let width = (range_max[0]-range_min[0]).max(0.01);
+    let height = (range_max[1]-range_min[1]).max(0.01);
+    let scale = 83.0 / width.max(height);
+    let screen = |p: [f32; 3]| -> [f32; 3] {
+        let v = project(p);
+        [48.0+(v[0]-center[0])*scale, 48.0-(v[1]-center[1])*scale, v[2]]
+    };
+    let mut rgba = vec![0u8; W*H*4];
+    for pixel in rgba.chunks_exact_mut(4) { pixel.copy_from_slice(&[25,34,46,255]); }
+    let mut depth = vec![f32::NEG_INFINITY; W*H];
+    for surface in &model.surfaces {
+        let vertices: Vec<_> = surface.vertices.iter().map(|v| screen(v.position)).collect();
+        for face in surface.indices.chunks_exact(3) {
+            let (Some(a),Some(b),Some(c)) = (
+                vertices.get(face[0] as usize),
+                vertices.get(face[1] as usize),
+                vertices.get(face[2] as usize)
+            ) else { continue; };
+            let area = (b[0]-a[0])*(c[1]-a[1])-(b[1]-a[1])*(c[0]-a[0]);
+            if area.abs() < 0.001 { continue; }
+            let lo_x = a[0].min(b[0]).min(c[0]).floor().max(0.0) as usize;
+            let hi_x = a[0].max(b[0]).max(c[0]).ceil().min(95.0) as usize;
+            let lo_y = a[1].min(b[1]).min(c[1]).floor().max(0.0) as usize;
+            let hi_y = a[1].max(b[1]).max(c[1]).ceil().min(95.0) as usize;
+            let brightness = (105.0 + area.abs().sqrt().min(90.0)*0.33).round() as u8;
+            for y in lo_y..=hi_y {
+                for x in lo_x..=hi_x {
+                    let px = x as f32 + 0.5;
+                    let py = y as f32 + 0.5;
+                    let u = ((b[0]-px)*(c[1]-py)-(b[1]-py)*(c[0]-px))/area;
+                    let v = ((c[0]-px)*(a[1]-py)-(c[1]-py)*(a[0]-px))/area;
+                    let w = 1.0-u-v;
+                    if u < -0.001 || v < -0.001 || w < -0.001 { continue; }
+                    let z = u*a[2]+v*b[2]+w*c[2];
+                    let i = y*W+x;
+                    if z <= depth[i] { continue; }
+                    depth[i] = z;
+                    rgba[i*4..i*4+4].copy_from_slice(&[
+                        brightness.saturating_sub(18), brightness,
+                        brightness.saturating_add(24), 255
+                    ]);
+                }
+            }
+        }
+    }
+    Some(DecodedImage { size:[W,H], rgba })
 }

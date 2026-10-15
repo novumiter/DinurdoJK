@@ -4,6 +4,7 @@ use crate::renderer::{
 };
 use wgpu::util::DeviceExt;
 
+#[derive(Clone)]
 pub(in crate::renderer) struct GpuImage {
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) view: wgpu::TextureView,

@@ -6,7 +6,7 @@
 use crate::{map_jobs::MapJobPool, thread_activity::Task};
 use image::ImageFormat;
 use jka_assets::{
-    bsp::{MATERIAL_MASK, SURF_NODRAW, SURF_SKY},
+    bsp::{MATERIAL_GLASS, MATERIAL_MASK, SURF_NODRAW, SURF_SKY},
     pk3::AssetSearchPath,
     shader::{self, AlphaGen, RgbGen, Shader, TcGen, TcMod},
 };
@@ -192,6 +192,19 @@ pub const SHADER_LIGHT_AUTHORED_OVERLAP: u32 = 1 << 31;
 pub const SHADER_LIGHT_ALL: u32 =
     SHADER_LIGHT_GLOW | SHADER_LIGHT_ADDITIVE | SHADER_LIGHT_EMISSIVE_COMPANION;
 
+static GLASS_PROMOTION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `r_glassPromotion`: promote `q3map_material Glass` shaders to transmissive
+/// draws. Read while materials compile and models load, so a change applies
+/// on the next map load.
+pub(crate) fn glass_promotion_enabled() -> bool {
+    GLASS_PROMOTION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_glass_promotion_enabled(enabled: bool) {
+    GLASS_PROMOTION.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ShaderLightPromotion {
     pub value: f32,
@@ -238,6 +251,12 @@ pub struct SurfaceMaterial {
     pub clamp_time: Option<f32>,
     pub stages: Vec<MaterialStage>,
     pub surface_material: u8,
+    /// Explicit Glass shader promoted to a single transmissive surface.
+    pub glass_promotion: bool,
+    /// Normalized linear tint inferred from the authored stage image.
+    pub glass_tint: [f32; 3],
+    /// Normal-incidence reflection, inferred from the authored additive image.
+    pub glass_reflectance: f32,
     pub cull: CullMode,
     pub offset: bool,
     /// Explicit shader sort rank, matching TaystJK's `shader.sort`.
@@ -308,6 +327,9 @@ impl Default for SurfaceMaterial {
             clamp_time: None,
             stages: Vec::new(),
             surface_material: 0,
+            glass_promotion: false,
+            glass_tint: [1.0; 3],
+            glass_reflectance: 0.04,
             cull: CullMode::Back,
             offset: false,
             sort: None,
@@ -1851,21 +1873,45 @@ pub(crate) fn authored_environment_composite_stage<T>(
     if stages.len() < 2 || !is_environment(stage) {
         return false;
     }
-    let Some(env_blend) = blend(stage) else {
-        return false;
+    let blended = |stage: &T| {
+        blend(stage).is_some_and(|b| b != BlendFunc { src: BlendFactor::One, dst: BlendFactor::Zero })
     };
-    if env_blend == (BlendFunc { src: BlendFactor::One, dst: BlendFactor::Zero }) {
-        return false;
+    // A multiplicative filter (the `$lightmap` pass, detail modulation) scales
+    // whatever is beneath it the same way with or without the environment pass.
+    let filter = |stage: &T| {
+        blend(stage).is_some_and(|b| {
+            matches!(
+                (b.src, b.dst),
+                (BlendFactor::DstColor, BlendFactor::Zero)
+                    | (BlendFactor::Zero, BlendFactor::SrcColor)
+                    | (BlendFactor::DstColor, BlendFactor::SrcColor)
+            )
+        })
+    };
+    if !blended(stage) {
+        // An opaque environment base is integral when an authored blended
+        // layer other than a filter is drawn over it.
+        return stages
+            .iter()
+            .any(|other| !is_environment(other) && blended(other) && !filter(other));
     }
-    stages.iter().any(|other| {
-        if is_environment(other) {
-            return false;
-        }
-        let coupled_blend = blend(other).is_some_and(|b| {
-            b != (BlendFunc { src: BlendFactor::One, dst: BlendFactor::Zero })
-        });
-        same_image(stage, other) || coupled_blend
-    })
+    // A blended environment pass is integral when it is stacked with another
+    // environment layer, shares its image with another stage, or sits with a
+    // translucent coverage layer (glass). Filters and additive layers
+    // (specular, glow, caustics) do not depend on it, so polished floors and
+    // chrome (opaque base + environment overlay + lightmap) stay optional
+    // reflections.
+    let coverage = |stage: &T| {
+        blended(stage) && !filter(stage) && !blend(stage).is_some_and(|b| b.dst == BlendFactor::One)
+    };
+    stages
+        .iter()
+        .filter(|other| is_environment(other) && blended(other))
+        .count()
+        >= 2
+        || stages.iter().any(|other| {
+            !is_environment(other) && (same_image(stage, other) || coverage(other))
+        })
 }
 
 /// An authored composite uses environment UVs as a mandatory part of its
@@ -1885,6 +1931,13 @@ fn preserves_authored_environment_composite(shader: &Shader) -> bool {
             |a, b| !a.image.is_empty() && a.image.eq_ignore_ascii_case(&b.image),
         )
     })
+}
+
+/// Explicit glass can be authored entirely as an additive environment stage
+/// (e.g. common/env_glass). It is the material's visible coverage and must
+/// survive reflection-quality filtering so promotion can be disabled.
+fn keeps_authored_environment_stages(shader: &Shader) -> bool {
+    shader.is_glass() || preserves_authored_environment_composite(shader)
 }
 
 fn alpha_cutoff(stage: &shader::Stage) -> f32 {
@@ -2091,6 +2144,21 @@ fn normalized_texture_average_inner(texture: &TextureData) -> [f32; 3] {
     }
 }
 
+fn glass_reflectance_from_texture(texture: &TextureData) -> f32 {
+    let pixel_count = (texture.width as usize).saturating_mul(texture.height as usize);
+    let base_bytes = pixel_count.saturating_mul(4).min(texture.rgba.len());
+    if base_bytes < 4 { return 0.04; }
+    let linear = srgb_byte_to_linear();
+    let mut luminance = 0.0_f64;
+    for pixel in texture.rgba[..base_bytes].chunks_exact(4) {
+        luminance += linear[pixel[0] as usize] * 0.2126
+            + linear[pixel[1] as usize] * 0.7152
+            + linear[pixel[2] as usize] * 0.0722;
+    }
+    let mean = (luminance / (base_bytes / 4) as f64) as f32;
+    0.04 + 0.08 * mean.sqrt().clamp(0.0, 1.0)
+}
+
 fn emissive_surface_light_stats(texture: &TextureData) -> Option<([f32; 3], f32)> {
     let pixel_count = usize::try_from(texture.width)
         .ok()
@@ -2282,7 +2350,7 @@ pub fn primary_texture_requests(
                         push(&format!("{prefix}_{suffix}"), true, true);
                     }
                 }
-                let keep_authored_env = preserves_authored_environment_composite(shader);
+                let keep_authored_env = keeps_authored_environment_stages(shader);
                 for stage in &shader.stages {
                     if omit_environment_stages
                         && !keep_authored_env
@@ -2417,10 +2485,9 @@ pub fn describe(
     let empty = Shader::default();
     let definition = definition.unwrap_or(&empty);
     let explicit = !definition.stages.is_empty();
-    // Off still strips standalone environment stages, but not the authored
-    // multistage composites that rely on those stages to be visible at all.
-    // This uses the same semantic topology as the Ultra planar guard.
-    let keep_authored_env = preserves_authored_environment_composite(definition);
+    // Keep mandatory authored coverage: explicit glass can have just one
+    // additive environment stage, while other composites have several stages.
+    let keep_authored_env = keeps_authored_environment_stages(definition);
     let stage_is_omitted = |stage: &shader::Stage| {
         omit_environment_stages
             && !keep_authored_env
@@ -2709,6 +2776,45 @@ pub fn describe(
                                     glow: false,
                 });
             }
+
+            // Off renders no portal view. id Tech 3 draws a `portal` shader
+            // over the reflected image, so without one its stages composite
+            // over the clear colour: a mirror floor whose window stage is
+            // fully transparent and whose diffuse is a 2x modulate
+            // (AMJH3TE graymarble_council) renders black. Stand in an opaque
+            // 50% gray for the missing image; a 2x modulate over it leaves the
+            // authored diffuse exactly as painted.
+            if omit_environment_stages && definition.portal && !stages.is_empty() {
+                // A fully transparent premultiplied window stage is a no-op over
+                // an opaque base: replace it instead of drawing it.
+                let transparent_window = stages[0].blend
+                    == Some(BlendFunc { src: BlendFactor::One, dst: BlendFactor::OneMinusSrcAlpha })
+                    && matches!(stages[0].rgb_gen, RgbGen::Identity | RgbGen::IdentityLighting)
+                    && matches!(stages[0].alpha_gen, AlphaGen::Identity)
+                    && !stages[0].glow
+                    && stages[0].animation.is_none()
+                    && matches!(stages[0].texture, StageTexture::Image(index)
+                        if textures.images.get(index).is_some_and(|image| image.rgba.iter().all(|&byte| byte == 0)));
+                if transparent_window {
+                    stages.remove(0);
+                }
+                stages.insert(0, MaterialStage {
+                    texture: StageTexture::White,
+                    animation: None,
+                    enhancements: StageEnhancements::default(),
+                    blend: None,
+                    alpha_cutoff: 0.0,
+                    opacity: 1.0,
+                    color: [0.22; 3],
+                    rgb_gen: RgbGen::Const,
+                    alpha_gen: AlphaGen::Identity,
+                    tc_gen: TcGen::Base,
+                    tc_mods: Vec::new(),
+                    depth_write: true,
+                    depth_equal: false,
+                    glow: false,
+                });
+            }
         } else {
             let texture = textures
                 .load(assets, name, false)
@@ -2790,8 +2896,58 @@ pub fn describe(
         }
     }
 
+    let glass_promotion = definition.is_glass() && glass_promotion_enabled();
+    if glass_promotion && stages.is_empty() {
+        // Reflection quality may omit the only authored environment stage.
+        // The promoted pane still needs one draw in that case.
+        stages.push(MaterialStage {
+            texture: StageTexture::White,
+            animation: None,
+            enhancements: StageEnhancements::default(),
+            blend: None,
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+            glow: false,
+        });
+    }
+    let glass_image = if glass_promotion {
+        definition
+            .primary()
+            .and_then(|stage| {
+                preferred_source
+                    .and_then(|source| textures.load_from_source(assets, &stage.image, false, source))
+                    .or_else(|| textures.load(assets, &stage.image, false))
+            })
+    } else {
+        None
+    };
+    let glass_tint = glass_image
+            .and_then(|index| textures.images.get(index))
+            .map(normalized_texture_average)
+            .unwrap_or([1.0; 3]);
+    let glass_reflectance = glass_image
+        .and_then(|index| textures.images.get(index))
+        .map(glass_reflectance_from_texture)
+        .unwrap_or(0.04);
+
     SurfaceMaterial {
-        surface_material: (flags & MATERIAL_MASK) as u8,
+        // A model shader (and an uncompiled source-map preview) has no BSP
+        // material bits. Prefer its explicit Glass declaration when present.
+        surface_material: if definition.is_glass() {
+            MATERIAL_GLASS as u8
+        } else {
+            (flags & MATERIAL_MASK) as u8
+        },
+        glass_promotion,
+        glass_tint,
+        glass_reflectance,
         hidden: !sky
             && (base_hidden
                 || (explicit && stages.is_empty() && surface_sprite_effects.is_empty())),
@@ -3076,6 +3232,29 @@ mod tests {
         assert_eq!(material.stages.len(), 3);
         assert!(matches!(material.stages[0].tc_gen, TcGen::Environment));
         assert!(matches!(material.stages[2].tc_gen, TcGen::Lightmap));
+    }
+
+    #[test]
+    fn reflection_off_preserves_env_glass_for_promotion_fallback() {
+        for declaration in ["q3map_material Glass", "material glass"] {
+            // Stock common/env_glass has no diffuse base: removing this single
+            // stage leaves a clear hole when glass promotion is disabled.
+            let script = format!("test {{\nqer_editorimage textures/common/etest4\nqer_trans 0.6\nsurfaceparm nonopaque\nsurfaceparm forcefield\nsurfaceparm trans\n{declaration}\nq3map_nolightmap\n{{\nmap textures/common/etest4\nblendFunc GL_ONE GL_ONE\ntcGen environment\n}}\n}}");
+            let shaders = shader::parse(&script).unwrap();
+            assert_eq!(primary_texture_requests(&["test".into()], &shaders, true),
+                [("textures/common/etest4".into(), false, true)]);
+            let legacy = material_with_environment_policy(&script, false);
+            let off = material_with_environment_policy(&script, true);
+            assert!(!off.hidden);
+            assert_eq!(off.stages.len(), legacy.stages.len());
+            assert_eq!(off.stages[0].tc_gen, TcGen::Environment);
+            assert_eq!(off.stages[0].blend, Some(BlendFunc {
+                src: BlendFactor::One, dst: BlendFactor::One,
+            }));
+            // Authored stages remain available even when promotion currently
+            // uses a synthetic transmission stage during batch preparation.
+            assert_eq!(off.stages[0].tc_gen, legacy.stages[0].tc_gen);
+        }
     }
 
     #[test]

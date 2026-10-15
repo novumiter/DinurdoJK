@@ -2,12 +2,13 @@
 // binds the post buffer (post.wgsl and rain_haze_mask.wgsl); it must match the
 // field order of `PostUniform` in renderer.rs, which a unit test checks.
 struct PostSettings {
-    color: vec4<f32>, // gamma, tone mapping (0 off / 1 SDR ACES / 3 display-output stage), bloom, ssao
+    color: vec4<f32>, // gamma, tone mapping (0..1 SDR ACES strength / 3 display-output stage), bloom, ssao
     aa: vec4<f32>, // fxaa, viewport width, viewport height, taa
     taa_params: vec4<f32>, // x HDR scene, y reflection debug, z reflection quality, w reserved
     scene: vec4<f32>, // contact shadows, volumetric fog, ssr, history valid
     film: vec4<f32>, // halation, chromatic aberration, vignette, LUT strength
-    grain: vec4<f32>, // strength, size, time, exposure
+    grain: vec4<f32>, // strength, size, time, manual exposure
+    exposure_controls: vec4<f32>, // x auto exposure strength; yzw reserved
     camera_fx: vec4<f32>, // motion shutter scale, DOF strength, focus distance, DOF quality
     legacy_fog: vec4<f32>, // authored display-space RGB, depthForOpaque; taa_params.w = scale/enabled
     clouds: vec4<f32>, // enabled, type, quality, coverage

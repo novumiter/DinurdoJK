@@ -109,9 +109,9 @@ fn scene(uv: vec2<f32>) -> vec3<f32> {
     ).rgb;
 }
 fn display_scene(uv: vec2<f32>) -> vec3<f32> {
-    var color = scene(uv) * exp2(settings.grain.w + auto_exposure_state.exposure_ev);
-    if (settings.color.y > 0.5 && settings.color.y < 2.0) {
-        color = aces_fitted(color);
+    var color = scene(uv) * exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
+    if (settings.color.y > 0.0 && settings.color.y < 2.0) {
+        color = mix(color, aces_fitted(color), settings.color.y);
     }
     return pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / max(settings.color.x, 0.05)));
 }
@@ -2992,7 +2992,7 @@ fn apply_legacy_weather_air(color_in: vec3<f32>, uv: vec2<f32>, depth: f32) -> v
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.5 && settings.color.y < 2.0;
+    let tonemap_enabled = settings.color.y > 0.0 && settings.color.y < 2.0;
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
     let halation_enabled = settings.film.x > 0.5;
@@ -3063,9 +3063,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         color = apply_film_halation(color, red_return);
     }
 
-    color *= exp2(settings.grain.w + auto_exposure_state.exposure_ev);
+    color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
     if (tonemap_enabled) {
-        color = aces_fitted(color);
+        color = mix(color, aces_fitted(color), settings.color.y);
     }
 
     color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
@@ -3090,7 +3090,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.5 && settings.color.y < 2.0;
+    let tonemap_enabled = settings.color.y > 0.0 && settings.color.y < 2.0;
     let dims = textureDimensions(linear_depth_texture);
     let dims_f = vec2<f32>(f32(dims.x), f32(dims.y));
     let max_pixel = vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1);
@@ -3114,9 +3114,9 @@ fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
     }
     color = apply_legacy_weather_air(color, input.uv, centre_depth);
 
-    color *= exp2(settings.grain.w + auto_exposure_state.exposure_ev);
+    color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
     if (tonemap_enabled) {
-        color = aces_fitted(color);
+        color = mix(color, aces_fitted(color), settings.color.y);
     }
     color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
     color = apply_rain_grade(color, settings.weather_look.y);
@@ -3139,7 +3139,7 @@ struct TaaFragmentOut {
 @fragment
 fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
     let gamma = max(settings.color.x, 0.05);
-    let tonemap_enabled = settings.color.y > 0.5 && settings.color.y < 2.0;
+    let tonemap_enabled = settings.color.y > 0.0 && settings.color.y < 2.0;
     let bloom_enabled = settings.color.z > 0.5;
     let ssao_enabled = settings.color.w > 0.5;
     let halation_enabled = settings.film.x > 0.5;
@@ -3216,9 +3216,9 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
         color = apply_film_halation(color, red_return);
     }
 
-    color *= exp2(settings.grain.w + auto_exposure_state.exposure_ev);
+    color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
     if (tonemap_enabled) {
-        color = aces_fitted(color);
+        color = mix(color, aces_fitted(color), settings.color.y);
     }
 
     color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);

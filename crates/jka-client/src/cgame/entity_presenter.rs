@@ -7,6 +7,9 @@
 //! `ET_GENERAL` entities and non-inline MD3 `ET_MOVER` entities while keeping the
 //! remaining entity kinds explicit instead of silently treating them as models.
 
+mod turret;
+use turret::TurretState;
+
 use super::{
     md3_lod,
     item_presenter::{cg_item, item_cone_origin, ItemDraw, ItemInput, IT_WEAPON},
@@ -171,6 +174,7 @@ pub struct EntityPresenter {
     /// `cent->damageTime` / `damageAngles` set by `CG_PlayerShieldHit`
     /// (EV_SHIELD_HIT: armor absorbed part of a hit), keyed by client number.
     shield_hits: HashMap<u16, ShieldHit>,
+    turret_states: HashMap<u16, TurretState>,
 }
 
 /// `centity_t::damageTime` and `damageAngles` for the armor hit shell.
@@ -240,6 +244,7 @@ impl EntityPresenter {
             static_props: None,
             static_props_rt: false,
             shield_hits: HashMap::new(),
+            turret_states: HashMap::new(),
         })
     }
 
@@ -583,6 +588,13 @@ impl EntityPresenter {
         let mut inline_models = Vec::new();
         let mut summary = EntityDispatchSummary::default();
         let intermission = game.rendering_intermission();
+        // Only scan active turret slots: ordinary maps do no extra allocations
+        // or target lookup work on the hot entity presentation path.
+        if !self.turret_states.is_empty() {
+            self.turret_states.retain(|number, _| entities.iter().any(|e|
+                e.number == *number && e.state.field_i32("modelGhoul2").unwrap_or(0) != 0
+                    && e.state.field_i32("bolt1").unwrap_or(0) != 0));
+        }
 
         for entity in entities {
             // TaystJK CG_AddCEntity returns before lerp/effects/dispatch for
@@ -597,7 +609,7 @@ impl EntityPresenter {
                 EntityPresentationKind::General
                 | EntityPresentationKind::Holocron => {
                     summary.general += 1;
-                    self.present_configstring_model(entity, game, time, ghoul2, &mut draws);
+                    self.present_configstring_model(entity, game, time, ghoul2, weapon_fx, entities, &mut draws);
                 }
                 EntityPresentationKind::Body => {
                     // ET_BODY is a Ghoul2 corpse copied from a client entity.
@@ -660,7 +672,7 @@ impl EntityPresenter {
         }
 
         // CG_AddLocalEntities: LE_FRAGMENT debris from EV_DEBRIS.
-        for chunk in weapon_fx.chunk_models() {
+        for chunk in weapon_fx.chunk_models().into_iter().chain(ghoul2.physics_debris_models(time)) {
             let submission = ItemDraw {
                 model: chunk.qpath.clone(),
                 origin: chunk.origin,
@@ -804,6 +816,8 @@ impl EntityPresenter {
         game: &ClientGameState,
         time: i32,
         ghoul2: &mut PlayerPresenter,
+        weapon_fx: &mut WeaponFx,
+        entities: &[PresentedEntity],
         draws: &mut Vec<DynamicModelSurface>,
     ) {
         // Holocrons are gameplay pickups that share this path, not map props.
@@ -836,6 +850,33 @@ impl EntityPresenter {
                 self.log_entity_once(entity, &format!("unresolved Ghoul2 CS_MODELS index {model_index}"));
                 return;
             };
+            if entity.state.field_i32("bolt1").unwrap_or(0) != 0 {
+                let fireflag = entity.state.field_i32("fireflag").unwrap_or(0);
+                let target = u16::try_from(entity.state.field_i32("bolt2").unwrap_or(1023))
+                    .ok().filter(|&n| n < 1023)
+                    .and_then(|n| entities.iter().find(|e| e.number == n))
+                    .map(|e| super::entity_vec3(&e.state, "pos.trBase").unwrap_or(e.origin));
+                let turret = self.turret_states.entry(entity.number).or_insert_with(||
+                    TurretState::new(model_index, time));
+                if turret.model_index != model_index || time < turret.last_time {
+                    *turret = TurretState::new(model_index, time);
+                }
+                let flash = turret.update(time, entity.origin, target, fireflag);
+                match ghoul2.present_turret_glm(
+                    entity.number, &qpath, entity.origin, angles_to_axis(entity.angles),
+                    entity_color(entity), turret.started_at, time, turret.angles, flash,
+                ) {
+                    Ok((mut model_draws, muzzle)) => {
+                        draws.append(&mut model_draws);
+                        if let Some((origin, dir)) = muzzle {
+                            weapon_fx.turret_muzzle(origin, dir);
+                        }
+                    }
+                    Err(error) => self.log_entity_once(entity, &format!("turret Ghoul2 {qpath}: {error}")),
+                }
+                return;
+            }
+            self.turret_states.remove(&entity.number);
             match ghoul2.present_static_glm(
                 entity.number,
                 &qpath,
@@ -876,6 +917,9 @@ impl EntityPresenter {
                         model,
                         origin: entity.origin,
                         axis: angles_to_axis(entity.angles),
+                        // CG_AddPacketEntities(qtrue) admits only snapshot
+                        // entities marked by the server's G_PortalifyEntities.
+                        is_portal_entity: entity.state.field_i32("isPortalEnt").unwrap_or(0) != 0,
                     });
                 }
             }
@@ -1478,6 +1522,13 @@ impl EntityPresenter {
         Ok(draws)
     }
 
+    /// Frame-zero model-space bounds shared by the MD3 browser and local model gizmo.
+    pub fn md3_frame_bounds(&mut self, qpath: &str) -> Result<([f32; 3], [f32; 3]), String> {
+        let asset = self.load_md3(qpath)?;
+        let frame = asset.model.frames.first().ok_or("MD3 has no frames")?;
+        Ok((frame.mins, frame.maxs))
+    }
+
     /// Developer Asset Viewer path: submit an arbitrary MD3 through the same
     /// material/texture registration used by live CGame entities, without
     /// fabricating a protocol entity just to inspect a model.
@@ -1629,7 +1680,7 @@ impl EntityPresenter {
         });
         let two_sided_indices = two_sided.then(|| md3_two_sided_indices(&cached_indices, true));
         let mut extra_stages = Vec::new();
-        if !invisible_without_override {
+        if !invisible_without_override && alpha_mode != DynamicModelAlphaMode::Glass {
             if let Some(shader) = definition.as_ref() {
                 let first = shader.primary().map(|stage| stage as *const Stage);
                 for (index, stage) in shader.stages.iter().enumerate() {
@@ -2163,10 +2214,12 @@ impl EntityPresenter {
         shader_name: &str,
     ) -> (Option<Arc<TextureData>>, DynamicModelAlphaMode, bool) {
         let effective = self.shader_remaps.effective_name(shader_name).into_owned();
-        let (image_name, clamp, alpha_mode, authored_glow) = jka_assets::shader::find_shader(&self.shaders, &effective)
+        let shader = jka_assets::shader::find_shader(&self.shaders, &effective);
+        let glass = shader.is_some_and(|shader| shader.is_glass() && crate::materials::glass_promotion_enabled());
+        let (image_name, clamp, alpha_mode, authored_glow) = shader
             .and_then(Shader::primary)
             .map(|stage| {
-                let alpha_mode = md3_stage_alpha_mode(stage);
+                let alpha_mode = if glass { DynamicModelAlphaMode::Glass } else { md3_stage_alpha_mode(stage) };
                 (stage.image.clone(), stage.clamp, alpha_mode, stage.glow)
             })
             .unwrap_or((

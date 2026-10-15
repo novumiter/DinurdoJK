@@ -35,9 +35,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -308,7 +307,7 @@ app_cvars! {
     }
 
     APP_R_FXGEOMETRY {
-        runtime: CvarDef::new("r_fxGeometry", "", "cpu|workers|gpu", "EFX geometry submission path: reference CPU tessellation, threaded CPU tessellation, or GPU-instanced sprites.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_fxgeometry(app)), |app, value| App::cvar_set_r_fxgeometry(app, APP_R_FXGEOMETRY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_fxgeometry, None),
+        runtime: CvarDef::new("r_fxGeometry", "", "cpu|workers|gpu", "EFX geometry submission path: reference CPU tessellation, threaded CPU tessellation, or GPU-instanced sprites, saber glows and spark lines/tails. This is geometry only, not GPU simulation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_fxgeometry(app)), |app, value| App::cvar_set_r_fxgeometry(app, APP_R_FXGEOMETRY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_fxgeometry, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.fx_geometry =
@@ -369,6 +368,32 @@ app_cvars! {
                         self.publish_ui();
                         self.console_status = format!("FX LOD SCALE: {}", self.video.fx_lod_scale);
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FXPARTICLESIMULATION {
+        runtime: CvarDef::new("r_fxParticleSimulation", "", "0..1", "Opt-in GPU-resident motion for compatible noncolliding EFX sprite primitives. Requires r_fxGeometry gpu. Other primitives retain CPU fallback; experimental until FX visual parity and frame-time A/B testing.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_fxparticlesimulation(app)), |app, value| App::cvar_set_r_fxparticlesimulation(app, APP_R_FXPARTICLESIMULATION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_fxparticlesimulation, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.fx_particle_simulation = parse_bool(value).unwrap_or(settings.fx_particle_simulation);
+            }),
+            archive: Some((178, |state| format!("{}", u8::from(state.video.fx_particle_simulation)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_fxparticlesimulation(&self) -> String {
+                    bool_value(self.video.fx_particle_simulation)
+                }
+                fn cvar_set_r_fxparticlesimulation(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.fx_particle_simulation = Self::parse_cvar_bool(name, value)?;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    self.console_status = format!("GPU RESIDENT FX: {} (requires r_fxGeometry gpu)",
+                        if self.video.fx_particle_simulation { "ON" } else { "OFF" });
                     Ok(())
                 }
             }

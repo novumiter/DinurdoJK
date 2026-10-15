@@ -97,7 +97,7 @@ impl ShaderComplexityTarget {
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::get().as_ref(),
         });
         Self {
             width, height, samples, scene_format,

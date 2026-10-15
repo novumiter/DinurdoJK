@@ -39,6 +39,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", md3_geometry_cache: false", "")
         .replace(", md3_geometry_cache: true", "")
         .replace(", md3_auto_lod: false, md3_lod_debug: false", "")
+        .replace(", md3_auto_lod: true, bsp_model_lod: true, md3_lod_debug: false", "")
         .replace(", model_render_bundles: false", "")
         .replace(", encoder_finish_threads: 2", "")
         .replace(", model_prepare_threads: 0, model_index_upload_cache: false, ghoul2_batch_key_cache: false", "")
@@ -51,7 +52,6 @@ pub(crate) fn digest(text: &str) -> String {
         // The prediction backend/rounding cvars were deleted. Preserve the old
         // NetworkSettings Debug-layout for unrelated frozen compatibility hashes.
         .replace(", prediction_miss_threshold: ", ", snap_mode: -1, predict_backend: -1, prediction_miss_threshold: ")
-        .replace(", camera_fps: 125", "")
         .replace(", third_person_flag_alpha: 1.0", "")
         .replace(", console_notify_lines: 3", "")
         .replace(", score_spectator_guess: true", "")
@@ -111,7 +111,6 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
         projected_archive = actual
             .lines()
             .filter(|line| {
-                !line.starts_with("seta cg_cameraFPS ") &&
                 !line.starts_with("seta r_rtTaa ") &&
                 !line.starts_with("seta con_notifylines ")
                     && !line.starts_with("seta cg_thirdPersonFlagAlpha ")
@@ -135,6 +134,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     // New controls are outside the frozen pre-registry archive.
                     && !line.starts_with("seta r_worldFlares ")
                     && !line.starts_with("seta r_saberFlares ")
+                    && !line.starts_with("seta r_md3AutoLod ")
                     && !line.starts_with("seta r_oceanInteraction ")
                     && !line.starts_with("seta r_oceanInteractionStrength ")
                     && !line.starts_with("seta r_oceanInteractionFx ")
@@ -535,4 +535,25 @@ seta r_saberFlares 0
     ] {
         assert!(saved.lines().any(|line| line == expected), "missing {expected}");
     }
+}
+
+#[test]
+fn shared_auto_lod_default_and_archive_round_trip() {
+    let defaults = crate::ui::VideoSettings::default();
+    assert!(defaults.md3_auto_lod);
+    assert!(defaults.bsp_model_lod);
+
+    let fixture = Fixture::new();
+    let path = fixture.0.join("model-lods.cfg");
+    fs::write(&path, "seta r_md3AutoLod 0\n").unwrap();
+    let settings = config::load_video_settings(&path);
+    assert!(!settings.md3_auto_lod);
+    assert!(settings.bsp_model_lod);
+    config::save_video_settings(
+        &path, settings, &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    ).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("seta r_md3AutoLod \"0\""));
+    assert!(!config::load_video_settings(&path).md3_auto_lod);
 }

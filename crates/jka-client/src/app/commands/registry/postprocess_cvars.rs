@@ -1,13 +1,39 @@
 //! Postprocess cvars: declarative runtime and config bindings.
 use super::cvar_prelude::*;
 
+// Normalized post strength. Accept the historical boolean spellings as
+// endpoints when loading older user configs, but retain fractional values.
+fn normalized_post_strength(value: &str) -> Option<f32> {
+    if let Ok(number) = value.trim().parse::<f32>() {
+        return number.is_finite().then_some(number.clamp(0.0, 1.0));
+    }
+    parse_bool(value).map(f32::from)
+}
+
+#[cfg(test)]
+mod strength_tests {
+    use super::normalized_post_strength;
+
+    #[test]
+    fn legacy_boolean_endpoints_and_fractional_strengths() {
+        assert_eq!(normalized_post_strength("0"), Some(0.0));
+        assert_eq!(normalized_post_strength("1"), Some(1.0));
+        assert_eq!(normalized_post_strength("0.35"), Some(0.35));
+        assert_eq!(normalized_post_strength("off"), Some(0.0));
+        assert_eq!(normalized_post_strength("on"), Some(1.0));
+        assert_eq!(normalized_post_strength("2"), Some(1.0));
+        assert_eq!(normalized_post_strength("-1"), Some(0.0));
+        assert_eq!(normalized_post_strength("NaN"), None);
+    }
+}
+
 app_cvars! {
     APP_R_AUTOEXPOSURE {
         runtime: CvarDef::new(
                 "r_autoExposure",
                 "",
                 "0..1",
-                "Adapt exposure from HDR scene luminance before tone mapping.",
+                "Auto exposure strength 0..1 (0 disabled); 1 preserves existing adaptation.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -20,94 +46,26 @@ app_cvars! {
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     {
-                        settings.auto_exposure = parse_bool(value).unwrap_or(settings.auto_exposure)
+                        settings.auto_exposure = normalized_post_strength(value).unwrap_or(settings.auto_exposure)
                     }
                 }),
                 archive: Some((40, |state| {
                     let settings = state.video;
-                    format!("{}", u8::from(settings.auto_exposure))
+                    format!("{:.3}", settings.auto_exposure)
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_autoexposure(&self) -> String {
-                    bool_value(self.video.auto_exposure)
+                    format!("{:.3}", self.video.auto_exposure)
                 }
                 fn cvar_set_r_autoexposure(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let lower = "r_autoexposure".to_owned();
-                    {
-                        let enabled = Self::parse_cvar_bool(name, value)?;
-                        match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
-                            "r_halation" => self.video.halation = enabled,
-                            "r_ssao" => {
-                                self.video.ssao = enabled;
-                                if enabled {
-                                    self.video.static_bsp_ao = false;
-                                }
-                            }
-                            "r_staticbspao" => {
-                                self.video.static_bsp_ao = enabled;
-                                if enabled {
-                                    self.video.ssao = false;
-                                }
-                            }
-                            "r_fxaa" => {
-                                self.video.fxaa = enabled;
-                                if enabled {
-                                    self.video.smaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_smaa" => {
-                                self.video.smaa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_taa" => {
-                                self.video.taa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.smaa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_contactshadows" => self.video.contact_shadows = enabled,
-                            "r_cloudshadows" => self.video.cloud_shadows = enabled,
-                            "r_cloudtemporal" => self.video.cloud_temporal = enabled,
-                            "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
-                            "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
-                            "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
-                            "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
-                            "r_rain" => self.video.rain = enabled,
-                            "r_sunoverride" => {
-                                self.set_sun_override(enabled, enabled);
-                                return Ok(());
-                            }
-                            "r_entitysunlighting" => self.video.entity_sun_lighting = enabled,
-                            "r_reflectiondebug" => self.video.reflection_debug = enabled,
-                            "r_vignette" => self.video.vignette = enabled,
-                            _ => unreachable!(),
-                        }
-                        self.sync_post_effects();
-                        if lower != "r_reflectiondebug" {
-                            self.mark_config_dirty();
-                        }
-                        // r_floatLightmap is only effective while HDR is active, matching
-                        // Rend2. If that changes the prepared lightmap representation,
-                        // video_restart_required() exposes the normal renderer-restart path.
-                        self.publish_ui();
-                    }
+                    self.video.auto_exposure = normalized_post_strength(value)
+                        .ok_or_else(|| format!("{name}: expected strength 0..1"))?;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }
@@ -285,9 +243,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -516,9 +473,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -595,8 +551,8 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_hdr",
                 "",
-                "0..1",
-                "HDR intermediate rendering.",
+                "0..2",
+                "HDR mode: 0 Off, 1 HDR Math Only (SDR output), 2 Full HDR Output (r_hdrStyle). Apply Video Settings when switching native output.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -606,95 +562,38 @@ app_cvars! {
             .with_text_setter(App::cvar_set_r_hdr, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
-                    settings.hdr = parse_bool(value).unwrap_or(settings.hdr)
+                    if let Ok(mode @ 0..=2) = value.trim().parse::<u32>() {
+                        settings.set_hdr_mode(mode);
+                    }
                 }),
                 archive: Some((37, |state| {
                     let settings = state.video;
-                    format!("{}", u8::from(settings.hdr))
+                    settings.hdr_mode().to_string()
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_hdr(&self) -> String {
-                    bool_value(self.video.hdr)
+                    self.video.hdr_mode().to_string()
                 }
-                fn cvar_set_r_hdr(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let lower = "r_hdr".to_owned();
+                pub(in crate::app) fn cvar_set_r_hdr(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let mode: u32 = value.trim().parse().map_err(|_| format!("{name}: expected 0, 1, or 2"))?;
+                    if mode > 2 { return Err(format!("{name}: expected 0, 1, or 2")); }
+                    if mode == 2 && self.hdr_modes_known
+                        && self.video.renderer_backend == self.applied_renderer_backend
+                        && self.video.gpu_adapter == self.applied_gpu_adapter
+                        && (self.hdr_available_modes & (1 << (self.video.hdr_style + 1))) == 0
                     {
-                        let enabled = Self::parse_cvar_bool(name, value)?;
-                        match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
-                            "r_halation" => self.video.halation = enabled,
-                            "r_ssao" => {
-                                self.video.ssao = enabled;
-                                if enabled {
-                                    self.video.static_bsp_ao = false;
-                                }
-                            }
-                            "r_staticbspao" => {
-                                self.video.static_bsp_ao = enabled;
-                                if enabled {
-                                    self.video.ssao = false;
-                                }
-                            }
-                            "r_fxaa" => {
-                                self.video.fxaa = enabled;
-                                if enabled {
-                                    self.video.smaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_smaa" => {
-                                self.video.smaa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_taa" => {
-                                self.video.taa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.smaa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_contactshadows" => self.video.contact_shadows = enabled,
-                            "r_cloudshadows" => self.video.cloud_shadows = enabled,
-                            "r_cloudtemporal" => self.video.cloud_temporal = enabled,
-                            "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
-                            "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
-                            "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
-                            "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
-                            "r_rain" => self.video.rain = enabled,
-                            "r_sunoverride" => {
-                                self.set_sun_override(enabled, enabled);
-                                return Ok(());
-                            }
-                            "r_entitysunlighting" => self.video.entity_sun_lighting = enabled,
-                            "r_reflectiondebug" => self.video.reflection_debug = enabled,
-                            "r_vignette" => self.video.vignette = enabled,
-                            _ => unreachable!(),
-                        }
-                        self.sync_post_effects();
-                        if lower != "r_reflectiondebug" {
-                            self.mark_config_dirty();
-                        }
-                        // r_floatLightmap is only effective while HDR is active, matching
-                        // Rend2. If that changes the prepared lightmap representation,
-                        // video_restart_required() exposes the normal renderer-restart path.
-                        self.publish_ui();
+                        return Err("Full HDR output unavailable for this display/backend".to_owned());
                     }
+                    self.video.set_hdr_mode(mode);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
+
             }
         ]
     }
@@ -853,9 +752,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -961,9 +859,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -1073,9 +970,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -1552,9 +1448,8 @@ app_cvars! {
                     {
                         let enabled = Self::parse_cvar_bool(name, value)?;
                         match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
+                            "r_tonemap" => self.video.tone_mapping = if enabled { 1.0 } else { 0.0 },
+                            "r_autoexposure" => self.video.auto_exposure = if enabled { 1.0 } else { 0.0 },
                             "r_halation" => self.video.halation = enabled,
                             "r_ssao" => {
                                 self.video.ssao = enabled;
@@ -1632,7 +1527,7 @@ app_cvars! {
                 "r_tonemap",
                 "",
                 "custom",
-                "Controls r_tonemap.",
+                "Tone mapping strength 0..1 (0 disabled, 1 original ACES/rolloff).",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1642,93 +1537,25 @@ app_cvars! {
             .with_text_setter(App::cvar_set_r_tonemap, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
-                    settings.tone_mapping = parse_bool(value).unwrap_or(settings.tone_mapping);
+                    settings.tone_mapping = normalized_post_strength(value).unwrap_or(settings.tone_mapping);
                 }),
                 archive: Some((39, |state| {
                     let settings = state.video;
-                    format!("{}", u8::from(settings.tone_mapping))
+                    format!("{:.3}", settings.tone_mapping)
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_tonemap(&self) -> String {
-                    bool_value(self.video.tone_mapping)
+                    format!("{:.3}", self.video.tone_mapping)
                 }
                 fn cvar_set_r_tonemap(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let lower = "r_tonemap".to_owned();
-                    {
-                        let enabled = Self::parse_cvar_bool(name, value)?;
-                        match lower.as_str() {
-                            "r_hdr" => self.video.hdr = enabled,
-                            "r_tonemap" => self.video.tone_mapping = enabled,
-                            "r_autoexposure" => self.video.auto_exposure = enabled,
-                            "r_halation" => self.video.halation = enabled,
-                            "r_ssao" => {
-                                self.video.ssao = enabled;
-                                if enabled {
-                                    self.video.static_bsp_ao = false;
-                                }
-                            }
-                            "r_staticbspao" => {
-                                self.video.static_bsp_ao = enabled;
-                                if enabled {
-                                    self.video.ssao = false;
-                                }
-                            }
-                            "r_fxaa" => {
-                                self.video.fxaa = enabled;
-                                if enabled {
-                                    self.video.smaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_smaa" => {
-                                self.video.smaa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.taa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_taa" => {
-                                self.video.taa = enabled;
-                                if enabled {
-                                    self.video.fxaa = false;
-                                    self.video.smaa = false;
-                                    self.video.msaa_samples = 1;
-                                    self.render_command(RenderCommand::SetMsaa(1));
-                                }
-                            }
-                            "r_contactshadows" => self.video.contact_shadows = enabled,
-                            "r_cloudshadows" => self.video.cloud_shadows = enabled,
-                            "r_cloudtemporal" => self.video.cloud_temporal = enabled,
-                            "r_cloudtemporaldepthfix" => self.video.cloud_temporal_depth_fix = enabled,
-                            "r_cloudshapeevolution" => self.video.cloud_shape_evolution = enabled,
-                            "r_cloudterraininteraction" => self.video.cloud_terrain_interaction = enabled,
-                            "r_cloudemptyskip" => self.video.cloud_empty_skip = enabled,
-                            "r_rain" => self.video.rain = enabled,
-                            "r_sunoverride" => {
-                                self.set_sun_override(enabled, enabled);
-                                return Ok(());
-                            }
-                            "r_entitysunlighting" => self.video.entity_sun_lighting = enabled,
-                            "r_reflectiondebug" => self.video.reflection_debug = enabled,
-                            "r_vignette" => self.video.vignette = enabled,
-                            _ => unreachable!(),
-                        }
-                        self.sync_post_effects();
-                        if lower != "r_reflectiondebug" {
-                            self.mark_config_dirty();
-                        }
-                        // r_floatLightmap is only effective while HDR is active, matching
-                        // Rend2. If that changes the prepared lightmap representation,
-                        // video_restart_required() exposes the normal renderer-restart path.
-                        self.publish_ui();
-                    }
+                    self.video.tone_mapping = normalized_post_strength(value)
+                        .ok_or_else(|| format!("{name}: expected strength 0..1"))?;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

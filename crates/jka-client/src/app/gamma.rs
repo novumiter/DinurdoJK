@@ -26,6 +26,24 @@ pub(super) struct GammaRuntime {
     monitor: Option<String>,
 }
 impl App {
+    /// Hardware gamma is incompatible only with actually active native HDR.
+    pub(super) fn native_hdr_blocks_hardware_gamma(&self) -> bool {
+        self.hdr_output_active
+    }
+    /// Display capability changes can demote Full HDR Output to Math Only.
+    /// The render thread will only allocate the output compositor when HDR
+    /// was actually selected, so an SDR startup fallback incurs no extra pass.
+    pub(super) fn demote_unsupported_hdr_output(&mut self) {
+        let requested = self.video.hdr_output;
+        if requested == 0 || !self.hdr_modes_known
+            || self.video.renderer_backend != self.applied_renderer_backend
+            || self.video.gpu_adapter != self.applied_gpu_adapter
+            || (self.hdr_available_modes & (1 << requested.min(3))) != 0
+        { return; }
+        self.video.set_hdr_mode(1);
+        self.sync_post_effects();
+        self.mark_config_dirty();
+    }
     fn gamma_notify(&self) -> Arc<dyn Fn(Status) + Send + Sync> {
         let proxy = self.proxy.clone();
         Arc::new(move |status| {
@@ -36,7 +54,7 @@ impl App {
         if self.render.is_none() || self.quit_requested {
             return;
         }
-        if (self.video.hdr_output != 0 || self.hdr_output_active) && self.video.gamma_method == GammaMethod::Hardware {
+        if self.native_hdr_blocks_hardware_gamma() && self.video.gamma_method == GammaMethod::Hardware {
             self.video.gamma_method = GammaMethod::Shader;
             self.mark_config_dirty();
         }
@@ -76,15 +94,15 @@ impl App {
         if self.video.gamma_method != GammaMethod::Hardware {
             return;
         }
+        if self.native_hdr_blocks_hardware_gamma() {
+            self.set_gamma_method(GammaMethod::Shader);
+            return;
+        }
         if self.gamma_runtime.hardware_active
             && self.window_focused
             && matches!(self.gamma_runtime.phase, Phase::Idle | Phase::Applying)
         {
-            if (self.video.hdr_output != 0 || self.hdr_output_active) && self.video.gamma_method == GammaMethod::Hardware {
-            self.video.gamma_method = GammaMethod::Shader;
-            self.mark_config_dirty();
-        }
-        self.gamma_runtime.generation = self.gamma_runtime.generation.wrapping_add(1);
+            self.gamma_runtime.generation = self.gamma_runtime.generation.wrapping_add(1);
             self.apply_hardware_gamma();
         } else {
             self.sync_gamma_method();
@@ -127,7 +145,7 @@ impl App {
         self.publish_ui();
     }
     fn hardware_target(&self) -> Result<Target, String> {
-        if self.hdr_output_active || self.video.hdr_output != 0 {
+        if self.native_hdr_blocks_hardware_gamma() {
             return Err("native HDR output uses shader brightness; hardware gamma is SDR-only".to_owned());
         }
         let window = self.window.as_ref().ok_or("game window is not ready")?;
@@ -244,7 +262,7 @@ impl App {
         if !self.gamma_runtime.controller.was_started() {
             return;
         }
-        if (self.video.hdr_output != 0 || self.hdr_output_active) && self.video.gamma_method == GammaMethod::Hardware {
+        if self.native_hdr_blocks_hardware_gamma() && self.video.gamma_method == GammaMethod::Hardware {
             self.video.gamma_method = GammaMethod::Shader;
             self.mark_config_dirty();
         }

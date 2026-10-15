@@ -93,6 +93,7 @@ pub fn lod_density(px: f32) -> f32 {
 }
 
 pub mod draw;
+pub mod gpu_sparks;
 pub mod gp2;
 pub mod light_promotion;
 pub mod system;

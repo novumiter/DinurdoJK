@@ -761,3 +761,29 @@ fn misc_bsp_input_is_validated_before_native_loading() {
             .is_err()
     );
 }
+
+#[test]
+fn collision_union_preparation_merges_only_matching_axis_aligned_solids() {
+    // Use the stock RBSP builder with adjacent worldspawn solids, no GPU/UI.
+    // The map must remain loadable even when the runtime A/B switch is OFF.
+    let map = Map::floor()
+        .box_brush([0.0, 0.0, 16.0], [64.0, 64.0, 80.0], 1)
+        .box_brush([64.0, 0.0, 16.0], [128.0, 64.0, 80.0], 1)
+        .box_brush([128.0, 0.0, 16.0], [192.0, 64.0, 80.0], 4);
+    let mut world = map.world();
+    assert_eq!(world.merged_static_brush_count(), 1);
+    // The content 4 volume must not be absorbed into the solid 1 brush.
+    assert_eq!(world.point_contents([160.0, 32.0, 40.0], 0), 4);
+    assert_eq!(world.point_contents([96.0, 32.0, 40.0], 0), 1);
+    // With the cvar at its default (OFF), collision traces use the stock
+    // OpenJK map, even though the alternate collision representation exists.
+    let trace = world.trace(TraceQuery {
+        start: [96.0, 32.0, 150.0],
+        end: [96.0, 32.0, 0.0],
+        mins: [0.0; 3],
+        maxs: [0.0; 3],
+        pass_entity: 0,
+        mask: 1,
+    });
+    assert!((trace.end[2] - 80.125).abs() < 0.001, "{trace:?}");
+}

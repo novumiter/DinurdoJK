@@ -433,7 +433,7 @@ pub(super) fn quality_meter(
     labels: &[&str],
     track_width: f32,
 ) -> Option<usize> {
-    quality_meter_impl(ui, Some(current), labels, track_width, None)
+    quality_meter_impl(ui, Some(current), labels, track_width, None, None, None)
 }
 
 /// Same ordered segmented meter as [`quality_meter`], but permits a genuine
@@ -448,7 +448,51 @@ pub(super) fn quality_meter_optional(
     track_width: f32,
     empty_label: &str,
 ) -> Option<usize> {
-    quality_meter_impl(ui, current, labels, track_width, Some(empty_label))
+    quality_meter_impl(ui, current, labels, track_width, Some(empty_label), None, None)
+}
+
+/// A quality meter that also reports which segment the pointer is over, even
+/// without clicking. Used solely for the read-only preset comparison on Video.
+pub(super) fn quality_meter_optional_preview(
+    ui: &mut egui::Ui,
+    current: Option<usize>,
+    labels: &[&str],
+    track_width: f32,
+    hovered: &mut Option<usize>,
+) -> Option<usize> {
+    quality_meter_impl(ui, current, labels, track_width, Some("Custom"), None, Some(hovered))
+}
+
+/// A switch followed by an enabled-only quality meter, like the Dynamic
+/// Lights row, with strict Off -> first-quality semantics. `current` uses
+/// 0=Off, 1=first quality, etc.; `max_enabled` is the highest allowed mode.
+/// Levels above that limit are greyed out and cannot be selected, including
+/// when the meter is clicked while switched Off.
+pub(super) fn quality_meter_power_limited(
+    ui: &mut egui::Ui,
+    current: usize,
+    labels: &[&str],
+    track_width: f32,
+    max_enabled: usize,
+) -> Option<usize> {
+    if labels.is_empty() {
+        return None;
+    }
+    if let Some(on) = switch(ui, current != 0) {
+        return Some(if on { 1 } else { 0 });
+    }
+    ui.add_space(10.0);
+    let enabled_width = self::track_width(ui).min(track_width);
+    quality_meter_track(
+        ui,
+        current.checked_sub(1),
+        labels,
+        enabled_width,
+        Some(""),
+        Some(max_enabled.saturating_sub(1).min(labels.len() - 1)),
+        None,
+    )
+    .map(|quality| quality + 1)
 }
 
 fn quality_meter_impl(
@@ -457,6 +501,8 @@ fn quality_meter_impl(
     labels: &[&str],
     track_width: f32,
     empty_label: Option<&str>,
+    max_enabled: Option<usize>,
+    mut preview_hover: Option<&mut Option<usize>>,
 ) -> Option<usize> {
     let segments = labels.len();
     if segments == 0 {
@@ -509,6 +555,8 @@ fn quality_meter_impl(
             enabled_labels,
             enabled_track_width,
             if on { None } else { Some("") },
+            max_enabled.map(|max| max.saturating_sub(1)),
+            preview_hover.as_deref_mut(),
         ) {
             // Clicking a quality segment while disabled is an explicit request
             // to enable that quality, so the returned enum index is +1.
@@ -517,7 +565,7 @@ fn quality_meter_impl(
         return None;
     }
 
-    quality_meter_track(ui, current, labels, track_width, empty_label)
+    quality_meter_track(ui, current, labels, track_width, empty_label, max_enabled, preview_hover)
 }
 
 fn quality_meter_track(
@@ -526,6 +574,8 @@ fn quality_meter_track(
     labels: &[&str],
     track_width: f32,
     empty_label: Option<&str>,
+    max_enabled: Option<usize>,
+    preview_hover: Option<&mut Option<usize>>,
 ) -> Option<usize> {
     let segments = labels.len();
     if segments == 0 {
@@ -543,6 +593,17 @@ fn quality_meter_track(
         .hover_pos()
         .filter(|pos| rect.contains(*pos))
         .map(|pos| index_at(pos.x));
+    let preset_picker = preview_hover.is_some();
+    // The preset picker shows the hovered option in its readout, without
+    // changing the selected preset or any renderer settings.
+    let hovered_preset = if preset_picker {
+        hovered.filter(|i| max_enabled.is_none_or(|max| *i <= max))
+    } else {
+        None
+    };
+    if let Some(output) = preview_hover {
+        *output = hovered_preset;
+    }
 
     let painter = ui.painter().clone();
     for segment in 0..segments {
@@ -550,7 +611,11 @@ fn quality_meter_track(
         let seg_rect =
             egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(seg_w, rect.height()));
         let lit = current.is_some_and(|selected| segment <= selected);
-        let fill = if lit {
+        let fill = if max_enabled.is_some_and(|max| segment > max) {
+            // Clearly inactive, rather than merely looking like an unselected
+            // quality segment. Unsupported options must never light up.
+            CONTROL.gamma_multiply(0.45)
+        } else if lit {
             // Ramp the filled run from deep to bright so "more" reads as
             // "heavier" rather than as a flat block of one color. Pending
             // Apply rows use the same ramp in warning orange.
@@ -574,7 +639,9 @@ fn quality_meter_track(
     }
 
     // Mark the exact selected level. An empty/disabled meter has no marker.
-    if let Some(selected) = current {
+    if let Some(selected) = current.filter(|&selected| {
+        max_enabled.is_none_or(|max| selected <= max)
+    }) {
         let tick_x = rect.left() + selected as f32 * (seg_w + gap) + seg_w - 2.0;
         painter.rect_filled(
             egui::Rect::from_min_size(
@@ -587,16 +654,30 @@ fn quality_meter_track(
     }
 
     ui.add_space(10.0);
-    match current {
-        Some(selected) => glow_label(ui, labels[selected], 12.5, TEXT),
-        None => glow_label(ui, empty_label.unwrap_or("Custom"), 12.5, TEXT_FAINT),
-    };
+    if let Some(index) = hovered_preset {
+        glow_label(ui, labels[index], 12.5, WARNING);
+    } else {
+        match current {
+            Some(selected) => glow_label(
+                ui,
+                labels[selected],
+                12.5,
+                if max_enabled.is_some_and(|max| selected > max) {
+                    TEXT_FAINT
+                } else {
+                    TEXT
+                },
+            ),
+            None => glow_label(ui, empty_label.unwrap_or("Custom"), 12.5, TEXT_FAINT),
+        };
+    }
 
     let interacted = response.clicked() || response.dragged();
     let target = interacted
         .then(|| response.interact_pointer_pos().map(|pos| index_at(pos.x)))
         .flatten();
-    target.filter(|value| current != Some(*value))
+    target.filter(|value| (preset_picker || current != Some(*value))
+        && max_enabled.is_none_or(|max| *value <= max))
 }
 
 /// Which stored setting a row's label restores when it is clicked.
@@ -615,6 +696,8 @@ pub(super) enum Reset {
     MovementCommandRate,
     /// A split-toning control, identified by its archived cvar.
     Color(&'static str),
+    /// Glass controls restore the selected style's preset value.
+    Glass(&'static str),
     /// One split-toning color picker backed by hue + saturation cvars.
     ColorPair(&'static str, &'static str),
     /// A `ui::ENV_ROW_*` row.
@@ -667,6 +750,71 @@ fn reset_is_pending(ctx: &egui::Context, reset: Reset) -> bool {
             data.get_temp::<Vec<Reset>>(pending_resets_channel())
                 .is_some_and(|rows| rows.contains(&reset))
         })
+}
+
+/// Read-only preview metadata for one settings row affected by a hovered
+/// quality preset. Hovering never applies a preset; it only changes how the row
+/// is painted so the destination state is visible in place.
+#[derive(Clone)]
+pub(super) struct PresetRowPreview {
+    pub reset: Reset,
+    pub target_label: Option<String>,
+}
+
+fn preset_preview_channel() -> egui::Id {
+    egui::Id::new("jka_video_preset_preview")
+}
+
+pub(super) fn set_preset_preview(ctx: &egui::Context, rows: Vec<PresetRowPreview>) {
+    ctx.data_mut(|data| data.insert_temp(preset_preview_channel(), std::sync::Arc::new(rows)));
+}
+
+pub(super) fn clear_preset_preview(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<std::sync::Arc<Vec<PresetRowPreview>>>(preset_preview_channel()));
+}
+
+fn preset_preview_for_row(ctx: &egui::Context, reset: Reset) -> Vec<PresetRowPreview> {
+    if reset == Reset::None { return Vec::new(); }
+    ctx.data(|data| {
+        data.get_temp::<std::sync::Arc<Vec<PresetRowPreview>>>(preset_preview_channel())
+            .map(|rows| rows.iter().filter(|entry| entry.reset == reset).cloned().collect())
+            .unwrap_or_default()
+    })
+}
+
+pub(super) fn preset_preview_active(ctx: &egui::Context, reset: Reset) -> bool {
+    !preset_preview_for_row(ctx, reset).is_empty()
+}
+
+pub(super) fn preset_preview_target_label(ctx: &egui::Context, reset: Reset) -> Option<String> {
+    preset_preview_for_row(ctx, reset)
+        .into_iter()
+        .find_map(|entry| entry.target_label)
+}
+
+pub(super) fn preview_index_for_labels(
+    ctx: &egui::Context,
+    reset: Reset,
+    labels: &[&str],
+    current: Option<usize>,
+) -> Option<usize> {
+    if let Some(target) = preset_preview_target_label(ctx, reset) {
+        if target.eq_ignore_ascii_case("custom") {
+            return None;
+        }
+        if let Some(index) = labels.iter().position(|label| *label == target) {
+            return Some(index);
+        }
+    }
+    current
+}
+
+pub(super) fn preview_toggle_value(ctx: &egui::Context, reset: Reset, current: bool) -> bool {
+    match preset_preview_target_label(ctx, reset).as_deref() {
+        Some("On") => true,
+        Some("Off") => false,
+        _ => current,
+    }
 }
 
 fn controls_are_pending(ui: &egui::Ui) -> bool {
@@ -758,6 +906,7 @@ fn row_inner<R>(
     note: Option<&str>,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    let preview_active = preset_preview_active(ui.ctx(), reset);
     let width = ui.available_width();
     let note_h = if note.is_some() { 17.0 } else { 0.0 };
     let height = ROW_H + note_h;
@@ -801,8 +950,17 @@ Click the label to restore the default.")
             .data_mut(|data| data.insert_temp(reset_channel(), reset));
     }
     let pending = reset_is_pending(ui.ctx(), reset);
+    if preview_active {
+        // A thin marker communicates that this row would move if the hovered
+        // preset were applied, while leaving the real setting untouched.
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.min, egui::vec2(2.0, height - 1.0)),
+            egui::CornerRadius::ZERO,
+            WARNING,
+        );
+    }
 
-    let label_color = if pending {
+    let label_color = if pending || preview_active {
         WARNING
     } else if emphasise || hovered {
         TEXT
@@ -862,7 +1020,7 @@ Click the label to restore the default.")
             .max_rect(control_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
     );
-    if pending {
+    if pending || preview_active {
         // Native sliders use the child visuals, while the custom meter/switch/chip
         // helpers below key off the warning selection stroke. This keeps the tint
         // local to the staged row rather than changing the page/global palette.

@@ -574,6 +574,17 @@ fn immersion_wetness(input: VertexOut) -> f32 {
 }
 
 @fragment
+fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
+    let last_mip = f32(max(textureNumLevels(base_texture), 1u) - 1u);
+    let tint = textureSampleLevel(base_texture, base_sampler, vec2<f32>(0.5), last_mip).rgb;
+    let brightness = dot(tint, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let f0 = 0.04 + 0.08 * sqrt(clamp(brightness, 0.0, 1.0));
+    return glass_shade(input.world_position, input.normal, input.clip_position,
+        camera.view_proj, camera.camera_pos_time.xyz, camera.camera_forward.xyz,
+        camera.camera_pos_time.w, tint, f0);
+}
+
+@fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     return fogged(
@@ -721,3 +732,5 @@ fn fs_spec_mask_blue() -> @location(0) vec4<f32> { return vec4<f32>(0.035, 0.22,
 fn fs_spec_mask_yellow() -> @location(0) vec4<f32> { return vec4<f32>(1.0, 0.62, 0.025, 1.0); }
 @fragment
 fn fs_spec_mask_clear() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
+
+@fragment fn fs_glass_mask(input: VertexOut) -> @location(0) vec4<f32> { return glass_mask_value(input.world_position,input.normal,camera.camera_pos_time.xyz,camera.camera_forward.xyz); }

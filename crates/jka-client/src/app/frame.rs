@@ -61,6 +61,18 @@ impl App {
         } else {
             dynamic_models
         };
+        let dynamic_models = if !self.model_placement.placed_draws.is_empty()
+            || !self.model_placement.preview_draws.is_empty() {
+            let mut merged = Vec::with_capacity(dynamic_models.len()
+                + self.model_placement.placed_draws.len()
+                + self.model_placement.preview_draws.len());
+            merged.extend(dynamic_models.iter().cloned());
+            merged.extend(self.model_placement.placed_draws.iter().cloned());
+            merged.extend(self.model_placement.preview_draws.iter().cloned());
+            Arc::new(merged)
+        } else {
+            dynamic_models
+        };
         // CGame owns mover state once it has a snapshot (demo, live, or the
         // solo shim, which spawns brush entities as ET_MOVERs); before that
         // inline models keep their compiled pose.
@@ -69,6 +81,48 @@ impl App {
             .as_ref()
             .filter(|playback| playback.current_snapshot.is_some())
             .map(|playback| Arc::clone(&playback.inline_models));
+        let inline_models = if !self.model_placement.bmodel_placed.is_empty()
+            || (self.model_placement.active
+                && self.model_placement.kind == super::egui_model_placement::PlacementKind::Bmodel)
+        {
+            let mut instances = if let Some(authoritative) = inline_models.as_ref() {
+                authoritative.as_ref().clone()
+            } else {
+                // Compiled inline models must remain visible before CGame has
+                // supplied its first authoritative snapshot. Passing Some([])
+                // without these base poses would hide every existing bmodel.
+                let mut originals = std::collections::BTreeMap::new();
+                if let Some(cache) = self.prepared_map_cache.as_ref() {
+                    for model in &cache.map.inline_models {
+                        originals.entry(model.model).or_insert(crate::renderer::InlineModelInstance {
+                            model: model.model,
+                            origin: [0.0; 3],
+                            axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                            is_portal_entity: false,
+                        });
+                    }
+                }
+                originals.into_values().collect()
+            };
+            instances.extend(self.model_placement.bmodel_placed.iter().map(|p| p.instance()));
+            if self.model_placement.active
+                && self.model_placement.kind == super::egui_model_placement::PlacementKind::Bmodel
+                && self.model_placement.hit_valid
+            {
+                if let (Some(model), Some(bounds)) = (self.model_placement.bmodel_selection,
+                    self.model_placement.bmodel_bounds)
+                {
+                    instances.push(super::egui_model_placement::BmodelPlacement {
+                        model, bounds, pivot: self.model_placement.bmodel_pivot,
+                        hit: self.model_placement.origin,
+                        angles: self.model_placement.angles,
+                    }.instance());
+                }
+            }
+            Some(Arc::new(instances))
+        } else {
+            inline_models
+        };
         // Profile/asset previews are isolated UI scenes, equivalent to the
         // RDF_NOWORLDMODEL model widgets in the JKA UI. They must never inherit
         // gameplay view rotation (including the render-thread subframe latch).

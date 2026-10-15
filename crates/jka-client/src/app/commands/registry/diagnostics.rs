@@ -313,6 +313,48 @@ commands! {
         }
     }
 
+    cmd_oceanpool ["oceanpool", ] ("oceanpool [pool] [reset | amp wavelength direction speed steepness slosh windchop foam spray]", "Script the Water settings page's local pool override (1-based pool number as in the pool label). No arguments lists pools; 'reset' is RESET OCEAN DEFAULTS.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match words.as_slice() {
+            [_verb] => {
+                let lines: Vec<String> = self.promoted_oceans.iter().map(|pool| {
+                    let local = self.promoted_ocean_overrides.iter().any(|(slot, _)| *slot == pool.index);
+                    format!("{} | heuristic amplitude {:.1}u variation {:.0}% | {}", pool.label(),
+                        pool.heuristic.amplitude, pool.heuristic.variation * 100.0, if local { "local override" } else { "auto" })
+                }).collect();
+                for line in lines { self.push_console_line(line); }
+                CommandResult::Handled
+            }
+            [_verb, pool, rest @ ..] => {
+                let Some(descriptor) = pool.parse::<usize>().ok().and_then(|n| n.checked_sub(1))
+                    .and_then(|slot| self.promoted_oceans.iter().find(|p| p.index == slot)).cloned() else {
+                    self.push_console_line("^1oceanpool: no such pool (run oceanpool with no arguments)".to_owned());
+                    return CommandResult::Handled;
+                };
+                if rest == ["reset"] {
+                    self.promoted_ocean_overrides.retain(|(slot, _)| *slot != descriptor.index);
+                } else {
+                    let values: Vec<f32> = rest.iter().filter_map(|word| word.parse().ok()).collect();
+                    if values.len() != 9 || values.len() != rest.len() {
+                        self.push_console_line("usage: oceanpool <pool> reset | oceanpool <pool> amp wavelength direction speed steepness slosh windchop foam spray".to_owned());
+                        return CommandResult::Handled;
+                    }
+                    let local = self.promoted_ocean_overrides.iter().find(|(slot, _)| *slot == descriptor.index).map(|(_, s)| *s);
+                    let mut settings = crate::ocean::appearance::surface_settings(self.video.ocean_settings, &descriptor, local);
+                    let a = &mut settings.authored;
+                    (a.amplitude, a.wavelength, a.direction, a.speed, a.steepness, a.slosh, a.wind_chop, a.foam, a.spray) =
+                        (values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]);
+                    self.promoted_ocean_overrides.retain(|(slot, _)| *slot != descriptor.index);
+                    self.promoted_ocean_overrides.push((descriptor.index, settings.sanitize()));
+                }
+                self.render_command(RenderCommand::SetPromotedOceanSettings(self.promoted_ocean_overrides.clone()));
+                self.publish_ui();
+                CommandResult::Handled
+            }
+            _ => return CommandResult::Unhandled,
+        }
+    }
+
     cmd_perfsample ["perfsample", ] ("perfsample [arguments]", "perfsample <seconds> [label]: hold the command buffer, then print the average render FPS.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -447,9 +489,11 @@ commands! {
                     Some(playback) => {
                         let stats = playback.weapon_fx.stats();
                         self.push_console_line(format!(
-                            "^3FX:^7 effects {} | live primitives {} | scheduled {} | dropped {} | unsupported spawns {} | lod culled {} | lod saved {} | surfaces {}",
+                            "^3FX:^7 effects {} | live primitives {} | GPU-offloaded {} | GPU slots {} | scheduled {} | dropped {} | unsupported spawns {} | lod culled {} | lod saved {} | surfaces {}",
                             stats.registered,
                             stats.active,
+                            stats.gpu_offloaded,
+                            playback.gpu_pool.live_count(),
                             stats.scheduled,
                             stats.dropped,
                             stats.unsupported_spawns,
@@ -499,6 +543,23 @@ commands! {
                         "^3AUDIO PAN:^7 largest per-frame gain step {:.3} (glided per sample, not stepped)",
                         info.largest_gain_step
                     ));
+                    if let Some(path) = &info.eal_file {
+                        self.push_console_line(format!(
+                            "^3EAL ZONES:^7 {} | {} presets | listener: {} | EAX effects: {}",
+                            path, info.eal_preset_count,
+                            info.eal_environment.as_deref().unwrap_or("outside EAL geometry"),
+                            if info.eal_effects_active { "active" } else { "inactive" }
+                        ));
+                    }
+                    if let Some(error) = &info.eal_effects_error {
+                        self.push_console_line(format!("^3EAL DSP:^7 {error}"));
+                    }
+                    if info.eal_enabled {
+                        self.push_console_line(format!(
+                            "^3EAL WORKER:^7 {:.1} ms wet latency | max render {} us | {} underruns | {} dropped blocks",
+                            info.eal_latency_ms, info.eal_max_render_us, info.eal_underruns, info.eal_overflows
+                        ));
+                    }
                     if info.overload_samples > 0 {
                         self.push_console_line(
                             "^3AUDIO NOTE:^7 the game mix exceeded full scale before the output limiter; this is a likely crackle/clipping source.",

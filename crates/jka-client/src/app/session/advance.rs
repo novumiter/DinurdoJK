@@ -594,6 +594,31 @@ impl GameSession {
         // Broadsword historically advanced ragdoll state immediately before
         // Ghoul2 submission. Keep the same presentation ownership: Rapier is
         // stepped once here, while OpenJK snapshot/pmove state stays untouched.
+        // Server EV_DEBRIS was prepared by the same reference FX event path.
+        // Promote its existing chunk models into the *same* Rapier world used
+        // for ragdolls before the fixed step; if unavailable, keep exact JKA
+        // ballistic chunks (for example while the map collider is loading).
+        let new_debris = self.weapon_fx.take_debris_spawns();
+        if !new_debris.is_empty() {
+            let promoted = self.player_presenter
+                .spawn_physics_debris(&new_debris, target_server_time);
+            self.weapon_fx.resolve_debris_promotion(promoted);
+        }
+        let new_gibs = self.weapon_fx.take_gib_spawns();
+        if !new_gibs.is_empty() {
+            let promoted = self.player_presenter
+                .spawn_physics_debris(&new_gibs, target_server_time);
+            self.weapon_fx.resolve_gib_promotion(promoted);
+        }
+        // Unlike MD3 gibs, glass keeps its tessellated FX quad presentation.
+        // Only the centre/orientation gets handed to Rapier; a capped remainder
+        // stays in the legacy FX physics path with no duplicate quads.
+        let new_glass = self.weapon_fx.take_glass_spawns();
+        if !new_glass.is_empty() {
+            let promoted = self.player_presenter
+                .spawn_physics_glass(&new_glass, target_server_time);
+            self.weapon_fx.resolve_glass_promotion(promoted);
+        }
         self.player_presenter
             .begin_physics_frame(target_server_time);
 
@@ -904,6 +929,7 @@ impl GameSession {
         }
         // FX_AddScheduledEffects + FX_Add after every CGame submission.
         let mut fx_frame = self.weapon_fx.end_frame();
+        fx_frame.draws.extend(self.player_presenter.physics_glass_draws(target_server_time));
         if self.screen_shake_level >= 1 {
             let view = scene::jka_position(sample.eye_position);
             for shake in &fx_frame.shakes {
@@ -923,6 +949,8 @@ impl GameSession {
             let promoted = promoter.promote(&fx_frame.auto_light_candidates, &mut resolve);
             fx_frame.lights.extend(promoted);
         }
+        self.gpu_commands = fx_frame.gpu_sparks.take();
+        self.gpu_draw_indices = std::mem::take(&mut fx_frame.gpu_sprite_draw_indices);
         self.fx_draws = fx_frame.draws;
         self.fx_blades = Arc::new(
             fx_frame

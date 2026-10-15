@@ -271,7 +271,7 @@ impl App {
             },
             Source::Cvars | Source::Commands | Source::Registered => {
                 let connected = self.console_scope();
-                for entry in crate::console::cvars().filter(|e| source != Source::Commands)
+                for entry in crate::console::cvars().filter(|_| source != Source::Commands)
                     .chain(crate::console::commands(connected).filter(|_| source != Source::Cvars))
                 {
                     add(entry.name, entry.name, entry.description);
@@ -732,6 +732,17 @@ impl App {
         self.console_input = next
             .map(|index| self.console_history[index].clone())
             .unwrap_or_default();
+        if let Some((start, end)) = Self::console_first_token_span(&self.console_input) {
+            if end == self.console_input.len()
+                && crate::console::find_command(
+                    &self.console_input[start..end],
+                    self.console_scope(),
+                )
+                .is_some_and(|entry| entry.kind == crate::console::EntryKind::Cvar)
+            {
+                self.console_input.push(' ');
+            }
+        }
         self.console_cursor = self.console_input.len();
         self.console_scroll = 0;
         // A recalled command is not a search: keep Up/Down on history.
