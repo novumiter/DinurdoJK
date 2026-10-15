@@ -222,6 +222,8 @@ pub struct PlayerPresenter {
     last_gpu: HashMap<u16, Vec<super::player_gore::GpuSnap>>,
     /// The last presented pose of each vehicle: muzzle bolts for EV_VEH_FIRE.
     vehicle_snaps: HashMap<u16, VehicleSnap>,
+    /// Persistent TaystJK CG_PlayerAnimation state for animal/vehicle NPCs.
+    vehicle_animations: HashMap<u16, vehicles::VehicleAnimationRuntime>,
     assets: AssetSearchPath,
     pbr: bool,
     shaders: Arc<BTreeMap<String, Shader>>,

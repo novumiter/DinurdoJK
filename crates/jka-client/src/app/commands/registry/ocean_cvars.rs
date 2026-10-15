@@ -35,15 +35,16 @@ app_cvars! {
         }]
     }
     APP_R_OCEANSKYEXTEND {
-        runtime: CvarDef::new("r_oceanSkyExtend", "1", "0|1",
-            "Camera-relative promoted clipmap beyond qualifying sky walls (default on); no infinite plane or coastal changes.",
-            CvarType::Bool, CvarFlags::NONE, LatchScope::None,
-            |app: &App| CvarValue::Bool(app.ocean_sky_extend),
+        runtime: CvarDef::new("r_oceanSkyExtend", "2", "0|1|2",
+            "0 original water; 1 camera-relative 3D sky extension; 2 3D clipmap plus mesh-free far ocean. Coastal unchanged.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.ocean_sky_extend as i32),
             |app, value| {
-                let CvarValue::Bool(enabled) = value else { unreachable!() };
-                if app.ocean_sky_extend != enabled {
-                    app.ocean_sky_extend = enabled;
-                    app.render_command(RenderCommand::SetOceanSkyExtend(enabled));
+                let CvarValue::Int(mode) = value else { unreachable!() };
+                let mode = mode as u8;
+                if app.ocean_sky_extend != mode {
+                    app.ocean_sky_extend = mode;
+                    app.render_command(RenderCommand::SetOceanSkyExtend(mode));
                 }
                 Ok(())
             }),
@@ -177,6 +178,29 @@ app_cvars! {
             ..CvarBinding::NONE
         },
         implementations: []
+    }
+    APP_R_OCEANFOAMDRIFT {
+        runtime: CvarDef::new("r_oceanFoamDrift", "0", "0..2",
+            "Rolls the persistent FFT whitecap foam downwind at this fraction of wind speed, so foam is not pinned to the tile that formed it (the visible 88 m repeat). 0 off, 0.2 is the Unity port's default.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.foam_drift.to_string()),
+            |app, value| App::cvar_set_foam_drift(app, APP_R_OCEANFOAMDRIFT.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_foam_drift, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.foam_drift = v.clamp(0.0, 2.0); }
+                }
+            }),
+            archive: Some((25034, |state| state.video.ocean_settings.foam_drift.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_foam_drift(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.foam_drift = Self::parse_cvar_finite(name, value)?.clamp(0.0, 2.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
     }
     APP_R_OCEANFOAMACTIVITY {
         runtime: CvarDef::new("r_oceanFoamActivity", "0", "0..3",
@@ -1657,6 +1681,54 @@ app_cvars! {
                 }
             }
         ]
+    }
+
+    APP_R_OCEANDYNAMICUPDATES {
+        runtime: CvarDef::new(
+            "r_oceanDynamicUpdates", "0", "0|1",
+            "0 original; 1 near two ocean mesh LODs sample the live 48 Hz FFT, third LOD uses a 32 Hz cached displacement, outer LODs 24 Hz; wind foam appearance follows the same ring rates. FFT cascades remain synchronized.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.dynamic_update_rates),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!() };
+                app.video.ocean_settings.dynamic_update_rates = enabled;
+                app.commit_ocean_settings();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.ocean_settings.dynamic_update_rates =
+                    parse_bool(value).unwrap_or(settings.ocean_settings.dynamic_update_rates);
+            }),
+            archive: Some((25030, |state| u8::from(state.video.ocean_settings.dynamic_update_rates).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_OCEANWINDFOAMSYNC {
+        runtime: CvarDef::new(
+            "r_oceanWindFoamSync", "1", "0|1",
+            "1 update wind-foam transport only when the finest FFT cascade publishes its new normal/foam field; 0 legacy every-render-frame update.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.wind_foam_sync),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!() };
+                app.video.ocean_settings.wind_foam_sync = enabled;
+                app.commit_ocean_settings();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.ocean_settings.wind_foam_sync =
+                    parse_bool(value).unwrap_or(settings.ocean_settings.wind_foam_sync);
+            }),
+            archive: Some((25031, |state| u8::from(state.video.ocean_settings.wind_foam_sync).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
     }
 
     APP_R_OCEANWATERCOLOR {

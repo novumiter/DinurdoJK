@@ -31,8 +31,8 @@ struct PostSettings {
     weather_look: vec4<f32>, // scattered puddle amount, wet grade amount, high-quality water, rain reaching camera (shared with RainyGlass lens exposure)
     legacy_weather: vec4<f32>, // sand haze, spacedust haze, acid-rain haze, 2D-precipitation-haze flag
     snow_haze: vec4<f32>, // x 2D snow haze density/cloud count (zero in froxel mode)
-    underwater: vec4<f32>, // water surface Y above a submerged camera (-1e30 when not submerged), absorption distance, reserved x2
-    cloud_foreground: vec4<f32>, // lit saber blade count, reserved x3
+    underwater: vec4<f32>, // water surface Y above a submerged camera (-1e30 when not submerged), absorption distance, promoted ocean plane Y (no-receiver volumetric fog), its square half-extent (0 = off)
+    cloud_foreground: vec4<f32>, // lit saber blade count, promoted ocean fog centre X/Z, reserved
     cloud_blades: array<vec4<f32>, 16>, // per blade: ax, ay, bx, by (pixels); glow radius px, nearest distance
     camera_pos_time: vec4<f32>,
     prev_camera_pos_time: vec4<f32>,

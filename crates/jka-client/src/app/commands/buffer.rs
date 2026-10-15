@@ -115,7 +115,7 @@ pub(in crate::app) fn split_console_script(text: &str) -> Vec<String> {
 }
 
 impl App {
-    pub(in crate::app) fn write_named_config(&mut self, name: &str) {
+    pub(in crate::app) fn write_named_config(&mut self, name: &str, verbose: bool) {
         let qpath = match normalize_cfg_qpath(name) {
             Ok(path) => path,
             Err(error) => {
@@ -138,7 +138,7 @@ impl App {
         self.config_dirty = true;
         self.flush_config();
         let destination = self.game_write_path(&qpath);
-        if destination == self.config_path {
+        if destination == self.config_path && !verbose {
             self.push_console_path_line(
                 format!("^2Writing {}", destination.display()),
                 destination.clone(),
@@ -154,8 +154,18 @@ impl App {
                 return;
             }
         }
-        match std::fs::copy(&self.config_path, &destination) {
-            Ok(_) => self.push_console_path_line(
+        // Verbose output derives exclusively from the committed snapshot. Do
+        // not mutate the ordinary saved config when writing a named verbose cfg.
+        let result = if verbose {
+            std::fs::read_to_string(&self.config_path)
+                .map(|snapshot| crate::config::verbose_config_from_snapshot(&snapshot))
+                .and_then(|text| std::fs::write(&destination, text))
+                .map(|()| ())
+        } else {
+            std::fs::copy(&self.config_path, &destination).map(|_| ())
+        };
+        match result {
+            Ok(()) => self.push_console_path_line(
                 format!("^2Writing {}", destination.display()),
                 destination.clone(),
             ),
@@ -359,5 +369,19 @@ impl App {
             }
             _ => self.push_console_line("^3usage:^7 plugin [bit number]".to_owned()),
         }
+    }
+}
+
+#[cfg(test)]
+mod config_comment_tests {
+    use super::split_console_script;
+
+    #[test]
+    fn console_exec_ignores_verbose_comments_but_not_quoted_urls() {
+        let compact = "seta cg_fov \"111\"\nbind MOUSE2 \"say http://example.org/\"\n";
+        let verbose = "// Video\nseta cg_fov \"111\" // FOV\nbind MOUSE2 \"say http://example.org/\" // Chat URL\n";
+        assert_eq!(split_console_script(compact), split_console_script(verbose));
+        assert_eq!(split_console_script("// heading;ignored\necho ok; // skip\necho yes\n"),
+            ["echo ok", "echo yes"]);
     }
 }

@@ -67,6 +67,7 @@ impl PlayerPresenter {
         self.gore.clear();
         self.last_gpu.clear();
         self.vehicle_snaps.clear();
+        self.vehicle_animations.clear();
         self.force_grip_targets.clear();
         self.force_gripped_entities.clear();
         self.pending_impulse_ragdolls.clear();
@@ -97,6 +98,8 @@ impl PlayerPresenter {
         self.shader_remaps = remaps.clone();
         self.models.clear();
         self.saber_models.clear();
+        self.vehicle_animations.clear();
+        self.vehicle_snaps.clear();
         // Replacing registries drops the old generation token; queued jobs from
         // the previous material mapping cannot populate the new caches.
         self.async_models = AssetRegistry::new("player model");
@@ -216,6 +219,7 @@ impl PlayerPresenter {
             gore_next_id: 1,
             last_gpu: HashMap::new(),
             vehicle_snaps: HashMap::new(),
+            vehicle_animations: HashMap::new(),
             entities: HashMap::new(),
             external_live_entities: HashSet::new(),
             jiggle: super::AsyncJiggleSystem::default(),

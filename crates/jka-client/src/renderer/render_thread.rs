@@ -2288,7 +2288,7 @@ pub(in crate::renderer) fn render_thread_main(
                 });
             if ocean.promoted_surfaces > 0 || ocean.authored_oceans > 0 || renderer.ocean_enabled {
                 println!(
-                    "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] topology_cpu[last/avg/max]={:.4}/{:.4}/{:.4}ms samples={} avg/min/max_ms sim={} coastal={} surface={} optics={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",
+                    "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] topology_cpu[last/avg/max]={:.4}/{:.4}/{:.4}ms samples={} avg/min/max_ms sim={} coastal={} surface={} optics={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} analytic={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",
                     u8::from(renderer.ocean_enabled),
                     u8::from(ocean_resources),
                     u8::from(ocean_variant),
@@ -2306,6 +2306,7 @@ pub(in crate::renderer) fn render_thread_main(
                     ocean.authored_oceans,
                     ocean.clipmap_batches,
                     ocean.clipmaps_drawn,
+                    ocean.analytic_draws,
                     ocean.rejected_duplicate,
                     ocean.rejected_area,
                     ocean.rejected_frustum,

@@ -16,6 +16,32 @@ use crate::renderer::{
 use bytemuck::Zeroable;
 
 impl Renderer {
+    /// Volumetric fog reads the linear-depth prepass, which has no depth for
+    /// water seen over no receiver (the rendered ocean is not in the prepass).
+    /// Post intersects those pixels' rays with the promoted water plane
+    /// instead. Returns [plane Y, square half-extent (0 = off), centre X, Z].
+    fn ocean_void_fog_params(&self, eye_y: f32) -> [f32; 4] {
+        let off = [NO_WATER_SURFACE, 0.0, 0.0, 0.0];
+        if !self.ocean_enabled || !self.ocean_sky_extend {
+            return off;
+        }
+        let (Some(world), Some(ocean)) = (self.world.as_ref(), self.ocean.as_ref()) else {
+            return off;
+        };
+        let mut best = off;
+        for (slot, region) in world.ocean_sky_regions.iter().enumerate() {
+            let (Some(_), Some(surface)) = (region, world.ocean_surfaces.get(slot)) else { continue };
+            let plane = surface.plane_height;
+            if plane >= eye_y || (best[1] > 0.0 && plane <= best[0]) {
+                continue;
+            }
+            let Some((centre, radius)) = ocean.promoted_coverage(slot) else { continue };
+            let extent = if self.ocean_sky_infinite { 1.0e9 } else { radius };
+            best = [plane, extent, centre[0], centre[1]];
+        }
+        best
+    }
+
     /// Queue only the active extraction variant and the shared downsample PSO.
     /// Off (without halation) does no polling or worker requests. Retain compiled
     /// PSOs for later toggles; never wait for shader compilation on a frame.
@@ -203,6 +229,7 @@ impl Renderer {
             view_proj,
             Vec3::new(camera_pos_time[0], camera_pos_time[1], camera_pos_time[2]),
         );
+        let ocean_void_fog = self.ocean_void_fog_params(camera_pos_time[1]);
         let legacy1_global_fog = self.weather.fog.legacy1_global_post_params();
         let (legacy_fog, legacy_fog_scale) = legacy1_global_fog
             .map_or(([0.0; 4], 0.0), |(color, depth, scale)| {
@@ -469,10 +496,10 @@ impl Renderer {
                     NO_WATER_SURFACE
                 },
                 self.ocean_settings.optics.absorption_distance(),
-                0.0,
-                0.0,
+                ocean_void_fog[0],
+                ocean_void_fog[1],
             ],
-            cloud_foreground: [cloud_blade_count, 0.0, 0.0, 0.0],
+            cloud_foreground: [cloud_blade_count, ocean_void_fog[2], ocean_void_fog[3], 0.0],
             cloud_blades,
             camera_pos_time,
             prev_camera_pos_time: if self.cloud_history_valid || (self.rt_taa_active() && history_valid) {

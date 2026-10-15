@@ -210,6 +210,10 @@ pub(in crate::cgame::player_presenter) struct SaberModelAsset {
     pub(in crate::cgame::player_presenter) gla: Arc<GlaAnimation>,
     pub(in crate::cgame::player_presenter) animation_gla: Arc<GlaAnimation>,
     pub(in crate::cgame::player_presenter) retargeter: Option<Arc<jka_assets::skeleton::PoseRetargeter>>,
+    /// Vehicle Ghoul2 animations are authored in the animation.cfg beside the
+    /// GLA (TaystJK CG_G2SkelForModel), not in the humanoid global table.
+    /// Non-vehicle static GLMs remain free of this extra asset load.
+    pub(in crate::cgame::player_presenter) animations: Option<Arc<jka_assets::animation::AnimationSet>>,
     pub(in crate::cgame::player_presenter) surfaces: Vec<PlayerSurfaceAsset>,
 }
 

@@ -87,6 +87,8 @@ pub struct OceanDrawStats {
     pub clipmap_batches: u32,
     /// Clipmap draws actually encoded (one per surface id per pass).
     pub clipmaps_drawn: u32,
+    /// Mesh-free fullscreen triangles drawn for qualifying ocean pools.
+    pub analytic_draws: u32,
     pub rejected_area: u32,
     pub rejected_frustum: u32,
     /// Collapsed by `claim_ocean_clipmap` because the surface was already drawn.
@@ -251,6 +253,16 @@ impl PromotedClipmapLayout {
     /// Conservative XY half-width of this finite camera-following grid.
     pub fn coverage_radius(&self, half_cells: i32) -> f32 {
         let level = self.levels_for_half_cells(half_cells).saturating_sub(1);
+        self.base_spacing * (1u32 << level) as f32
+            * promoted_level_half_cells(level, half_cells) as f32
+    }
+
+    /// Exact outer radius of the levels that survived underwater distance culling.
+    /// The analytic continuation starts only outside this square; it never
+    /// overlays the displaced geometric clipmap or depends on arbitrary range.
+    pub fn coverage_radius_for_limit(&self, half_cells: i32, minimum_level: u32, level_limit: u32) -> f32 {
+        let level = self.levels_for_half_cells(half_cells)
+            .min(level_limit.max(minimum_level.saturating_add(1))).saturating_sub(1);
         self.base_spacing * (1u32 << level) as f32
             * promoted_level_half_cells(level, half_cells) as f32
     }
@@ -1409,6 +1421,13 @@ pub struct OceanSettings {
     pub map_size: u32,
     pub mesh_quality: u8, // 0 low, 1 high (upstream MeshQuality)
     pub updates_per_second: f32,
+    /// 0 = original rendering, 1 = near two mesh rings at full simulation Hz,
+    /// ring 2 at 2/3, outer rings at 1/2. FFT cascade rates are UNCHANGED.
+    pub dynamic_update_rates: bool,
+    /// Match global windrow transport to completed high-detail FFT frames.
+    /// With mesh LOD enabled, medium/far windrow *display* is also cached at
+    /// 32/24 Hz. The clipmap still renders every frame.
+    pub wind_foam_sync: bool,
     pub water_color: [f32; 3],
     pub foam_color: [f32; 3],
     // Optical A/B tests; all default to the pre-test rendering path.
@@ -1419,6 +1438,10 @@ pub struct OceanSettings {
     pub foam_brightness: f32,
     pub sun_gain: f32,
     pub foam_debug: u8, // 0 regular, 1 raw foam, 2 gated foam, 3 final foam
+    /// Downwind roll speed of the persistent FFT foam as a fraction of wind
+    /// speed (Unity port: OceanFoamDriftFraction). 0 pins foam to the texel
+    /// where it formed, which makes it repeat at the cascade's tile pitch.
+    pub foam_drift: f32,
     pub visual_fixes: u8, // 0 untouched, 1 balanced, 2 Godot-leaning ocean appearance
     pub foam_source_mode: u8, // 0 original Jacobian, 1 mild, 2 strong grow/crest threshold
     /// Bitmask of `links::*`: swell controls (and roughness) that follow the amplitude.
@@ -1454,6 +1477,8 @@ impl Default for OceanSettings {
             map_size: OCEAN_DEFAULT_MAP_SIZE,
             mesh_quality: 1,
             updates_per_second: 48.0,
+            dynamic_update_rates: false,
+            wind_foam_sync: true,
             // GodotOceanWaves water.gd defaults. Godot converts these from
             // sRGB to linear before the shader; the BSP shader does the same.
             water_color: [0.1, 0.15, 0.18],
@@ -1467,6 +1492,7 @@ impl Default for OceanSettings {
             foam_brightness: 1.0,
             sun_gain: 1.0,
             foam_debug: 0,
+            foam_drift: 0.0,
             visual_fixes: 0,
             foam_source_mode: 0,
             links: links::ALL,
@@ -1514,7 +1540,9 @@ impl OceanSettings {
             _ => 1024,
         };
         self.mesh_quality = self.mesh_quality.min(1);
-        self.updates_per_second = self.updates_per_second.clamp(0.0, 60.0);
+        self.updates_per_second = if self.updates_per_second.is_finite() {
+            self.updates_per_second.clamp(0.0, 60.0)
+        } else { 48.0 };
         for value in self.water_color.iter_mut().chain(self.foam_color.iter_mut()) {
             *value = value.clamp(0.0, 1.0);
         }
@@ -1525,6 +1553,7 @@ impl OceanSettings {
         self.foam_brightness = if self.foam_brightness.is_finite() { self.foam_brightness.clamp(0.0, 8.0) } else { 1.0 };
         self.sun_gain = if self.sun_gain.is_finite() { self.sun_gain.clamp(0.0, 8.0) } else { 1.0 };
         self.foam_debug = self.foam_debug.min(3);
+        self.foam_drift = if self.foam_drift.is_finite() { self.foam_drift.clamp(0.0, 2.0) } else { 0.0 };
         self.visual_fixes = self.visual_fixes.min(2);
         self.foam_source_mode = self.foam_source_mode.min(2);
         self.links &= links::ALL;
@@ -1556,7 +1585,7 @@ struct CascadeGpu {
     shape: [f32; 4],
     foam: [f32; 4],
     seed: [u32; 4],
-    time: [f32; 4],
+    time: [f32; 4], // x simulation time, yz foam drift this update (metres, texel axes)
 }
 
 #[repr(C)]
@@ -1625,9 +1654,9 @@ pub struct OceanRenderUniform {
     // Appended to preserve ALL offsets read by spray, coastal and optics shaders.
     pub sky_segments: [[f32; 4]; sky_extend::SEGMENTS_PER_POOL],
     // Append only: older spray/optics shaders consume just the common prefix.
-    pub appearance_a: [f32; 4], // detail mode, promoted foam gate mode, foam gain, foam fade rate
+    pub appearance_a: [f32; 4], // detail mode, foam gate, foam gain, promoted seam flatten (0/1)
     pub appearance_b: [f32; 4], // color mode, foam brightness, sun gain, foam debug
-    pub appearance_c: [f32; 4], // visual fixes bundle (x); yzw reserved
+    pub appearance_c: [f32; 4], // x visual fixes, y spatial-LOD ready, z near cell spacing, w analytic far radius
 
 }
 
@@ -1639,10 +1668,33 @@ struct PromotedRenderSurface {
     bind_group: wgpu::BindGroup,
 }
 
+/// Upload-on-demand render-space displacement fields for the *mesh* LODs.
+/// FFT cascades keep their original synchronized timing. These lower-resolution
+/// snapshots avoid re-sampling all 3 FFT textures at every distant vertex in
+/// every 1000+ FPS render frame. They cannot reduce global FFT dispatch count.
+struct OceanLodSnapshot {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    _bind_group: wgpu::BindGroup,
+    foam: wgpu::Buffer,
+    size: u32,
+}
+
+/// Preserve the fractional 32/24 Hz deadlines instead of quantizing to FPS.
+fn ocean_lod_deadline(next: &mut f32, now: f32, hz: f32) -> bool {
+    if now + 1e-6 < *next { return false; }
+    let period = 1.0 / hz;
+    let skipped = ((now - *next) / period).max(0.0).floor() + 1.0;
+    *next += skipped * period;
+    true
+}
+
 pub struct OceanGpu {
     sky_extend_enabled: bool,
+    sky_infinite_enabled: bool,
     sky_extend_regions: [Option<sky_extend::SkyExtension>; OCEAN_MAX_SURFACES],
     promoted_centres: [Option<[f32; 2]>; OCEAN_MAX_SURFACES],
+    promoted_far_radii: [Option<f32>; OCEAN_MAX_SURFACES],
     pub coastal: Option<coastal::Gpu>,
     coastal_render: std::sync::Arc<coastal::RenderResources>,
     coastal_key: Option<(usize, u8, bool, u32, u32)>,
@@ -1656,6 +1708,14 @@ pub struct OceanGpu {
     times: [f32; OCEAN_CASCADES],
     elapsed: f32,
     next_update: f32,
+    lod_snapshots: [OceanLodSnapshot; 2], // medium (32 Hz) and far (24 Hz)
+    lod_pipeline: wgpu::ComputePipeline,
+    lod_due: [f32; 2],
+    lod_valid: [bool; 2],
+    last_windrow_update: Option<f32>,
+    staged_params: [CascadeGpu; OCEAN_CASCADES],
+    /// Which half of the foam buffer each cascade reads next (it writes the other).
+    foam_parity: [u32; OCEAN_CASCADES],
     // One phase/dispatch is encoded at a time; FFT scratch is shared by all
     // cascades, so phase order is strictly cascade 2 -> 1 -> 0.
     phase: usize,
@@ -1840,6 +1900,10 @@ impl OceanGpu {
                 bg_buffer(9, &coastal.params),
                 bg_buffer(10, &coastal.lookup),
                 bg_buffer(11, &coastal.surface),
+                wgpu::BindGroupEntry {binding:12, resource:wgpu::BindingResource::TextureView(&displacement_view)},
+                wgpu::BindGroupEntry {binding:13, resource:wgpu::BindingResource::TextureView(&displacement_view)},
+                bg_buffer(14, &windrow),
+                bg_buffer(15, &windrow),
             ],
         })
     }
@@ -1859,6 +1923,11 @@ impl OceanGpu {
                 uniform_layout_entry(9,wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT),
                 wgpu::BindGroupLayoutEntry{binding:10,visibility:wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Buffer{ty:wgpu::BufferBindingType::Storage{read_only:true},has_dynamic_offset:false,min_binding_size:None},count:None},
                 wgpu::BindGroupLayoutEntry{binding:11,visibility:wgpu::ShaderStages::VERTEX|wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Buffer{ty:wgpu::BufferBindingType::Storage{read_only:true},has_dynamic_offset:false,min_binding_size:None},count:None},
+                // Render-LOD snapshots; sampled only by the vertex stage.
+                wgpu::BindGroupLayoutEntry{binding:12,visibility:wgpu::ShaderStages::VERTEX,ty:wgpu::BindingType::Texture{sample_type:wgpu::TextureSampleType::Float{filterable:true},view_dimension:wgpu::TextureViewDimension::D2Array,multisampled:false},count:None},
+                wgpu::BindGroupLayoutEntry{binding:13,visibility:wgpu::ShaderStages::VERTEX,ty:wgpu::BindingType::Texture{sample_type:wgpu::TextureSampleType::Float{filterable:true},view_dimension:wgpu::TextureViewDimension::D2Array,multisampled:false},count:None},
+                wgpu::BindGroupLayoutEntry{binding:14,visibility:wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Buffer{ty:wgpu::BufferBindingType::Storage{read_only:true},has_dynamic_offset:false,min_binding_size:None},count:None},
+                wgpu::BindGroupLayoutEntry{binding:15,visibility:wgpu::ShaderStages::FRAGMENT,ty:wgpu::BindingType::Buffer{ty:wgpu::BufferBindingType::Storage{read_only:true},has_dynamic_offset:false,min_binding_size:None},count:None},
             ]
         })
     }
@@ -1902,12 +1971,15 @@ impl OceanGpu {
         let spectrum_buffer = storage("Ocean spectrum", n*n*OCEAN_CASCADES as u64*16);
         let butterfly_buffer = storage("Ocean FFT butterfly", n*u64::from(stages)*16);
         let fft_buffer = storage("Ocean FFT pingpong", n*n*4*2*8);
-        let foam_buffer = storage("Ocean persistent foam", n*n*OCEAN_CASCADES as u64*4);
+        // Two halves per cascade set, ping-ponged by `CascadeGpu::foam[3]`: the unpack
+        // pass reads its neighbours' previous foam, so it cannot also write in place.
+        let foam_buffer = storage("Ocean persistent foam", n*n*OCEAN_CASCADES as u64*4*2);
         let output_desc = |label: &'static str| wgpu::TextureDescriptor {
             label: Some(label), size: wgpu::Extent3d { width:map_size,height:map_size,depth_or_array_layers:OCEAN_CASCADES as u32 },
             mip_level_count:1, sample_count:1, dimension:wgpu::TextureDimension::D2,
             format:wgpu::TextureFormat::Rgba16Float,
-            usage:wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage:wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING
+                | if cfg!(test) { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
             view_formats:&[],
         };
         let displacement = device.create_texture(&output_desc("Ocean displacement array"));
@@ -1922,7 +1994,7 @@ impl OceanGpu {
         let windrow_field_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ocean wind foam streak field"),
             size: u64::from(OCEAN_WINDROW_SIZE) * u64::from(OCEAN_WINDROW_SIZE) * 2 * 4,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -1990,6 +2062,62 @@ impl OceanGpu {
         let coastal_render = coastal::RenderResources::inert(device);
         let render_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label:Some("Ocean render uniform"), contents:bytemuck::bytes_of(&render_uniform), usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label:Some("Ocean repeat sampler"), address_mode_u:wgpu::AddressMode::Repeat,address_mode_v:wgpu::AddressMode::Repeat,address_mode_w:wgpu::AddressMode::ClampToEdge,mag_filter:wgpu::FilterMode::Linear,min_filter:wgpu::FilterMode::Linear,mipmap_filter:wgpu::MipmapFilterMode::Linear,..Default::default() });
+        // Two inexpensive spatially coarser snapshots of the *complete* FFT
+        // displacement field, not two independently simulated wave cascades.
+        // 1024 FFT => 512x512 medium and 256x256 far; ~7.5 MiB total.
+        let lod_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Ocean mesh LOD snapshot shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("ocean_lod_snapshot.wgsl").into()),
+        });
+        let lod_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Ocean mesh LOD snapshot compute layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding:0, visibility:wgpu::ShaderStages::COMPUTE,
+                    ty:wgpu::BindingType::Texture { sample_type:wgpu::TextureSampleType::Float {filterable:true},view_dimension:wgpu::TextureViewDimension::D2Array,multisampled:false }, count:None },
+                wgpu::BindGroupLayoutEntry { binding:1, visibility:wgpu::ShaderStages::COMPUTE,
+                    ty:wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),count:None },
+                wgpu::BindGroupLayoutEntry { binding:2, visibility:wgpu::ShaderStages::COMPUTE,
+                    ty:wgpu::BindingType::StorageTexture { access:wgpu::StorageTextureAccess::WriteOnly,
+                        format:wgpu::TextureFormat::Rgba16Float,view_dimension:wgpu::TextureViewDimension::D2Array },count:None },
+            ],
+        });
+        let lod_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Ocean mesh LOD snapshot pipeline layout"),
+            bind_group_layouts: &[Some(&lod_layout)], immediate_size: 0,
+        });
+        let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Ocean mesh LOD snapshot pipeline"), layout:Some(&lod_pipeline_layout),
+            module:&lod_shader, entry_point:Some("main"),
+            compilation_options:Default::default(), cache:crate::pipeline_cache::get().as_ref(),
+        });
+        let lod_snapshots: [OceanLodSnapshot; 2] = std::array::from_fn(|i| {
+            let size=(map_size >> (i+1)).max(32);
+            let texture=device.create_texture(&wgpu::TextureDescriptor {
+                label:Some(if i==0 {"Ocean mesh LOD 2 (32 Hz)"} else {"Ocean mesh LOD 3+ (24 Hz)"}),
+                size:wgpu::Extent3d {width:size,height:size,depth_or_array_layers:OCEAN_CASCADES as u32},
+                mip_level_count:1, sample_count:1, dimension:wgpu::TextureDimension::D2,
+                format:wgpu::TextureFormat::Rgba16Float,
+                usage:wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats:&[],
+            });
+            let view=texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension:Some(wgpu::TextureViewDimension::D2Array),..Default::default()
+            });
+            let bind_group=device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:Some("Ocean mesh LOD downsample"),layout:&lod_layout,entries:&[
+                    wgpu::BindGroupEntry{binding:0,resource:wgpu::BindingResource::TextureView(&displacement_view)},
+                    wgpu::BindGroupEntry{binding:1,resource:wgpu::BindingResource::Sampler(&sampler)},
+                    wgpu::BindGroupEntry{binding:2,resource:wgpu::BindingResource::TextureView(&view)},
+                ],
+            });
+            let foam=device.create_buffer(&wgpu::BufferDescriptor {
+                label:Some(if i==0 {"Ocean wind foam 32 Hz snapshot"} else {"Ocean wind foam 24 Hz snapshot"}),
+                size: u64::from(OCEAN_WINDROW_SIZE) * u64::from(OCEAN_WINDROW_SIZE) * 4,
+                usage:wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation:false,
+            });
+            OceanLodSnapshot{_texture:texture,view,_bind_group:bind_group,foam,size}
+        });
         let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label:Some("Ocean render bind group"), layout:render_layout, entries:&[
             wgpu::BindGroupEntry{binding:0,resource:wgpu::BindingResource::TextureView(&displacement_view)},
             wgpu::BindGroupEntry{binding:1,resource:wgpu::BindingResource::TextureView(&normal_view)},
@@ -2002,7 +2130,10 @@ impl OceanGpu {
             bg_buffer(8, &interaction.splash_uniform),
             bg_buffer(9, &coastal_render.params),
             bg_buffer(10, &coastal_render.lookup),
-            bg_buffer(11, &coastal_render.surface),
+            bg_buffer(11,&coastal_render.surface),
+            wgpu::BindGroupEntry{binding:12,resource:wgpu::BindingResource::TextureView(&lod_snapshots[0].view)},
+            wgpu::BindGroupEntry{binding:13,resource:wgpu::BindingResource::TextureView(&lod_snapshots[1].view)},
+            bg_buffer(14,&lod_snapshots[0].foam),bg_buffer(15,&lod_snapshots[1].foam),
         ]});
         let windrow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Ocean wind foam streak compute bind group"),
@@ -2015,12 +2146,12 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { sky_extend_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view:displacement_view, render_normal_view:normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
             interaction_splash_uniform: interaction.splash_uniform.clone(),
-            coastal: None, coastal_render, coastal_key: None, promoted_centres: [None;OCEAN_MAX_SURFACES] };
+            coastal: None, coastal_render, coastal_key: None, promoted_centres: [None;OCEAN_MAX_SURFACES], promoted_far_radii: [None;OCEAN_MAX_SURFACES] };
         ocean.upload_params(queue,0.0);
         let mut encoder=device.create_command_encoder(&wgpu::CommandEncoderDescriptor{label:Some("Ocean FFT init")});
         {
@@ -2045,6 +2176,8 @@ impl OceanGpu {
             // one final unpack dispatch, never a partly computed FFT stage.
             self.phase = 0;
             self.phase_count = 0;
+            self.lod_valid = [false;2];
+            self.lod_due = [seconds;2];
         }
     }
 
@@ -2057,6 +2190,7 @@ impl OceanGpu {
         let mut uniform=make_render_uniform(self.enabled,&self.settings);
         uniform.clipmap=self.clipmap_center;
         uniform.clipmap[3] = self.windrow_front as f32;
+        uniform.appearance_c[1] = if self.settings.dynamic_update_rates && self.lod_valid.iter().all(|v| *v) { 1.0 } else { 0.0 };
         uniform.swell_motion[3] = self.elapsed;
         let wind = self.settings.wind.at(self.elapsed);
         uniform.wind_motion[0] = wind[0] / OCEAN_UNITS_PER_METER;
@@ -2073,6 +2207,17 @@ impl OceanGpu {
             if let Some(centre)=self.promoted_centres[surface.descriptor.index] {
                 local.clipmap[0]=centre[0];local.clipmap[1]=centre[1];
             }
+            // Keep clipmap.z as the geometric lattice spacing. Store Phase 2's
+            // analytic exterior radius in the reserved appearance_c.w slot.
+            local.appearance_c[3]=self.promoted_far_radii[surface.descriptor.index].unwrap_or(0.0);
+            // Flatten the outer clipmap ring only where the mesh-free infinite
+            // ocean continues it. Only promoted views carry a nonzero value:
+            // authored oceans stay untouched.
+            let has_infinite_seam = self.sky_extend_enabled && self.sky_infinite_enabled
+                && self.sky_extend_regions[surface.descriptor.index].is_some()
+                && local.appearance_c[3] > 0.0;
+            // appearance_a.w is the seam flatten flag (0/1).
+            local.appearance_a[3] = promoted_seam_flatten(has_infinite_seam);
             if self.sky_extend_enabled {
                 if let Some(region) = self.sky_extend_regions[surface.descriptor.index] {
                     local.sky_segments = region.segments;
@@ -2099,15 +2244,17 @@ impl OceanGpu {
 
     /// Runtime A/B switch; never mutates coastal fields or FFT simulation.
     pub fn set_sky_extension(&mut self, queue: &wgpu::Queue, enabled: bool,
-        regions: &[Option<sky_extend::SkyExtension>]) {
+        infinite: bool, regions: &[Option<sky_extend::SkyExtension>]) {
         let mut selected = [None; OCEAN_MAX_SURFACES];
         for (index, region) in regions.iter().enumerate().take(OCEAN_MAX_SURFACES) {
             selected[index] = *region;
         }
-        if self.sky_extend_enabled == enabled && self.sky_extend_regions == selected {
+        if self.sky_extend_enabled == enabled && self.sky_infinite_enabled == infinite
+            && self.sky_extend_regions == selected {
             return;
         }
         self.sky_extend_enabled = enabled;
+        self.sky_infinite_enabled = infinite;
         self.sky_extend_regions = selected;
         self.write_render_uniform(queue);
     }
@@ -2122,10 +2269,19 @@ impl OceanGpu {
     /// The shader must place the mesh at the same centre the CPU used when
     /// pruning indices. Clamping independently to the AABB caused dry-corner
     /// cameras to draw topology generated for a different water location.
-    pub fn set_promoted_clipmap_centres(&mut self,queue:&wgpu::Queue,centres:[Option<[f32;2]>;OCEAN_MAX_SURFACES]) {
-        if self.promoted_centres==centres {return;}
+    pub fn set_promoted_clipmap_centres(&mut self, queue:&wgpu::Queue,
+        centres:[Option<[f32;2]>;OCEAN_MAX_SURFACES],
+        radii:[Option<f32>;OCEAN_MAX_SURFACES]) {
+        if self.promoted_centres==centres && self.promoted_far_radii==radii {return;}
         self.promoted_centres=centres;
+        self.promoted_far_radii=radii;
         self.write_render_uniform(queue);
+    }
+
+    /// Centre and square half-extent the geometric clipmap currently covers for
+    /// a promoted pool (post-process fog needs it for no-receiver water pixels).
+    pub fn promoted_coverage(&self, slot: usize) -> Option<([f32; 2], f32)> {
+        Some(((*self.promoted_centres.get(slot)?)?, (*self.promoted_far_radii.get(slot)?)?))
     }
 
     /// Rebuild only when the map/selection/amplitude changes. Failed selections
@@ -2186,6 +2342,9 @@ impl OceanGpu {
                             wgpu::BindGroupEntry{binding:6,resource:wgpu::BindingResource::TextureView(&self.interaction_view)},
                             bg_buffer(7,&self.interaction_uniform),bg_buffer(8,&self.interaction_splash_uniform),
                             bg_buffer(9,&self.coastal_render.params),bg_buffer(10,&self.coastal_render.lookup),bg_buffer(11,&self.coastal_render.surface),
+                            wgpu::BindGroupEntry{binding:12,resource:wgpu::BindingResource::TextureView(&self.lod_snapshots[0].view)},
+                            wgpu::BindGroupEntry{binding:13,resource:wgpu::BindingResource::TextureView(&self.lod_snapshots[1].view)},
+                            bg_buffer(14,&self.lod_snapshots[0].foam),bg_buffer(15,&self.lod_snapshots[1].foam),
                         ]});
                     return;
                 }
@@ -2278,6 +2437,9 @@ impl OceanGpu {
                         bg_buffer(9, &self.coastal_render.params),
                         bg_buffer(10, &self.coastal_render.lookup),
                         bg_buffer(11, &self.coastal_render.surface),
+                        wgpu::BindGroupEntry{binding:12,resource:wgpu::BindingResource::TextureView(&self.lod_snapshots[0].view)},
+                        wgpu::BindGroupEntry{binding:13,resource:wgpu::BindingResource::TextureView(&self.lod_snapshots[1].view)},
+                        bg_buffer(14,&self.lod_snapshots[0].foam),bg_buffer(15,&self.lod_snapshots[1].foam),
                     ],
                 });
                 PromotedRenderSurface {
@@ -2359,6 +2521,13 @@ impl OceanGpu {
         debug_assert_eq!(settings.map_size,self.settings.map_size,"map-size changes recreate OceanGpu");
         if settings == self.settings { return; }
         let old_updates=self.settings.updates_per_second;
+        let change_schedule = settings.updates_per_second != old_updates;
+        if settings.dynamic_update_rates && !self.settings.dynamic_update_rates {
+            // Do not disturb an in-flight FFT cycle when enabling ring cache.
+            // First show original waves, then publish both snapshots atomically.
+            self.lod_valid = [false;2];
+            self.lod_due = [self.elapsed;2];
+        }
         let spectrum_changed = settings.authored.seed != self.settings.authored.seed
             || settings.authored.direction != self.settings.authored.direction
             || settings.wind != self.settings.wind
@@ -2374,6 +2543,13 @@ impl OceanGpu {
             self.next_update -= old_period-new_period;
         }
         self.settings=settings;
+        if change_schedule {
+            // A partially encoded job can be discarded safely: FFT output
+            // textures are only published in its final unpack pass.
+            self.phase = 0;
+            self.phase_count = 0;
+            self.next_update = self.elapsed;
+        }
         self.spectrum_dirty |= spectrum_changed;
         // Whitecap/foam rates and displacement/normal scales do not require a
         // spectrum rebuild, but do need fresh compute/render parameters.
@@ -2386,15 +2562,33 @@ impl OceanGpu {
         self.write_render_uniform(queue);
     }
 
-    fn build_params(&mut self, delta:f32) -> [CascadeGpu;OCEAN_CASCADES] {
-        let mut gpu=[CascadeGpu::zeroed();OCEAN_CASCADES];
+    /// Swell heading (degrees) the shared FFT (and so its whitecap foam)
+    /// travels along. The FFT is shared by every promoted pool, but each pool
+    /// draws its own analytic swell from the heading its map shader scrolls in,
+    /// so the largest pool's heading is the swell that is on screen. Without
+    /// this the FFT follows the global cvar heading and the whitecaps grow
+    /// against the visible swell.
+    fn fft_heading_degrees(&self) -> f32 {
+        let area = |s: &PromotedRenderSurface| {
+            let o = s.descriptor.surface;
+            (o.maximum[0] - o.minimum[0]).abs() * (o.maximum[1] - o.minimum[1]).abs()
+        };
+        self.promoted_surfaces.iter()
+            .max_by(|a, b| area(a).total_cmp(&area(b)))
+            .map_or(self.settings.authored.direction, |s| s.settings.authored.direction)
+    }
+
+    fn build_params_selected(&mut self, deltas:[Option<f32>;OCEAN_CASCADES]) -> [CascadeGpu;OCEAN_CASCADES] {
+        let mut gpu=self.staged_params;
         for (i, gpu_param) in gpu.iter_mut().enumerate() {
+            let Some(delta) = deltas[i] else { continue; };
             let s=self.settings.cascades[i]; self.times[i]+=delta;
             let authored = self.settings.authored;
+            let heading = self.fft_heading_degrees();
             let weather = self.settings.wind;
             let fetch=s.fetch_length.max(0.0001)*1000.0;
             let wind=if i == 2 { (weather.speed / OCEAN_UNITS_PER_METER).max(0.01) } else { s.wind_speed.max(0.0001) };
-            let direction = if i == 2 { weather.direction } else { authored.direction + s.wind_direction };
+            let direction = if i == 2 { weather.direction } else { heading + s.wind_direction };
             let resolved_wind = weather.at(self.elapsed);
             let wind_strength = (resolved_wind[0].hypot(resolved_wind[1]) / 800.0).clamp(0.0, 2.0);
             let derivative_scale = if i == 2 { s.displacement_scale * authored.wind_chop * wind_strength } else {
@@ -2412,26 +2606,43 @@ impl OceanGpu {
                 2.. => (0.20, 1.6),
                 _ => (0.0, 1.0),
             };
+            // Foam texel axes are (world x, -world z) (the shaders sample with
+            // world_m * (1,-1)), and the wind is in JKA units/s, so the downwind
+            // roll in texel axes is (wind.x, wind.y) / units-per-metre.
+            let drift_scale = self.settings.foam_drift * delta / OCEAN_UNITS_PER_METER;
+            let drift = [resolved_wind[0] * drift_scale, resolved_wind[1] * drift_scale];
+            let foam_read_half = self.foam_parity[i];
+            self.foam_parity[i] ^= 1;
+            let spectrum_angle = (direction + 180.0).to_radians();
+            // The spectrum is baked by the regenerate pass, so a changed
+            // heading (e.g. a different pool becoming dominant) must rebake it.
+            if self.staged_params[i].spectrum[3] != spectrum_angle { self.spectrum_dirty = true; }
             *gpu_param=CascadeGpu {
                 tile:[s.tile_length[0],s.tile_length[1],derivative_scale,0.0],
-                spectrum:[jonswap_alpha(wind,fetch),jonswap_peak(wind,fetch),wind,(direction + 180.0).to_radians()],
+                spectrum:[jonswap_alpha(wind,fetch),jonswap_peak(wind,fetch),wind,spectrum_angle],
                 shape:[DEPTH_METERS,s.swell,s.detail,s.spread],
                 foam:[s.whitecap + wind_strength * 0.15 + whitecap_bias,
                     delta*s.foam_amount*7.5*authored.foam*(0.25+wind_strength)*grow_multiplier,
-                    delta/authored.foam_lifetime,0.0],
-                seed:[authored.seed,authored.seed ^ (i as u32).wrapping_mul(0x9e3779b9),0,0], time:[self.times[i],0.0,0.0,0.0]
+                    delta/authored.foam_lifetime,foam_read_half as f32],
+                seed:[authored.seed,authored.seed ^ (i as u32).wrapping_mul(0x9e3779b9),0,0], time:[self.times[i],drift[0],drift[1],0.0]
             };
         }
+        self.staged_params = gpu;
         gpu
     }
 
     fn upload_params(&mut self, queue:&wgpu::Queue, delta:f32) {
-        let gpu=self.build_params(delta);
+        let gpu=self.build_params_selected([Some(delta);OCEAN_CASCADES]);
         queue.write_buffer(&self.params_buffer,0,bytemuck::cast_slice(&gpu));
     }
 
     fn stage_params(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32) {
-        let gpu=self.build_params(delta);
+        self.stage_params_selected(queue, encoder, [Some(delta);OCEAN_CASCADES]);
+    }
+
+    fn stage_params_selected(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder,
+                             deltas:[Option<f32>;OCEAN_CASCADES]) {
+        let gpu=self.build_params_selected(deltas);
         queue.write_buffer(&self.params_upload_buffer,0,bytemuck::cast_slice(&gpu));
         encoder.copy_buffer_to_buffer(
             &self.params_upload_buffer,
@@ -2504,11 +2715,62 @@ impl OceanGpu {
         let delta=delta.max(0.0);
         let now=self.elapsed;
         let updates=self.settings.updates_per_second;
-        let target=1.0/(updates+1e-10);
+        // 0 Hz is the original unthrottled per-render-frame mode.
+        let (fine_fft_completed, completed_cycle) =
+            self.encode_original_cascades(queue,encoder,now,delta,updates);
+        self.elapsed=now+delta;
+        // The near two clipmap levels always sample the just-published FFT.
+        // Medium and far snapshot jobs are spatial mesh LODs only. They never
+        // make the fine/middle/swell FFT components step out of sync.
+        let mut updated_lod = [false;2];
+        if self.settings.dynamic_update_rates && completed_cycle {
+            for i in 0..2 {
+                let hz=if i==0 { updates*(2.0/3.0) } else { updates*0.5 };
+                if hz <= 0.0 || ocean_lod_deadline(&mut self.lod_due[i],self.elapsed,hz) {
+                    let snapshot=&self.lod_snapshots[i];
+                    let mut pass=encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label:Some("Ocean mesh LOD displacement snapshot"),timestamp_writes:None,
+                    });
+                    pass.set_pipeline(&self.lod_pipeline);
+                    pass.set_bind_group(0,&snapshot._bind_group,&[]);
+                    pass.dispatch_workgroups(snapshot.size.div_ceil(8),snapshot.size.div_ceil(8),OCEAN_CASCADES as u32);
+                    updated_lod[i]=true;
+                }
+            }
+        }
+        if self.settings.wind_foam_streaks || self.promoted_surfaces.iter().any(|s| s.settings.wind_foam_streaks) {
+            // The FFT and clipmap render independently: clipmap vertices are
+            // drawn every frame, but the windrow transport only needs to run
+            // when its source (finest FFT normal/foam layer) is republished.
+            if !self.settings.wind_foam_sync || fine_fft_completed {
+                let dt = self.last_windrow_update
+                    .map_or(if updates > 0.0 { 1.0/updates } else { delta },
+                            |last| (self.elapsed-last).max(0.0));
+                self.encode_windrow(queue, encoder, dt);
+                self.last_windrow_update=Some(self.elapsed);
+            }
+        } else {
+            // When re-enabled, do not integrate the entire disabled interval.
+            self.last_windrow_update=None;
+        }
+        // Snapshot foam from the published windrow ping-pong half at exactly
+        // the same tick as the matching medium/far displacement cache. The
+        // transport itself remains global and follows the finest FFT.
+        for (i, updated) in updated_lod.iter().enumerate() {
+            if *updated {
+                let cells=u64::from(OCEAN_WINDROW_SIZE)*u64::from(OCEAN_WINDROW_SIZE);
+                encoder.copy_buffer_to_buffer(&self._windrow_field_buffer,
+                    self.windrow_front as u64 * cells * 4,
+                    &self.lod_snapshots[i].foam,0,cells*4);
+                self.lod_valid[i]=true;
+            }
+        }
+        self.write_render_uniform(queue);
+    }
 
-        // Begin only when the previous update has finished. In particular,
-        // NEVER flush overdue cascades into one render frame: that was the
-        // large periodic GPU spike in the original scheduling path.
+    fn encode_original_cascades(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder,
+                                now:f32, delta:f32, updates:f32) -> (bool,bool) {
+        let target=1.0/(updates+1e-10);
         if self.phase_count == 0 && (updates == 0.0 || now >= self.next_update) {
             let update_delta=if updates==0.0 { delta } else { target+(now-self.next_update) };
             self.next_update=now+target;
@@ -2520,14 +2782,10 @@ impl OceanGpu {
             self.phase_period=if updates==0.0 { 0.0 } else { target };
             self.spectrum_dirty=false;
         }
-
+        let mut fine_completed=false;
+        let mut cycle_completed=false;
         if self.phase_count > 0 {
-            // Spread the existing 15 passes across the update interval when
-            // rendering fast. At lower FPS allow bounded catch-up rather than
-            // reducing the ocean to one simulation update per 15 frames.
             let due=ocean_phases_due(now,self.phase_started_at,self.phase_period,self.phase_count);
-            // A zero-UPS setting means "run every render frame", matching the
-            // original unthrottled mode rather than reducing it to 1/3 speed.
             let budget=due.saturating_sub(self.phase).min(if updates == 0.0 {
                 self.phase_count
             } else {
@@ -2543,23 +2801,19 @@ impl OceanGpu {
                 } else {
                     let fft_phase=self.phase-usize::from(self.phase_spectrum);
                     let cascade=OCEAN_CASCADES-1-fft_phase/OCEAN_PASSES_PER_CASCADE;
-                    self.encode_fft_phase(encoder,cascade,fft_phase%OCEAN_PASSES_PER_CASCADE);
+                    let phase=fft_phase%OCEAN_PASSES_PER_CASCADE;
+                    self.encode_fft_phase(encoder,cascade,phase);
+                    fine_completed |= cascade==OCEAN_CASCADES-1 && phase==OCEAN_PASSES_PER_CASCADE-1;
                 }
                 self.phase+=1;
             }
             if self.phase==self.phase_count {
                 self.phase=0;
                 self.phase_count=0;
+                cycle_completed=true;
             }
         }
-
-        self.elapsed=now+delta;
-        if self.settings.wind_foam_streaks || self.promoted_surfaces.iter().any(|s| s.settings.wind_foam_streaks) {
-            self.encode_windrow(queue, encoder, delta);
-        }
-        // Each cascade's output is still published only by its complete
-        // unpack dispatch. The mesh and ocean texture layout are unchanged.
-        self.write_render_uniform(queue);
+        (fine_completed,cycle_completed)
     }
 
     fn encode_windrow(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32) {
@@ -2665,13 +2919,21 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         mask_tiles: [[0; 4]; OCEAN_MAX_SURFACES],
         mask_triangles: [[0.0; 4]; OCEAN_MASK_VEC4S],
         sky_segments: [[0.0;4]; sky_extend::SEGMENTS_PER_POOL],
-        // Shader detail modes are 1 (foam kept) / 2 (full cascades); w is unused.
+        // Shader detail modes are 1 (foam kept) / 2 (full cascades); w is the promoted
+        // seam flatten flag, always 0 for the shared (authored) view.
         appearance_a: [settings.foam_detail_mode as f32 + 1.0, settings.foam_activity_mode as f32,
             settings.foam_gain, 0.0],
         appearance_b: [settings.color_mode as f32, settings.foam_brightness,
             settings.sun_gain, settings.foam_debug as f32],
-        appearance_c: [settings.visual_fixes as f32, 0.0, 0.0, 0.0],
+        appearance_c: [settings.visual_fixes as f32, 0.0,
+            if settings.mesh_quality > 0 { OCEAN_HIGH_MESH_SPACING_UNITS } else { OCEAN_LOW_MESH_SPACING_UNITS }, 0.0],
     }
+}
+
+/// Whether the shader flattens the outermost clipmap ring. Sky extension mode 1
+/// has no flat analytic tail, so its outer ring must keep animating.
+fn promoted_seam_flatten(has_analytic_tail: bool) -> f32 {
+    if has_analytic_tail { 1.0 } else { 0.0 }
 }
 
 /// Use the same render view for the water and its spray emitter. Finest wind
@@ -2701,6 +2963,7 @@ fn make_promoted_render_uniform(
     local.appearance_a = shared.appearance_a;
     local.appearance_b = shared.appearance_b;
     local.appearance_c = shared.appearance_c;
+    local.appearance_c[2] = if settings.mesh_quality > 0 { OCEAN_HIGH_MESH_SPACING_UNITS } else { OCEAN_LOW_MESH_SPACING_UNITS };
     let base_spacing = if settings.mesh_quality > 0 {
         OCEAN_HIGH_MESH_SPACING_UNITS
     } else {
@@ -2768,6 +3031,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn promoted_seam_flatten_follows_the_flat_analytic_tail_only() {
+        assert_eq!(promoted_seam_flatten(false), 0.0);
+        assert_eq!(promoted_seam_flatten(true), 1.0);
+    }
+
+    #[test]
     fn ocean_optical_ab_defaults_keep_distance_detail() {
         let s = OceanSettings::default();
         assert_eq!(s.foam_detail_mode, 1);
@@ -2779,7 +3048,7 @@ mod tests {
         let u = make_render_uniform(true, &s);
         assert_eq!(u.appearance_a, [2.0, 0.0, 1.0, 0.0]);
         assert_eq!(u.appearance_b, [0.0, 1.0, 1.0, 0.0]);
-        assert_eq!(u.appearance_c, [0.0; 4]);
+        assert_eq!(u.appearance_c, [0.0, 0.0, OCEAN_HIGH_MESH_SPACING_UNITS, 0.0]);
     }
 
     #[test]
@@ -2800,7 +3069,7 @@ mod tests {
         assert_eq!(edited.map_scales, baseline.map_scales);
         assert_eq!(edited.appearance_a, [2.0, 3.0, 8.0, 0.0]);
         assert_eq!(edited.appearance_b, [3.0, 1.7, 2.0, 1.0]);
-        assert_eq!(edited.appearance_c, [2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(edited.appearance_c, [2.0, 0.0, OCEAN_HIGH_MESH_SPACING_UNITS, 0.0]);
         let pool = appearance::tests::pool(0,0.0);
         let local = pool.settings(shared);
         let promoted = make_promoted_render_uniform(&edited, &local, &pool, false, 1);
@@ -3398,9 +3667,142 @@ mod ocean_phase_scheduler_tests {
     }
 
     #[test]
+    fn mesh_lod_deadlines_keep_32_and_24_hz_without_frame_quantization() {
+        for fps in [60,120,240,1000] {
+            let mut next = [0.0f32;2];
+            let mut delivered = [0usize;2];
+            for frame in 0..fps*5 {
+                let now = frame as f32/fps as f32;
+                for (i,hz) in [32.0,24.0].iter().enumerate() {
+                    if ocean_lod_deadline(&mut next[i],now,*hz) { delivered[i]+=1; }
+                }
+            }
+            for (i,hz) in [32.0,24.0].iter().enumerate() {
+                assert!((delivered[i] as f32/5.0 - hz).abs() < 1.0,
+                    "{fps} fps mesh region {i}: expected {hz}, delivered {:?}",delivered);
+            }
+        }
+    }
+
+    #[test]
+    fn mesh_lod_toggle_is_not_a_fft_cascade_scheduler() {
+        assert!(!OceanSettings::default().dynamic_update_rates);
+        assert_eq!(OCEAN_FFT_PASSES,OCEAN_PASSES_PER_CASCADE * OCEAN_CASCADES);
+    }
+
+    #[test]
     fn handles_zero_rate_and_clamps_overdue_phases() {
         assert_eq!(ocean_phases_due(0.0, 0.0, 0.0, 15), 15);
         assert_eq!(ocean_phases_due(10.0, 0.0, 1.0/60.0, 16), 16);
         assert_eq!(ocean_phases_due(-1.0, 0.0, 1.0/60.0, 16), 1);
+    }
+}
+
+#[cfg(test)]
+mod ocean_fft_heading_tests {
+    use super::*;
+    use futures_lite::future::block_on;
+
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exp = ((bits >> 10) & 0x1f) as i32;
+        let frac = (bits & 0x3ff) as f32;
+        if exp == 0 { sign * frac * 2f32.powi(-24) } else { sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15) }
+    }
+
+    fn angle_difference(a: f32, b: f32) -> f32 {
+        (a - b + 540.0).rem_euclid(360.0) - 180.0
+    }
+
+    /// Measures which way the FFT crests (and so the Jacobian whitecap foam
+    /// laid down on them) really travel, in renderer XZ, and requires that to
+    /// follow the swell `bsp.wgsl` animates -- the dominant promoted pool's
+    /// heading when there is one, not the global `r_oceanAuthoring` heading.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn fft_travel_follows_dominant_pool_swell_heading() {
+        use crate::ocean::appearance::{wave_heuristic, PromotedOcean};
+        block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), ..Default::default()
+            }).await.unwrap();
+            let n = 256u32;
+            let albedo = device.create_texture(&wgpu::TextureDescriptor {
+                label: None, size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let albedo_view = albedo.create_view(&Default::default());
+            let layout = OceanGpu::create_render_layout(&device);
+            // (global cvar heading, promoted pool swell heading)
+            for (cvar, pool_swell) in [(0.0f32, None), (90.0, None), (180.0, None), (0.0, Some(180.0f32)), (0.0, Some(90.0))] {
+                let expected = pool_swell.unwrap_or(cvar);
+                let mut settings = OceanSettings { map_size: n, updates_per_second: 0.0, ..Default::default() };
+                settings.authored.direction = cvar;
+                settings.wind.speed = 0.0;
+                let mut ocean = OceanGpu::new(&device, &queue, &layout, &albedo_view, settings);
+                ocean.set_enabled(&queue, true);
+                if let Some(swell) = pool_swell {
+                    let pool = PromotedOcean { index: 0, name: "pool".into(),
+                        surface: OceanSurface { plane_height: 100.0, minimum: [0.0; 2], maximum: [4096.0; 2] },
+                        heuristic: wave_heuristic(0.0, None), color: [0.1, 0.2, 0.3], roughness: None,
+                        swell_direction: Some(swell) };
+                    ocean.set_surfaces(&queue, &[pool.surface]);
+                    ocean.set_promoted_surfaces(&device, &queue, &[pool], &[]);
+                }
+                let read = |ocean: &mut OceanGpu, layer: u32| -> Vec<f32> {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    ocean.encode_frame(&queue, &mut encoder, 0.3);
+                    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None, size: u64::from(n * n * 8),
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+                    encoder.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo { texture: &ocean._displacement, mip_level: 0,
+                            origin: wgpu::Origin3d { x: 0, y: 0, z: layer }, aspect: wgpu::TextureAspect::All },
+                        wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0, bytes_per_row: Some(n * 8), rows_per_image: Some(n) } },
+                        wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 });
+                    let submission = queue.submit([encoder.finish()]);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+                    device.poll(wgpu::PollType::Wait { submission_index: Some(submission),
+                        timeout: Some(std::time::Duration::from_secs(60)) }).unwrap();
+                    rx.recv().unwrap().unwrap();
+                    let data = buffer.slice(..).get_mapped_range().expect("range");
+                    // Texel .y is the vertical displacement.
+                    (0..(n * n) as usize).map(|i| f16_to_f32(u16::from_le_bytes([data[i * 8 + 2], data[i * 8 + 3]]))).collect()
+                };
+                // Settle: the first frames also regenerate the spectrum.
+                for _ in 0..6 { read(&mut ocean, 0); }
+                // Cascade 1 carries a +15 degree offset from the heading.
+                let layer = 1;
+                let before = read(&mut ocean, layer);
+                let after = read(&mut ocean, layer);
+                let (mut best, mut shift) = (f64::MAX, (0i32, 0i32));
+                for sy in -16i32..=16 { for sx in -16i32..=16 {
+                    let mut sse = 0.0f64;
+                    for y in (0..n as i32).step_by(4) { for x in (0..n as i32).step_by(4) {
+                        let px = (x - sx).rem_euclid(n as i32) as usize;
+                        let py = (y - sy).rem_euclid(n as i32) as usize;
+                        let d = f64::from(after[y as usize * n as usize + x as usize] - before[py * n as usize + px]);
+                        sse += d * d;
+                    }}
+                    if sse < best { best = sse; shift = (sx, sy); }
+                }}
+                // FFT grid is (x, -z): world travel = (sx, -sy); heading a = (cos a, -sin a).
+                let travel = (-(-shift.1 as f32)).atan2(shift.0 as f32).to_degrees();
+                let error = angle_difference(travel, expected + 15.0);
+                println!("cvar {cvar:>5} pool {pool_swell:?}: grid shift {shift:?} -> travel {travel:>7.1} deg, expected {:>6.1} (error {error:>6.1})", expected + 15.0);
+                assert!(error.abs() < 35.0, "FFT crests travel {travel} deg, swell heading is {expected}");
+            }
+        });
     }
 }

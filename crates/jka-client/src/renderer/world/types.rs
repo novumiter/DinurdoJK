@@ -268,6 +268,8 @@ impl WorldPipelineCompilePlan {
 #[derive(Clone)]
 pub(in crate::renderer) struct WorldPipelineVariant {
     pub(in crate::renderer) pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    /// Compiled asynchronously only on first use of r_oceanSkyExtend 2.
+    pub(in crate::renderer) ocean_far_pipeline: Option<wgpu::RenderPipeline>,
     /// OpenJK-style projected-light redraw. The normal world material pipelines
     /// compile with Legacy dlights disabled; only touched BSP triangles enter
     /// these additive depth-equal pipelines.
@@ -602,6 +604,10 @@ pub(in crate::renderer) struct WorldGpu {
     /// must use FULL geometry rather than reintroducing whole-map sky unions.
     pub(in crate::renderer) full_all_batches: Vec<usize>,
     pub(in crate::renderer) last_cluster: Option<Option<usize>>,
+    /// (camera cluster, bit per ocean slot whose original water faces that
+    /// cluster can see). Gates the sky-extension ocean; see
+    /// `Renderer::refresh_ocean_extension_gate`.
+    pub(in crate::renderer) ocean_gate_cache: Option<(usize, u8)>,
     pub(in crate::renderer) textures: Vec<GpuImage>,
     pub(in crate::renderer) footprint_mark_textures: [Option<usize>; 2],
     pub(in crate::renderer) lightmaps: Vec<GpuImage>,

@@ -715,6 +715,12 @@ impl GameSession {
         let followed_started = Instant::now();
         let intermission = sample.policy.pm_type == crate::cgame::PM_INTERMISSION;
         if let Some(entity) = followed_entity
+            // TaystJK CG_AddPacketEntities synthesizes predictedPlayerEntity,
+            // then dispatches it via CG_AddCEntity. ET_INVISIBLE (notably the
+            // PM_SPECTATOR used by NPC-control mods) does NOT invoke CG_Player.
+            // Keep the entity for audio/state bookkeeping above; only suppress
+            // its visual branch, including sprites, sabers and view weapons.
+            .filter(crate::cgame::predicted_player_dispatches_cg_player)
             .filter(|entity| !crate::cgame::suppressed_during_intermission(intermission, entity))
         {
             let client_num = entity
@@ -928,7 +934,13 @@ impl GameSession {
                 .footstep(&impact, stages, self.local && impact.entity < 32);
         }
         // FX_AddScheduledEffects + FX_Add after every CGame submission.
+        self.weapon_fx.set_fx_light_promotion_level(self.promote_fx_lights);
         let mut fx_frame = self.weapon_fx.end_frame();
+        // CG_EntityEffects runs once per presented entity on every cgame frame,
+        // irrespective of the optional EFX promotion setting.
+        fx_frame.lights.extend(self.presented_entities.iter().filter_map(
+            crate::cgame::weapon_fx::WeaponFx::constant_entity_light,
+        ));
         fx_frame.draws.extend(self.player_presenter.physics_glass_draws(target_server_time));
         if self.screen_shake_level >= 1 {
             let view = scene::jka_position(sample.eye_position);
@@ -942,11 +954,35 @@ impl GameSession {
                 );
             }
         }
-        if self.promote_fx_lights && !fx_frame.auto_light_candidates.is_empty() {
+        let projectile_emitters = self.weapon_fx.take_projectile_light_requests();
+        if self.promote_fx_lights == 2 {
+            // Effects' animated primitive draws can expire between fxFPS ticks.
+            // The live missile position is sampled per presentation frame.
+            // Resolve all material evidence using the map-worker's catalog.
+            let mut anchored = Vec::new();
+            for (effect, origin, _direction) in projectile_emitters {
+                if let Some(candidate) = self.fx_light_promoter.projectile_candidate(&effect, origin) {
+                    anchored.push(candidate);
+                }
+            }
+            // A live projectile emitter supersedes nearby trail samples from
+            // the same shader. The existing spatial merge remains unchanged.
+            fx_frame.auto_light_candidates.retain(|trail| {
+                !anchored.iter().any(|current| {
+                    current.shader.eq_ignore_ascii_case(&trail.shader)
+                        && current.kind == trail.kind
+                        && current.origin.iter().zip(trail.origin).map(|(a, b)| (*a - b) * (*a - b)).sum::<f32>() < 120.0 * 120.0
+                })
+            });
+            fx_frame.auto_light_candidates.extend(anchored);
+        }
+        if self.promote_fx_lights > 0 {
             let promoter = &mut self.fx_light_promoter;
             let presenter = &mut self.entity_presenter;
             let mut resolve = |shader: &str| presenter.fx_material_stages(shader);
-            let promoted = promoter.promote(&fx_frame.auto_light_candidates, &mut resolve);
+            let promoted = promoter.promote(
+                &fx_frame.auto_light_candidates, &mut resolve, target_server_time, self.promote_fx_lights,
+            );
             fx_frame.lights.extend(promoted);
         }
         self.gpu_commands = fx_frame.gpu_sparks.take();

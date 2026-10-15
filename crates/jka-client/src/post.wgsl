@@ -2852,6 +2852,28 @@ fn apply_volumetric_fog(
     return color * transmittance + max(volume.rgb, vec3<f32>(0.0));
 }
 
+// The rendered ocean is not in the linear-depth prepass, so water seen over no
+// receiver (open sea, an unfloored pool) has no depth and would skip volumetric
+// fog. Intersect its ray with the promoted water plane instead; the CPU only
+// supplies the plane while the ocean is rendered there.
+fn apply_ocean_void_fog(color: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let extent = settings.underwater.w;
+    if (settings.scene.y <= 0.5 || extent <= 0.0) {
+        return color;
+    }
+    let ray = world_ray(uv);
+    let eye = settings.camera_pos_time.xyz;
+    if (ray.y > -1.0e-4 || eye.y <= settings.underwater.z) {
+        return color;
+    }
+    let distance_to_plane = (settings.underwater.z - eye.y) / ray.y;
+    let hit = eye + ray * distance_to_plane;
+    if (max(abs(hit.x - settings.cloud_foreground.y), abs(hit.z - settings.cloud_foreground.z)) > extent) {
+        return color;
+    }
+    return apply_volumetric_fog(color, uv, min(distance_to_plane, 999990.0));
+}
+
 fn precipitation_haze_field(uv: vec2<f32>) -> vec2<f32> {
     let mask_dims = textureDimensions(rain_haze_mask, 0);
     if (mask_dims.x == 0u || mask_dims.y == 0u) {
@@ -3042,6 +3064,8 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         if (settings.legacy_weather.w > 0.5) {
             color = apply_precipitation_haze(color, input.uv, world, centre_depth);
         }
+    } else {
+        color = apply_ocean_void_fog(color, input.uv);
     }
 
     // The transfer buffer is depth-clipped, so the same composite now handles
@@ -3111,6 +3135,8 @@ fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
         if (settings.legacy_weather.w > 0.5) {
             color = apply_precipitation_haze(color, input.uv, world, centre_depth);
         }
+    } else {
+        color = apply_ocean_void_fog(color, input.uv);
     }
     color = apply_legacy_weather_air(color, input.uv, centre_depth);
 
@@ -3195,6 +3221,8 @@ fn fs_main_taa(input: VertexOut) -> TaaFragmentOut {
         if (settings.legacy_weather.w > 0.5) {
             color = apply_precipitation_haze(color, input.uv, world, centre_depth);
         }
+    } else {
+        color = apply_ocean_void_fog(color, input.uv);
     }
 
     // The transfer buffer is depth-clipped, so the same composite now handles

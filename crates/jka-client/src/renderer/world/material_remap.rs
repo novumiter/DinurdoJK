@@ -658,6 +658,7 @@ impl Renderer {
         world.animated_batches = None;
         world.active_selection_key = None;
         world.last_cluster = None;
+        world.ocean_gate_cache = None;
         world.coarse_all_batches = (0..world.coarse_batches.len()).collect();
         world.full_all_batches = if world.sky_portal.is_some() { (0..world.full_batches.len()).collect() } else { Vec::new() };
         world.coarse_visible_batches_by_cluster = world.visibility.as_ref().map(|vis|

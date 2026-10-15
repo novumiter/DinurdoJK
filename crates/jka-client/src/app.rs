@@ -800,7 +800,7 @@ pub struct App {
     promoted_oceans: Vec<crate::ocean::appearance::PromotedOcean>,
     promoted_ocean_overrides: Vec<(usize, crate::ocean::OceanSettings)>,
     /// Independent session-only toggle for sky-wall water clipmap continuation.
-    ocean_sky_extend: bool,
+    ocean_sky_extend: u8,
     /// Session-only Phase 2.5 overlay: 0 off, 1 treatment, 2 boundaries,
     /// 3 bathymetry cells.
     coastal_debug_mode: u8,

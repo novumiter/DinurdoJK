@@ -123,6 +123,20 @@ var<private> g_eye_depth: f32;
 // outline hollow (see capture_sample).
 const MASK_DRY_DEPTH: f32 = 128.0;
 
+// Depth of the water entry point that sets the in-scattered light colour. From
+// above the surface the nearest entry governs: the 128-unit hollow fallback span
+// starts deeper by construction and must not override a ray that already met the
+// wet surface (that made fog darker only inside the original BSP footprint).
+// A submerged eye keeps the deepest entry, as before.
+fn note_eye_depth(top: f32, delta_y: f32, span_x: f32, first: bool) {
+    let depth = max(top - (optics.eye.y + delta_y * span_x), 0.0);
+    if (optics.eye.y > top) {
+        g_eye_depth = select(min(g_eye_depth, depth), depth, first);
+    } else {
+        g_eye_depth = max(g_eye_depth, depth);
+    }
+}
+
 fn add_span(span: vec2<f32>, top: f32, delta_y: f32) {
     if (span.y <= span.x) {
         return;
@@ -136,10 +150,11 @@ fn add_span(span: vec2<f32>, top: f32, delta_y: f32) {
             min(g_spans[OCEAN_MAX_SPANS - 1u].x, span.x),
             max(g_spans[OCEAN_MAX_SPANS - 1u].y, span.y),
         );
-        g_eye_depth = max(g_eye_depth, max(top - (optics.eye.y + delta_y * span.x), 0.0));
+        note_eye_depth(top, delta_y, span.x, false);
         return;
     }
     // Insertion sort allows exact union of overlapping bounds (no double fog).
+    let first_span = g_span_count == 0u;
     var j = g_span_count;
     loop {
         if (j == 0u) { break; }
@@ -149,7 +164,7 @@ fn add_span(span: vec2<f32>, top: f32, delta_y: f32) {
     }
     g_spans[j] = span;
     g_span_count += 1u;
-    g_eye_depth = max(g_eye_depth, max(top - (optics.eye.y + delta_y * span.x), 0.0));
+    note_eye_depth(top, delta_y, span.x, first_span);
 }
 
 // Part of `span` where the ray's xz line is inside one outline triangle (grown
@@ -364,7 +379,7 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
     if (depth > 0.0) {
         add_sky_ocean_spans(delta);
     }
-    let eye_depth = g_eye_depth;
+    var eye_depth = g_eye_depth;
     var water_fraction = 0.0;
     var end = 0.0;
     for (var i = 0u; i < g_span_count; i += 1u) {
@@ -414,7 +429,13 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
     // must not leave a dark void-coloured border there.
     if (depth <= 0.0 && delta.y < 0.0) {
         for (var i = 0u; i < u32(optics.sky_info.x); i += 1u) {
-            if (optics.eye.y > optics.sky_regions[i].plane.x) { water_fraction = 1.0; }
+            if (optics.eye.y > optics.sky_regions[i].plane.x) {
+                water_fraction = 1.0;
+                // The unbounded column starts at the surface. Do not inherit the
+                // original box's 128-unit hollow span depth: that darkened only the
+                // no-receiver pixels inside the BSP footprint (red fog -> black).
+                eye_depth = 0.0;
+            }
         }
     }
     if (water_fraction > 0.0) {

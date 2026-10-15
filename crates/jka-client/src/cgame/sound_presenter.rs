@@ -1160,6 +1160,7 @@ impl SoundPresenter {
                     }
                     resolved.push((request, found));
                 }
+                Err(error) if error == "NPC_SOUND_UNREGISTERED" => {} // upstream sound handle 0 is silent
                 Err(error) => self.warn_once(&request.qpath, &error),
             }
         }
@@ -1187,10 +1188,11 @@ impl SoundPresenter {
         Some(sound.result)
     }
 
-    /// OpenJK CG_CustomSound/CG_LoadCISounds lookup order for protocol sounds
-    /// whose CS_SOUNDS entry begins with '*': the entity's model/skin selects
-    /// models/players/<model>/sounds*.cfg, then the named voice resolves under
-    /// sound/chars/<soundpath>/misc with the male/female generic bank as fallback.
+    /// TaystJK has two independent custom-sound registration paths:
+    /// - players: CG_LoadCISounds (model sounds.cfg + generic voice fallback)
+    /// - NPCs: CG_HandleNPCSounds (snapshot csSounds_* -> CS_SOUNDS `*$dir`),
+    ///   with *no* fallback if that NPC's bank was never registered.
+    /// See codemp/cgame/cg_servercmds.c and cg_players.c in TaystJK.
     fn custom_sound_candidates(
         &mut self,
         game: &ClientGameState,
@@ -1198,28 +1200,32 @@ impl SoundPresenter {
         entity: u16,
         custom_name: &str,
     ) -> Result<Vec<String>, String> {
-        let info = game
-            .entity_state(entity)
-            .and_then(|state| {
-                if state.field_i32("eType").unwrap_or(0) == ET_NPC || entity >= MAX_CLIENTS {
-                    game.npc_client_info(state).ok()
-                } else {
-                    game.client_info(usize::from(entity), siege_classes)
-                }
-            })
-            .or_else(|| game.client_info(usize::from(entity), siege_classes))
-            .ok_or_else(|| format!("custom sound {custom_name}: no client/NPC info for entity {entity}"))?;
-
-        let profile = self.custom_sound_profile(&info)?;
         let without_marker = custom_name.strip_prefix('*').unwrap_or(custom_name);
         let stem = without_marker
             .strip_suffix(".wav")
             .or_else(|| without_marker.strip_suffix(".mp3"))
             .unwrap_or(without_marker);
 
-        // TaystJK CG_CustomSound treats the jaPRO VGS table specially: VGS
-        // tokens always resolve from the fixed generic male/female banks rather
-        // than the speaking player's authored model sound directory.
+        // CG_CustomSound uses cg_entities[n].npcClient for NPC entity slots,
+        // never cgs.clientinfo[n]. A missing NPC state/bank is silent; treating
+        // it as a player is how a Gonk picked up Kyle's generic pain sounds.
+        let state = game.entity_state(entity);
+        let is_npc = entity >= MAX_CLIENTS
+            || state.is_some_and(|state| state.field_i32("eType") == Some(ET_NPC));
+        if is_npc && !crate::vgs::is_vgs_sound(custom_name) {
+            return Ok(state.map_or_else(Vec::new, |state| npc_sound_candidates(game, state, stem)));
+        }
+
+        let info = if is_npc {
+            state.and_then(|state| game.npc_client_info(state).ok())
+        } else {
+            game.client_info(usize::from(entity), siege_classes)
+        }
+        .ok_or_else(|| format!("custom sound {custom_name}: no client/NPC info for entity {entity}"))?;
+
+        let profile = self.custom_sound_profile(&info)?;
+        // TaystJK uses a global gender-specific VGS sound table, not an NPC
+        // sound bank or a player model voice directory.
         if crate::vgs::is_vgs_sound(custom_name) {
             let generic = if profile.female { "mp_generic_female" } else { "mp_generic_male" };
             return Ok(vec![format!("sound/chars/{generic}/misc/{stem}")]);
@@ -1231,8 +1237,8 @@ impl SoundPresenter {
         } else {
             candidates.push(format!("sound/chars/{}/misc/{stem}", info.model_name));
         }
-        // Match CG_LoadCISounds' gender fallback if the authored model sound is
-        // absent. SoundAssets.register tries both WAV and MP3 for extensionless paths.
+        // TaystJK CG_LoadCISounds falls back to a generic male/female voice
+        // ONLY for player-model registrations, not CG_HandleNPCSounds.
         let generic = if profile.female { "mp_generic_female" } else { "mp_generic_male" };
         candidates.push(format!("sound/chars/{generic}/misc/{stem}"));
         Ok(candidates)
@@ -1246,6 +1252,11 @@ impl SoundPresenter {
         custom_name: &str,
     ) -> Result<(String, Arc<crate::audio::RegisteredSound>), String> {
         let candidates = self.custom_sound_candidates(game, siege_classes, entity, custom_name)?;
+        if candidates.is_empty() {
+            // TaystJK CG_CustomSound returns sound handle 0 for an unregistered
+            // NPC bank; CG_PainEvent then simply has nothing to play.
+            return Err("NPC_SOUND_UNREGISTERED".to_owned());
+        }
         let mut last_error = String::new();
         for qpath in candidates {
             match self.assets.register(&qpath) {
@@ -1305,6 +1316,67 @@ impl SoundPresenter {
         Ok(profile)
     }
 
+}
+
+
+// Exact CG_CustomSound lookup family priority (cg_players.c). Basic sounds
+// precede duel sounds, which precede NPC combat/extra/jedi sounds. The latter
+// are only registered when the corresponding NPC snapshot csSounds_* is set.
+// The duel bank is separate from the NPC's four sound banks; NPCs do not get
+// one via CG_HandleNPCSounds, so overlapping *anger/*taunt1 names stay silent.
+fn npc_sound_bank_field(stem: &str) -> Option<&'static str> {
+    const BASIC: &[&str] = &[
+        "death1", "death2", "death3", "jump1", "pain25", "pain50", "pain75", "pain100",
+        "falling1", "choke1", "choke2", "choke3", "gasp", "land1", "taunt", "roll",
+    ];
+    const DUEL: &[&str] = &[
+        "anger1", "anger2", "anger3", "victory1", "victory2", "victory3",
+        "taunt1", "taunt2", "taunt3", "deflect1", "deflect2", "deflect3",
+        "gloat1", "gloat2", "gloat3",
+    ];
+    const COMBAT: &[&str] = &[
+        "anger1", "anger2", "anger3", "victory1", "victory2", "victory3",
+        "confuse1", "confuse2", "confuse3", "pushed1", "pushed2", "pushed3",
+        "choke1", "choke2", "choke3", "ffwarn", "ffturn",
+    ];
+    const EXTRA: &[&str] = &[
+        "chase1", "chase2", "chase3", "cover1", "cover2", "cover3", "cover4", "cover5",
+        "detected1", "detected2", "detected3", "detected4", "detected5", "lost1",
+        "outflank1", "outflank2", "escaping1", "escaping2", "escaping3",
+        "giveup1", "giveup2", "giveup3", "giveup4", "look1", "look2",
+        "sight1", "sight2", "sight3", "sound1", "sound2", "sound3",
+        "suspicious1", "suspicious2", "suspicious3", "suspicious4", "suspicious5",
+    ];
+    const JEDI: &[&str] = &[
+        "combat1", "combat2", "combat3", "jdetected1", "jdetected2", "jdetected3",
+        "taunt1", "taunt2", "taunt3", "jchase1", "jchase2", "jchase3",
+        "jlost1", "jlost2", "jlost3", "deflect1", "deflect2", "deflect3",
+        "gloat1", "gloat2", "gloat3", "pushfail",
+    ];
+    if BASIC.contains(&stem) { Some("csSounds_Std") }
+    else if DUEL.contains(&stem) { None } // NPC duelSounds[] is not registered by CG_HandleNPCSounds
+    else if COMBAT.contains(&stem) { Some("csSounds_Combat") }
+    else if EXTRA.contains(&stem) { Some("csSounds_Extra") }
+    else if JEDI.contains(&stem) { Some("csSounds_Jedi") }
+    else { None } // CG_CustomSound returns zero for unknown custom sounds
+}
+
+/// Pure lookup equivalent of TaystJK CG_HandleNPCSounds + CG_CustomSound.
+/// A zero bank or absent configstring intentionally produces no candidates;
+/// there is no model/sounds.cfg or generic-male fallback for NPCs.
+fn npc_sound_candidates(
+    game: &ClientGameState,
+    state: &jka_protocol::gamestate::EntityState,
+    stem: &str,
+) -> Vec<String> {
+    let Some(field) = npc_sound_bank_field(stem) else { return Vec::new() };
+    let bank_index = state.field_i32(field).unwrap_or(0);
+    if bank_index <= 0 { return Vec::new() }
+    let Some(config) = game.sound_qpath(bank_index) else { return Vec::new() };
+    let Some(directory) = config.strip_prefix("*$").filter(|dir| !dir.is_empty()) else {
+        return Vec::new();
+    };
+    vec![format!("sound/chars/{directory}/misc/{stem}")]
 }
 
 fn load_ambient_sets(assets: &mut SoundAssets) -> AmbientSets {
@@ -2399,6 +2471,55 @@ mod tests {
             server_time: 1_000,
             state,
         }
+    }
+
+    #[test]
+    fn npc_pain_requires_snapshot_registered_bank_not_kyle_fallback() {
+        let mut game = ClientGameState::new();
+        let mut gonk = EntityState { number: 90, fields: [0; ENTITY_FIELDS.len()] };
+        let field = |name| ENTITY_FIELDS.iter().position(|(field, _)| *field == name).unwrap();
+        gonk.fields[field("eType")] = ET_NPC as u32;
+        assert_eq!(npc_sound_bank_field("pain25"), Some("csSounds_Std"));
+        // TaystJK CG_HandleNPCSounds: no standard bank means sounds[] = 0.
+        assert!(npc_sound_candidates(&game, &gonk, "pain25").is_empty());
+        assert!(npc_sound_candidates(&game, &gonk, "death1").is_empty());
+
+        // Even if a sound bank is assigned, it comes from the CS_SOUNDS
+        // `*$` directory, NOT from models/players/gonk/sounds.cfg.
+        gonk.fields[field("csSounds_Std")] = 5;
+        game.configstrings.insert(super::super::CS_SOUNDS + 5, b"*$gnkvoice".to_vec());
+        assert_eq!(npc_sound_candidates(&game, &gonk, "pain50"),
+            vec!["sound/chars/gnkvoice/misc/pain50"]);
+        // Unregistered voices cannot fall back to a human bank.
+        game.configstrings.insert(super::super::CS_SOUNDS + 5, b"sound/chars/kyle/misc/pain50".to_vec());
+        assert!(npc_sound_candidates(&game, &gonk, "pain50").is_empty());
+    }
+
+    #[test]
+    fn npc_custom_sound_families_respect_taystjk_bank_separation() {
+        let mut game = ClientGameState::new();
+        let mut npc = EntityState { number: 80, fields: [0; ENTITY_FIELDS.len()] };
+        let field = |name| ENTITY_FIELDS.iter().position(|(field, _)| *field == name).unwrap();
+        npc.fields[field("eType")] = ET_NPC as u32;
+        for (bank, index, dir) in [
+            ("csSounds_Combat", 1, "rebel"),
+            ("csSounds_Extra", 2, "stormtrooper"),
+            ("csSounds_Jedi", 3, "jedi"),
+        ] {
+            npc.fields[field(bank)] = index as u32;
+            game.configstrings.insert(super::super::CS_SOUNDS + index, format!("*${dir}").into_bytes());
+        }
+        assert_eq!(npc_sound_candidates(&game, &npc, "pushed2"), vec!["sound/chars/rebel/misc/pushed2"]);
+        assert_eq!(npc_sound_candidates(&game, &npc, "cover5"), vec!["sound/chars/stormtrooper/misc/cover5"]);
+        assert_eq!(npc_sound_candidates(&game, &npc, "combat3"), vec!["sound/chars/jedi/misc/combat3"]);
+        // TaystJK CG_CustomSound looks at basic sounds before combat, even
+        // though *choke1 also appears in its combat sound table.
+        assert!(npc_sound_candidates(&game, &npc, "choke1").is_empty());
+        // Duel sounds precede NPC combat/Jedi tables in CG_CustomSound; the
+        // server's four NPC banks do not populate duelSounds[].
+        assert!(npc_sound_candidates(&game, &npc, "anger1").is_empty());
+        assert!(npc_sound_candidates(&game, &npc, "gloat1").is_empty());
+        assert!(npc_sound_candidates(&game, &npc, "unknown").is_empty());
     }
 
     #[test]

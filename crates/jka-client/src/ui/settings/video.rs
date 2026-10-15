@@ -409,7 +409,7 @@ pub struct VideoSettings {
     /// Diagnostic receiver view: neutral dark BSP surfaces plus runtime dynamic-light contribution only.
     pub dynamic_light_debug: bool,
     /// Infer transient lights from emissive legacy EFX that omit Light{} stages.
-    pub promote_fx_lights: bool,
+    pub promote_fx_lights: u8,
     /// Master for BSP shader-driven area-light promotion. q3map_surfacelight is
     /// intentionally separate and remains controlled by emissive_area_lights.
     pub promote_shader_lights: bool,
@@ -829,7 +829,7 @@ impl Default for VideoSettings {
             entity_ambient_lighting: EntityAmbientLightingMode::Off,
             dynamic_lights: DynamicLightsMode::Off,
             dynamic_light_debug: false,
-            promote_fx_lights: false,
+            promote_fx_lights: 0,
             promote_shader_lights: false,
             promote_shader_glow: true,
             promote_shader_additive: true,

@@ -971,14 +971,14 @@ impl App {
                 );
             }
             ui::VIDEO_ROW_PROMOTE_FX_LIGHTS => {
-                self.video.promote_fx_lights = !self.video.promote_fx_lights;
+                self.video.promote_fx_lights = (i32::from(self.video.promote_fx_lights) + direction).rem_euclid(3) as u8;
                 if let Some(session) = self.game_session.as_mut() {
                     session.promote_fx_lights = self.video.promote_fx_lights;
                 }
                 self.mark_config_dirty();
                 self.console_status = format!(
                     "FX LIGHT PROMOTION: {}",
-                    if self.video.promote_fx_lights { "ON" } else { "OFF" }
+                    match self.video.promote_fx_lights { 0 => "OFF", 1 => "CONSERVATIVE", _ => "AGGRESSIVE" }
                 );
             }
             ui::VIDEO_ROW_PROMOTE_SHADER_LIGHTS => {

@@ -413,6 +413,7 @@ impl Bindings {
 
 fn apply_cfg(bindings: &mut Bindings, text: &str) -> bool {
     let mut saw_bindings = false;
+    let text = crate::config::strip_cfg_comments(text);
     for raw in text.lines() {
         let words = split_command_words(raw.trim());
         if words.is_empty() {
@@ -671,6 +672,26 @@ fn escape_cfg(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_bind_loader_ignores_inline_and_block_comments() {
+        let mut bindings = Bindings::default();
+        let text = concat!(
+            "// Bindings\n",
+            "unbindall // reset\n",
+            "bind MOUSE1 \"+attack\" // attack\n",
+            "/* ignored\n",
+            "bind MOUSE1 \"+altattack\" */\n",
+            "bind MOUSE2 \"say http://example.org/\"// keep quoted URL\n",
+            "unbindspecall // spectator only\n",
+            "bindspec MOUSE3 \"toggle cg_thirdPerson 0 1 2\" // camera\n",
+        );
+        assert!(apply_cfg(&mut bindings, text));
+        assert_eq!(bindings.get(BindKey::Mouse(1)), Some("+attack"));
+        assert_eq!(bindings.get(BindKey::Mouse(2)), Some("say http://example.org/"));
+        assert_eq!(bindings.get_spectator(BindKey::Mouse(3)),
+            Some("toggle cg_thirdPerson 0 1 2"));
+    }
 
     #[test]
     fn quoted_bind_keeps_multiword_command() {

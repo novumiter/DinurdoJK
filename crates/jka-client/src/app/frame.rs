@@ -5,6 +5,16 @@ use crate::app::{
     RenderSnapshot, SessionPhase, SpectatorHighlight, SpectatorHighlightTeam, ViewLatchMode,
 };
 
+/// Build the menu's presentation view without mutating the camera that owns
+/// the user's archived gameplay FOV. This also keeps preview crossfades and
+/// live menu frames on the exact same projection when a zoom is held or a
+/// gameplay camera option changes in the settings UI.
+fn frontend_scene_camera(mut camera: crate::camera::Camera) -> crate::camera::Camera {
+    camera.set_presentation_fov(super::constants::FRONTEND_SCENE_FOV);
+    camera.shake = Default::default();
+    camera
+}
+
 impl App {
     pub(in crate::app) fn subframe_input_view_rotation(&self) -> Option<[f32; 2]> {
         if !self.live_remote_view_forced() {
@@ -128,7 +138,8 @@ impl App {
         // gameplay view rotation (including the render-thread subframe latch).
         let isolated_preview = self.profile_preview_active
             || (self.front_end && self.frontend_page == FrontendPage::AssetViewer);
-        let input_view_rotation = if isolated_preview {
+        let input_view_rotation = if isolated_preview || self.front_end {
+            // Menu cameras never consume live mouse/third-person late-latch data.
             None
         } else {
             self.subframe_input_view_rotation()
@@ -208,6 +219,8 @@ impl App {
             }),
             camera: if isolated_preview {
                 self.asset_preview_camera()
+            } else if self.front_end {
+                frontend_scene_camera(self.camera)
             } else {
                 let mut camera = self.camera;
                 camera.set_presentation_fov(self.japro_effective_fov(Instant::now()));
@@ -280,7 +293,7 @@ impl App {
             movement_hud: self.current_movement_hud_state(),
             player_names: self.world_player_names(),
             jump_shade: self.current_jump_shade(),
-            camera_shake: if isolated_preview {
+            camera_shake: if isolated_preview || self.front_end {
                 None
             } else {
                 self.game_session
@@ -488,5 +501,49 @@ impl App {
         self.game_session.as_ref().is_some_and(|session| {
             !session.live && session.phase == SessionPhase::Playing && session.demo_index.is_some()
         })
+    }
+}
+
+#[cfg(test)]
+mod frontend_scene_camera_tests {
+    use super::frontend_scene_camera;
+    use crate::camera::{Camera, CameraShakeOffset};
+
+    #[test]
+    fn frontend_projection_ignores_gameplay_fov_without_overwriting_it() {
+        let reference = frontend_scene_camera(Camera::new_with_fov(
+            [100.0, 35.0, -50.0], 0.2, 90.0,
+        ));
+        for gameplay_fov in [1.0, 50.0, 90.0, 120.0, 140.0] {
+            let gameplay = Camera::new_with_fov([100.0, 35.0, -50.0], 0.2, gameplay_fov);
+            let menu = frontend_scene_camera(gameplay);
+            assert_eq!(gameplay.cg_fov(), gameplay_fov, "gameplay FOV must survive");
+            assert_eq!(menu.cg_fov(), super::super::constants::FRONTEND_SCENE_FOV);
+            for (width, height) in [(1280, 720), (2560, 1440), (1920, 1200)] {
+                let matrix = menu.view_projection(width, height).to_cols_array();
+                assert_eq!(
+                    matrix,
+                    reference.view_projection(width, height).to_cols_array(),
+                    "FOV must not change menu framing",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frontend_camera_preserves_cinematic_pose_but_discards_game_shake() {
+        let mut gameplay = Camera::new_with_fov([10.0, 20.0, 30.0], 1.25, 118.0);
+        gameplay.pitch = -0.12;
+        gameplay.shake = CameraShakeOffset {
+            position: glam::Vec3::new(1.0, 2.0, 3.0),
+            yaw: 0.7,
+            pitch: 0.2,
+        };
+        let menu = frontend_scene_camera(gameplay);
+        assert_eq!(menu.position, gameplay.position);
+        assert_eq!(menu.yaw, gameplay.yaw);
+        assert_eq!(menu.pitch, gameplay.pitch);
+        assert_eq!(menu.shake, CameraShakeOffset::default());
+        assert_eq!(gameplay.shake.position, glam::Vec3::new(1.0, 2.0, 3.0));
     }
 }

@@ -365,8 +365,8 @@ pub(in crate::renderer) struct PostUniform {
     pub(in crate::renderer) weather_look: [f32; 4], // scattered puddle amount, wet grade amount, high-quality water, rain reaching camera
     pub(in crate::renderer) legacy_weather: [f32; 4], // sand haze, spacedust haze, acid-rain haze, 2D-precipitation-haze flag
     pub(in crate::renderer) snow_haze: [f32; 4], // x: 2D snow haze density/cloud count (zero in froxel mode)
-    pub(in crate::renderer) underwater: [f32; 4], // surface Y over a submerged camera (NO_WATER_SURFACE if dry), absorption distance, reserved
-    pub(in crate::renderer) cloud_foreground: [f32; 4], // blade count, reserved x3
+    pub(in crate::renderer) underwater: [f32; 4], // surface Y over a submerged camera (NO_WATER_SURFACE if dry), absorption distance, promoted ocean plane Y for no-receiver fog, its square half-extent (0 = off)
+    pub(in crate::renderer) cloud_foreground: [f32; 4], // blade count, promoted ocean fog centre X/Z, reserved
     // Two vec4 per blade: [ax, ay, bx, by] pixels, then [glow radius px, nearest distance].
     pub(in crate::renderer) cloud_blades: [[f32; 4]; MAX_CLOUD_FOREGROUND_BLADES * 2],
     pub(in crate::renderer) camera_pos_time: [f32; 4],

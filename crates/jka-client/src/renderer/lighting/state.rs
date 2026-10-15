@@ -134,7 +134,9 @@ impl Renderer {
                 crate::fx::system::FxLightKind::Saber => stats.saber_sources += 1,
                 crate::fx::system::FxLightKind::SaberMark => stats.saber_mark_sources += 1,
                 crate::fx::system::FxLightKind::AuthoredEffect
-                | crate::fx::system::FxLightKind::PlayerPowerup => stats.authored_fx_sources += 1,
+                | crate::fx::system::FxLightKind::PlayerPowerup
+                | crate::fx::system::FxLightKind::Missile
+                | crate::fx::system::FxLightKind::EntityConstant => stats.authored_fx_sources += 1,
                 crate::fx::system::FxLightKind::PromotedEffect => stats.promoted_fx_sources += 1,
             }
         }
@@ -174,7 +176,9 @@ impl Renderer {
                     crate::fx::system::FxLightKind::Saber => stats.saber_pairs += 1,
                     crate::fx::system::FxLightKind::SaberMark => stats.saber_mark_pairs += 1,
                     crate::fx::system::FxLightKind::AuthoredEffect
-                    | crate::fx::system::FxLightKind::PlayerPowerup => stats.authored_fx_pairs += 1,
+                    | crate::fx::system::FxLightKind::PlayerPowerup
+                    | crate::fx::system::FxLightKind::Missile
+                    | crate::fx::system::FxLightKind::EntityConstant => stats.authored_fx_pairs += 1,
                     crate::fx::system::FxLightKind::PromotedEffect => stats.promoted_fx_pairs += 1,
                 }
             }

@@ -18,6 +18,14 @@ use crate::cgame::player_presenter::{
     MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER,
 };
 
+/// TaystJK `CG_Player` (`cg_players.c`): `EF_NODRAW` and
+/// `EF2_SHIP_DEATH` suppress *all* Ghoul2 presentation, not just shadows.
+/// Use this for both packet entities and the separately synthesized local
+/// playerState entity: pilots in enclosed fighters are EF_NODRAW.
+pub(super) fn cg_player_hidden_by_server_flags(e_flags: i32, e_flags2: i32) -> bool {
+    (e_flags & EF_NODRAW != 0) || (e_flags2 & EF2_SHIP_DEATH != 0)
+}
+
 impl PlayerPresenter {
     pub fn present_snapshot_players(
         &mut self,
@@ -135,11 +143,21 @@ impl PlayerPresenter {
         // mesh/ragdoll submission, but its weapon state comes only from ircg.
         // NPCs resolve `ci = cent->npcClient` instead of cgs.clientinfo[].
         let intermission = game.rendering_intermission();
-        for entity in entities.iter().filter(|entity| {
+        // TaystJK CG_AddPacketEntities submits each vehicle before its pilot
+        // (cg_ents.c). Stable two-pass ordering also covers the separately
+        // presented local player and prevents a one-frame-old *driver bolt.
+        // Do not reorder non-vehicle players, corpses or unrelated NPCs.
+        let player_entities = entities.iter().filter(|entity| {
             entity.entity_type == ET_PLAYER
                 || entity.entity_type == ET_NPC
                 || entity.entity_type == ET_BODY
-        }) {
+        });
+        let ordered_entities = player_entities.clone()
+            .filter(|entity| entity.entity_type == ET_NPC
+                && entity.state.field_i32("NPC_class").unwrap_or(0) == crate::cgame::CLASS_VEHICLE)
+            .chain(player_entities.filter(|entity| !(entity.entity_type == ET_NPC
+                && entity.state.field_i32("NPC_class").unwrap_or(0) == crate::cgame::CLASS_VEHICLE)));
+        for entity in ordered_entities {
             // Hidden intermission entities remain live centities in TaystJK;
             // only their CG_AddCEntity presentation is skipped. Preserve the
             // cached Ghoul2 owner while withholding its draw/update work.
@@ -173,9 +191,10 @@ impl PlayerPresenter {
             // CG_Player returns before animating or submitting anything for
             // EF_NODRAW (e.g. NPCs a spawner is still holding, parked with
             // anim 0) and EF2_SHIP_DEATH; the centity itself stays alive.
-            if entity.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW != 0
-                || entity.state.field_i32("eFlags2").unwrap_or(0) & EF2_SHIP_DEATH != 0
-            {
+            if cg_player_hidden_by_server_flags(
+                entity.state.field_i32("eFlags").unwrap_or(0),
+                entity.state.field_i32("eFlags2").unwrap_or(0),
+            ) {
                 continue;
             }
             self.look = crate::japro_cg::Appearance::NORMAL;
@@ -351,6 +370,10 @@ impl PlayerPresenter {
         live_ragdolls.extend(self.active_impulse_ragdolls.keys().copied());
         self.entities
             .retain(|entity_num, _| live_entities.contains(entity_num));
+        self.vehicle_animations
+            .retain(|entity_num, _| live_entities.contains(entity_num));
+        self.vehicle_snaps
+            .retain(|entity_num, _| live_entities.contains(entity_num));
         self.jiggle.retain_entities(&live_entities);
         let mut live_dismember_sources = live_entities.clone();
         live_dismember_sources.extend(
@@ -402,6 +425,31 @@ impl PlayerPresenter {
         first_person_saber: bool,
         view: Option<Ghoul2PresentationView>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
+        // The outer session dispatches ET_INVISIBLE away from CG_Player,
+        // matching TaystJK CG_AddCEntity. Keep the presenter itself safe from
+        // accidental direct local-player calls with an invisible entity too.
+        // ET_BODY remains a separate supported corpse presentation path.
+        if entity.entity_type != ET_PLAYER && entity.entity_type != ET_BODY {
+            self.report_player_status(
+                entity.number,
+                format!("submitted=0 reason=eType={}", entity.entity_type),
+            );
+            return Ok(Vec::new());
+        }
+        // The snapshot-player loop already applies TaystJK's CG_Player
+        // EF_NODRAW/EF2_SHIP_DEATH early-return. The local/followed player
+        // comes from playerState instead and bypasses that loop. In the supplied
+        // TIE fighter demo its playerState has eFlags=264 (EF_NODRAW | 8), so
+        // missing this guard rendered a floating pilot despite the server's
+        // explicit no-draw flag. Do not submit effects or advance Ghoul2 while
+        // hidden: CG_Player returns before those operations too.
+        if entity.entity_type != ET_BODY && cg_player_hidden_by_server_flags(
+            entity.state.field_i32("eFlags").unwrap_or(0),
+            entity.state.field_i32("eFlags2").unwrap_or(0),
+        ) {
+            self.report_player_status(entity.number, "submitted=0 reason=EF_NODRAW/EF2_SHIP_DEATH".to_owned());
+            return Ok(Vec::new());
+        }
         let mut entity_alpha = entity_alpha;
         self.look = crate::japro_cg::Appearance::NORMAL;
         if entity.entity_type == ET_BODY {
@@ -509,6 +557,10 @@ impl PlayerPresenter {
         first_person_saber: bool,
         view: Option<Ghoul2PresentationView>,
     ) -> Result<Vec<DynamicModelSurface>, String> {
+        // CG_Player adjusts the rider's lerpOrigin and yaw from the vehicle
+        // before CG_G2PlayerAngles and before any attachment/skin submissions.
+        let attached_entity = self.vehicle_attached_entity(entity, current_time)?;
+        let entity = attached_entity.as_ref().unwrap_or(entity);
         self.poll_asset_completions();
 
         // CG_NewClientInfo/CG_RegisterClientModelname normalize team presentation

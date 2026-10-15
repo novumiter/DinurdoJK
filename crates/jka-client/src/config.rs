@@ -231,6 +231,7 @@ pub fn load_audio_settings(primary: &Path) -> AudioSettings {
         return settings;
     };
 
+    let text = strip_cfg_comments(&text);
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
@@ -323,6 +324,7 @@ pub fn load_client_presentation_settings(
         return settings;
     };
 
+    let text = strip_cfg_comments(&text);
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
@@ -357,6 +359,7 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
     };
 
     let mut context = cvars::VideoLoadState::default();
+    let text = strip_cfg_comments(&text);
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
@@ -424,6 +427,168 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
     settings
 }
 
+/// Group the archived settings by purpose without losing any registered archive
+/// entry. Unknown/new cvars always remain in the Other section.
+const CONFIG_SECTIONS: &[&str] = &[
+    "Controls", "Mouse & Input", "Video & Display", "Textures & Materials",
+    "World & Models", "Lighting & Shadows", "Postprocessing & Color",
+    "Weather & Sky", "Ocean & Water", "Effects & Physics", "HUD & Crosshair",
+    "Gameplay & Spectator", "Sound", "Network & Server Browser",
+    "Console & Interface", "Diagnostics & Advanced", "Other",
+];
+
+fn config_section(name: &str) -> usize {
+    let n = name.to_ascii_lowercase();
+    let n = n.as_str();
+    let matches = |needles: &[&str]| needles.iter().any(|needle| n.contains(*needle));
+    if matches(&["sensitivity", "m_yaw", "m_pitch", "mouseaccel", "m_filter", "cl_input", "cl_timerresolution", "in_mouse"]) {
+        1
+    } else if matches(&["r_mode", "r_custom", "r_window", "r_fullscreen", "r_backend", "r_swapinterval", "r_maxframelatency", "r_earlysubmit", "r_presentcopy", "r_ext_multisample", "com_maxfps", "r_hdrpaperwhite", "r_hdrpeak", "r_hdrstyle"]) {
+        2
+    } else if matches(&["texture", "material", "anisotrop", "r_picmip", "r_pom", "r_parallax", "r_glass", "r_detail", "r_bump", "r_normalmap"]) {
+        3
+    } else if matches(&["r_ghoul2", "r_lod", "r_pvs", "r_novis", "r_faceplane", "r_world", "r_model", "r_grass", "r_terrain", "r_distancecull", "r_occlusion", "r_patch", "r_bsp", "r_foliage", "fs_allowasset"] ) {
+        4
+    } else if matches(&["r_sun", "r_shadow", "r_light", "r_rt", "r_ambient", "r_ssr", "r_reflect", "r_mirror", "r_cascade", "r_contactshadow", "r_staticbspao", "r_ssao", "r_entitysun"]) {
+        5
+    } else if matches(&["r_gamma", "r_hdr", "r_tonemap", "r_autoexposure", "r_glow", "r_bloom", "r_fxaa", "r_smaa", "r_taa", "r_halation", "r_color", "r_lut", "r_crt", "r_film", "r_saturation", "r_contrast", "r_vibrance", "r_exposure", "r_splittoning", "r_post", "r_brightness", "r_dof", "r_depthoffield", "r_motionblur"]) {
+        6
+    } else if matches(&["r_weather", "r_rain", "r_snow", "r_cloud", "r_fog", "r_sky", "r_wind", "r_puddle", "r_spacedust", "r_acidrain", "r_sand"]) {
+        7
+    } else if matches(&["r_ocean", "r_coastal", "r_water", "cg_waterwake", "r_caustic", "r_shore"]) {
+        8
+    } else if matches(&["r_fx", "cg_fx", "fx_", "r_footprint", "r_cloth", "r_jiggle", "r_ragdoll", "r_particle", "r_decal", "r_saber", "r_dismember", "r_physics"]) {
+        9
+    } else if matches(&["cg_hud", "cg_draw", "cg_crosshair", "cg_movementkeys", "cg_strafehelper", "cg_strafetrail", "cg_lagometer", "cg_racetimer", "cg_speedometer", "cg_chatbox", "cg_playername"]) {
+        10
+    } else if matches(&["cg_", "ui_vgs", "model", "name", "sex", "force", "handicap", "color1", "color2", "japro", "r_jumpheightshade"]) {
+        11
+    } else if n.starts_with("s_") || n.starts_with("snd_") {
+        12
+    } else if n.starts_with("cl_") || n.starts_with("snaps") || n.starts_with("rate") || n.starts_with("sv_master") || matches(&["net_", "rcon", "password", "protocol"]) {
+        13
+    } else if n.starts_with("con_") || n.starts_with("ui_") || matches(&["chatlog", "console"]) {
+        14
+    } else if matches(&["developer", "r_debug", "r_verbose", "r_show", "r_gpu", "r_perf", "r_pipeline", "r_wireframe", "com_", "fs_"]) {
+        15
+    } else {
+        16
+    }
+}
+
+fn concise_config_help(entry: &crate::console::Entry) -> String {
+    let range = entry.range.trim();
+    let description = entry.description.trim().trim_end_matches('.');
+    // Preserve authored choice meanings whenever possible; descriptions in the
+    // canonical registry often specify what 0/1/2/3 actually do.
+    // A 0..1 domain may be a continuous slider (e.g. s_volume), not a
+    // boolean. Do not invent off/on semantics for it.
+    let domain = range;
+    let source = if description.is_empty() { domain.to_owned() }
+        else if domain.is_empty() { description.to_owned() }
+        else { format!("{domain}; {description}") };
+    // One line per setting, at most about two sentences. Truncate at a word
+    // boundary, not in the middle of an enum/value token.
+    const MAX_HELP_CHARS: usize = 176;
+    if source.chars().count() <= MAX_HELP_CHARS { return source; }
+    let boundary = source.char_indices().take_while(|(i, _)| *i <= MAX_HELP_CHARS)
+        .filter(|(_, ch)| ch.is_whitespace()).map(|(i, _)| i).last();
+    let end = boundary.unwrap_or_else(|| source.char_indices()
+        .map(|(i, _)| i).take_while(|i| *i <= MAX_HELP_CHARS).last().unwrap_or(0));
+    format!("{}…", source[..end].trim_end_matches(|ch: char| matches!(ch, ' ' | ',' | ';' | '.')))
+}
+
+fn format_archived_config(
+    settings: VideoSettings,
+    bindings: &crate::keybinds::Bindings,
+    presentation: &ClientPresentationSettings,
+    audio: &AudioSettings,
+) -> String {
+    use std::fmt::Write;
+    let state = cvars::ArchiveState { video: &settings, presentation, audio };
+    let mut sections: Vec<Vec<_>> = (0..CONFIG_SECTIONS.len()).map(|_| Vec::new()).collect();
+    let mut definitions: Vec<_> = crate::app::cvar_definitions().iter()
+        .filter(|def| def.runtime.flags.contains(crate::console::cvars::CvarFlags::ARCHIVE))
+        .collect();
+    // Preserve the existing declaration order within each section, including
+    // dependent values such as r_novis/r_pvsMode and video dimensions.
+    definitions.sort_by_key(|def| def.config.archive.expect("archived cvar needs a config binding").0);
+    for def in definitions {
+        let (_, get) = def.config.archive.expect("archived cvar needs a config binding");
+        sections[config_section(def.runtime.entry.name)].push((def.runtime.entry.name, get(&state)));
+    }
+    let mut text = String::from("// DinurdoJK configuration - archived settings and bindings.\n");
+    let _ = writeln!(text, "\n// ===== {} =====", CONFIG_SECTIONS[0]);
+    bindings.write_cfg(&mut text);
+    for (index, entries) in sections.iter().enumerate().skip(1) {
+        if entries.is_empty() { continue; }
+        let _ = writeln!(text, "\n// ===== {} =====", CONFIG_SECTIONS[index]);
+        for (name, value) in entries {
+            let _ = writeln!(text, "seta {name} \"{value}\"");
+        }
+    }
+    text
+}
+
+/// Add opt-in explanations to an already flushed snapshot. This preserves the
+/// exact serialized values (including latched/confirmed video settings) rather
+/// than attempting to reconstruct them from currently mutable UI state.
+fn bind_config_help(command: &str, spectator: bool) -> String {
+    let mode = if spectator { "spectator override" } else { "gameplay" };
+    if command.contains(';') {
+        return format!("{mode}: command sequence");
+    }
+    let verb = command.split_whitespace().next().unwrap_or("");
+    if verb.is_empty() {
+        return format!("{mode}: empty bind");
+    }
+    if let Some(entry) = crate::console::find_command(verb, true) {
+        let help = entry.description.trim().trim_end_matches('.');
+        if !help.is_empty() {
+            return format!("{mode}: {help}");
+        }
+    }
+    format!("{mode}: run {verb}")
+}
+
+pub(crate) fn verbose_config_from_snapshot(snapshot: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(snapshot.len() * 2);
+    for line in snapshot.lines() {
+        if line.is_empty() || line.trim_start().starts_with("//") {
+            let _ = writeln!(out, "{line}");
+            continue;
+        }
+        let words = split_cfg_words(line);
+        let note = match words.as_slice() {
+            [verb, name, ..] if verb.eq_ignore_ascii_case("seta") =>
+                crate::app::cvar_definition(name)
+                    .map(|def| concise_config_help(&def.runtime.entry)),
+            [verb, _, command, ..] if verb.eq_ignore_ascii_case("bind") => {
+                Some(bind_config_help(command, false))
+            }
+            [verb, _, command, ..] if verb.eq_ignore_ascii_case("bindspec") => {
+                Some(bind_config_help(command, true))
+            }
+            [verb] if verb.eq_ignore_ascii_case("unbindall") => Some("Clear normal bindings first".to_owned()),
+            [verb] if verb.eq_ignore_ascii_case("unbindspecall") => Some("Clear spectator overrides first".to_owned()),
+            _ => None,
+        };
+        if let Some(note) = note.filter(|note| !note.is_empty()) {
+            let note = if note.chars().count() > 176 {
+                let end = note.char_indices().filter(|(i, ch)| *i <= 173 && ch.is_whitespace())
+                    .map(|(i, _)| i).last().unwrap_or_else(||
+                        note.char_indices().map(|(i, _)| i).take_while(|i| *i <= 173).last().unwrap_or(0));
+                format!("{}…", note[..end].trim_end())
+            } else { note };
+            let _ = writeln!(out, "{line} // {note}");
+        } else {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    out
+}
+
 pub fn save_video_settings(
     path: &Path,
     settings: VideoSettings,
@@ -431,19 +596,10 @@ pub fn save_video_settings(
     presentation: &ClientPresentationSettings,
     audio: &AudioSettings,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?; }
-    use std::fmt::Write;
-    let mut text = "// JKA Rust client video settings. JKA-style archived cvars.\n".to_owned();
-    let state = cvars::ArchiveState { video: &settings, presentation, audio };
-    let mut definitions: Vec<_> = crate::app::cvar_definitions().iter().filter(|def| def.runtime.flags.contains(crate::console::cvars::CvarFlags::ARCHIVE)).collect();
-    definitions.sort_by_key(|def| def.config.archive.expect("archived cvar needs a config binding").0);
-    let mut bindings_written = false;
-    for def in definitions {
-        let (order, get) = def.config.archive.expect("archived cvar needs a config binding");
-        if order >= 10000 && !bindings_written { bindings.write_cfg(&mut text); bindings_written = true; }
-        let _ = writeln!(text, "seta {} \"{}\"", def.runtime.entry.name, get(&state));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
-    if !bindings_written { bindings.write_cfg(&mut text); }
+    let text = format_archived_config(settings, bindings, presentation, audio);
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -568,7 +724,62 @@ pub(crate) fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Strip // and /* ... */ outside quotes, as in TaystJK Cbuf_Execute.
+/// Also used by the native startup loaders, which do not execute `exec`.
+/// Backslash-escaped quotes are supported for serialized bind arguments.
+pub(crate) fn strip_cfg_comments(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+        if line_comment {
+            if ch == '\n' || ch == '\r' {
+                out.push(ch);
+                line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if block_comment {
+            if ch == '*' && next == Some('/') {
+                block_comment = false;
+                i += 2;
+            } else {
+                // Preserve line separation around multi-line comments.
+                if ch == '\n' || ch == '\r' { out.push(ch); }
+                i += 1;
+            }
+            continue;
+        }
+        if quoted && escaped {
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if !quoted && ch == '/' && next == Some('/') {
+            line_comment = true;
+            i += 2;
+            continue;
+        } else if !quoted && ch == '/' && next == Some('*') {
+            block_comment = true;
+            i += 2;
+            continue;
+        }
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
 fn split_cfg_words(line: &str) -> Vec<String> {
+    let line = strip_cfg_comments(line);
     let mut out = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -600,6 +811,87 @@ fn split_cfg_words(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_comments_preserve_quoted_slashes_and_multiline_block_comments() {
+        let input = concat!(
+            "// heading\n",
+            "seta cg_fov \"111\"// trailing note\n",
+            "/* omitted;\n",
+            "   seta cg_fov \"33\" */\n",
+            "seta cg_rGhostDemoBaseUrl \"http://example.invalid/races\" // URL\n",
+            "seta cg_fov /* between */ \"112\"\n",
+        );
+        let clean = strip_cfg_comments(input);
+        assert_eq!(clean.matches("seta cg_fov").count(), 2);
+        assert!(!clean.contains("33"));
+        assert!(clean.contains("http://example.invalid/races"));
+        assert_eq!(split_cfg_words("seta cg_fov \"110\"// help"), ["seta", "cg_fov", "110"]);
+        assert_eq!(split_cfg_words("seta sv_master1 \"https://example.org:443/\" // help"),
+            ["seta", "sv_master1", "https://example.org:443/"]);
+    }
+
+    #[test]
+    fn organized_and_verbose_configs_restore_the_same_settings_and_binds() {
+        let dir = std::env::temp_dir().join(format!(
+            "jka-organized-config-{}-{:?}", std::process::id(), std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let normal = dir.join("normal.cfg");
+        let verbose = dir.join("verbose.cfg");
+        let mut video = VideoSettings::default();
+        video.gamma = 2.25;
+        let mut presentation = ClientPresentationSettings::default();
+        presentation.fov = 111.0;
+        presentation.mouse.sensitivity = 7.25;
+        presentation.race_ghost_demo_base_url = "http://example.invalid/races".to_owned();
+        let mut audio = AudioSettings::default();
+        audio.effects_volume = 0.375;
+        let bindings = crate::keybinds::Bindings::default();
+        save_video_settings(&normal, video, &bindings, &presentation, &audio).expect("save");
+        let compact = std::fs::read_to_string(&normal).expect("read");
+        assert!(compact.contains("// ===== Controls ====="));
+        assert!(compact.contains("// ===== Video & Display ====="));
+        assert!(compact.contains("// ===== Sound ====="));
+        assert!(compact.contains("// ===== Ocean & Water ====="));
+        assert!(compact.contains("// ===== Mouse & Input ====="));
+        assert!(compact.contains("unbindall"));
+        assert!(compact.contains("unbindspecall"));
+        assert_eq!(compact.lines().filter(|line| line.starts_with("seta ")).count(),
+            crate::app::cvar_definitions().iter()
+                .filter(|def| def.runtime.flags.contains(crate::console::cvars::CvarFlags::ARCHIVE))
+                .count());
+
+        let annotated = verbose_config_from_snapshot(&compact);
+        assert!(annotated.contains("seta cg_fov \"111.000\" // "));
+        assert!(annotated.contains("0..1; OpenJK game/effects volume"));
+        assert!(annotated.lines().any(|line| line.starts_with("bind MOUSE1 ") && line.contains(" // ")));
+        assert!(annotated.lines().any(|line| line.starts_with("bindspec ") && line.contains(" // ")));
+        // Removing the explanations must produce the same executable lines.
+        let commands = |text: &str| -> Vec<String> {
+            strip_cfg_comments(text).lines().map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned).collect()
+        };
+        assert_eq!(commands(&compact), commands(&annotated));
+        std::fs::write(&verbose, annotated).expect("write verbose");
+        for path in [&normal, &verbose] {
+            let loaded_video = load_video_settings(path);
+            let loaded_presentation = load_client_presentation_settings(path);
+            let loaded_audio = load_audio_settings(path);
+            let loaded_binds = crate::keybinds::Bindings::load(path);
+            assert!((loaded_video.gamma - 2.25).abs() < 0.0001);
+            assert!((loaded_presentation.fov - 111.0).abs() < 0.0001);
+            assert!((loaded_presentation.mouse.sensitivity - 7.25).abs() < 0.0001);
+            assert_eq!(loaded_presentation.race_ghost_demo_base_url, "http://example.invalid/races");
+            assert!((loaded_audio.effects_volume - 0.375).abs() < 0.0001);
+            assert_eq!(loaded_binds.get(crate::keybinds::BindKey::Mouse(1)),
+                bindings.get(crate::keybinds::BindKey::Mouse(1)));
+            assert_eq!(loaded_binds.get_spectator(crate::keybinds::BindKey::Mouse(3)),
+                bindings.get_spectator(crate::keybinds::BindKey::Mouse(3)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn gamma_methods_round_trip_and_ignore_obsolete_names() {

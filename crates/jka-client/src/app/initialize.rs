@@ -550,7 +550,7 @@ impl App {
             ocean_settings_target: -1,
             promoted_oceans: Vec::new(),
             promoted_ocean_overrides: Vec::new(),
-            ocean_sky_extend: true,
+            ocean_sky_extend: 2,
             coastal_debug_mode: 0,
             coastal_enabled: false,
             coastal_pool: 0,

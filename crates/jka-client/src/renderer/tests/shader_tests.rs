@@ -27,6 +27,23 @@ fn promoted_glass_shader_variants_validate() {
 }
 
 #[test]
+fn promoted_ocean_edge_fast_path_skips_fft_and_stays_lod_independent() {
+    let shader = include_str!("../../bsp.wgsl");
+    let edge_begin = shader.find("fn promoted_ocean_edge_weight(").unwrap();
+    let sample_begin = shader.find("fn sample_ocean_displacement(").unwrap();
+    let next_function = shader[sample_begin..].find("struct VertexLightgridSample").unwrap()
+        + sample_begin;
+    let edge = &shader[edge_begin..sample_begin];
+    let sample = &shader[sample_begin..next_function];
+    assert!(!edge.contains("vertex_spacing") && !edge.contains("input.color"),
+        "Shared fine/coarse clipmap vertices must receive the same edge weighting");
+    let zero_return = sample.find("if (edge_weight <= 0.0) { return vec4<f32>(0.0); }").unwrap();
+    let first_fft_read = sample.find("textureSampleLevel(ocean_displacement").unwrap();
+    assert!(zero_return < first_fft_read, "Flat vertices must skip all FFT sampling");
+    assert!(edge.contains("ocean.appearance_c.w"), "Outer seam must match analytic radius");
+}
+
+#[test]
 fn legacy_rgb_transfer_is_shared_by_fused_and_additive_bsp_paths() {
     // Both zero-pass implementations must use the same exact-sRGB transfer.
     // Keep fast, lean and full variants in sync without another pipeline.
@@ -1906,6 +1923,40 @@ fn painted_water(p:vec4<f32>)->vec4<f32> {
         }
         assert!(block_on(scope.pop()).is_none(),"water blend shader must validate");
     });
+}
+
+/// The exterior sky extension and the analytic tail must never replace the
+/// captured transmission with raw fog RGB. The A/B regression produced
+/// a hard bright-water/dark-water boundary at the original BSP footprint.
+#[test]
+fn ocean_sky_extension_does_not_force_raw_fog_transmission() {
+    let shader = include_str!("../../bsp.wgsl");
+    let begin = shader.find("fn ocean_surface_sample(").unwrap();
+    let end = shader[begin..].find("fn shade_surface(").unwrap() + begin;
+    let surface = &shader[begin..end];
+    assert!(surface.contains("let transmission = textureSampleLevel(ocean_scene,"));
+    assert!(!surface.contains("transmission = ocean_optics.fog.rgb"),
+        "ocean exterior must not be painted with unattenuated fog color");
+    assert!(shader.contains("let shaded = shade_surface(surface, eye.y >= sea_height);"),
+        "analytic ocean must reuse the geometric ocean surface shader");
+}
+
+/// The analytic continuation keeps its radius separate from dynamic LOD
+/// fields and draws after the original geometric clipmaps.
+#[test]
+fn ocean_infinite_tail_uses_reserved_radius_and_draws_after_mesh() {
+    let ocean_source = include_str!("../../ocean.rs");
+    let shader = include_str!("../../bsp.wgsl");
+    let draws = include_str!("../frame/draw.rs");
+    assert!(ocean_source.contains("local.appearance_c[3]=self.promoted_far_radii"));
+    assert!(!ocean_source.contains("local.clipmap[2]=self.promoted_far_radii"));
+    assert!(shader.contains("let radius = ocean.appearance_c.w;"));
+    let start = draws.find("label: Some(\"JKA ocean surface and diagnostics\")")
+        .expect("ocean pass");
+    let pass = &draws[start..];
+    let mesh = pass.find("let mut ocean_drawn = 0u8;").expect("geometric ocean draw");
+    let tail = pass.find("if self.ocean_sky_infinite {").expect("analytic ocean draw");
+    assert!(mesh < tail, "geometric water must draw before the analytic far tail");
 }
 
 #[test]

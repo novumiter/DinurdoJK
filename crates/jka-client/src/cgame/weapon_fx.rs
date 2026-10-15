@@ -12,13 +12,14 @@ use super::player_presenter::PlayerFxRequest;
 use super::saber_melt::SaberMelt;
 use crate::{
     fx::{
-        system::{EffectId, FxBlade, FxClass, FxDraw, FxFrame, FxLight, FxLightKind, FxLightSegment, FxSound, FxStats, FxSystem},
-        template::Rng,
+        system::{EffectId, FxBlade, FxClass, FxDraw, FxFrame, FxLight, FxLightKind, FxLightSegment, FxSound, FxStats, FxSystem, FxAutoLightCandidate},
+        template::{Rng, PrimType},
     },
     ui::{FootprintMode, SaberMarkMode},
 };
 use jka_assets::{
     pk3::AssetSearchPath,
+    vehicle::{load_vehicle_definitions, VehicleDefinitions},
     saber::{load_saber_definitions, SaberDefinition, SaberDefinitions},
     siege::SiegeClassVisual,
 };
@@ -53,6 +54,12 @@ const EF_MISSILE_STICK: i32 = 1 << 22;
 
 const TR_STATIONARY: i32 = 0;
 const TR_INTERPOLATE: i32 = 1;
+
+/// TaystJK overloads EF_JETPACK_ACTIVE specifically for vehicle missiles.
+/// Their otherEntityNum2 is a .vwp index, never CS_EFFECTS.
+fn is_vehicle_projectile(flags: i32, other_entity_num2: i32) -> bool {
+    other_entity_num2 > 0 && flags & EF_JETPACK_ACTIVE != 0
+}
 
 
 const MAX_EFX_BYTES: usize = 65536;
@@ -432,10 +439,29 @@ fn saber_mark_uv(frame: &SaberMarkFrame, point: [f32; 3]) -> [f32; 2] {
 /// The small normal lift substitutes for q3 polygonOffset in the transient FX path.
 const SABER_MARK_LIFT: f32 = 0.24;
 
+/// Same world orientation for authored `.vwp` projectile models and ordinary
+/// model-carrying missiles (`CG_Missile`).
+fn missile_axis(state: &jka_protocol::gamestate::EntityState, time: i32, forward: [f32; 3]) -> [[f32; 3]; 3] {
+    let e_flags = state.field_i32("eFlags").unwrap_or(0);
+    if state.field_i32("apos.trType").unwrap_or(0) != TR_INTERPOLATE {
+        let stick = e_flags & EF_MISSILE_STICK != 0;
+        let yaw = if state.field_i32("pos.trType").unwrap_or(0) != TR_STATIONARY {
+            time as f32 * if stick { 0.5 } else { 0.25 }
+        } else if stick {
+            state.field_i32("pos.trTime").unwrap_or(0) as f32 * 0.5
+        } else {
+            state.field_i32("time").unwrap_or(0) as f32
+        };
+        jka_movement::rotate_around_direction(forward, yaw)
+    } else {
+        angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))
+    }
+}
+
 /// The refEntity CG_Missile submits for a model-carrying missile.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MissileModel {
-    pub qpath: &'static str,
+    pub qpath: String,
     pub origin: [f32; 3],
     pub axis: [[f32; 3]; 3],
 }
@@ -822,6 +848,11 @@ pub struct SaberClashFlare {
 
 pub struct WeaponFx {
     saber_definitions: SaberDefinitions,
+    vehicle_definitions: VehicleDefinitions,
+    /// Lazily populated `g_vehWeaponInfo` indices, 1-based; tied to the map's
+    /// CS_MODELS vehicle registrations (not indexes in CS_EFFECTS).
+    vehicle_weapon_names: Vec<String>,
+    reported_vehicle_weapon_missing: HashSet<i32>,
     worker_tx: mpsc::Sender<FxWorkerCommand>,
     worker: Option<JoinHandle<()>>,
     cached_stats: FxStats,
@@ -862,6 +893,10 @@ pub struct WeaponFx {
     immediate_draws: Vec<FxDraw>,
     immediate_sounds: Vec<FxSound>,
     immediate_lights: Vec<FxLight>,
+    /// One current interpolated position per visible missile; consumed at the
+    /// presentation seam by the aggressive FX promoter, never per fx tick.
+    projectile_light_requests: Vec<(String, [f32; 3], [f32; 3])>,
+    fx_light_promotion_level: u8,
     immediate_blades: Vec<FxBlade>,
     /// OpenJK combines 3+ blade sabers into one dynamic light per saber.
     saber_multi_lights: HashMap<SaberLightKey, SaberLightAggregate>,
@@ -912,10 +947,17 @@ impl WeaponFx {
             eprintln!("FX SABER DEFINITIONS UNAVAILABLE (stock impact FX only): {error}");
             SaberDefinitions::default()
         });
+        let vehicle_definitions = load_vehicle_definitions(&mut assets).unwrap_or_else(|error| {
+            eprintln!("FX VEHICLE DEFINITIONS UNAVAILABLE: {error}");
+            VehicleDefinitions::default()
+        });
         let (worker_tx, rx) = mpsc::channel();
         let worker = thread::Builder::new().name("jka-fx".to_owned()).spawn(move || fx_worker_loop(rx, assets)).expect("failed to start JKA FX worker");
         Self {
             saber_definitions,
+            vehicle_definitions,
+            vehicle_weapon_names: Vec::new(),
+            reported_vehicle_weapon_missing: HashSet::new(),
             worker_tx,
             worker: Some(worker),
             cached_stats: FxStats::default(),
@@ -944,6 +986,8 @@ impl WeaponFx {
             immediate_draws: Vec::new(),
             immediate_sounds: Vec::new(),
             immediate_lights: Vec::new(),
+            projectile_light_requests: Vec::new(),
+            fx_light_promotion_level: 0,
             immediate_blades: Vec::new(),
             saber_multi_lights: HashMap::new(),
             modern_sabers: false,
@@ -1126,6 +1170,8 @@ impl WeaponFx {
         let _ = self.worker_tx.send(FxWorkerCommand::ResetTime(time));
         self.entity_fx.clear();
         self.missile_fx.clear();
+        self.vehicle_weapon_names.clear();
+        self.reported_vehicle_weapon_missing.clear();
         self.puffs.clear();
         self.beams.clear();
         self.chunks.clear();
@@ -1138,6 +1184,7 @@ impl WeaponFx {
         self.immediate_draws.clear();
         self.immediate_sounds.clear();
         self.immediate_lights.clear();
+        self.projectile_light_requests.clear();
         self.immediate_blades.clear();
         self.saber_multi_lights.clear();
         self.saber_trail_history.clear();
@@ -1152,6 +1199,7 @@ impl WeaponFx {
 
     /// FX_AdjustTime for this presentation frame (`cg.time`).
     pub fn begin_frame(&mut self, time: i32) {
+        self.projectile_light_requests.clear();
         self.immediate_draws.clear();
         self.immediate_sounds.clear();
         self.immediate_lights.clear();
@@ -1534,6 +1582,11 @@ impl WeaponFx {
         models
     }
 
+    /// Only affects inferred lights from directly drawn beams; never EFX visuals.
+    pub fn set_fx_light_promotion_level(&mut self, level: u8) {
+        self.fx_light_promotion_level = level;
+    }
+
     /// FX_AddScheduledEffects + FX_Add, then CG_AddLocalEntities' puffs.
     pub fn end_frame(&mut self) -> FxFrame {
         let (reply, recv) = mpsc::sync_channel(1);
@@ -1580,6 +1633,7 @@ impl WeaponFx {
         frame.sounds.append(&mut self.immediate_sounds);
         frame.lights.append(&mut self.immediate_lights);
         frame.blades.append(&mut self.immediate_blades);
+        let promote_beams = self.fx_light_promotion_level == 2;
         self.beams.retain(|beam| {
             let life = beam.spec.kill_time.max(1);
             let age = time - beam.start_time;
@@ -1599,6 +1653,25 @@ impl WeaponFx {
                 rgba: [byte(spec.rgb[0]), byte(spec.rgb[1]), byte(spec.rgb[2]), 0],
                 shader: spec.shader.to_owned(),
             });
+            if promote_beams {
+                // Direct trap_FX_AddLine beams bypass .efx primitive spawn;
+                // feed them through the SAME material classifier and merging
+                // pass, rather than introducing a parallel light renderer.
+                let length2 = spec.start.iter().zip(spec.end).map(|(a, b)| (*a - b) * (*a - b)).sum::<f32>();
+                if length2 > 16.0 {
+                    let effect = spec.shader.bytes().fold(2166136261_u32, |h, b| h.wrapping_mul(16777619) ^ u32::from(b));
+                    frame.auto_light_candidates.push(FxAutoLightCandidate {
+                        effect, score: 3, kind: PrimType::Line,
+                        origin: spec.start,
+                        radius: spec.size1 + (spec.size2 - spec.size1) * t,
+                        rgba: [byte(spec.rgb[0]), byte(spec.rgb[1]), byte(spec.rgb[2]), 255],
+                        shader: spec.shader.to_owned(),
+                        life_ms: life,
+                        spot: None,
+                        segment: Some([spec.start, spec.end]),
+                    });
+                }
+            }
             true
         });
         let view = self.view_origin;
@@ -2685,6 +2758,57 @@ impl WeaponFx {
         samples
     }
 
+    /// Current projectile emitters; workers only precompute material profiles.
+    /// Returning the current frame's positions avoids jerky or expired
+    /// particle-based lights when cg_fxFPS is lower than the render rate.
+    pub fn take_projectile_light_requests(&mut self) -> Vec<(String, [f32; 3], [f32; 3])> {
+        std::mem::take(&mut self.projectile_light_requests)
+    }
+
+    /// TaystJK cg_ents.c CG_EntityEffects, packed `constantLight`: RGB in
+    /// low 24 bits, radius in the top byte times four. Player/body/NPC/
+    /// invisible states reuse the field and must NOT emit this light.
+    pub fn constant_entity_light(entity: &PresentedEntity) -> Option<FxLight> {
+        if matches!(entity.entity_type, super::ET_PLAYER | super::ET_BODY | super::ET_NPC | super::ET_INVISIBLE) {
+            return None;
+        }
+        let packed = entity.state.field_i32("constantLight").unwrap_or(0) as u32;
+        if packed == 0 { return None; }
+        Some(FxLight {
+            kind: FxLightKind::EntityConstant,
+            origin: entity.origin,
+            radius: ((packed >> 24) & 255) as f32 * 4.0,
+            source_radius: 0.0,
+            rgb: [
+                (packed & 255) as f32 / 255.0,
+                ((packed >> 8) & 255) as f32 / 255.0,
+                ((packed >> 16) & 255) as f32 / 255.0,
+            ],
+            spot: None, segment: None, blade_segments: None,
+        })
+    }
+
+    /// Client `BG_GetVehicleModelName` registers each `$vehicle` in the
+    /// CS_MODELS sequence. Its `VEH_LoadVehicle` registers weapon names in
+    /// weap1/weap2/muzzle order. The game sends these 1-based integer IDs in
+    /// projectile `otherEntityNum2` (with EF_JETPACK_ACTIVE), not CS_EFFECTS.
+    /// Rebuild only on an unrecognized index; never scan 512 configstrings
+    /// in the per-frame hot path after the first vehicle shot.
+    fn vehicle_weapon_slot(&mut self, game: &ClientGameState, index: i32) -> Option<usize> {
+        if index <= 0 || index >= 16 { return None; }
+        let slot = usize::try_from(index - 1).ok()?;
+        if self.vehicle_weapon_names.len() <= slot {
+            let mut names = Vec::new();
+            for model_index in 1..=512 {
+                let Some(path) = game.model_qpath(model_index) else { continue };
+                let Some(vehicle) = path.split('*').next().and_then(|v| v.strip_prefix('$')) else { continue };
+                self.vehicle_definitions.register_weapons_for_vehicle(vehicle, &mut names);
+            }
+            self.vehicle_weapon_names = names;
+        }
+        (slot < self.vehicle_weapon_names.len()).then_some(slot)
+    }
+
     /// CG_Missile: play the weapon's trail effect for this frame and return
     /// the missile model refEntity, if the weapon has one.
     pub fn missile(&mut self, entity: &PresentedEntity, game: &ClientGameState, time: i32) -> Option<MissileModel> {
@@ -2706,20 +2830,75 @@ impl WeaponFx {
             alt_fire: alt,
         };
         if other2 != 0 {
-            // An over-ridden trail effect (cgs.gameEffects = CS_EFFECTS).
-            if e_flags & EF_JETPACK_ACTIVE == 0 {
-                if let Some(name) = game.effect_qpath(other2) {
-                    let samples =
-                        self.missile_fx_samples(entity.number, generation, time, entity.origin);
-                    for origin in samples {
-                        self.play(&name, origin, forward);
+            if is_vehicle_projectile(e_flags, other2) {
+                // TaystJK CG_Missile: g_vehWeaponInfo[otherEntityNum2].
+                // iShotFX/iModel are authored in ext_data/vehicles/weapons/*.vwp.
+                // These are not entries in CS_EFFECTS.
+                let vehicle_weapon = self.vehicle_weapon_slot(game, other2)
+                    .and_then(|slot| self.vehicle_weapon_names.get(slot))
+                    .and_then(|name| self.vehicle_definitions.weapon_definition(name))
+                    .map(|definition| (definition.shot_fx.clone(), definition.model.clone()));
+                if let Some((shot_fx, model)) = vehicle_weapon {
+                    if shot_fx.is_some() || model.is_some() {
+                        if let Some(ref shot_fx) = shot_fx {
+                            self.projectile_light_requests.push((shot_fx.clone(), entity.origin, forward));
+                            let samples = self.missile_fx_samples(entity.number, generation, time, entity.origin);
+                            for origin in samples { self.play(shot_fx, origin, forward); }
+                        }
+                        if let Some(ref model) = model {
+                            return Some(MissileModel {
+                                qpath: model.clone(),
+                                origin: entity.origin,
+                                axis: missile_axis(state, time, forward),
+                            });
+                        }
+                        // A projectile model is optional. A shotFX alone draws
+                        // the turbolaser, as in TaystJK CG_Missile.
+                        return None;
                     }
                 }
+                // Exact CG_Missile fallback: if the vehicle entry has neither
+                // iShotFX nor iModel, the engine uses cgs.gameEffects[index].
+                // This is NOT the normal path for a properly registered TIE.
+                if self.reported_vehicle_weapon_missing.insert(other2) {
+                    eprintln!(
+                        "VEHICLE SHOT FX MISSING: weapon index={other2} registered={:?}; check installed .veh/.vwp assets",
+                        self.vehicle_weapon_names
+                    );
+                }
+                if let Some(name) = game.effect_qpath(other2) {
+                    self.projectile_light_requests.push((name.clone(), entity.origin, forward));
+                    let samples = self.missile_fx_samples(entity.number, generation, time, entity.origin);
+                    for origin in samples { self.play(&name, origin, forward); }
+                }
+                return None;
+            }
+            // Regular custom projectile uses the server CS_EFFECTS index.
+            if let Some(name) = game.effect_qpath(other2) {
+                self.projectile_light_requests.push((name.clone(), entity.origin, forward));
+                let samples = self.missile_fx_samples(entity.number, generation, time, entity.origin);
+                for origin in samples { self.play(&name, origin, forward); }
             }
             return None;
         }
 
+        // Exact stock CG_RegisterWeapon data from TaystJK cg_weaponinit.c:
+        // rocket missileDlight and altMissileDlight are both radius 125,
+        // RGB (1,1,0.5). Most ordinary bolt weaponInfo_t entries set 0;
+        // those use only optional FX-derived promotion, never fake stock data.
+        if weapon == WP_ROCKET_LAUNCHER {
+            self.immediate_lights.push(FxLight {
+                kind: FxLightKind::Missile,
+                origin: entity.origin,
+                radius: 125.0,
+                source_radius: 0.0,
+                rgb: [1.0, 1.0, 0.5],
+                spot: None, segment: None, blade_segments: None,
+            });
+        }
+
         if let Some(name) = trail_effect(weapon, alt) {
+            self.projectile_light_requests.push((name.to_owned(), entity.origin, forward));
             let samples = self.missile_fx_samples(entity.number, generation, time, entity.origin);
             for origin in samples {
                 if alt && (weapon == WP_BRYAR_PISTOL || weapon == WP_BRYAR_OLD) {
@@ -2733,21 +2912,11 @@ impl WeaponFx {
         }
 
         let qpath = missile_model(weapon, alt)?;
-        let axis = if state.field_i32("apos.trType").unwrap_or(0) != TR_INTERPOLATE {
-            let stick = e_flags & EF_MISSILE_STICK != 0;
-            let yaw = if state.field_i32("pos.trType").unwrap_or(0) != TR_STATIONARY {
-                time as f32 * if stick { 0.5 } else { 0.25 }
-            } else if stick {
-                state.field_i32("pos.trTime").unwrap_or(0) as f32 * 0.5
-            } else {
-                state.field_i32("time").unwrap_or(0) as f32
-            };
-            jka_movement::rotate_around_direction(forward, yaw)
-        } else {
-            // lerpAngles is a copy of s1->angles for missiles.
-            angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))
-        };
-        Some(MissileModel { qpath, origin: entity.origin, axis })
+        Some(MissileModel {
+            qpath: qpath.to_owned(),
+            origin: entity.origin,
+            axis: missile_axis(state, time, forward),
+        })
     }
 
     /// The FX part of CG_EntityEvent. The semantic decode is deliberately
@@ -2818,18 +2987,31 @@ impl WeaponFx {
                 custom_requested,
                 custom_effect,
                 vehicle_pending,
+                vehicle_weapon_index,
                 weapon,
                 alt,
                 charge,
             } => {
+                if *vehicle_pending {
+                    // CG_VehicleWeaponImpact takes the authored iImpactFX from
+                    // the same 1-based vehicle-weapon registration table.
+                    let effect = usize::try_from(*vehicle_weapon_index - 1).ok()
+                        .and_then(|index| self.vehicle_weapon_names.get(index))
+                        .and_then(|name| self.vehicle_definitions.weapon_definition(name))
+                        .and_then(|weapon| weapon.impact_fx.clone());
+                    let played = effect.as_deref()
+                        .is_some_and(|name| self.play(name, event.position, *dir));
+                    return Some(if played {
+                        EventDispatchResult::Handled("FX_VEHICLE_WEAPON_IMPACT")
+                    } else {
+                        EventDispatchResult::Partial("FX_VEHICLE_WEAPON_IMPACT_MISSING")
+                    });
+                }
                 if *custom_requested {
                     let played = custom_effect
                         .as_deref()
                         .is_some_and(|name| self.play(name, event.position, *dir));
                     return Some(if played { EventDispatchResult::Handled("FX_CUSTOM_IMPACT") } else { EventDispatchResult::Partial("FX_CUSTOM_IMPACT_MISSING") });
-                }
-                if *vehicle_pending {
-                    return Some(EventDispatchResult::Partial("FX_VEHICLE_WEAPON_IMPACT_PENDING"));
                 }
                 let effects = if event.event == EntityEvent::EV_MISSILE_HIT {
                     player_impacts(*weapon, *alt)
@@ -2976,6 +3158,7 @@ pub(crate) enum PreparedFxEvent {
         custom_requested: bool,
         custom_effect: Option<String>,
         vehicle_pending: bool,
+        vehicle_weapon_index: i32,
         weapon: i32,
         alt: bool,
         charge: i32,
@@ -3150,11 +3333,11 @@ pub(crate) fn prepare_entity_event(
         EntityEvent::EV_MISSILE_HIT | EntityEvent::EV_MISSILE_MISS | EntityEvent::EV_MISSILE_MISS_METAL => {
             let dir = jka_movement::byte_to_dir(event.parm);
             let custom = state.field_i32("emplacedOwner").unwrap_or(0);
-            let custom_requested = custom != 0;
-            let custom_effect = if custom_requested { game.effect_qpath(custom) } else { None };
+            let vehicle_weapon_index = state.field_i32("otherEntityNum2").unwrap_or(0);
             let flags = state.field_i32("eFlags").unwrap_or(0);
-            let vehicle_pending = flags & EF_JETPACK_ACTIVE != 0
-                && state.field_i32("otherEntityNum2").unwrap_or(0) != 0;
+            let vehicle_pending = is_vehicle_projectile(flags, vehicle_weapon_index);
+            let custom_requested = custom != 0 && !vehicle_pending;
+            let custom_effect = if custom_requested { game.effect_qpath(custom) } else { None };
             let weapon = state.field_i32("weapon").unwrap_or(0);
             let alt = flags & EF_ALT_FIRING != 0;
             let charge = if alt { state.field_i32("generic1").unwrap_or(0) } else { 0 };
@@ -3163,6 +3346,7 @@ pub(crate) fn prepare_entity_event(
                 custom_requested,
                 custom_effect,
                 vehicle_pending,
+                vehicle_weapon_index,
                 weapon,
                 alt,
                 charge,
@@ -3644,6 +3828,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vehicle_missiles_use_vwp_indices_not_effect_configstrings() {
+        // From the TaystJK oktry2.dm_26 fighter shot: flags=2048, otherEntityNum2=1.
+        assert!(is_vehicle_projectile(2048, 1));
+        assert!(is_vehicle_projectile(2048 | EF_ALT_FIRING, 2));
+        assert!(!is_vehicle_projectile(0, 1));
+        assert!(!is_vehicle_projectile(EF_JETPACK_ACTIVE, 0));
+        assert!(!is_vehicle_projectile(EF_JETPACK_ACTIVE, -1));
+    }
+
+    #[test]
     fn flag_carrier_light_uses_japro_radius_and_has_no_persistent_trail() {
         let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
         let mut fx = WeaponFx::new(assets);
@@ -3658,6 +3852,68 @@ mod tests {
         assert!((200.0..=231.0).contains(&frame.lights[0].radius));
         fx.begin_frame(1016);
         assert!(fx.end_frame().lights.is_empty(), "dropping the flag stops its light immediately");
+    }
+
+    #[test]
+    fn tayst_rocket_missile_light_follows_entity_in_both_fire_modes() {
+        use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+        let mut fx = WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap());
+        let mut state = EntityState { number: 7, fields: [0; ENTITY_FIELDS.len()] };
+        let set = |state: &mut EntityState, key: &str, value: u32| {
+            let index = ENTITY_FIELDS.iter().position(|(field, _)| *field == key).unwrap();
+            state.fields[index] = value;
+        };
+        set(&mut state, "weapon", WP_ROCKET_LAUNCHER as u32);
+        for (time, alt) in [(1000, 0), (1016, EF_ALT_FIRING)] {
+            set(&mut state, "eFlags", alt as u32);
+            let entity = PresentedEntity {
+                number: 7, entity_type: super::super::ET_MISSILE,
+                origin: [time as f32, 21.0, 43.0], angles: [0.0; 3],
+                state: state.clone(),
+            };
+            fx.begin_frame(time);
+            let _ = fx.missile(&entity, &ClientGameState::new(), time);
+            let lights = fx.end_frame().lights;
+            let light = lights.iter().find(|light| light.kind == FxLightKind::Missile).unwrap();
+            assert_eq!(light.origin, entity.origin);
+            assert_eq!(light.radius, 125.0);
+            assert_eq!(light.rgb, [1.0, 1.0, 0.5]);
+        }
+    }
+
+    #[test]
+    fn tayst_constant_light_uses_packed_rgb_radius_and_excludes_players() {
+        use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+        let mut state = EntityState { number: 10, fields: [0; ENTITY_FIELDS.len()] };
+        let index = ENTITY_FIELDS.iter().position(|(field, _)| *field == "constantLight").unwrap();
+        state.fields[index] = (20 << 24) | (64 << 16) | (128 << 8) | 255;
+        let mut entity = PresentedEntity {
+            number: 10, entity_type: super::super::ET_GENERAL,
+            origin: [1.0, 2.0, 3.0], angles: [0.0; 3], state,
+        };
+        let light = WeaponFx::constant_entity_light(&entity).unwrap();
+        assert_eq!(light.kind, FxLightKind::EntityConstant);
+        assert_eq!(light.radius, 80.0);
+        assert_eq!(light.rgb, [1.0, 128.0/255.0, 64.0/255.0]);
+        assert_eq!(light.origin, [1.0, 2.0, 3.0]);
+        entity.entity_type = super::super::ET_PLAYER;
+        assert!(WeaponFx::constant_entity_light(&entity).is_none());
+    }
+
+    #[test]
+    fn aggressive_direct_beam_uses_existing_line_promotion_route() {
+        let mut fx = WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap());
+        let spec = BeamSpec { start: [1.0, 2.0, 3.0], end: [501.0, 2.0, 3.0], size1: 1.0,
+            size2: 8.0, kill_time: 150, rgb: [1.0, 0.1, 0.2], shader: "gfx/effects/redLine" };
+        fx.begin_frame(1000);
+        fx.beams.push(Beam { spec: spec.clone(), start_time: 1000 });
+        let conservative = fx.end_frame();
+        assert!(conservative.auto_light_candidates.is_empty());
+        fx.begin_frame(1010);
+        fx.set_fx_light_promotion_level(2);
+        let aggressive = fx.end_frame();
+        assert_eq!(aggressive.auto_light_candidates.len(), 1);
+        assert_eq!(aggressive.auto_light_candidates[0].segment, Some([spec.start, spec.end]));
     }
 
     #[test]

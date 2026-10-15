@@ -1022,7 +1022,7 @@ pub enum RenderCommand {
     SetSsrDebug(u8),
     SetOceanEnabled(bool),
     /// Phase-1 render-only clipmap continuation at qualifying BSP sky walls.
-    SetOceanSkyExtend(bool),
+    SetOceanSkyExtend(u8),
     SetOceanSettings(crate::ocean::OceanSettings),
     SetPromotedOceanSettings(Vec<(usize, crate::ocean::OceanSettings)>),
     SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),

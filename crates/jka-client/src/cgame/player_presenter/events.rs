@@ -116,6 +116,10 @@ impl PlayerPresenter {
                 self.force_gesture_anim.remove(&entity);
                 self.last_gpu.remove(&entity);
                 self.vehicle_snaps.remove(&entity);
+                // CG_KillGhoul2_f invalidates the Ghoul2 instance and its
+                // animation channels. Do not let a recycled entity slot reuse
+                // its old vehicle lerp frames (even for the same model).
+                self.vehicle_animations.remove(&entity);
                 self.player_diagnostics.remove(&entity);
             }
         }

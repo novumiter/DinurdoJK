@@ -178,6 +178,10 @@ pub enum FxLightKind {
     AuthoredEffect,
     /// Inferred from an emissive legacy EFX that had no authored Light{} stage.
     PromotedEffect,
+    /// TaystJK CG_Missile's registered weaponInfo_t missileDlight.
+    Missile,
+    /// TaystJK CG_EntityEffects packed entityState_t.constantLight.
+    EntityConstant,
     /// CG_PlayerPowerups flag-carrier / quad light.
     PlayerPowerup,
     /// CG_DoSaber / CG_DoSaberLight blade light.
@@ -265,6 +269,8 @@ pub struct FxAutoLightCandidate {
     pub radius: f32,
     pub rgba: [u8; 4],
     pub shader: String,
+    /// Original EFX lifetime; does not modify authored visual simulation.
+    pub life_ms: i32,
     pub spot: Option<FxSpotLight>,
     pub segment: Option<[[f32; 3]; 2]>,
 }
@@ -1177,6 +1183,7 @@ fn update_primitive(
                         radius,
                         rgba,
                         shader: shader.clone(),
+                        life_ms: prim.time_end.saturating_sub(prim.time_start),
                         spot,
                         segment,
                     });

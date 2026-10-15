@@ -201,6 +201,13 @@ fn model_shader_source(map_lights: bool) -> Result<String, String> {
             &include_str!("../../md3.wgsl").replace("\r\n", "\n"),
         )
     );
+    // RT model receivers only compile the opaque, mask, and blend entry points.
+    // The regular model's glass entry points need a separate glass resource
+    // group, which is absent from this receiver layout.
+    for anchor in ["@fragment\nfn fs_glass(", "@fragment fn fs_glass_mask("] {
+        let glass_fragment = declaration(&source, anchor)?.to_owned();
+        source = source.replacen(&glass_fragment, "", 1);
+    }
     for anchor in [
         "struct PointLight ",
         "struct ClusterRecord ",

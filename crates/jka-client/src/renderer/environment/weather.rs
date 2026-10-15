@@ -249,7 +249,8 @@ impl Renderer {
                     let (Some(region), Some(ocean)) = (region.as_ref(), world.ocean_surfaces.get(slot)) else {
                         continue;
                     };
-                    if eye.y <= ocean.plane_height && region.contains([eye.x, eye.z]) {
+                    if self.ocean_extension_active(slot)
+                        && eye.y <= ocean.plane_height && region.contains([eye.x, eye.z]) {
                         surface = surface.max(ocean.plane_height);
                     }
                 }

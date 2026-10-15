@@ -8,9 +8,9 @@ struct CascadeParams {
     tile: vec4<f32>,          // xy tile length (m), zw unused
     spectrum: vec4<f32>,      // alpha, peak omega, wind speed, wind angle radians
     shape: vec4<f32>,         // depth, swell, detail, spread
-    foam: vec4<f32>,          // whitecap, grow, decay, unused
+    foam: vec4<f32>,          // whitecap, grow, decay, foam buffer half to read (0/1)
     seed: vec4<u32>,          // xy seed, zw unused
-    time: vec4<f32>,          // x simulation time
+    time: vec4<f32>,          // x simulation time, yz foam drift this update (metres, texel axes)
 };
 
 struct OceanState {
@@ -272,11 +272,34 @@ fn fft_unpack(
         let dhz_dx = s3.y*sign_shift*p.tile.z;
         let jacobian = (1.0+dhx_dx)*(1.0+dhz_dz)-dhz_dx*dhz_dx;
         let foam_factor = -min(0.0,jacobian-p.foam.x);
-        let fi = c*n*n+gid.y*n+gid.x;
-        var foam = foam_data[fi];
-        foam = foam*exp(-p.foam.z)+foam_factor*p.foam.y;
+        // Foam history lives in two halves: read last update's, write the other.
+        // Drift back-traces this texel along the wind and reads that bilinearly
+        // (the cascade tiles, so the lookup wraps), so foam rolls off the spot
+        // where the fold formed instead of being pinned to the tile. Zero drift
+        // reads exactly this texel.
+        let half_size = NUM_CASCADES*n*n;
+        let read_base = u32(p.foam.w+0.5)*half_size + c*n*n;
+        let write_base = (1u-u32(p.foam.w+0.5))*half_size + c*n*n;
+        let fi = gid.y*n+gid.x;
+        var history = foam_data[read_base+fi];
+        if (p.time.y != 0.0 || p.time.z != 0.0) {
+            let src = vec2<f32>(gid.xy) - p.time.yz/(p.tile.xy/f32(n));
+            let base = floor(src);
+            let f = src-base;
+            let ni = i32(n);
+            let x0 = u32(((i32(base.x)%ni)+ni)%ni);
+            let y0 = u32(((i32(base.y)%ni)+ni)%ni);
+            let x1 = (x0+1u)%n;
+            let y1 = (y0+1u)%n;
+            let a = foam_data[read_base+y0*n+x0];
+            let b = foam_data[read_base+y0*n+x1];
+            let d0 = foam_data[read_base+y1*n+x0];
+            let d1 = foam_data[read_base+y1*n+x1];
+            history = mix(mix(a,b,f.x),mix(d0,d1,f.x),f.y);
+        }
+        var foam = history*exp(-p.foam.z)+foam_factor*p.foam.y;
         foam = clamp(foam,0.0,1.0);
-        foam_data[fi]=foam;
+        foam_data[write_base+fi]=foam;
         let gradient = vec2<f32>(dhy_dx,dhy_dz)/(vec2<f32>(1.0)+abs(vec2<f32>(dhx_dx,dhz_dz)));
         textureStore(normal_map,vec2<i32>(gid.xy),i32(c),vec4<f32>(gradient,dhx_dx,foam));
     }

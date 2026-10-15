@@ -2172,6 +2172,7 @@ pub(in crate::renderer) fn build_world(
         pipeline_variants.insert(
             shader_variant,
             WorldPipelineVariant {
+                ocean_far_pipeline: None,
                 pipelines,
                 legacy_dlight_pipelines,
                 fog_pass_pipelines,
@@ -2499,6 +2500,7 @@ pub(in crate::renderer) fn build_world(
             coarse_all_batches,
             full_all_batches,
             last_cluster: None,
+            ocean_gate_cache: None,
             textures,
             footprint_mark_textures,
             lightmaps,

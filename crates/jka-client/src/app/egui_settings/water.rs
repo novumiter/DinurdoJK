@@ -394,6 +394,18 @@ impl App {
                 }
             },
         );
+        theme::row(
+            ui,
+            "Dynamic mesh LOD rates",
+            "r_oceanDynamicUpdates: 0 original; 1 nearest two mesh rings use live FFT (48 Hz), third uses a 32 Hz displacement snapshot, outer rings a 24 Hz snapshot. Wind foam streak appearance follows these mesh rates. All FFT cascades remain synchronized; this reduces cached texture bandwidth, not FFT dispatch count.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, settings.dynamic_update_rates) {
+                    settings.dynamic_update_rates = value;
+                    changed = true;
+                }
+            },
+        );
 
         });
         theme::row(
@@ -419,6 +431,19 @@ impl App {
                 let preview = theme::preview_toggle_value(ui.ctx(), reset(theme::Reset::Ocean(OCEAN_WIND_FOAM)), settings.wind_foam_streaks);
                 if let Some(value) = theme::switch(ui, preview) {
                     settings.wind_foam_streaks = value;
+                    changed = true;
+                }
+            },
+        );
+
+        theme::row(
+            ui,
+            "Sync wind foam to waves",
+            "r_oceanWindFoamSync: wind-streak transport runs only when the fine FFT layer finishes updating, rather than every rendered frame. The mesh still renders each frame.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, settings.wind_foam_sync) {
+                    settings.wind_foam_sync = value;
                     changed = true;
                 }
             },

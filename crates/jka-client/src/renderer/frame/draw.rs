@@ -41,12 +41,11 @@ fn count_world_program_bind(info: &mut FrameInfo, binding: WorldPipelineBinding)
 }
 
 impl Renderer {
-    // Ocean/sky contact is a stable map-load result. No dependency on the
-    // render-only r_oceanSkyExtend toggle or coastal bathymetry.
+    // The black lower sky hemisphere belongs to the sky-extension ocean, so it
+    // follows the same per-frame gate: r_oceanSkyExtend on and the camera's PVS
+    // can see the water (`refresh_ocean_extension_gate`).
     pub(in crate::renderer) fn ocean_sky_horizon_flag(&self) -> u32 {
-        u32::from(self.world.as_ref().is_some_and(|world| {
-            world.ocean_sky_regions.iter().any(Option::is_some)
-        })) << 16
+        u32::from(self.ocean_sky_extend && self.ocean_extension_mask != 0) << 16
     }
 
     pub(in crate::renderer) fn render(
@@ -142,8 +141,12 @@ impl Renderer {
         // Promote authored water only once both the setting and active compiled
         // PSO agree that ocean support is live; until then stock water remains.
         let render_ocean = self.ocean_enabled && active_world_variant.is_some_and(|key| key.ocean);
+        if render_ocean && self.ocean_sky_infinite {
+            self.ensure_ocean_far_pipeline();
+        }
         let ocean_clipmap =
             render_ocean.then(|| usize::from(self.ocean_settings.mesh_quality.min(1)));
+        self.refresh_ocean_extension_gate(camera.position.to_array(), render_ocean);
         let topology_started=render_ocean.then(Instant::now);
         if render_ocean {
             self.update_promoted_ocean_clipmap_lod(camera.position.to_array());
@@ -365,6 +368,9 @@ impl Renderer {
                         let (Some(region), Some(surface)) = (region.as_ref(), world.ocean_surfaces.get(slot)) else {
                             continue;
                         };
+                        if !self.ocean_extension_active(slot) {
+                            continue;
+                        }
                         let [min_x, min_z, max_x, max_z] = region.bounds;
                         let mut corner_bits = 0u32;
                         for c in 0..4 {
@@ -1091,7 +1097,9 @@ impl Renderer {
                 world.ocean_surfaces.clone(),
                 Arc::clone(&world.ocean_masks),
                 world.promoted_oceans.clone(),
-                world.ocean_sky_regions.clone(),
+                world.ocean_sky_regions.iter().enumerate()
+                    .map(|(slot, region)| if self.ocean_extension_active(slot) { *region } else { None })
+                    .collect::<Vec<_>>(),
             )
         });
         // The FFT cascade generation and the wind-foam transport are their own
@@ -1139,7 +1147,7 @@ impl Renderer {
         }
         if let Some(ocean) = &mut self.ocean {
             if let Some((sky_average, has_skybox, surfaces, masks, promoted, sky_regions)) = ocean_scene_context.as_ref() {
-                ocean.set_sky_extension(&self.queue, self.ocean_sky_extend, sky_regions);
+                ocean.set_sky_extension(&self.queue, self.ocean_sky_extend, self.ocean_sky_infinite, sky_regions);
                 ocean.set_masks(&self.queue, masks);
                 ocean.set_environment(
                     &self.queue,
@@ -4231,7 +4239,7 @@ impl Renderer {
                 // The normal ocean capture culls using source BSP faces.
                 // Extended water can be visible even when those faces are not.
                 if self.ocean_sky_extend {
-                    if world.ocean_sky_regions.iter().any(Option::is_some) {
+                    if self.ocean_extension_mask != 0 {
                         // A camera-following clipmap isn't bounded by the old
                         // water-face AABB; never scissor away its refraction.
                         water_visible = true;
@@ -4434,6 +4442,7 @@ impl Renderer {
                 if self.ocean_sky_extend {
                     for (slot, extension) in world.ocean_sky_regions.iter().enumerate() {
                         let Some(_extension) = extension else { continue; };
+                        if slot >= 8 || self.ocean_extension_mask >> slot & 1 == 0 { continue; }
                         let bit = 1u8 << slot;
                         if ocean_drawn & bit != 0 { continue; }
                         // The clipmap is centered on the viewer, not bounded
@@ -4472,6 +4481,29 @@ impl Renderer {
                         pass.set_bind_group(6, Self::ocean_bind_group_for(batch,
                             &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
                         draw_world_batch(&mut pass, batch, 0..1, ocean_clipmap);
+                    }
+                }
+                // Draw the pre-existing geometric clipmap first. The analytic
+                // tail then fills only the exterior and cannot occlude displaced
+                // near-water triangles.
+                if self.ocean_sky_infinite {
+                    if let Some(far_pipeline) = active_pipeline_variant.ocean_far_pipeline.as_ref() {
+                        if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
+                        pass.set_pipeline(far_pipeline);
+                        for (slot, region) in world.ocean_sky_regions.iter().enumerate() {
+                            if region.is_none() || slot >= 8 || self.ocean_extension_mask >> slot & 1 == 0 { continue; }
+                            let Some(batch) = world.ocean_sky_representatives[slot]
+                                .and_then(|index| world.full_batches.get(index)) else {continue;};
+                            if capture_api_calls {
+                                info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(2);
+                                info.perf_encode_calls.draw = info.perf_encode_calls.draw.saturating_add(1);
+                            }
+                            pass.set_bind_group(1, batch.ocean_surface_bind_group.as_ref().unwrap_or(&batch.bind_group), &[]);
+                            pass.set_bind_group(6, Self::ocean_bind_group_for(batch,
+                                &self.authored_oceans, &self.ocean, &self.ocean_inert_bind_group), &[]);
+                            pass.draw(0..3, 0..1);
+                            info.ocean.analytic_draws = info.ocean.analytic_draws.saturating_add(1);
+                        }
                     }
                 }
                 if ocean_query.is_some() {

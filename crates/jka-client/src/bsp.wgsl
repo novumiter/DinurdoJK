@@ -140,9 +140,9 @@ struct OceanRenderSettings {
     mask_triangles: array<vec4<f32>, 512>,
     // Extra per-pool rendering data, NOT part of the coastal or spray inputs.
     sky_segments: array<vec4<f32>, 16>,
-    appearance_a: vec4<f32>, // detail mode, promoted foam gates, foam gain, foam distance fade
+    appearance_a: vec4<f32>, // detail mode, foam gates, foam gain, promoted seam flatten (0/1)
     appearance_b: vec4<f32>, // body color mode, foam brightness, sun gain, foam debug
-    appearance_c: vec4<f32>, // 0 existing, 1 balanced improvements, 2 Godot-inspired strong look
+    appearance_c: vec4<f32>, // x visual fixes; y dynamic LOD ready; z mesh spacing; w analytic far radius
 };
 struct SkyFogRegion {
     bounds: vec4<f32>,
@@ -323,10 +323,15 @@ override PBR_VERTEX_LIGHTGRID: bool = false;
 @group(4) @binding(1) var planar_reflection_sampler: sampler;
 @group(4) @binding(2) var<uniform> planar_reflection: PlanarReflectionSettings;
 @group(6) @binding(0) var ocean_displacement: texture_2d_array<f32>;
+// Spatial mesh-LOD caches (not the 3 FFT frequency cascades).
+@group(6) @binding(12) var ocean_displacement_medium: texture_2d_array<f32>;
+@group(6) @binding(13) var ocean_displacement_far: texture_2d_array<f32>;
 @group(6) @binding(1) var ocean_normal: texture_2d_array<f32>;
 @group(6) @binding(2) var ocean_sampler: sampler;
 @group(6) @binding(3) var<uniform> ocean: OceanRenderSettings;
 @group(6) @binding(5) var<storage, read> ocean_windrow: array<f32>;
+@group(6) @binding(14) var<storage, read> ocean_windrow_medium: array<f32>;
+@group(6) @binding(15) var<storage, read> ocean_windrow_far: array<f32>;
 struct OceanInteractionDomain {
     region: vec4<f32>, bounds: vec4<f32>, controls: vec4<f32>,
     identity: vec4<f32>,
@@ -636,31 +641,27 @@ fn is_ocean_vertex(input: VertexIn) -> bool {
 // Snapping those boundary vertices onto the parent lattice makes the mismatched
 // half of them land exactly on a coarse vertex, so the 2:1 LOD seam closes with
 // degenerate triangles instead of needing transition fans.
-fn ocean_clipmap_position(input: VertexIn) -> vec3<f32> {
+fn ocean_clipmap_center(input: VertexIn) -> vec2<f32> {
     let promoted_dynamic = ocean.authored_plane.w > 0.5;
-    // Reuse the per-pool bounds uniform, so switching between the original
-    // water and the sky extension requires no extra mask fetch per vertex.
     let use_uniform_bounds = ocean.authored_plane.x > 0.0 || promoted_dynamic;
     let minimum = select(input.uv, ocean.authored_bounds.xy, use_uniform_bounds);
     let maximum = select(input.lightmap_uv, ocean.authored_bounds.zw, use_uniform_bounds);
-
-    // The clipmap follows the viewer, but the viewer is often nowhere near the
-    // water - a lake is a small part of a map. Pulling the centre back into the
-    // footprint keeps the fine rings on the nearest water instead of folding
-    // the whole mesh onto one edge, and re-snapping to the same lattice
-    // afterwards keeps every level aligned.
-    // Static/authored clipmaps bake their outer lattice into color.b. Promoted
-    // water is runtime-adaptive: amplitude changes its ring width and true 3D
-    // camera distance can skip fine levels, so its per-pool uniform carries the
-    // current outer lattice instead.
-    let static_step = select(max(ocean.clipmap.z, 1.0), input.color.b, input.color.b > 0.0);
-    let step = select(static_step, max(ocean.wind_motion.w, 1.0), promoted_dynamic);
-    // The selected pool's own render uniform is authoritative. The previous
-    // lookup depended on the vertex-mask slot, even for rectangular source
-    // pools whose baseline geometry needed no outline mask.
+    let static_step = select(max(ocean.clipmap.z,1.0),input.color.b,input.color.b > 0.0);
+    let step = select(static_step,max(ocean.wind_motion.w,1.0),promoted_dynamic);
     let sky_enabled = promoted_dynamic && ocean.authored_plane.w > 1.5;
-    let origin = select(clamp(ocean.clipmap.xy, minimum, maximum), ocean.clipmap.xy, sky_enabled);
-    let centre = round(origin / step) * step;
+    let origin = select(clamp(ocean.clipmap.xy,minimum,maximum),ocean.clipmap.xy,sky_enabled);
+    return round(origin / step) * step;
+}
+
+fn ocean_clipmap_position(input: VertexIn) -> vec3<f32> {
+    let promoted_dynamic = ocean.authored_plane.w > 0.5;
+    let use_uniform_bounds = ocean.authored_plane.x > 0.0 || promoted_dynamic;
+    let minimum = select(input.uv, ocean.authored_bounds.xy, use_uniform_bounds);
+    let maximum = select(input.lightmap_uv, ocean.authored_bounds.zw, use_uniform_bounds);
+    let static_step = select(max(ocean.clipmap.z,1.0),input.color.b,input.color.b > 0.0);
+    let step = select(static_step,max(ocean.wind_motion.w,1.0),promoted_dynamic);
+    let sky_enabled = promoted_dynamic && ocean.authored_plane.w > 1.5;
+    let centre = ocean_clipmap_center(input);
 
     var offset = input.position.xz;
     if (promoted_dynamic) {
@@ -779,10 +780,34 @@ fn ocean_mask_contains(slot: i32, p: vec2<f32>) -> bool {
     return false;
 }
 
-fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool) -> vec4<f32> {
+// This is a VERTEX-only predicate. Evaluate it before any texture fetch,
+// Gerstner swell, coastal lookup, or interaction sampling, so an exactly-flat
+// vertex costs just arithmetic and an early return instead of 3 FFT reads.
+// Flattens the outermost clipmap ring where it joins the mesh-free infinite
+// ocean. appearance_a.w is 1 only in a promoted per-pool
+// render uniform that has that analytic tail.
+fn promoted_ocean_edge_weight(position: vec3<f32>, mesh_center: vec2<f32>) -> f32 {
+    if (floor(ocean.appearance_a.w) < 0.5 || ocean.authored_plane.w < 0.5) { return 1.0; }
+    // The CPU's analytic continuation uses this exact square radius, including
+    // its underwater LOD limit. Do not flatten LOD ring joins.
+    let radius = ocean.appearance_c.w;
+    if (radius <= 0.0) { return 1.0; }
+    // The seam attenuation MUST use position + per-pool uniforms only. A fine
+    // and coarse LOD vertex at the same world position must get the exact
+    // same height or the existing watertight 2:1 clipmap transition cracks.
+    let seam_cell = min(max(ocean.wind_motion.w, 1.0), radius / max(ocean.authored_plane.y, 1.0));
+    let seam_fade = max(seam_cell * 2.0, 1.0);
+    let outer_distance = radius - max(abs(position.x-mesh_center.x),
+        abs(position.z-mesh_center.y));
+    return smoothstep(0.0, seam_fade, outer_distance);
+}
+
+fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool, mesh_center: vec2<f32>) -> vec4<f32> {
     if (!is_ocean) {
         return vec4<f32>(0.0);
     }
+    let edge_weight = promoted_ocean_edge_weight(position, mesh_center);
+    if (edge_weight <= 0.0) { return vec4<f32>(0.0); }
     let units_per_meter = max(ocean.ocean_info.z, 0.001);
     let camera_distance_m = distance(position, camera.camera_pos_time.xyz) / units_per_meter;
     // Direct port of water.gdshader vertex(): sample in the undisplaced world
@@ -790,11 +815,47 @@ fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool) -> vec4<f32> {
     let distance_factor = min(exp(-(camera_distance_m - 150.0) * 0.007), 1.0);
     let world_m = position.xz / units_per_meter;
     var displacement_m = vec3<f32>(0.0);
+    // The clipping rings are concentric squares. Position-only selection
+    // means the exact shared edge vertices of adjacent LODs use identical
+    // displacement, rather than opening a crack from mismatched wave ages.
+    // Both nearest mesh levels (0, 1) use live waves all the way to their
+    // outer seam; blending begins *inside* the next coarser mesh ring.
+    var medium_weight = 0.0;
+    var far_weight = 0.0;
+    if (ocean.appearance_c.y > 0.5) {
+        let half_cells = select(128.0, max(ocean.authored_plane.y,1.0), ocean.authored_plane.w > 0.5);
+        let base_spacing = ocean.appearance_c.z;
+        let square_radius = max(abs(position.x-mesh_center.x),abs(position.z-mesh_center.y));
+        let near_seam = half_cells * base_spacing * 2.0;
+        let middle_seam = half_cells * base_spacing * 4.0;
+        // Fade across a few coarse cells; no per-ring choice at the seam.
+        medium_weight = smoothstep(near_seam,near_seam+base_spacing*16.0,square_radius);
+        far_weight = smoothstep(middle_seam,middle_seam+base_spacing*32.0,square_radius);
+    }
     for (var i = 0u; i < 3u; i = i + 1u) {
         let scale = ocean.map_scales[i];
-        displacement_m += textureSampleLevel(
-            ocean_displacement, ocean_sampler, world_m * vec2<f32>(1.0,-1.0) * scale.xy, i32(i), 0.0
-        ).xyz * vec3<f32>(1.0,1.0,-1.0) * scale.z;
+        let uv=world_m * vec2<f32>(1.0,-1.0) * scale.xy;
+        var sample: vec4<f32>;
+        // One displacement-field read per FFT cascade in the steady state,
+        // not simultaneous reads from live, medium AND far. The seam path
+        // pays for blending to keep the seams watertight.
+        if (far_weight >= 1.0) {
+            sample=textureSampleLevel(ocean_displacement_far,ocean_sampler,uv,i32(i),0.0);
+        } else if (medium_weight >= 1.0 && far_weight <= 0.0) {
+            sample=textureSampleLevel(ocean_displacement_medium,ocean_sampler,uv,i32(i),0.0);
+        } else if (medium_weight <= 0.0) {
+            sample=textureSampleLevel(ocean_displacement,ocean_sampler,uv,i32(i),0.0);
+        } else {
+            let medium=textureSampleLevel(ocean_displacement_medium,ocean_sampler,uv,i32(i),0.0);
+            if (far_weight > 0.0) {
+                let far=textureSampleLevel(ocean_displacement_far,ocean_sampler,uv,i32(i),0.0);
+                sample=mix(medium,far,far_weight);
+            } else {
+                let live=textureSampleLevel(ocean_displacement,ocean_sampler,uv,i32(i),0.0);
+                sample=mix(live,medium,medium_weight);
+            }
+        }
+        displacement_m += sample.xyz * vec3<f32>(1.0,1.0,-1.0) * scale.z;
     }
     displacement_m.x *= ocean.swell_motion.z;
     displacement_m.z *= ocean.swell_motion.z;
@@ -809,7 +870,10 @@ fn sample_ocean_displacement(position: vec3<f32>, is_ocean: bool) -> vec4<f32> {
     // no material multiplier attenuates the wave controls a second time.
     let interaction = sample_ocean_interaction(position);
     displacement_m.y += interaction.x / units_per_meter;
-    return vec4<f32>(displacement_m * distance_factor, displacement_m.y);
+    // A zero-weight vertex returns BEFORE any of these expensive samples.
+    // Only the narrow transition strip pays for this multiply.
+    return vec4<f32>(displacement_m * distance_factor * edge_weight,
+        displacement_m.y * edge_weight);
 }
 
 struct VertexLightgridSample {
@@ -960,7 +1024,9 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     let ocean_vertex = is_ocean_vertex(input);
     var source_position = input.position;
     var source_normal = input.normal;
+    var ocean_grid_center = vec2<f32>(0.0);
     if (ocean_vertex) {
+        ocean_grid_center = ocean_clipmap_center(input);
         source_position = ocean_clipmap_position(input);
         source_normal = vec3<f32>(0.0, 1.0, 0.0);
     }
@@ -974,10 +1040,18 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
             allow_shell
         );
     }
-    let ocean_sample = sample_ocean_displacement(deformation.xyz, ocean_vertex);
+    let ocean_sample = sample_ocean_displacement(deformation.xyz, ocean_vertex, ocean_grid_center);
     let ocean_displacement_m = ocean_sample.xyz;
     let world_position = deformation.xyz + ocean_displacement_m * max(ocean.ocean_info.z, 0.001);
     output.clip_position = camera.view_proj * vec4<f32>(world_position, 1.0);
+    if (ocean_vertex && output.clip_position.w > 0.0) {
+        // The map's distanceCull sets the camera far plane, but water is meant to
+        // reach the horizon. Reverse-Z puts the far plane at depth 0, so flatten
+        // beyond-far vertices to the same epsilon the analytic far ocean writes
+        // instead of letting the clipper cut the clipmap off. Only depth changes;
+        // x/y/w, and so the screen position and interpolated world position, are exact.
+        output.clip_position.z = max(output.clip_position.z, output.clip_position.w * 0.000001);
+    }
     output.uv = vec2<f32>(0.0);
     if (!ocean_vertex) {
         output.uv = generated_uv(input);
@@ -3131,6 +3205,17 @@ fn ocean_authored_blend(src: vec4<f32>, dst: vec4<f32>, factors: vec2<u32>) -> v
         + dst.rgb * ocean_authored_blend_factor(factors.y,src,dst);
 }
 
+// Wind-foam transport is one shared field. At slower mesh LODs, its *visible*
+// transport state is cached on the same 32/24 Hz snapshots as displacement.
+// The expensive transport compute still runs once globally at the live rate.
+fn ocean_windrow_lod(index: u32, live_offset: u32, middle: f32, far: f32) -> f32 {
+    if (far >= 1.0) {return ocean_windrow_far[index];}
+    if (middle >= 1.0 && far <= 0.0) {return ocean_windrow_medium[index];}
+    if (middle <= 0.0) {return ocean_windrow[live_offset+index];}
+    if (far > 0.0) {return mix(ocean_windrow_medium[index],ocean_windrow_far[index],far);}
+    return mix(ocean_windrow[live_offset+index],ocean_windrow_medium[index],middle);
+}
+
 fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     let units_per_meter = max(ocean.ocean_info.z, 0.001);
     let world_m = input.ocean_uv_m;
@@ -3220,10 +3305,22 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         let x1 = (x0 + 1u) % windrow_size;
         let y1 = (y0 + 1u) % windrow_size;
         let offset = windrow_layer * windrow_cells;
-        let a = ocean_windrow[offset + y0*windrow_size + x0];
-        let b = ocean_windrow[offset + y0*windrow_size + x1];
-        let c = ocean_windrow[offset + y1*windrow_size + x0];
-        let d = ocean_windrow[offset + y1*windrow_size + x1];
+        var mid_lod = 0.0;
+        var far_lod = 0.0;
+        if (ocean.appearance_c.y > 0.5) {
+            let half_cells=select(128.0,max(ocean.authored_plane.y,1.0),ocean.authored_plane.w > 0.5);
+            let spacing=ocean.appearance_c.z;
+            let world_pos=world_m*units_per_meter;
+            let radius=max(abs(world_pos.x-ocean.clipmap.x),abs(world_pos.y-ocean.clipmap.y));
+            let near_seam=half_cells*spacing*2.0;
+            let middle_seam=half_cells*spacing*4.0;
+            mid_lod=smoothstep(near_seam,near_seam+spacing*16.0,radius);
+            far_lod=smoothstep(middle_seam,middle_seam+spacing*32.0,radius);
+        }
+        let a = ocean_windrow_lod(y0*windrow_size + x0,offset,mid_lod,far_lod);
+        let b = ocean_windrow_lod(y0*windrow_size + x1,offset,mid_lod,far_lod);
+        let c = ocean_windrow_lod(y1*windrow_size + x0,offset,mid_lod,far_lod);
+        let d = ocean_windrow_lod(y1*windrow_size + x1,offset,mid_lod,far_lod);
         let transported = mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
         // Keep thin windrows visible farther than crest foam while still fading
         // sub-texel structure before it reaches the horizon.
@@ -3322,10 +3419,9 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     if (ocean.appearance_b.x == 1.0 || ocean.appearance_b.x >= 2.5) {
         body_color = ocean.water_color.rgb;
     }
-    // The synthetic extension samples the same captured underwater medium;
-    // the optics pass analytically continues that medium beyond sky contacts.
-    // Source and extension both retain authored opacity and FFT lighting.
-    let sky_exterior = ocean_sky_exterior(input.ocean_uv_m * units_per_meter);
+    // Both geometric and analytic ocean share the same captured scene and
+    // Beer-Lambert optics. The exterior eligibility mask is handled by
+    // ocean_mask_contains; do not use it to override water transmission.
     var body_opacity = select(0.0, material.ocean_color.a, authored_water);
     // The ocean optics capture now recognizes the same extended underwater
     // medium outside the BSP. Do NOT force exterior opacity to 1: that would
@@ -3362,17 +3458,11 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
         // transparency with the captured scene but skip the second depth lookup.
         refracted_uv = uv;
     }
-    // Preserve captured scene transmission for exterior ocean pixels too.
-    // Substituting the raw ocean fog color here creates artificial flat fog
-    // wedges at the authored-water/sky-extension boundary.
-    var transmission = textureSampleLevel(ocean_scene, ocean_scene_sampler, refracted_uv, 0.0).rgb;
-    // Extension pixels with no receiver behind them (capture depth 1e6) see
-    // an unbounded water column: the optics medium at full opacity is the fog
-    // colour, matching the inner ocean's deep water instead of the void.
-    if (sky_exterior && !below) {
-        let behind = textureLoad(ocean_scene_depth, vec2<i32>(refracted_uv*dims), 0).r;
-        if (behind >= 900000.0) { transmission = ocean_optics.fog.rgb; }
-    }
+    // The capture already contains absorption for real scene receivers.
+    // Missing receiver/sky pixels retain the captured background; forcing
+    // raw fog RGB here only on sky-exterior pixels creates the visible
+    // interior/extension color boundary (also in the analytic far tail).
+    let transmission = textureSampleLevel(ocean_scene, ocean_scene_sampler, refracted_uv, 0.0).rgb;
     let surface_light = indirect + albedo * direct_diffuse + local_lights;
     // alphaGen/texture alpha controls how much lit water replaces the
     // transmitted scene. Fresnel and foam still use the FFT ocean response.
@@ -4300,10 +4390,11 @@ fn sample_sky_cost_probe(d: vec3<f32>, probe: u32) -> vec4<f32> {
     return sample_outer_sky(d);
 }
 
-// Rendering policy, independent from r_oceanSkyExtend: a BSP map with
-// an authored water/vertical-sky contact uses a black lower sky hemisphere.
+// While the sky-extension ocean is active (r_oceanSkyExtend on and the camera's
+// PVS sees the water) a map with an authored water/vertical-sky contact uses a
+// black lower sky hemisphere.
 // This is an angular horizon test in JKA Z-up, NOT a water height/depth test.
-// Camera render_flags.y bit 16 is set by the frame after map-load detection.
+// Camera render_flags.y bit 16 is set per frame from the extension gate.
 fn ocean_connected_sky_below_horizon(direction_z: f32) -> bool {
     return (camera.render_flags.y & 65536u) != 0u && direction_z < 0.0;
 }
@@ -4488,3 +4579,95 @@ fn sky_box_color(input: SkyBoxOut, color: vec4<f32>) -> vec4<f32> {
 @fragment fn fs_sky_box_ft(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_ft, sky_sampler, sky_box_uv(input.uv))); }
 @fragment fn fs_sky_box_up(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_up, sky_sampler, sky_box_uv(input.uv))); }
 @fragment fn fs_sky_box_dn(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_dn, sky_sampler, sky_box_uv(input.uv))); }
+
+// Phase 2: mesh-free continuation outside the camera-relative displaced grid.
+// A single fullscreen triangle produces world-space intersections with the
+// promoted water plane. No enormous BSP mesh, CPU tessellation, or far LOD
+// update is needed. This entrypoint has its own lazy PSO, compiled only when
+// r_oceanSkyExtend=2, and reuses the SAME per-pool material/FFT/optics bindings.
+struct OceanFarVertex {
+    @builtin(position) position: vec4<f32>,
+};
+
+@vertex fn vs_ocean_far(@builtin(vertex_index) i: u32) -> OceanFarVertex {
+    var output: OceanFarVertex;
+    // Standard oversize fullscreen triangle, no vertex buffer.
+    let corner = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    output.position = vec4<f32>(corner * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    return output;
+}
+
+struct OceanFarFragment {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+};
+
+@fragment fn fs_ocean_far(pixel: OceanFarVertex) -> OceanFarFragment {
+    // The inverse view-projection is already in the optical capture uniform,
+    // updated using this exact frame's (possibly TAA-jittered) view matrix.
+    let dimensions = vec2<f32>(textureDimensions(ocean_scene));
+    let ndc = vec2<f32>(pixel.position.x / dimensions.x * 2.0 - 1.0,
+        1.0 - pixel.position.y / dimensions.y * 2.0);
+    // Reverse-Z perspective: avoid exactly 0 at the infinite far plane where
+    // inverse projection produces homogeneous w=0.
+    let a = ocean_optics.inverse_view_projection * vec4<f32>(ndc, 0.75, 1.0);
+    let b = ocean_optics.inverse_view_projection * vec4<f32>(ndc, 0.25, 1.0);
+    let ray = normalize(b.xyz / b.w - a.xyz / a.w);
+    let eye = camera.camera_pos_time.xyz;
+    let sea_height = ocean.spray_planes[0].x; // promoted BSP pool plane; Y up
+    if (abs(ray.y) < 1.0e-7) { discard; }
+    let distance_to_plane = (sea_height - eye.y) / ray.y;
+    if (distance_to_plane <= 0.0) { discard; }
+    let world = eye + ray * distance_to_plane;
+
+    // The clipmap's current outermost *drawn* ring, not a made-up extension
+    // distance or the original BSP footprint. For a square projected grid,
+    // max(abs(dx),abs(dz)) is the matching exterior coverage predicate.
+    let radius = ocean.appearance_c.w;
+    // The mesh edge and this per-pixel test are two independent evaluations of the
+    // same square, so a one-pixel line can fall between them and show the clear
+    // colour. With the seam flattened (the edge flatten) the mesh is nearly flat
+    // there, so start half an outer cell inside it and let the depth test pick.
+    let edge_mode = floor(ocean.appearance_a.w);
+    var seam_overlap = 0.0;
+    if (radius > 0.0 && edge_mode == 1.0) {
+        seam_overlap = 0.5 * min(max(ocean.wind_motion.w, 1.0), radius / max(ocean.authored_plane.y, 1.0));
+    }
+    if (radius <= 0.0 || max(abs(world.x-ocean.clipmap.x),
+        abs(world.z-ocean.clipmap.y)) < radius - seam_overlap) { discard; }
+    let pool_slot = i32(round(ocean.spray_planes[0].z));
+    if (!ocean_mask_contains(pool_slot, world.xz)) { discard; }
+
+    let projected = camera.view_proj * vec4<f32>(world, 1.0);
+    // Reverse-Z maps the far horizon toward zero. Clamp the infinite part
+    // just above sky clear depth (0), retaining foreground depth occlusion.
+    let depth = clamp(projected.z / projected.w, 0.000001, 1.0);
+
+    // Feed the existing physical/optical water shading with reconstructed
+    // fragment inputs. Exterior shading already bypasses coastal bathymetry.
+    var surface: VertexOut;
+    surface.clip_position = pixel.position;
+    surface.uv = vec2<f32>(0.0);
+    surface.lightmap_uv = vec2<f32>(0.0);
+    surface.color = vec4<f32>(1.0);
+    surface.sky_dir_ao = vec4<f32>(world-eye, 0.0);
+    surface.world_position = world;
+    surface.world_normal = vec3<f32>(0.0, 1.0, 0.0);
+    surface.shell_kind = 0u;
+    surface.shell_coverage = 0.0;
+    surface.ocean_wave_height = 0.0;
+    surface.ocean_uv_m = world.xz / max(ocean.ocean_info.z, 0.001);
+    surface.ocean_vertex = 2.0 + f32(pool_slot);
+    surface.pbr_lightgrid_direction = vec4<f32>(0.0);
+    surface.pbr_lightgrid_lighting = vec4<f32>(0.0);
+    surface.vertex_dlight = vec3<f32>(0.0);
+    surface.legacy_dlight_bits = 0u;
+
+    var result: OceanFarFragment;
+    // Keep analytic pixels on the same material, optics and fog path as the
+    // displaced mesh.
+    let shaded = shade_surface(surface, eye.y >= sea_height);
+    result.color = legacy_rgb_output(apply_jump_shade(shaded, world));
+    result.depth = depth;
+    return result;
+}

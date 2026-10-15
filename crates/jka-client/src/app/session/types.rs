@@ -182,7 +182,7 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) weapon_fx: crate::cgame::weapon_fx::WeaponFx,
     /// Material/texture analysis cache used by inferred legacy-EFX lights.
     pub(in crate::app) fx_light_promoter: crate::fx::light_promotion::FxLightPromoter,
-    pub(in crate::app) promote_fx_lights: bool,
+    pub(in crate::app) promote_fx_lights: u8,
     /// This frame's FX primitives, tessellated once the final camera is known.
     pub(in crate::app) fx_draws: Vec<crate::fx::system::FxDraw>,
     pub(in crate::app) gpu_commands: Option<crate::fx::gpu_sparks::GpuSparkCommands>,

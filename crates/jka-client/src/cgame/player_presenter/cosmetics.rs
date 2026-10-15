@@ -5,11 +5,14 @@ use crate::cgame::player_presenter::{
     PlayerModelAsset, SaberModelAsset, Vec3,
 };
 
-/// A vehicle's last presented (static) pose, kept for muzzle bolts.
+/// This frame's animated vehicle pose, also used by the *driver rider tag.
 #[derive(Clone)]
 pub(in crate::cgame::player_presenter) struct VehicleSnap {
     /// Lower-case `.veh` name.
     pub(in crate::cgame::player_presenter) vehicle: String,
+    pub(in crate::cgame::player_presenter) frame_time: i32,
+    pub(in crate::cgame::player_presenter) owner: i32,
+    pub(in crate::cgame::player_presenter) yaw: f32,
     pub(in crate::cgame::player_presenter) model: Arc<SaberModelAsset>,
     pub(in crate::cgame::player_presenter) pose: Vec<Matrix3x4>,
     pub(in crate::cgame::player_presenter) axis: [[f32; 3]; 3],

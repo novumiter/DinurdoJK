@@ -1197,8 +1197,8 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_promoteFxLights",
                 "",
-                "0..1",
-                "Infer point/spot/segment transient lights from emissive legacy EFX that omit authored Light{} stages.",
+                "0..2",
+                "0 off; 1 conservative FX inference; 2 aggressive FX + live projectile light promotion. Authored Light{} is preserved.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1210,22 +1210,24 @@ app_cvars! {
             .with_text_setter(App::cvar_set_r_promotefxlights, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
-                    settings.promote_fx_lights =
-                        parse_bool(value).unwrap_or(settings.promote_fx_lights);
+                    settings.promote_fx_lights = value.trim().parse::<u8>().ok()
+                        .filter(|level| *level <= 2).unwrap_or(settings.promote_fx_lights);
                 }),
                 archive: Some((417, |state| {
                     let settings = state.video;
-                    format!("{}", u8::from(settings.promote_fx_lights))
+                    format!("{}", settings.promote_fx_lights)
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_promotefxlights(&self) -> String {
-                    bool_value(self.video.promote_fx_lights)
+                    self.video.promote_fx_lights.to_string()
                 }
                 fn cvar_set_r_promotefxlights(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    self.video.promote_fx_lights = Self::parse_cvar_bool(name, value)?;
+                    self.video.promote_fx_lights = value.trim().parse::<u8>()
+                        .ok().filter(|value| *value <= 2)
+                        .ok_or_else(|| format!("{name}: expected 0, 1 or 2"))?;
                     if let Some(session) = self.game_session.as_mut() {
                         session.promote_fx_lights = self.video.promote_fx_lights;
                     }

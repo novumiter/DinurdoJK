@@ -182,7 +182,7 @@ impl GameSession {
             sound_presenter: None,
             weapon_fx,
             fx_light_promoter: crate::fx::light_promotion::FxLightPromoter::default(),
-            promote_fx_lights: false,
+            promote_fx_lights: 0,
             fx_draws: Vec::new(),
             gpu_commands: None,
             gpu_draw_indices: Vec::new(),

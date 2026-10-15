@@ -95,7 +95,7 @@ fn scene_hash(scene: &str, mod_name: &str) -> u64 {
 pub(super) fn path(base: &Path, game: Option<&Path>, scene: &str) -> PathBuf {
     let mod_name = game.map_or("base", |path| path.to_str().unwrap_or("mod"));
     base.join("cache").join("frontend_scenes").join(format!(
-        "v4_{:016x}.jpg", scene_hash(scene, mod_name),
+        "v5_{:016x}.jpg", scene_hash(scene, mod_name),
     ))
 }
 
@@ -171,15 +171,17 @@ impl App {
     }
 }
 
-/// Best-effort removal of snapshots written by older cache formats (v3 could
-/// contain console/HUD pixels).
+/// Best-effort removal of snapshots written by older cache formats.
+/// v4 inherited gameplay FOV and can no longer be used for the fixed menu
+/// projection; v3 and earlier could contain console/HUD pixels.
 fn remove_legacy_snapshots(current: &Path) {
     let Some(dir) = current.parent() else { return; };
     let Ok(entries) = std::fs::read_dir(dir) else { return; };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if (name.starts_with("v3_") || name.starts_with("v2_") || name.starts_with("v1_"))
+        if (name.starts_with("v4_") || name.starts_with("v3_")
+            || name.starts_with("v2_") || name.starts_with("v1_"))
             && name.ends_with(".jpg")
         {
             let _ = std::fs::remove_file(entry.path());

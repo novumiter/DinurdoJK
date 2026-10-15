@@ -675,6 +675,11 @@ struct Renderer {
     camera_water_surface: f32,
     ocean_enabled: bool,
     ocean_sky_extend: bool,
+    /// Mesh-free far-plane continuation, live only in r_oceanSkyExtend 2.
+    ocean_sky_infinite: bool,
+    /// Bit per ocean slot: the sky-extension ocean may draw from the camera's
+    /// current PVS cluster (see `refresh_ocean_extension_gate`).
+    ocean_extension_mask: u8,
     coastal_enabled: bool,
     coastal_pool: u8,
     coastal_atlas: Option<Arc<jka_assets::bsp::bathymetry::Atlas>>,

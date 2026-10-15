@@ -19,6 +19,11 @@ pub(in crate::app) const DEMO_SCRUB_PREVIEW_INTERVAL: Duration = Duration::from_
 /// a cvar or an authored list of menu scenes without changing the load path.
 pub(in crate::app) const FRONTEND_BACKGROUND_MAP: &str = "mp/duel3";
 
+/// The menu is art-directed against this legacy horizontal 4:3 FOV, regardless
+/// of `cg_fov`, `cg_zoomFov`, or the current gameplay/spectator camera.
+/// It is a render-only override: never write it into the saved gameplay cvar.
+pub(in crate::app) const FRONTEND_SCENE_FOV: f32 = 90.0;
+
 pub(in crate::app) const FRONTEND_CAMERA_EYE_HEIGHT: f32 = 18.0;
 
 pub(in crate::app) const FRONTEND_FOREGROUND_MODEL: &str = "jedi_hm/head_a1|torso_d1|lower_a1";

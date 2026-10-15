@@ -270,6 +270,8 @@ pub fn surface_settings(
     settings.map_size = shared.map_size;
     settings.simulate_when_hidden = shared.simulate_when_hidden;
     settings.updates_per_second = shared.updates_per_second;
+    settings.dynamic_update_rates = shared.dynamic_update_rates;
+    settings.wind_foam_sync = shared.wind_foam_sync;
     settings.mesh_quality = shared.mesh_quality;
     settings.cascades = shared.cascades;
     settings.optics = shared.optics;

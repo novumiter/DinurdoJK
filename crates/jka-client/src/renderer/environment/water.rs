@@ -26,15 +26,70 @@ impl Renderer {
     }
 
     /// Live A/B toggle. Source masks and coastal resources never change.
-    pub(in crate::renderer) fn set_ocean_sky_extend(&mut self, enabled: bool) {
-        if self.ocean_sky_extend == enabled { return; }
+    pub(in crate::renderer) fn set_ocean_sky_extend(&mut self, mode: u8) {
+        let enabled = mode > 0;
+        let infinite = mode >= 2;
+        if self.ocean_sky_extend == enabled && self.ocean_sky_infinite == infinite { return; }
         self.ocean_sky_extend = enabled;
+        self.ocean_sky_infinite = infinite;
         // Reprime visibility so the first newly exposed ocean frame cannot
         // inherit the old no-water occlusion/capture decision.
         self.ocean_visibility.primed = false;
         self.ocean_hidden_time = 0.0;
-        eprintln!("OCEAN SKY phase1: {} (render-only, r_coastal untouched)",
-            if enabled { "ON" } else { "OFF" });
+        eprintln!("OCEAN SKY: mode {mode} (0 original, 1 geometric, 2 geometric + analytic far; coastal untouched)");
+    }
+
+    /// Whether the sky-extension ocean (mesh, analytic far plane, optics, fog,
+    /// submerged classification) is active for `slot` from the current camera.
+    pub(in crate::renderer) fn ocean_extension_active(&self, slot: usize) -> bool {
+        self.ocean_sky_extend && slot < 8 && self.ocean_extension_mask >> slot & 1 != 0
+    }
+
+    /// The extension only exists where the camera's PVS can see the pool's
+    /// original water faces. Outside the map (no cluster), in a room that
+    /// cannot see the water, or inside the skybox region it is off. With PVS
+    /// off, or a map without compiled visibility, nothing can be gated.
+    pub(in crate::renderer) fn refresh_ocean_extension_gate(&mut self, camera: [f32; 3], ocean_rendered: bool) {
+        let pvs_off = matches!(self.pvs_mode, PvsMode::Off);
+        let Some(world) = self.world.as_mut().filter(|_| ocean_rendered) else {
+            self.ocean_extension_mask = 0;
+            return;
+        };
+        let mut all = 0u8;
+        for (slot, region) in world.ocean_sky_regions.iter().enumerate().take(8) {
+            if region.is_some() {
+                all |= 1 << slot;
+            }
+        }
+        let Some(visibility) = world.visibility.as_ref().filter(|_| !pvs_off && all != 0) else {
+            self.ocean_extension_mask = all;
+            return;
+        };
+        let Some(cluster) = visibility.cluster_at(crate::scene::jka_position(camera)) else {
+            self.ocean_extension_mask = 0;
+            return;
+        };
+        if let Some((cached, mask)) = world.ocean_gate_cache {
+            if cached == cluster {
+                self.ocean_extension_mask = mask;
+                return;
+            }
+        }
+        let batches = if world.full_batches.is_empty() { &world.coarse_batches } else { &world.full_batches };
+        let (word, bit) = (cluster / 64, cluster % 64);
+        let mut mask = 0u8;
+        for batch in batches {
+            if batch.ocean_clipmap.is_none() || batch.ocean_clipmap_id >= 8 {
+                continue;
+            }
+            let signature = &batch.source.pvs_signature;
+            if signature.is_empty() || signature.get(word).is_none_or(|value| *value & (1_u64 << bit) != 0) {
+                mask |= 1 << batch.ocean_clipmap_id;
+            }
+        }
+        let mask = mask & all;
+        world.ocean_gate_cache = Some((cluster, mask));
+        self.ocean_extension_mask = mask;
     }
 
     /// Keeps promoted-water geometry in sync with the live pool amplitude,
@@ -105,7 +160,8 @@ impl Renderer {
                     .max(crate::ocean::appearance::MIN_PROMOTED_AMPLITUDE)
             };
             let half_cells = crate::ocean::promoted_clipmap_half_cells(amplitude);
-            let sky = if self.ocean_sky_extend {
+            let sky = if self.ocean_sky_extend && descriptor.index < 8
+                && self.ocean_extension_mask >> descriptor.index & 1 != 0 {
                 world.ocean_sky_regions[descriptor.index].as_ref()
             } else { None };
             let extension = sky.is_some();
@@ -187,8 +243,13 @@ impl Renderer {
             world.runtime_ocean_clipmaps.iter().find(|r|r.quality==quality && r.slot as usize==slot)
                 .map(|r|r.current_centre).filter(|c|c.iter().all(|v|v.is_finite()))
         });
+        let radii=std::array::from_fn(|slot| {
+            world.runtime_ocean_clipmaps.iter().find(|r|r.quality==quality && r.slot as usize==slot)
+                .filter(|r|r.current_sky_extend)
+                .map(|r| r.layout.coverage_radius_for_limit(r.current_half_cells, r.current_minimum_level, r.current_level_limit))
+        });
         if let Some(ocean)=self.ocean.as_mut() {
-            ocean.set_promoted_clipmap_centres(queue,centres);
+            ocean.set_promoted_clipmap_centres(queue,centres,radii);
         }
         let Some(changed_ranges) = changed_ranges else { return; };
         let apply = |batches: &mut [WorldBatch]| {

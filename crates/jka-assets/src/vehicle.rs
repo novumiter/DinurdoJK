@@ -54,6 +54,18 @@ pub struct VehicleDefinition {
     /// `weapMuzzle1..12`: the vehicle weapon (a `.vwp` name) fired from each
     /// `*muzzleN` bolt. Turret-owned muzzles are not resolved.
     pub weap_muzzles: [Option<String>; MAX_VEHICLE_MUZZLES],
+    /// TaystJK VEH_LoadVehicle resolves these before any weapMuzzleN entries.
+    pub weapons: [Option<String>; 2],
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VehicleWeaponDefinition {
+    /// `.vwp` muzzleFX, shotFX, impactFX, model and loopSound (not CS_EFFECTS).
+    pub muzzle_fx: Option<String>,
+    pub shot_fx: Option<String>,
+    pub impact_fx: Option<String>,
+    pub model: Option<String>,
+    pub loop_sound: Option<String>,
 }
 
 pub const MAX_VEHICLE_MUZZLES: usize = 12;
@@ -62,7 +74,7 @@ pub const MAX_VEHICLE_MUZZLES: usize = 12;
 pub struct VehicleDefinitions {
     definitions: BTreeMap<String, VehicleDefinition>,
     /// Vehicle weapon name (lower case) -> `muzzleFX` effect from `.vwp` files.
-    weapon_muzzle_fx: BTreeMap<String, String>,
+    weapon_definitions: BTreeMap<String, VehicleWeaponDefinition>,
 }
 
 impl VehicleDefinitions {
@@ -76,7 +88,25 @@ impl VehicleDefinitions {
 
     /// `g_vehWeaponInfo[weapon].iMuzzleFX` as an effect name.
     pub fn weapon_muzzle_fx(&self, weapon: &str) -> Option<&str> {
-        self.weapon_muzzle_fx.get(&weapon.to_ascii_lowercase()).map(String::as_str)
+        self.weapon_definition(weapon)?.muzzle_fx.as_deref()
+    }
+
+    pub fn weapon_definition(&self, weapon: &str) -> Option<&VehicleWeaponDefinition> {
+        self.weapon_definitions.get(&weapon.to_ascii_lowercase())
+    }
+
+    /// `VEH_LoadVehicle`: register weap1, weap2, then weapMuzzle1..10.
+    /// `VEH_VehWeaponIndexForName` deduplicates globally by weapon name and
+    /// assigns indices starting at 1 (0 is VEH_WEAPON_NONE).
+    pub fn register_weapons_for_vehicle(&self, vehicle: &str, registered: &mut Vec<String>) {
+        let Some(definition) = self.get(vehicle) else { return };
+        for name in definition.weapons.iter().chain(definition.weap_muzzles.iter().take(10)) {
+            let Some(name) = name.as_deref() else { continue };
+            if !self.weapon_definitions.contains_key(&name.to_ascii_lowercase()) { continue; }
+            if !registered.iter().any(|item| item.eq_ignore_ascii_case(name)) {
+                registered.push(name.to_ascii_lowercase());
+            }
+        }
     }
 }
 
@@ -98,7 +128,7 @@ pub fn load_vehicle_definitions(assets: &mut AssetSearchPath) -> Result<VehicleD
         parse_vehicle_file(&asset.bytes, &mut definitions)
             .map_err(|error| format!("{name}: {error}"))?;
     }
-    let mut weapon_muzzle_fx = BTreeMap::new();
+    let mut weapon_definitions = BTreeMap::new();
     let weapons = assets
         .names()
         .filter(|name| name.starts_with(WEAPON_DIRECTORY) && name.ends_with(WEAPON_EXTENSION))
@@ -112,33 +142,38 @@ pub fn load_vehicle_definitions(assets: &mut AssetSearchPath) -> Result<VehicleD
             continue;
         };
         // A malformed weapon file only loses its muzzle effects.
-        let _ = parse_weapon_file(&asset.bytes, &mut weapon_muzzle_fx);
+        let _ = parse_weapon_file(&asset.bytes, &mut weapon_definitions);
     }
-    Ok(VehicleDefinitions { definitions, weapon_muzzle_fx })
+    Ok(VehicleDefinitions { definitions, weapon_definitions })
 }
 
-/// `.vwp` blocks: `name { ... muzzleFX "effect" ... }`.
-fn parse_weapon_file(bytes: &[u8], out: &mut BTreeMap<String, String>) -> Result<(), String> {
+/// `BG_ParseVehWeaponParm`: use the authored shotFX, muzzleFX, impactFX
+/// and optional model, instead of treating a vehicle index as CS_EFFECTS.
+fn parse_weapon_file(
+    bytes: &[u8],
+    out: &mut BTreeMap<String, VehicleWeaponDefinition>,
+) -> Result<(), String> {
     let mut parser = ComParser::new(bytes);
     while let Some(name) = parser.token(true)? {
         if parser.token(true)?.as_deref() != Some("{") {
             return Err(format!("vehicle weapon {name:?} missing opening '{{'"));
         }
-        let mut muzzle_fx = None;
+        let mut weapon = VehicleWeaponDefinition::default();
         loop {
-            let Some(key) = parser.token(true)? else { return Err("unexpected EOF in vehicle weapon".into()) };
-            if key == "}" {
-                break;
-            }
-            if key.eq_ignore_ascii_case("muzzleFX") {
-                muzzle_fx = parser.token(false)?.filter(|value| !value.is_empty());
-            } else {
-                parser.skip_rest_of_line();
+            let Some(key) = parser.token(true)? else {
+                return Err("unexpected EOF in vehicle weapon".into());
+            };
+            if key == "}" { break; }
+            match key.to_ascii_lowercase().as_str() {
+                "muzzlefx" => weapon.muzzle_fx = parser.token(false)?.filter(|v| !v.is_empty()),
+                "shotfx" => weapon.shot_fx = parser.token(false)?.filter(|v| !v.is_empty()),
+                "impactfx" => weapon.impact_fx = parser.token(false)?.filter(|v| !v.is_empty()),
+                "model" => weapon.model = parser.token(false)?.filter(|v| !v.is_empty()),
+                "loopsound" => weapon.loop_sound = parser.token(false)?.filter(|v| !v.is_empty()),
+                _ => parser.skip_rest_of_line(),
             }
         }
-        if let Some(effect) = muzzle_fx {
-            out.entry(name.to_ascii_lowercase()).or_insert(effect);
-        }
+        out.entry(name.to_ascii_lowercase()).or_insert(weapon);
     }
     Ok(())
 }
@@ -164,6 +199,7 @@ fn parse_vehicle_file(
         let mut vehicle_type = None;
         let mut camera = VehicleCameraDefinition::default();
         let mut weap_muzzles: [Option<String>; MAX_VEHICLE_MUZZLES] = Default::default();
+        let mut weapons: [Option<String>; 2] = Default::default();
         loop {
             let Some(key) = parser.token(true)? else {
                 return Err(format!("unexpected EOF while parsing vehicle {name:?}"));
@@ -194,6 +230,11 @@ fn parse_vehicle_file(
                 continue;
             }
             match lower.as_str() {
+                "weap1" | "weap2" => {
+                    let slot = usize::from(lower == "weap2");
+                    weapons[slot] = parser.token(false)?
+                        .filter(|weapon| !weapon.is_empty() && weapon != "0");
+                }
                 "model" => {
                     if let Some(value) = parser.token(false)? {
                         let value = value.replace('\\', "/");
@@ -245,6 +286,7 @@ fn parse_vehicle_file(
                     vehicle_type,
                     camera,
                     weap_muzzles,
+                    weapons,
                 });
         }
     }
@@ -411,7 +453,7 @@ muzzleFX \"ships/swoop_blastermuzzleflash\"
 speed 2500
 }
 ", &mut fx).unwrap();
-        assert_eq!(fx["swoop_laser"], "ships/swoop_blastermuzzleflash");
+        assert_eq!(fx["swoop_laser"].muzzle_fx.as_deref(), Some("ships/swoop_blastermuzzleflash"));
     }
 
     #[test]
@@ -481,4 +523,38 @@ speed 2500
         parse_vehicle_file(b"X-Wing { model first }\nx-wing { model second }\n", &mut defs).unwrap();
         assert_eq!(defs["x-wing"].model, "first");
     }
+    #[test]
+    fn vehicle_weapon_indices_use_taystjk_registration_order_and_effect_names() {
+        let mut defs = BTreeMap::new();
+        parse_vehicle_file(br#"tie-fighter {
+            type VH_FIGHTER
+            model tie_fighter
+            weapMuzzle1 tie_laser
+            weapMuzzle2 tie_laser
+            weap1 tie_laser
+            weap2 tie_torpedo
+        }"#, &mut defs).unwrap();
+        let mut weapons = BTreeMap::new();
+        parse_weapon_file(br#"tie_laser {
+            name tie_laser
+            projectile 1
+            muzzleFX ships/tie_muzzle
+            shotFX ships/tie_shot
+            impactFX ships/tie_impact
+        }
+        tie_torpedo {
+            name tie_torpedo
+            model models/weapons2/tie/torpedo.md3
+            shotFX ships/tie_torpedo
+        }"#, &mut weapons).unwrap();
+        let db = VehicleDefinitions { definitions: defs, weapon_definitions: weapons };
+        let mut registered = Vec::new();
+        db.register_weapons_for_vehicle("tie-fighter", &mut registered);
+        assert_eq!(registered, vec!["tie_laser", "tie_torpedo"]);
+        assert_eq!(db.weapon_definition(&registered[0]).unwrap().shot_fx.as_deref(), Some("ships/tie_shot"));
+        assert_eq!(db.weapon_definition(&registered[1]).unwrap().model.as_deref(), Some("models/weapons2/tie/torpedo.md3"));
+        db.register_weapons_for_vehicle("tie-fighter", &mut registered);
+        assert_eq!(registered.len(), 2);
+    }
+
 }

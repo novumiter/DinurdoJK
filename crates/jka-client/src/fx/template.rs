@@ -633,7 +633,7 @@ fn infer_auto_light_spot(effect_name: &str, primitive: &PrimitiveTemplate) -> Op
     })
 }
 
-fn token_score(value: &str, effect_name: bool) -> i16 {
+pub(super) fn token_score(value: &str, effect_name: bool) -> i16 {
     let value = value.to_ascii_lowercase();
     let contains_any = |tokens: &[&str]| tokens.iter().any(|token| value.contains(token));
 

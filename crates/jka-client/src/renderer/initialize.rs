@@ -2371,6 +2371,8 @@ impl Renderer {
             camera_water_surface: NO_WATER_SURFACE,
             ocean_enabled: false,
             ocean_sky_extend: true,
+            ocean_sky_infinite: true,
+            ocean_extension_mask: 0,
             coastal_enabled: false,
             coastal_pool: 0,
             coastal_atlas: None,

@@ -96,12 +96,13 @@ pub struct LegsFrameStep {
 }
 
 impl PlayerAnimationState {
-    /// OpenJK `CG_RegisterClientModelname` seeds model_root with frames 0..12 at
-    /// speed 1.0 before cgame starts applying network animation IDs.
+    /// `CG_RegisterClientModelname` seeds the *humanoid player* model_root with
+    /// 0..12. That setup is not used by TaystJK's `CG_G2AnimEntModelLoad` path
+    /// for CLASS_VEHICLE; a valid fighter GLA can contain only two frames.
     pub fn new(gla: &GlaAnimation, current_time: i32) -> Result<Self, String> {
-        let mut animator = Ghoul2Animator::new(gla);
+        let mut state = Self::new_vehicle(gla);
         if Ghoul2Animator::bone_index(gla, "model_root").is_some() {
-            animator.set_bone_anim(
+            state.animator.set_bone_anim(
                 gla,
                 "model_root",
                 0,
@@ -113,8 +114,15 @@ impl PlayerAnimationState {
                 -1,
             )?;
         }
-        Ok(Self {
-            animator,
+        Ok(state)
+    }
+
+    /// The non-humanoid vehicle starts in its authored frame-0 pose. The
+    /// authoritative `legsAnim` is applied by `update` only when defined in
+    /// the vehicle's actual animation.cfg; no humanoid 12-frame pre-roll.
+    pub fn new_vehicle(gla: &GlaAnimation) -> Self {
+        Self {
+            animator: Ghoul2Animator::new(gla),
             legs: LerpFrameState::default(),
             torso: LerpFrameState::default(),
             ci_legs_anim: 0,
@@ -123,7 +131,7 @@ impl PlayerAnimationState {
             no_lumbar: Ghoul2Animator::bone_index(gla, "lower_lumbar").is_none(),
             frames_seen: false,
             legs_step: None,
-        })
+        }
     }
 
     /// The legs frame change of the last `update`, the input of the animation
@@ -649,6 +657,19 @@ fn field_i32(entity: &EntityState, name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two-frame TIE fighter GLA from `oktry2.dm_26` must not be treated
+    /// as a humanoid with an unconditional 0..12 root animation.
+    #[test]
+    fn vehicle_animation_initialization_does_not_seed_humanoid_frames() {
+        let mut gla = jka_assets::ghoul2::openjk_default_gla().unwrap();
+        gla.skeleton[0].name = "model_root".into();
+        gla.num_frames = 2;
+        assert!(PlayerAnimationState::new(&gla, 1401575).is_err());
+        let vehicle = PlayerAnimationState::new_vehicle(&gla);
+        assert!(!vehicle.animator.bone_anim(0).unwrap().is_animating());
+        assert!(!vehicle.legs.has_animation);
+    }
 
     #[test]
     fn broken_arm_speed_order_matches_bg_saber_start_trans_anim() {

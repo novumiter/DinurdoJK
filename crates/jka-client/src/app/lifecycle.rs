@@ -1108,6 +1108,10 @@ impl ApplicationHandler<UserEvent> for App {
                     if let Some(spawn) = self.spawns.first().copied() {
                         let mut position = spawn.position;
                         position[1] += FRONTEND_CAMERA_EYE_HEIGHT;
+                        // Preserve the configured gameplay FOV in App::camera;
+                        // render_snapshot gives this scene its own fixed FOV.
+                        // Replacing the stored value here would overwrite the
+                        // console/UI cg_fov getter and the archived setting.
                         self.camera =
                             Camera::new_with_fov(position, spawn.yaw, self.camera.cg_fov());
                         self.frontend_cinematic = Some(FrontendCinematic {

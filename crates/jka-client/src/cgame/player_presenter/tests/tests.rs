@@ -1,6 +1,25 @@
 use super::*;
 use super::submission::mesh::append_surface_indices;
 
+
+/// `Oktiefighter.dm_26`: on mount the local playerState transmits eFlags=264
+/// (EF_NODRAW | EF_TELEPORT_BIT) and m_iVehicleNum=112. It has no packet
+/// ET_PLAYER of its own; the predicted/followed presentation MUST honor the
+/// same visibility guard as ordinary snapshot entities.
+#[test]
+fn fighter_pilot_nodraw_and_ship_death_flags_suppress_player_model() {
+    use super::presentation::cg_player_hidden_by_server_flags;
+    assert!(cg_player_hidden_by_server_flags(264, 0));
+    assert!(cg_player_hidden_by_server_flags(EF_NODRAW, 0));
+    assert!(cg_player_hidden_by_server_flags(0, EF2_SHIP_DEATH));
+    assert!(cg_player_hidden_by_server_flags(EF_NODRAW, EF2_SHIP_DEATH));
+    // Ordinary mounted riders remain visible when the server requests it.
+    assert!(!cg_player_hidden_by_server_flags(EF_TELEPORT_BIT, 0));
+    assert!(!cg_player_hidden_by_server_flags(0, 0));
+    // A corpse is presented by the separate ET_BODY path, regardless of
+    // the original pilot's EF_NODRAW state.
+}
+
 #[test]
 fn skeletal_binding_keeps_stock_pose_exact_and_native_models_use_72_gpu_matrices() {
     use jka_assets::skeleton::{humanoid_reference, HumanoidRig};

@@ -1037,6 +1037,33 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
     };
     let animation_gla = source.load_gla(&gla_qpath)?;
     let (gla, retargeter) = mesh_skeleton_binding(&glm, &animation_gla)?;
+    // Vehicle registration in CG_G2AnimEntModelLoad uses the animation table
+    // beside the GLA. The static weapon/hilt path must not load these tables.
+    let animations = if label.starts_with('$') {
+        // TaystJK CG_G2AnimEntModelLoad initializes Ghoul2 BEFORE trying
+        // BG_ParseAnimationFile. An absent/bad vehicle animation.cfg gives
+        // localAnimIndex=-1; it must not unregister the ship model itself.
+        let cfg = gla_sibling_qpath(&gla_qpath, "animation.cfg");
+        match cfg.as_deref() {
+            Some(cfg) => match source.read_optional(cfg, MAX_CHARACTER_ANIMATION_CFG_BYTES) {
+                Ok(Some(bytes)) => match parse_animation_cfg(&bytes) {
+                    Ok(animations) => Some(Arc::new(animations)),
+                    Err(error) => {
+                        log::warn!("VEHICLE ANIMATION OPTIONAL: model={} cfg={} parse error={} (rendering static pose)", model_qpath, cfg, error);
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(error) => {
+                    log::warn!("VEHICLE ANIMATION OPTIONAL: model={} cfg={} read error={} (rendering static pose)", model_qpath, cfg, error);
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
     // Match OpenJK's MDXM registration rule: the mesh may use fewer
     // bones than the referenced GLA, it just may not reference beyond it.
     if glm.num_bones > gla.skeleton.len() {
@@ -1053,15 +1080,17 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
                 .into_iter()
                 .map(|surface| (surface.name.to_ascii_lowercase(), surface.shader))
                 .collect::<HashMap<_, _>>(),
-            Err(error) if preview_fallback => {
-                rverbose!(
-                    1,
-                    "ASSET VIEWER GLM SKIN FALLBACK: model={} skin={} error={}; using embedded shaders/gray fallback",
+            Err(error) => {
+                // TaystJK R_RegisterSkin can return skinID=0 without failing
+                // G2API_InitGhoul2Model. An optional skin registration failure
+                // must not make the entire vehicle/NPC/weapon disappear.
+                // With no skin, Ghoul2 uses the GLM's embedded shaders.
+                log::warn!(
+                    "GHOUL2 OPTIONAL SKIN: model={} skin={} error={}; using embedded shader names",
                     model_qpath, skin_qpath, error,
                 );
                 HashMap::new()
-            }
-            Err(error) => return Err(error),
+            },
         }
     } else {
         HashMap::new()
@@ -1094,15 +1123,12 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
         }
         let missing_shader = shader_name.is_empty();
         let shader_name = if missing_shader {
-            if preview_fallback {
-                // Player/NPC GLMs often have no embedded shader refs and
-                // normally rely entirely on model_default.skin. If that
-                // skin is absent/incomplete, keep the geometry inspectable
-                // instead of silently producing zero draw surfaces.
-                "$whiteimage"
-            } else {
-                continue;
-            }
+            // In OpenJK, even when R_RegisterSkin returns zero, RenderSurfaces
+            // submits the mesh with the renderer's default shader. Do not
+            // erase a ship simply because both its embedded name and optional
+            // skin mapping are unavailable. $whiteimage is our neutral default
+            // material, while the asset log above retains the missing path.
+            "$whiteimage"
         } else {
             shader_name
         };
@@ -1158,7 +1184,7 @@ pub(in crate::cgame::player_presenter) fn build_static_glm(
         gla.skeleton.len(),
         gla_qpath,
     );
-    Ok(SaberModelAsset { glm, gla, animation_gla, retargeter, surfaces })
+    Ok(SaberModelAsset { glm, gla, animation_gla, retargeter, animations, surfaces })
 }
 
 impl PlayerPresenter {
@@ -1227,7 +1253,20 @@ impl PlayerPresenter {
         status: String,
     ) {
         if self.player_diagnostics.get(&entity_num) != Some(&status) {
-            devprintln!(2, "PLAYER PRESENTATION: entity={entity_num} {status}");
+            // In a protocol-26 demo, a missing CS_MODELS entry is not a
+            // missing PK3: the server never supplied the vehicle identity.
+            // Make that actionable at normal console verbosity instead of
+            // silently reporting an invisible vehicle only at developer 2.
+            if status.contains("has no CS_MODELS entry") {
+                println!("VEHICLE MODEL UNRESOLVED: entity={entity_num} {status}; missing server/demo registration, not a guessed model name");
+            } else if status.starts_with("vehicle submitted=0 reason=") {
+                // A missing GLM, GLA or .veh definition can otherwise look
+                // exactly like a valid EF_NODRAW vehicle; report the complete
+                // registration chain once when the status changes.
+                println!("VEHICLE PRESENTATION FAILED: entity={entity_num} {status}");
+            } else {
+                devprintln!(2, "PLAYER PRESENTATION: entity={entity_num} {status}");
+            }
             self.player_diagnostics.insert(entity_num, status);
         }
     }
@@ -1545,8 +1584,7 @@ impl PlayerPresenter {
         let warning_key = format!("{}|{}|{}", requested, resolved, resolved_skin.unwrap_or(""))
             .to_ascii_lowercase();
         if self.reported_vehicle_fallbacks.insert(warning_key) {
-            rverbose!(
-                1,
+            println!(
                 "VEHICLE MODEL FALLBACK: entity={} requested={} resolved={} skin={} reason={}; using {}",
                 entity_num,
                 requested,
@@ -1599,7 +1637,13 @@ impl PlayerPresenter {
         if !self.async_loading_enabled() {
             return self.load_static_glm(model_qpath, custom_skin, label);
         }
-        let key = static_model_key(model_qpath, custom_skin, false);
+        let mut key = static_model_key(model_qpath, custom_skin, false);
+        // The same GLM may be registered as a weapon/hilt and as a vehicle;
+        // only the latter loads the model-local animation table. A shared key
+        // would silently return a static model when the weapon loaded first.
+        if label.starts_with('$') {
+            key.push_str("|vehicle_animations=1");
+        }
         if let Some(model) = self.saber_models.get(&key) {
             return Ok(Arc::clone(model));
         }
@@ -1664,7 +1708,10 @@ impl PlayerPresenter {
         label: &str,
         preview_fallback: bool,
     ) -> Result<Arc<SaberModelAsset>, String> {
-        let key = static_model_key(model_qpath, custom_skin, preview_fallback);
+        let mut key = static_model_key(model_qpath, custom_skin, preview_fallback);
+        if label.starts_with('$') {
+            key.push_str("|vehicle_animations=1");
+        }
         if let Some(model) = self.saber_models.get(&key) {
             return Ok(Arc::clone(model));
         }

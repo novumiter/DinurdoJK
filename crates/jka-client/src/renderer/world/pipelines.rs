@@ -189,6 +189,7 @@ impl Renderer {
             world.pipeline_variants.insert(
                 key,
                 WorldPipelineVariant {
+                    ocean_far_pipeline: None,
                     pipelines,
                     legacy_dlight_pipelines,
                     fog_pass_pipelines,
@@ -855,6 +856,101 @@ impl WorldPassPipelineIdentity {
 /// each a single texture sample (`vs_sky_box_*` / `fs_sky_box_*`). Drawn after
 /// the opaque world at far depth with depth writes off, so only uncovered pixels
 /// are shaded.
+/// Fullscreen analytic far ocean, compiled lazily on the existing pipeline
+/// worker. It uses the active enhanced BSP module, so FFT/optics/materials
+/// are identical to the normal ocean; it is NOT another renderer path.
+pub(in crate::renderer) fn create_ocean_far_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    variant: WorldShaderVariantKey,
+) -> wgpu::RenderPipeline {
+    // The fullscreen vertex stage uses no shader overrides. Pass only
+    // overrides reachable from fs_ocean_far (ocean_surface_sample and its
+    // lighting/fog helpers). Supplying the fs_main-only set can cause a WGPU
+    // validation error when this optional pipeline first compiles.
+    let mut constants = variant.base_pass_key().compilation_constants();
+    constants.retain(|(name, _)| matches!(*name,
+        "ENABLE_PBR" | "ENABLE_POINT_LIGHTS" | "ENABLE_MAP_LIGHT_SIMULATION"
+        | "ENABLE_LEGACY_DLIGHTS" | "ENABLE_VERTEX_DLIGHTS"
+        | "ENABLE_CLUSTERED_LITE_DLIGHTS" | "ENABLE_AREA_LIGHTS"
+        | "ENABLE_IRRADIANCE_VOLUME" | "ENABLE_VOXEL_GI"
+        | "ENABLE_LOCAL_SHADOWS" | "ENABLE_CASCADED_SHADOWS"
+        | "ENABLE_PLANAR_REFLECTIONS" | "ENABLE_LEGACY_FOG"
+        | "ENABLE_JUMP_SHADE"));
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA analytic far ocean (mesh free)"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader, entry_point: Some("vs_ocean_far"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(camera_depth_compare()),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples, ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader, entry_point: Some("fs_ocean_far"),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &constants, ..Default::default()
+            },
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: None, write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: crate::pipeline_cache::get().as_ref(),
+    })
+}
+
+impl Renderer {
+    /// Enqueue work only when infinite far water is actively requested, with
+    /// the same cancellation/worker machinery as other optional pipelines.
+    pub(in crate::renderer) fn ensure_ocean_far_pipeline(&mut self) {
+        if !self.ocean_sky_infinite || !self.ocean_enabled { return; }
+        let Some(world) = self.world.as_ref() else { return; };
+        if !world.ocean_sky_regions.iter().any(Option::is_some) { return; }
+        let variant = world.active_pipeline_variant;
+        if !variant.ocean || variant.family() != WorldShaderFamily::Enhanced {return;}
+        if self.world.as_ref().and_then(|world|
+            world.pipeline_variants.get(&variant))
+            .is_some_and(|p| p.ocean_far_pipeline.is_some()) {return;}
+        let format = self.scene_format();
+        let samples = self.msaa_samples;
+        let key = PipelineJobKey::new("ocean-far", 0, pipeline_hash(&(variant,format,samples)));
+        if let Some(pipeline) = self.pipeline_jobs.take_ready::<wgpu::RenderPipeline>(key) {
+            if let Some(pipelines) = self.world.as_mut()
+                .and_then(|world| world.pipeline_variants.get_mut(&variant)) {
+                pipelines.ocean_far_pipeline = Some(pipeline);
+            }
+            return;
+        }
+        let (layout, shader) = if variant.ray_traced_shadows {
+            let Some(rt) = self.ray_traced_shadows.as_ref() else {return;};
+            (rt.world_pipeline_layout.clone(), rt.world_shader_for_variant(variant).clone())
+        } else {
+            (self.world_pipeline_layout.clone(), self.world_shader.clone())
+        };
+        let device = self.device.clone();
+        self.pipeline_jobs.request(key, "analytic far ocean", move || {
+            create_ocean_far_pipeline(&device,&layout,&shader,format,samples,variant)
+        });
+    }
+}
+
 pub(in crate::renderer) fn create_sky_box_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -1362,6 +1458,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
     };
 
     Some(WorldPipelineVariant {
+        ocean_far_pipeline: None,
         pipelines,
         legacy_dlight_pipelines,
         fog_pass_pipelines,

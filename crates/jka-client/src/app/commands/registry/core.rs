@@ -257,17 +257,25 @@ commands! {
         }
     }
 
-    cmd_write ["write", "writeconfig"] ("writeconfig <filename>", "Alias for writeconfig <filename>; writes archived client settings and binds.", CommandScope::Always) |self, command| {
+    cmd_write ["write", "writeconfig"] ("writeconfig <filename> [verbose]", "Write archived cvars and binds in sections; verbose adds concise value help.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb, filename] => {
-                self.write_named_config(filename);
+                self.write_named_config(filename, false);
+                CommandResult::Handled
+            }
+            [_verb, filename, verbose] if verbose.eq_ignore_ascii_case("verbose") => {
+                self.write_named_config(filename, true);
                 CommandResult::Handled
             }
             [_verb] => {
                 self.push_console_line(
-                    "^3usage:^7 writeconfig <filename>  (write is an alias)".to_owned(),
+                    "^3usage:^7 writeconfig <filename> [verbose]  (write is an alias)".to_owned(),
                 );
+                CommandResult::Handled
+            }
+            [_verb, ..] => {
+                self.push_console_line("^3usage:^7 writeconfig <filename> [verbose]");
                 CommandResult::Handled
             }
             _ => return CommandResult::Unhandled,

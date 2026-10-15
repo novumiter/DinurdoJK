@@ -3322,6 +3322,17 @@ pub fn presented_player_state_entity(ps: &PlayerState) -> Option<PresentedEntity
     presented_player_state(ps)
 }
 
+/// TaystJK CG_AddPacketEntities sends cg.predictedPlayerEntity through
+/// CG_AddCEntity. Only ET_PLAYER dispatches CG_Player: ET_INVISIBLE (including
+/// PM_SPECTATOR, PM_INTERMISSION and gibbed playerState) must not queue local
+/// Ghoul2 geometry, sprites, saber FX or a first-person weapon.
+///
+/// This is an entity-type dispatch gate, NOT an EF_NODRAW check. A custom mod
+/// can leave eFlags=0 while using PM_SPECTATOR to hide its controlling player.
+pub(crate) fn predicted_player_dispatches_cg_player(entity: &PresentedEntity) -> bool {
+    entity.entity_type == ET_PLAYER
+}
+
 /// Presentation-only interpolation for auxiliary playerState sources such as
 /// race ghosts. This intentionally reuses the exact predicted-player conversion
 /// instead of maintaining a second animation/state translation table.
@@ -3436,6 +3447,31 @@ fn entity_vec3(entity: &EntityState, prefix: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `oktry2.dm_26` (TaystJK recording): vehicle #112 has modelindex=4,
+    /// and the same snapshot's server commands register both the actual GLM
+    /// at CS_MODELS+2 and the `$tie-fighter` identity at CS_MODELS+4.
+    /// The cgame renderer must see the latter, not confuse modelindex with the
+    /// pre-registration GLM or require the configstring at demo gamestate.
+    #[test]
+    fn taystjk_tie_fighter_dynamic_model_registration() {
+        let mut game = ClientGameState::new();
+        game.queue_server_command(ServerCommand {
+            sequence: 19,
+            text: br#"cs 300 "models/players/tie_fighter/model.glm""#.to_vec(),
+        });
+        game.queue_server_command(ServerCommand {
+            sequence: 20,
+            text: br#"cs 302 "$tie-fighter""#.to_vec(),
+        });
+        assert_eq!(game.model_qpath(4), None);
+        game.execute_server_commands(19).unwrap();
+        assert_eq!(game.model_qpath(2).as_deref(), Some("models/players/tie_fighter/model.glm"));
+        assert_eq!(game.model_qpath(4), None);
+        game.execute_server_commands(20).unwrap();
+        assert_eq!(game.model_qpath(4).as_deref(), Some("$tie-fighter"));
+        assert_eq!(game.model_qpath(3), None);
+    }
 
     #[test]
     fn legacy_server_command_bytes_preserve_configstrings_and_sequence() {
@@ -3792,6 +3828,59 @@ mod tests {
         assert!(presented_player_state_entity(&ps).is_some());
         ps.persistant[PERS_TEAM] = TEAM_SPECTATOR;
         assert!(presented_player_state_entity(&ps).is_none());
+    }
+
+    /// `demo2026-10-15_16-49-33.dm_26` recorded client #4 controlling a
+    /// rancor with pm_type=4, m_iVehicleNum=0 and frequently eFlags=0.
+    /// Vanilla dispatches that predicted player as ET_INVISIBLE, not CG_Player.
+    /// Importantly PERS_TEAM is still the playing team, so this must NOT be
+    /// conflated with the separate free-spectator team gate.
+    #[test]
+    fn rancor_control_pm_spectator_predicted_entity_never_dispatches_cg_player() {
+        let mut ps = PlayerState::default();
+        assert!(ps.set_field_bits("clientNum", 4));
+        assert!(ps.set_field_bits("m_iVehicleNum", 0));
+        assert!(ps.set_field_bits("eFlags", 0));
+        assert!(ps.set_field_bits("pm_type", PM_SPECTATOR as u32));
+        ps.stats[0] = 100;
+        ps.persistant[PERS_TEAM] = 0; // Still playing, not TEAM_SPECTATOR.
+
+        let entity = presented_player_state_entity(&ps).expect("playing-team player state");
+        assert_eq!(entity.number, 4);
+        assert_eq!(entity.state.field_i32("eType"), Some(ET_INVISIBLE));
+        assert_eq!(entity.entity_type, ET_INVISIBLE);
+        assert!(!predicted_player_dispatches_cg_player(&entity));
+
+        // Control released: do not leave the avatar hidden after returning to
+        // PM_NORMAL. Vehicle/mounted players remain ordinary ET_PLAYER here.
+        assert!(ps.set_field_bits("pm_type", 0));
+        let entity = presented_player_state_entity(&ps).unwrap();
+        assert_eq!(entity.entity_type, ET_PLAYER);
+        assert!(predicted_player_dispatches_cg_player(&entity));
+        assert!(ps.set_field_bits("m_iVehicleNum", 112));
+        assert!(predicted_player_dispatches_cg_player(
+            &presented_player_state_entity(&ps).unwrap()
+        ));
+    }
+
+    #[test]
+    fn intermission_and_gibbed_predicted_player_skip_cg_player() {
+        let mut ps = PlayerState::default();
+        ps.stats[0] = 100;
+        assert!(ps.set_field_bits("pm_type", PM_INTERMISSION as u32));
+        let entity = presented_player_state_entity(&ps).unwrap();
+        assert_eq!(entity.entity_type, ET_INVISIBLE);
+        assert!(!predicted_player_dispatches_cg_player(&entity));
+
+        assert!(ps.set_field_bits("pm_type", 0));
+        ps.stats[0] = GIB_HEALTH;
+        assert!(!predicted_player_dispatches_cg_player(
+            &presented_player_state_entity(&ps).unwrap()
+        ));
+        ps.stats[0] = GIB_HEALTH + 1;
+        assert!(predicted_player_dispatches_cg_player(
+            &presented_player_state_entity(&ps).unwrap()
+        ));
     }
 
     #[test]
