@@ -748,6 +748,8 @@ pub struct PostEffects {
     pub sun_visibility: SunVisibilityMode,
     pub entity_sun_lighting: bool,
     pub sky_fractal_override: bool,
+    pub sky_backend: u8,
+    pub cloud_backend: u8,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,

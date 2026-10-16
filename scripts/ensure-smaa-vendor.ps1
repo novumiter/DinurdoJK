@@ -25,7 +25,7 @@ function Set-SmaaWgpuDefaultsOff([string]$ManifestPath) {
     } else {
         # Cargo.toml.orig is maintained as documentation; only Cargo.toml is
         # consumed by Cargo. Support the upstream inline dependency declaration.
-        $inlinePattern = '(?m)^(\s*wgpu\s*=\s*\{)([^}\r\n]*)(\}[ \t]*)$'
+        $inlinePattern = '(?m)^(\s*wgpu\s*=\s*\{)([^}\r\n]*)(\}[ \t]*\r?)$'
         $match = [regex]::Match($text, $inlinePattern)
         if (-not $match.Success) {
             throw "Cannot find upstream SMAA's WGPU dependency in $ManifestPath"

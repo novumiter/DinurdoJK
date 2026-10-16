@@ -602,6 +602,8 @@ impl App {
             sun_visibility: self.video.sun_visibility,
             entity_sun_lighting: self.video.entity_sun_lighting,
             sky_fractal_override: self.video.sky_fractal_override,
+            sky_backend: self.video.sky_backend,
+            cloud_backend: self.video.cloud_backend,
             clouds: self.video.clouds,
             cloud_type: self.video.cloud_type,
             cloud_quality: self.video.cloud_quality,
@@ -1611,11 +1613,37 @@ impl App {
     }
 
     /// Gate the existing GPU Godot wake/deformation system without erasing
-    /// the user's r_oceanInteraction preference. No new pipelines are compiled.
+    /// the user's r_oceanInteraction preference. RenderCommand carries canonical
+    /// (unresolved) settings: Renderer::set_ocean_settings resolves exactly once.
+    /// Otherwise Hybrid transparency multipliers would be applied twice.
     pub(in crate::app) fn effective_ocean_settings(&self) -> crate::ocean::OceanSettings {
         let mut settings = self.video.ocean_settings;
         settings.interaction &= self.video.water_wake == 2;
         settings
+    }
+
+    /// Single ocean selector. No promotion uses the existing resource-off path,
+    /// so stock BSP/JKA water returns rather than an invisible promoted mesh.
+    pub(in crate::app) fn set_ocean_type(&mut self, ocean_type: u8) {
+        let ocean_type = ocean_type.min(3);
+        let enabled = ocean_type != 0;
+        let backend = ocean_type.saturating_sub(1);
+        if enabled {
+            self.video.ocean_settings.backend = backend;
+        }
+        self.video.ocean = enabled;
+        if let Some(session) = self.game_session.as_mut() {
+            session.ocean_interaction_enabled = enabled
+                && self.video.ocean_settings.interaction && self.video.water_wake == 2;
+        }
+        // Prepare settings before enabling: this also switches the simulation
+        // when both backends happen to already have GPU resources.
+        self.commit_ocean_settings();
+        if !enabled || self.applied_ocean {
+            self.render_command(RenderCommand::SetOceanEnabled(enabled));
+        } else {
+            self.console_status = "OCEAN: PRESS APPLY VIDEO SETTINGS TO ENABLE PROMOTION".into();
+        }
     }
 
     /// Brings loaded or edited ocean settings to their effective form: shared

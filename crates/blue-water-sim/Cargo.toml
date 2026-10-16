@@ -1,0 +1,9 @@
+[package]
+name = "blue-water-sim"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }

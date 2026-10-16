@@ -542,6 +542,8 @@ pub(in crate::renderer) fn render_thread_main(
         sun_visibility: initial_ui.video.sun_visibility,
         entity_sun_lighting: initial_ui.video.entity_sun_lighting,
         sky_fractal_override: initial_ui.video.sky_fractal_override,
+        sky_backend: initial_ui.video.sky_backend,
+        cloud_backend: initial_ui.video.cloud_backend,
         clouds: initial_ui.video.clouds,
         cloud_type: initial_ui.video.cloud_type,
         cloud_quality: initial_ui.video.cloud_quality,

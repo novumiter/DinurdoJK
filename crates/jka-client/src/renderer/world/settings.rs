@@ -420,7 +420,8 @@ impl Renderer {
                         .any(|batch| batch.ocean_clipmap.is_some())
             });
         let needs_deformed_world = self.frame_plan.world_path == WorldRenderPath::Advanced
-            && ((self.wireframe_mask & ui::wireframe::OCEAN != 0 && has_ocean_clipmap)
+            && ((self.wireframe_mask & ui::wireframe::OCEAN != 0
+                    && self.ocean_settings.backend == 0 && has_ocean_clipmap)
                 || (self.wireframe_mask & ui::wireframe::DEFORMATION != 0 && has_deformation));
         if needs_deformed_world {
             if let Some(variant) = active_key {

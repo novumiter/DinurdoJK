@@ -42,6 +42,24 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_water(&mut self, ui: &mut egui::Ui) {
+        let current = if self.video.ocean { self.video.ocean_settings.backend + 1 } else { 0 };
+        theme::section(ui, "OCEAN TYPE", "One switch controls water promotion. Off keeps stock JKA map water.");
+        theme::row(ui, "Ocean renderer", "Hybrid = Blue Water above the surface, JKA/Godot optics and surface when submerged. Sky and clouds are independent under Clouds.", theme::Reset::None, |ui| {
+            for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid")] {
+                if theme::chip(ui, label, mode == current).clicked() && mode != current {
+                    self.set_ocean_type(mode);
+                }
+                ui.add_space(3.0);
+            }
+        });
+        if !self.video.ocean {
+            theme::banner(ui, "Stock JKA water is active; promoted-ocean simulation and shading are disabled.", theme::TEXT_DIM);
+            return;
+        }
+        if self.video.ocean && !self.applied_ocean {
+            theme::banner(ui, "Ocean resources need Apply because this renderer started without them.", theme::WARNING);
+        }
+
         let mut wake_mode = self.video.water_wake;
         ui.horizontal(|ui| {
             ui.label("Water Wake");
@@ -99,23 +117,12 @@ impl App {
             self.video.ocean_settings.interaction_splash_mode = splash_mode;
             self.commit_ocean_settings();
         }
-        self.egui_environment_toggle(
-            ui,
-            "Simulated ocean",
-            "Replaces flat water surfaces with real rolling waves that move, \
-             catch the light and form foam on their crests. Costs GPU time. \
-             (An FFT wave simulation ported from GodotOceanWaves.)",
-            ui::ENV_ROW_OCEAN,
-            self.video.ocean,
-        );
-        if self.video.ocean && !self.applied_ocean {
-            theme::banner(
-                ui,
-                "Ocean needs Apply: this renderer started without ocean resources.",
-                theme::WARNING,
-            );
+        if self.video.ocean_settings.backend != 0 {
+            self.egui_blue_water(ui);
+            return;
         }
-
+        // Godot-only controls begin below. Native Blue Water and Hybrid do not
+        // display values that they never consume.
         let mut target = self.ocean_settings_target;
         let target_label = if target >= 0 {
             self.promoted_oceans.iter().find(|p| p.index == target as usize).map(|p| p.label())
@@ -550,6 +557,7 @@ impl App {
             0.0..=4.0,
             &mut changed,
         );
+        ocean_slider(ui, "Caustic view distance", "Camera-to-terrain receiver range in metres. Caustics fade over the final 25%; 0 disables distance culling. Does not change fog/refraction.", theme::Reset::None, &mut settings.optics.caustic_max_distance_m, 0.0..=500.0, &mut changed);
         ocean_slider(ui, "Underwater cull", "Skips geometry the water already hides, as a multiple of the absorption distance (the transparency distance; never below 2, where 0.2% of the light is left). Underwater: everything beyond it (never closer than 256), plus the far ocean sheet. From above: anything lying under that much water. Murkier water culls more. Zero disables.", reset(theme::Reset::Ocean(15)), &mut settings.optics.underwater_cull, 0.0..=8.0, &mut changed);
 
         });

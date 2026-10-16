@@ -308,7 +308,7 @@ impl Renderer {
             legacy_fog,
             clouds: CloudRenderSettings {
                 values: [
-                    if self.clouds_enabled { 1.0 } else { 0.0 },
+                    if self.clouds_enabled && self.cloud_backend == 0 { 1.0 } else { 0.0 },
                     self.cloud_type.shader_value(),
                     self.cloud_quality,
                     self.cloud_coverage,
@@ -336,7 +336,7 @@ impl Renderer {
             },
             cloud_shadow: PostCloudShadowSettings {
                 values: [
-                    if self.clouds_enabled && self.cloud_shadows_enabled {
+                    if self.clouds_enabled && self.cloud_shadows_enabled && self.cloud_backend == 0 {
                         1.0
                     } else {
                         0.0

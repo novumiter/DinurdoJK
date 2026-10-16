@@ -2,6 +2,34 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_SKYBACKEND {
+        runtime: CvarDef::new("r_skyBackend", "0", "0|1",
+            "0 authored JKA sky; 1 original Blue Water atmosphere, celestial bodies and environment lighting.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.sky_backend as i32),
+            |app, value| {
+                let CvarValue::Int(backend) = value else { unreachable!() };
+                app.video.sky_backend = backend as u8;
+                app.sync_post_effects();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+    APP_R_CLOUDBACKEND {
+        runtime: CvarDef::new("r_cloudBackend", "0", "0|1",
+            "0 JKA volumetric clouds; 1 original Blue Water cloud march, reconstruction and shadows.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.cloud_backend as i32),
+            |app, value| {
+                let CvarValue::Int(backend) = value else { unreachable!() };
+                app.video.cloud_backend = backend as u8;
+                app.sync_post_effects(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_R_CLOUDAERIAL {
         runtime: CvarDef::new(
                 "r_cloudAerial",

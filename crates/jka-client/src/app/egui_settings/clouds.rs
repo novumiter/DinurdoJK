@@ -14,14 +14,37 @@ impl App {
             self.mark_config_dirty();
             self.publish_ui();
         }
-        self.egui_environment_toggle(
-            ui,
-            "Volumetric clouds",
-            "Replaces the flat skybox clouds with a raymarched cloud deck that \
-             has real depth, lighting and motion.",
-            ui::ENV_ROW_CLOUDS,
-            self.video.clouds,
-        );
+        theme::section(ui, "ATMOSPHERE BACKENDS", "Sky and volumetric clouds can be selected independently of the ocean.");
+        theme::row(ui, "Sky", "Author-authored BSP sky or original Blue Water atmosphere.", theme::Reset::None, |ui| {
+            for (backend, name) in [(0, "JKA sky"), (1, "Blue Water sky")] {
+                if theme::chip(ui, name, self.video.sky_backend == backend).clicked() && self.video.sky_backend != backend {
+                    self.video.sky_backend = backend; self.sync_post_effects(); self.publish_ui();
+                }
+            }
+        });
+        theme::row(ui, "Volumetric clouds", "Select original JKA volumetrics or imported Blue Water cloud reconstruction.", theme::Reset::None, |ui| {
+            for (backend, name) in [(0, "JKA clouds"), (1, "Blue Water clouds")] {
+                if theme::chip(ui, name, self.video.cloud_backend == backend).clicked() && self.video.cloud_backend != backend {
+                    self.video.cloud_backend = backend; self.sync_post_effects(); self.publish_ui();
+                }
+            }
+        });
+        self.egui_environment_toggle(ui, "Volumetric clouds enabled", "Enable the selected volumetric cloud renderer.", ui::ENV_ROW_CLOUDS, self.video.clouds);
+        self.egui_environment_toggle(ui, "Cloud shadows", "Project moving cloud shadows onto BSP surfaces.", ui::ENV_ROW_CLOUD_SHADOWS, self.video.cloud_shadows);
+        theme::row(ui, "Cloud coverage", "Fraction of sky filled by Blue Water clouds.", theme::Reset::Environment(ui::ENV_ROW_CLOUD_COVERAGE), |ui| {
+            let mut v = self.video.cloud_coverage;
+            let label = percent(v);
+            if theme::slider(ui, &mut v, 0.0..=1.0, &label) {
+                self.set_cloud_coverage(v);
+            }
+        });
+        if self.video.cloud_backend == 1 {
+            theme::banner(
+                ui,
+                "Blue Water uses its North Atlantic weather preset. Coverage and Weather > Wind feed it; cloud type, height, thickness, quality and raymarch tuning below currently affect JKA clouds only.",
+                theme::TEXT_DIM,
+            );
+        }
 
         ui.add_enabled_ui(self.video.clouds, |ui| {
             const TYPES: [(CloudType, &str); 3] = [
@@ -55,20 +78,6 @@ impl App {
                     let readout = percent(value);
                     if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
                         self.set_cloud_quality(value);
-                    }
-                },
-            );
-            theme::row(
-                ui,
-                "Coverage",
-                "Fraction of the sky the deck fills, from scattered wisps to solid \
-             overcast.",
-                theme::Reset::Environment(ui::ENV_ROW_CLOUD_COVERAGE),
-                |ui| {
-                    let mut value = self.video.cloud_coverage;
-                    let readout = percent(value);
-                    if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
-                        self.set_cloud_coverage(value);
                     }
                 },
             );
@@ -111,14 +120,6 @@ impl App {
             );
 
             theme::section(ui, "RENDER COST", "");
-            self.egui_environment_toggle(
-                ui,
-                "Cloud shadows on map",
-                "Projects the deck's shadow onto the world, so cloud cover sweeps \
-             across the ground as it drifts.",
-                ui::ENV_ROW_CLOUD_SHADOWS,
-                self.video.cloud_shadows,
-            );
             const CLOUD_RES: [(CloudRenderResolution, &str); 4] = [
                 (CloudRenderResolution::Quarter, "25%"),
                 (CloudRenderResolution::Half, "50%"),

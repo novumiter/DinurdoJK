@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 31;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 39;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -74,6 +74,16 @@ pub(in crate::renderer) enum GpuPass {
     SsrVisibility = 28,
     SsrTrace = 29,
     CoastalSim = 30,
+    // Sub-timing inside World after transparency; bounded original effects.
+    BlueWaterUnderwater = 31,
+    BlueWaterSkyPrepare = 32,
+    BlueWaterSkyDraw = 33,
+    BlueWaterClouds = 34,
+    BlueWaterAerial = 35,
+    // Diagnostics nested in world/pre-world. Not independent frame costs.
+    BlueWaterCausticsCompute = 36,
+    BlueWaterCausticsReceiver = 37,
+    BlueWaterSceneCapture = 38,
 }
 
 impl GpuPass {
@@ -115,6 +125,14 @@ impl GpuPass {
         Self::SsrVisibility,
         Self::SsrTrace,
         Self::CoastalSim,
+        Self::BlueWaterUnderwater,
+        Self::BlueWaterSkyPrepare,
+        Self::BlueWaterSkyDraw,
+        Self::BlueWaterClouds,
+        Self::BlueWaterAerial,
+        Self::BlueWaterCausticsCompute,
+        Self::BlueWaterCausticsReceiver,
+        Self::BlueWaterSceneCapture,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -150,13 +168,25 @@ impl GpuPass {
             Self::SsrVisibility => "ssr_visibility",
             Self::SsrTrace => "ssr_trace",
             Self::CoastalSim => "coastal_sim",
+            Self::BlueWaterUnderwater => "blue_water_underwater",
+            Self::BlueWaterSkyPrepare => "blue_water_sky_prepare",
+            Self::BlueWaterSkyDraw => "blue_water_sky_draw",
+            Self::BlueWaterClouds => "blue_water_clouds",
+            Self::BlueWaterAerial => "blue_water_aerial",
+            Self::BlueWaterCausticsCompute => "blue_water_caustics_compute",
+            Self::BlueWaterCausticsReceiver => "blue_water_caustics_receiver",
+            Self::BlueWaterSceneCapture => "blue_water_scene_capture",
         }
     }
 }
 
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(in crate::renderer) struct GpuTiming {
     pub(in crate::renderer) milliseconds: [Option<f64>; GPU_PASS_COUNT],
+}
+
+impl Default for GpuTiming {
+    fn default() -> Self { Self { milliseconds: [None; GPU_PASS_COUNT] } }
 }
 
 impl GpuTiming {

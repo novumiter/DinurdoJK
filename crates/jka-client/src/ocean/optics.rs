@@ -21,6 +21,10 @@ pub struct Settings {
     pub depth_darkening: f32,
     pub refraction: f32,
     pub caustics: f32,
+    /// Maximum camera-to-receiver distance for Godot and Hybrid Godot caustics,
+    /// in metres. The final 25% fades smoothly; 0 preserves unbounded legacy
+    /// behavior. Native Blue Water caustics keep their own visibility policy.
+    pub caustic_max_distance_m: f32,
     /// Water-hidden geometry cull, as a multiple of the absorption distance: the
     /// distance past which a submerged view sees nothing, and the water depth that
     /// hides a batch from above. Zero disables. See `cull.rs`.
@@ -47,7 +51,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self { fog_color: [20.0 / 255.0, 40.0 / 255.0, 50.0 / 255.0], transparency: 2304.0,
-            depth_darkening: 1.0, refraction: 0.1, caustics: 1.0, underwater_cull: 3.0,
+            depth_darkening: 1.0, refraction: 0.1, caustics: 1.0, caustic_max_distance_m: 80.0, underwater_cull: 3.0,
             // The scissor is off by default: measured on a real map, a promoted
             // surface's bounds surround the camera, so there is no tight screen
             // rectangle to find and it falls back to full-screen anyway. Kept
@@ -66,6 +70,7 @@ impl Settings {
         self.depth_darkening = valid(self.depth_darkening, d.depth_darkening, 0.01, 32.0);
         self.refraction = valid(self.refraction, d.refraction, 0.0, 0.15);
         self.caustics = valid(self.caustics, d.caustics, 0.0, 8.0);
+        self.caustic_max_distance_m = valid(self.caustic_max_distance_m, d.caustic_max_distance_m, 0.0, 500.0);
         self.underwater_cull = valid(self.underwater_cull, d.underwater_cull, 0.0, 32.0);
         self
     }
@@ -103,6 +108,9 @@ pub struct Uniform {
     // Only populated for r_oceanSkyExtend and qualifying map sky contacts.
     pub sky_regions: [SkyFogRegion; 8],
     pub sky_info: [f32; 4], // active continuation count; zero for OFF
+    /// Caustics: spatial density, focus gain, optional 3-tap derivative,
+    /// camera-to-receiver distance limit in JKA units (0 = unlimited).
+    pub caustic_tuning: [f32; 4],
 }
 
 pub fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -140,6 +148,7 @@ pub struct Resources {
     pub glass_uniform: wgpu::Buffer,
     pub edges: crate::glass::edges::Resources,
     capture_color: wgpu::TextureView,
+    pub receiver_color: wgpu::TextureView,
     background: wgpu::TextureView,
     background_ready: bool,
     color: wgpu::TextureView,
@@ -153,7 +162,12 @@ pub struct Resources {
     capture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     depth: wgpu::TextureView,
+    pub water_distance: wgpu::TextureView,
+    water_distance_capture: wgpu::RenderPipeline,
+    distance_params: wgpu::Buffer,
+    distance_group: wgpu::BindGroup,
     capture: wgpu::RenderPipeline,
+    capture_receiver: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
 }
 impl Resources {
@@ -163,7 +177,7 @@ impl Resources {
         let target = |format, label| device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label), size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
         }).create_view(&Default::default());
         // Keep premultiplied blur validity precise near excluded foregrounds.
         let optical_format = wgpu::TextureFormat::Rgba16Float;
@@ -176,7 +190,9 @@ impl Resources {
         let color = color_texture.create_view(&Default::default());
         let mip_view = |mip| color_texture.create_view(&wgpu::TextureViewDescriptor { base_mip_level: mip, mip_level_count: Some(1), ..Default::default() });
         let capture_color = mip_view(0);
+        let receiver_color = target(optical_format, "Godot caustics before BlueWater absorption");
         let depth = target(wgpu::TextureFormat::R32Float, "Ocean pre-surface linear depth");
+        let water_distance = target(wgpu::TextureFormat::R32Float, "Blue Water bounded ray length in metres");
         let background = background_target(device, 1, 1);
         let edges = crate::glass::edges::Resources::new(device, width, height, samples, &depth);
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -199,6 +215,41 @@ impl Resources {
             label: Some("Ocean optical capture"), source: wgpu::ShaderSource::Wgsl(capture_source.into()),
         });
         let capture = pipeline(device, &shader, &[&capture_layout, ocean_layout], "fs_capture", &[optical_format, wgpu::TextureFormat::R32Float], 1);
+        let capture_receiver = pipeline(device, &shader, &[&capture_layout, ocean_layout], "fs_capture_receiver", &[optical_format, wgpu::TextureFormat::R32Float, optical_format], 1);
+        // The original underwater probe admits the near-plane point first.
+        // Its open-water rays must continue through qualified sky contacts even
+        // without a finite receiver; the legacy color capture keeps its rule.
+        let source = shader_source(samples > 1).replace("\r\n", "\n");
+        let sky_guard = "if (depth > 0.0) {\n        add_sky_ocean_spans(delta);\n    }";
+        assert_eq!(source.matches(sky_guard).count(), 1);
+        let source = source.replace(sky_guard, "add_sky_ocean_spans(delta);")
+            .replace("let world = h.xyz / h.w;", "let receiver = h.xyz / h.w;\n    let world = select(receiver, optics.eye.xyz + normalize(receiver - optics.eye.xyz) * 400000.0, depth <= 0.0);")
+            .replace("run.y >= merged.x - 1.0e-4 && run.x <= merged.y + 1.0e-4",
+                "run.y >= merged.x - 1.0e-7 && run.x <= merged.y + 1.0e-7")
+            .replace("let hi = optics.maximum[i].xyz;", "let top = optics.maximum[i].xyz;\n        let hi = vec3<f32>(top.x, jka_wave_top(top.y), top.z);")
+            .replace("region.plane.x", "jka_wave_top(region.plane.x)")
+            .replace("optics.sky_regions[i].plane.x", "jka_wave_top(optics.sky_regions[i].plane.x)");
+        let source = format!("{source}\n@group(2) @binding(0) var<uniform> jka_wave_envelope: vec4<f32>;\nfn jka_wave_top(top: f32) -> f32 {{ return top + select(0.0, jka_wave_envelope.y, abs(top - jka_wave_envelope.x) < 0.75); }}");
+        let distance_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Blue Water wave envelope"), entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false,
+                    min_binding_size: None }, count: None }],
+        });
+        let distance_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Blue Water wave envelope"), size: 16, mapped_at_creation: false,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let distance_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blue Water wave envelope"), layout: &distance_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: distance_params.as_entire_binding() }],
+        });
+        let distance_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blue Water bounded underwater path"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let water_distance_capture = pipeline(device, &distance_shader, &[&capture_layout, ocean_layout, &distance_layout],
+            "fs_water_distance", &[wgpu::TextureFormat::R32Float], 1);
         let background_capture = pipeline(device, &shader, &[&capture_layout, ocean_layout], "fs_glass_background", &[optical_format], 1);
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Ocean optical composite"), source: wgpu::ShaderSource::Wgsl(include_str!("../ocean_composite.wgsl").into()),
@@ -235,9 +286,10 @@ impl Resources {
             blur_inputs.push(input);
             blur_outputs.push(mip_view(mip));
         }
-        Self { key, bind_group, uniform, glass_uniform, edges, capture_color, background,
+        Self { key, bind_group, uniform, glass_uniform, edges, capture_color, receiver_color, background,
             background_ready: false, color, background_capture, blur_first, blur_next, blur_groups,
-            blur_layout, blur_inputs, blur_outputs, capture_layout, sampler, depth, capture, blit }
+            blur_layout, blur_inputs, blur_outputs, capture_layout, sampler, depth, capture, capture_receiver, blit,
+            water_distance, water_distance_capture, distance_params, distance_group }
     }
 
     /// Disabled recovery keeps only a 1x1 binding placeholder. Toggle allocation
@@ -287,15 +339,23 @@ impl Resources {
     pub fn capture(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
         scissor: Option<(u32, u32, u32, u32)>) {
+        self.capture_with_receiver(device, encoder, scene, depth, ocean, scissor, false);
+    }
+
+    pub fn capture_with_receiver(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
+        scissor: Option<(u32, u32, u32, u32)>, receiver: bool) {
         let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None);
-        let attachments = [&self.capture_color, &self.depth].map(|view| Some(wgpu::RenderPassColorAttachment {
+        let views: &[_] = if receiver { &[&self.capture_color, &self.depth, &self.receiver_color] }
+            else { &[&self.capture_color, &self.depth] };
+        let attachments: Vec<_> = views.iter().map(|view| Some(wgpu::RenderPassColorAttachment {
             view, depth_slice: None, resolve_target: None,
             ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-        }));
+        })).collect();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Ocean optical capture"), color_attachments: &attachments, ..Default::default()
         });
-        pass.set_pipeline(&self.capture);
+        pass.set_pipeline(if receiver { &self.capture_receiver } else { &self.capture });
         pass.set_bind_group(0, &input, &[]);
         pass.set_bind_group(1, ocean, &[]);
         if let Some((x, y, width, height)) = scissor {
@@ -318,6 +378,26 @@ impl Resources {
             pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
+    }
+
+    /// Bounded JKA volume path after the original surface has written depth.
+    /// The original underwater shader clamps its optical path to this length.
+    pub fn capture_water_distance(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup, envelope: [f32; 4]) {
+        queue.write_buffer(&self.distance_params, 0, bytemuck::bytes_of(&envelope));
+        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None);
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Blue Water JKA bounded underwater path"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.water_distance, depth_slice: None, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })], ..Default::default()
+        });
+        pass.set_pipeline(&self.water_distance_capture);
+        pass.set_bind_group(0, &input, &[]);
+        pass.set_bind_group(1, ocean, &[]);
+        pass.set_bind_group(2, &self.distance_group, &[]);
+        pass.draw(0..3, 0..1);
     }
     pub fn composite(&self, encoder: &mut wgpu::CommandEncoder, color: &wgpu::TextureView, resolve: Option<&wgpu::TextureView>) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -407,9 +487,11 @@ pub fn shader_source(msaa: bool) -> String {
     if (max_depth - min_depth <= 0.00001) {
         return capture_sample(uv, first_depth, textureLoad(scene_color, pixel, 0).rgb);
     }
-    var out: Capture;
+    var out: OpticalSample;
     out.color = vec4<f32>(0.0);
     out.depth = 1000000.0;
+    out.water_distance = 0.0;
+    out.receiver = vec4<f32>(0.0);
     for (var i = 0u; i < sample_count; i += 1u) {
         let sample = capture_sample(
             uv,
@@ -418,8 +500,11 @@ pub fn shader_source(msaa: bool) -> String {
         );
         out.color += sample.color;
         out.depth = min(out.depth, sample.depth);
+        out.water_distance = max(out.water_distance, sample.water_distance);
+        out.receiver += sample.receiver;
     }
     out.color = vec4<f32>(out.color.rgb / f32(sample_count), 1.0);
+    out.receiver = vec4<f32>(out.receiver.rgb / f32(sample_count), 1.0);
     return out;"#
             } else {
                 r#"return capture_sample(
@@ -446,7 +531,7 @@ mod tests {
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
                 .validate(&module).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
         }
-        assert_eq!(std::mem::size_of::<Uniform>(), 384);
+        assert_eq!(std::mem::size_of::<Uniform>(), 2704);
     }
 
     #[test]
@@ -499,7 +584,14 @@ mod tests {
                 let depth_view = depth.create_view(&Default::default());
                 let output = if samples == 1 { &color_view } else { &msaa_view };
                 let resolve = (samples > 1).then_some(&color_view);
-                for (volumes, surface_z, fraction) in [(0, 10.0, 0.0), (1, 10.0, 1.0), (2, 10.0, 1.0), (1, 0.25, 0.5)] {
+                // Last pair: a wave reaches above the nominal volume plane.
+                // The distance envelope follows it; legacy color is unchanged.
+                for (volumes, surface_z, fraction, top, crest, distance_fraction, receiver_depth, open) in [
+                    (0, 10.0, 0.0, 10.0, 0.0, 0.0, 0.5, false), (1, 10.0, 1.0, 10.0, 0.0, 1.0, 0.5, false),
+                    (2, 10.0, 1.0, 10.0, 0.0, 1.0, 0.5, false), (1, 0.25, 0.5, 10.0, 0.0, 0.5, 0.5, false),
+                    (1, 10.0, 0.5, -0.0625, 0.0, 0.5, 0.5, false), (1, 10.0, 0.5, -0.0625, 0.1, 1.0, 0.5, false),
+                    (1, 10.0, 1.0, 10.0, 0.0, 1.0, 0.0, false), (1, 10.0, 1.0, 10.0, 0.0, 1.0, 0.0, true),
+                ] {
                     let mut uniform = Uniform::zeroed();
                     uniform.inverse_view_projection = glam::Mat4::IDENTITY.to_cols_array_2d();
                     uniform.forward = [0.0,0.0,1.0,0.0];
@@ -507,7 +599,13 @@ mod tests {
                     uniform.params = [20.0,0.0,0.0,volumes as f32];
                     for i in 0..volumes {
                         uniform.minimum[i] = [-10.0,-10.0,-10.0,0.0];
-                        uniform.maximum[i] = [10.0,10.0,surface_z,0.0];
+                        uniform.maximum[i] = [10.0,top,surface_z,0.0];
+                    }
+                    if open {
+                        uniform.sky_info[0] = 1.0;
+                        uniform.sky_regions[0].bounds = [-10.0, -10.0, 10.0, 10.0];
+                        uniform.sky_regions[0].plane = [top, 1.0, 0.0, 1.0];
+                        uniform.sky_regions[0].segments[0] = [10.0, -10.0, 10.0, 2.0];
                     }
                     queue.write_buffer(&resources.uniform, 0, bytemuck::bytes_of(&uniform));
                     let mut encoder = device.create_command_encoder(&Default::default());
@@ -516,21 +614,49 @@ mod tests {
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: output, depth_slice: None, resolve_target: resolve,
                                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })],
                             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth_view,
-                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.5), store: wgpu::StoreOp::Store }), stencil_ops: None }), ..Default::default()
+                                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(receiver_depth), store: wgpu::StoreOp::Store }), stencil_ops: None }), ..Default::default()
                         });
                     }
                     let capture_color = if samples == 1 { &color_view } else { &msaa_view };
-                    resources.capture(&device, &mut encoder, capture_color, &depth_view, &ocean, None);
+                    resources.capture_with_receiver(&device, &mut encoder, capture_color, &depth_view, &ocean, None, true);
+                    resources.capture_water_distance(&device, &queue, &mut encoder, capture_color, &depth_view, &ocean, [top, crest, 0.0, 0.0]);
                     resources.composite(&mut encoder, output, resolve);
                     let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256*8,
                         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
                     encoder.copy_texture_to_buffer(color.as_image_copy(), wgpu::TexelCopyBufferInfo { buffer: &readback,
                         layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(8) } }, extent);
+                    let distance_readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256*8,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+                    encoder.copy_texture_to_buffer(resources.water_distance.texture().as_image_copy(),
+                        wgpu::TexelCopyBufferInfo { buffer: &distance_readback,
+                            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(8) } }, extent);
+                    let receiver_readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256*8,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+                    encoder.copy_texture_to_buffer(resources.receiver_color.texture().as_image_copy(),
+                        wgpu::TexelCopyBufferInfo { buffer: &receiver_readback,
+                            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(8) } }, extent);
                     queue.submit([encoder.finish()]);
                     readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+                    distance_readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+                    receiver_readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
                     device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
                     let bytes = readback.slice(..).get_mapped_range().expect("GPU readback range");
-                    let distance = (0.125_f32.powi(2)*2.0 + 0.5_f32.powi(2)).sqrt() * fraction;
+                    let receiver_bytes = receiver_readback.slice(..).get_mapped_range().expect("receiver color readback");
+                    let receiver: &[u16] = bytemuck::cast_slice(&receiver_bytes[4*256+4*8..4*256+5*8]);
+                    if receiver != &[0x3c00; 4] {
+                        panic!("receiver must retain raw white before Godot absorption, samples={samples}, actual={receiver:?}, validation={:?}", scope.pop().await);
+                    }
+                    let ray = (0.125_f32.powi(2)*2.0 + receiver_depth.powi(2)).sqrt();
+                    let distance = ray * fraction;
+                    let distances = distance_readback.slice(..).get_mapped_range().expect("bounded length readback");
+                    let actual = f32::from_le_bytes(distances[4*256+4*4..4*256+4*4+4].try_into().unwrap());
+                    // The inert adapter's map scale is zero: the distance pass
+                    // still uses JKA's fixed metre conversion, even without waves.
+                    let bounded = if receiver_depth == 0.0 {
+                        if open { 400000.0 } else { 200.0_f32.sqrt() }
+                    } else { ray * distance_fraction } / crate::ocean::OCEAN_UNITS_PER_METER;
+                    assert!((actual - bounded).abs() < 1e-3,
+                        "samples={samples} volumes={volumes}: bounded length {actual}");
                     for (channel, ratio) in [38.0/7.5, 38.0/22.0, 1.0].iter().enumerate() {
                         let expected = (-4.321928 * ratio * distance / 20.0).exp2();
                         let actual = bytes[4*256+4*4+channel] as f32 / 255.0;

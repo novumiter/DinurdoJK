@@ -26,10 +26,11 @@ fn video_section_label(section: VideoSection) -> &'static str {
         VideoSection::DebugTools => "Debug & tools",
         VideoSection::Physics => "Physics",
         VideoSection::Sun => "Sun",
+        VideoSection::BlueWater => "Ocean",
         VideoSection::Clouds => "Clouds",
         VideoSection::Weather => "Weather",
         VideoSection::Surface => "Surface interaction",
-        VideoSection::Water => "Water",
+        VideoSection::Water => "Ocean",
         VideoSection::Glass => "Glass",
     }
 }
@@ -81,7 +82,11 @@ impl App {
                 "SUN",
                 "Runtime q3 shader-sun direction, intensity and chromaticity.",
             ),
-            VideoSection::Clouds => ("CLOUDS", "Volumetric cloud deck and shaping controls."),
+            VideoSection::BlueWater => (
+                "OCEAN",
+                "Choose Godot, native Blue Water or Hybrid in the single Ocean page.",
+            ),
+            VideoSection::Clouds => ("CLOUDS", "Cloud renderer and shaping controls."),
             VideoSection::Weather => (
                 "WEATHER",
                 "Shared world wind, fog, precipitation and atmospheric effects.",
@@ -90,7 +95,7 @@ impl App {
                 "SURFACE INTERACTION",
                 "Footprints and procedural ground detail.",
             ),
-            VideoSection::Water => ("WATER", "FFT ocean simulation and promoted water surfaces."),
+            VideoSection::Water => ("OCEAN", "Stock JKA, Godot, Blue Water or Hybrid promoted water."),
             VideoSection::Glass => ("GLASS", "Glass promotion, transmission, frosting and refractive edges."),
         };
         // The preset toolbar is global to Video, not part of any individual
@@ -127,6 +132,7 @@ impl App {
                 VideoSection::DebugTools => self.egui_debug_tools(ui),
                 VideoSection::Physics => self.egui_physics(ui),
                 VideoSection::Sun => self.egui_sun(ui),
+                VideoSection::BlueWater => self.egui_water(ui),
                 VideoSection::Clouds => self.egui_clouds(ui),
                 VideoSection::Weather => self.egui_weather(ui),
                 VideoSection::Surface => self.egui_surface(ui),

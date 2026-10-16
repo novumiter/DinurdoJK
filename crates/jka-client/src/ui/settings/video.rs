@@ -303,6 +303,8 @@ pub struct VideoSettings {
     pub distance_cull_scale: f32,
     /// Experimental Star Nest procedural override of map-authored sky faces.
     pub sky_fractal_override: bool,
+    pub sky_backend: u8,
+    pub cloud_backend: u8,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,
@@ -747,6 +749,8 @@ impl Default for VideoSettings {
             entity_sun_lighting: false,
             distance_cull_scale: 0.0,
             sky_fractal_override: false,
+            sky_backend: 0,
+            cloud_backend: 0,
             clouds: true,
             cloud_type: CloudType::Storm,
             cloud_quality: 1.0,
