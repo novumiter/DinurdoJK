@@ -247,6 +247,15 @@ impl App {
                 self.console_status = "RCON PASSWORD SET".to_owned();
                 self.push_console_line(format!("^2Saved RCON password loaded:^7 {server}"));
             }
+            AccountType::Server => {
+                if credential.password.is_empty() || credential.password.chars().any(char::is_control)
+                {
+                    return Err(format!("Saved Server account for {server} is invalid"));
+                }
+                self.network.password = credential.password;
+                self.console_status = "SERVER PASSWORD LOADED".to_owned();
+                self.push_console_line(format!("^2Saved server password loaded:^7 {server}"));
+            }
         }
         Ok(())
     }
@@ -278,6 +287,10 @@ impl App {
             AccountType::Rcon => {
                 self.set_console_cvar("rconPassword", "")?;
                 self.console_status = "RCON PASSWORD CLEARED".to_owned();
+            }
+            AccountType::Server => {
+                self.network.password.clear();
+                self.console_status = "SERVER PASSWORD CLEARED".to_owned();
             }
         }
         Ok(())

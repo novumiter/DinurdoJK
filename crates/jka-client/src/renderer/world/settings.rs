@@ -601,6 +601,11 @@ impl Renderer {
             weather_surface: self.weather_surface_needed(),
             classic_render_flags: self.classic_world_render_flags() != 0,
             static_bsp_ao: self.static_bsp_ao_enabled,
+            baked_sun_relight: self.baked_sun_removal > 0.0
+                && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some())
+                && (self.cascaded_shadows_enabled
+                    || (self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+                        && self.ray_tracing_supported)),
             planar_debug: self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off,
             deluxe: self.deluxe_shader_enabled(),
             deluxe_specular: self.deluxe_shader_enabled() && self.deluxe_specular > 0.0,
@@ -669,6 +674,11 @@ impl Renderer {
         let needed = self.weather_surface_needed();
         let classic = self.classic_world_render_flags() != 0;
         let static_ao = self.static_bsp_ao_enabled;
+        let baked_sun_relight = self.baked_sun_removal > 0.0
+            && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some())
+            && (self.cascaded_shadows_enabled
+                || (self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+                    && self.ray_tracing_supported));
         let planar_debug = self.planar_reflection_debug_mode != PlanarReflectionDebugMode::Off;
         let surface_deformation = self.surface_deformation_shader_needed();
         let dynamic_light_debug = self.dynamic_light_debug;
@@ -679,6 +689,7 @@ impl Renderer {
                 key.weather_surface != needed
                     || key.classic_render_flags != classic
                     || key.static_bsp_ao != static_ao
+                    || key.baked_sun_relight != baked_sun_relight
                     || key.planar_debug != planar_debug
                     || key.surface_deformation != surface_deformation
                     || key.dynamic_light_debug != dynamic_light_debug

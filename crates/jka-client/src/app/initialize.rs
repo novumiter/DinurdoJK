@@ -77,8 +77,9 @@ impl App {
             launch_map.then(|| MapLoadingState::new(0, initial_label.clone(), game.as_deref()));
         let front_end = !launch_map;
         let (server_browser_tx, server_browser_rx) = server_browser::spawn()?;
-        let server_browser =
+        let mut server_browser =
             BrowserUiState::new(&settings_dir, presentation.master_servers.clone());
+        server_browser.apply_filters_string(&presentation.server_filters);
         let (demo_metadata_tx, demo_metadata_rx) = mpsc::channel();
         let (race_ghost_tx, race_ghost_rx) = mpsc::channel();
         let (race_ghost_web_tx, race_ghost_web_rx) = mpsc::channel();

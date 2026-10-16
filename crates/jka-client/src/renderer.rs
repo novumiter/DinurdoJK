@@ -755,6 +755,8 @@ struct Renderer {
     /// Team overlay model/weapon/powerup art packed on demand (UI texture source 6).
     _ui_team_icons: GpuImage,
     ui_team_icon_key: Vec<String>,
+    _ui_ext_images: GpuImage,
+    ui_ext_image_key: Vec<String>,
     /// True while bind group binding 3 holds the unknown-map art rather than the
     /// splash/levelshot, so a rebuild for another binding keeps the right image.
     ui_binding_is_unknown_map: bool,
@@ -863,6 +865,7 @@ struct Renderer {
     sun_color: [f32; 3],
     sun_visibility: SunVisibilityMode,
     entity_sun_lighting: bool,
+    baked_sun_removal: f32,
     sky_fractal_override: bool,
     clouds_enabled: bool,
     cloud_type: CloudType,

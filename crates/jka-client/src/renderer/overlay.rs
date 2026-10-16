@@ -33,15 +33,27 @@ impl Renderer {
         }
         self.load_ui_icons_if_needed();
         self.sync_ui_team_icons();
+        self.sync_ui_extension_images();
         self.sync_ui_loading_background();
         self.rebuild_ui();
     }
 
     pub(in crate::renderer) fn set_extension_hud(
-        &mut self, widgets: Vec<crate::extensions::PlacedHudWidget>,
+        &mut self,
+        widgets: Vec<crate::extensions::PlacedHudWidget>,
+        hidden: crate::extensions::NativeHudMask,
+        images: Vec<String>,
     ) {
-        if self.ui_state.extension_hud == widgets { return; }
+        if self.ui_state.extension_hud == widgets
+            && self.ui_state.native_hidden == hidden
+            && self.ui_state.extension_images == images
+        {
+            return;
+        }
         self.ui_state.extension_hud = widgets;
+        self.ui_state.native_hidden = hidden;
+        self.ui_state.extension_images = images;
+        self.sync_ui_extension_images();
         // Uses the existing dynamic HUD buffer/pass. No new egui pass or pipeline.
         self.rebuild_dynamic_ui();
     }
@@ -126,6 +138,10 @@ impl Renderer {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&self._ui_team_icons.view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&self._ui_ext_images.view),
+                },
             ],
         });
     }
@@ -183,6 +199,75 @@ impl Renderer {
         };
         self._ui_team_icons = upload_texture(&self.device, &self.queue, &data);
         self.rebuild_ui_bind_group();
+    }
+
+    /// Keep the extension image atlas in step with `ui_state.extension_images`.
+    ///
+    /// The slot list only grows while an extension is loaded, so this loads just
+    /// the images that are new and writes each into its own cell: nothing already
+    /// on screen is touched, and no frame ever re-reads the whole set from the
+    /// game files. A list that is not an extension of the last one (extensions
+    /// unloaded, or reloaded with different art) starts over with a blank atlas.
+    pub(in crate::renderer) fn sync_ui_extension_images(&mut self) {
+        if self.ui_state.extension_images == self.ui_ext_image_key {
+            return;
+        }
+        let started = Instant::now();
+        let wanted = self.ui_state.extension_images.clone();
+        if wanted.is_empty() {
+            self._ui_ext_images = upload_texture(
+                &self.device,
+                &self.queue,
+                &empty_ui_font_texture("JKA UI extension image atlas (not loaded)"),
+            );
+            self.ui_ext_image_key.clear();
+            self.rebuild_ui_bind_group();
+            return;
+        }
+        if self.ui_ext_image_key.is_empty() || !wanted.starts_with(&self.ui_ext_image_key) {
+            self._ui_ext_images =
+                upload_texture(&self.device, &self.queue, &blank_ui_extension_atlas());
+            self.ui_ext_image_key.clear();
+            self.rebuild_ui_bind_group();
+        }
+        let first_new = self.ui_ext_image_key.len();
+        let cells = load_ui_extension_images(
+            &self.base,
+            self.detail_texture_game.as_deref(),
+            &wanted[first_new..],
+        );
+        let cell = ui::EXT_IMAGE_CELL;
+        for (offset, pixels) in cells.iter().enumerate() {
+            let Some(pixels) = pixels else { continue };
+            let index = (first_new + offset) as u32;
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self._ui_ext_images._texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: (index % ui::EXT_IMAGE_COLUMNS) * cell,
+                        y: (index / ui::EXT_IMAGE_COLUMNS) * cell,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(cell * 4),
+                    rows_per_image: Some(cell),
+                },
+                wgpu::Extent3d { width: cell, height: cell, depth_or_array_layers: 1 },
+            );
+        }
+        rverbose!(
+            1,
+            "UI extension images: {} new in {:.1} ms ({} total)",
+            wanted.len() - first_new,
+            started.elapsed().as_secs_f64() * 1000.0,
+            wanted.len()
+        );
+        self.ui_ext_image_key = wanted;
     }
 
     /// Read the movement key images and bind them. Runs once, the first time the
@@ -480,6 +565,7 @@ impl Renderer {
         self.ui_state.team_overlay = team_overlay;
         self.load_ui_icons_if_needed();
         self.sync_ui_team_icons();
+        self.sync_ui_extension_images();
         if scoreboard_changed {
             // Scoreboard visibility and focus are transient state. Rebuild its
             // retained batch only when either input changes.
@@ -974,46 +1060,53 @@ impl Renderer {
         // and aim angles arrive as one LatestViewState sample, so this projection uses
         // the exact camera that produced that hit rather than a previous-frame point.
         let tail_start = self.ui_transient_vertices.len();
-        if let Some(anchor) = dynamic_crosshair_world {
-            let clip = view_proj * Vec3::from_array(anchor).extend(1.0);
-            if clip.w > 0.001 {
-                let ndc = clip.truncate() / clip.w;
-                if (0.0..=1.0).contains(&ndc.z) && ndc.x.abs() <= 1.15 && ndc.y.abs() <= 1.15 {
+        // Projected player names and the late-latched crosshair are screen-space
+        // CG_Draw2D, even though their vertices are appended after HUD publishing.
+        // Check the snapshot boolean once; no cvar lookup in the render loop.
+        if self.ui_state.video.draw_2d {
+            if ui::gameplay_hud_visible(&self.ui_state, self.config.width, self.config.height) {
+                if let Some(anchor) = dynamic_crosshair_world {
+                    let clip = view_proj * Vec3::from_array(anchor).extend(1.0);
+                    if clip.w > 0.001 {
+                        let ndc = clip.truncate() / clip.w;
+                        if (0.0..=1.0).contains(&ndc.z) && ndc.x.abs() <= 1.15 && ndc.y.abs() <= 1.15 {
+                            let x = (ndc.x * 0.5 + 0.5) * self.config.width.max(1) as f32;
+                            let y = (0.5 - ndc.y * 0.5) * self.config.height.max(1) as f32;
+                            ui::build_crosshair_vertices(
+                                &mut self.ui_transient_vertices,
+                                &self.ui_state,
+                                Some([x, y]),
+                                self.config.width,
+                                self.config.height,
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Some(player_names) = self.player_names.as_ref() {
+                for label in player_names.labels.iter() {
+                    let clip = view_proj * Vec3::from_array(label.anchor).extend(1.0);
+                    if clip.w <= 0.001 {
+                        continue;
+                    }
+                    let ndc = clip.truncate() / clip.w;
+                    if !(0.0..=1.0).contains(&ndc.z) || ndc.x.abs() > 1.15 || ndc.y.abs() > 1.15 {
+                        continue;
+                    }
                     let x = (ndc.x * 0.5 + 0.5) * self.config.width.max(1) as f32;
                     let y = (0.5 - ndc.y * 0.5) * self.config.height.max(1) as f32;
-                    ui::build_crosshair_vertices(
+                    ui::build_world_player_label_vertices(
                         &mut self.ui_transient_vertices,
-                        &self.ui_state,
-                        Some([x, y]),
+                        label,
+                        x,
+                        y,
+                        player_names.scale,
+                        self.ui_small_font_metrics.as_ref(),
                         self.config.width,
                         self.config.height,
                     );
                 }
-            }
-        }
-
-        if let Some(player_names) = self.player_names.as_ref() {
-            for label in player_names.labels.iter() {
-                let clip = view_proj * Vec3::from_array(label.anchor).extend(1.0);
-                if clip.w <= 0.001 {
-                    continue;
-                }
-                let ndc = clip.truncate() / clip.w;
-                if !(0.0..=1.0).contains(&ndc.z) || ndc.x.abs() > 1.15 || ndc.y.abs() > 1.15 {
-                    continue;
-                }
-                let x = (ndc.x * 0.5 + 0.5) * self.config.width.max(1) as f32;
-                let y = (0.5 - ndc.y * 0.5) * self.config.height.max(1) as f32;
-                ui::build_world_player_label_vertices(
-                    &mut self.ui_transient_vertices,
-                    label,
-                    x,
-                    y,
-                    player_names.scale,
-                    self.ui_small_font_metrics.as_ref(),
-                    self.config.width,
-                    self.config.height,
-                );
             }
         }
 
@@ -1105,6 +1198,71 @@ pub(in crate::renderer) fn load_ui_icon_atlas(base: &Path, game: Option<&Path>) 
         clamp: true,
         srgb: true,
     }
+}
+
+/// Full-size, fully transparent extension image atlas: `MAX_HUD_IMAGES` cells of
+/// `ui::EXT_IMAGE_CELL` squares, `ui::EXT_IMAGE_COLUMNS` per row. Allocated once;
+/// images are written into their cells as they are first needed.
+pub(in crate::renderer) fn blank_ui_extension_atlas() -> TextureData {
+    let cell = ui::EXT_IMAGE_CELL;
+    let rows = (crate::extensions::MAX_HUD_IMAGES as u32).div_ceil(ui::EXT_IMAGE_COLUMNS);
+    let (width, height) = (ui::EXT_IMAGE_COLUMNS * cell, rows * cell);
+    TextureData {
+        label: "JKA UI extension image atlas".into(),
+        source: None,
+        width,
+        height,
+        rgba: vec![0u8; (width * height * 4) as usize],
+        rgba16f: None,
+        mip_level_count: 1,
+        clamp: true,
+        srgb: true,
+    }
+}
+
+/// Decode extension `hud_image()` pictures into `ui::EXT_IMAGE_CELL` squares
+/// (RGBA8, `None` when the image is missing). Images are stretched to the cell and
+/// drawn with the whole cell as UVs, so their aspect ratio survives.
+pub(in crate::renderer) fn load_ui_extension_images(
+    base: &Path,
+    game: Option<&Path>,
+    names: &[String],
+) -> Vec<Option<Vec<u8>>> {
+    let cell = ui::EXT_IMAGE_CELL;
+    let mut assets = match AssetSearchPath::open_game(base, game) {
+        Ok(assets) => assets,
+        Err(error) => {
+            eprintln!("Extension HUD image asset search: {error}");
+            return vec![None; names.len()];
+        }
+    };
+    names
+        .iter()
+        .map(|name| {
+            let Some(image) = try_load_texture_asset_from_search_path(
+                &mut assets,
+                name,
+                true,
+                false,
+                true,
+                "extension HUD image",
+            ) else {
+                eprintln!("Extension HUD image {name}: not found");
+                return None;
+            };
+            let (source_w, source_h) = (image.width, image.height);
+            let Some(source) = image::RgbaImage::from_raw(source_w, source_h, image.rgba) else {
+                eprintln!("Extension HUD image {name}: unexpected pixel format");
+                return None;
+            };
+            Some(if source_w == cell && source_h == cell {
+                source.into_raw()
+            } else {
+                image::imageops::resize(&source, cell, cell, image::imageops::FilterType::Triangle)
+                    .into_raw()
+            })
+        })
+        .collect()
 }
 
 /// Dynamic atlas for CG_DrawTeamOverlay model, weapon and powerup icons.
@@ -1432,4 +1590,35 @@ pub(in crate::renderer) struct ScreenFxBatch {
     pub(in crate::renderer) range: std::ops::Range<u32>,
     pub(in crate::renderer) blend: FxBlend,
     pub(in crate::renderer) texture_key: Option<String>,
+}
+
+#[cfg(test)]
+mod extension_image_atlas_tests {
+    use super::*;
+
+    #[test]
+    fn blank_atlas_has_room_for_every_slot() {
+        let atlas = blank_ui_extension_atlas();
+        let cells = (atlas.width / ui::EXT_IMAGE_CELL) * (atlas.height / ui::EXT_IMAGE_CELL);
+        assert!(cells as usize >= crate::extensions::MAX_HUD_IMAGES);
+        assert!(atlas.rgba.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    #[ignore = "requires JKA_TEST_BASE with stock assets"]
+    fn stock_hud_art_decodes_into_cells() {
+        let base = std::path::PathBuf::from(std::env::var_os("JKA_TEST_BASE").expect("set JKA_TEST_BASE"));
+        let names: Vec<String> = [
+            "gfx/2d/numbers/t_one", "gfx/hud/armor_tic_1", "gfx/hud/hudleft", "gfx/hud/health_tic_1",
+            "gfx/hud/nonexistent_image",
+        ].iter().map(|n| (*n).to_owned()).collect();
+        let cells = load_ui_extension_images(&base, None, &names);
+        let opaque = |cell: &Vec<u8>| cell.chunks_exact(4).filter(|p| p[3] > 16).count();
+        for cell in &cells[..4] {
+            let cell = cell.as_ref().expect("stock image missing");
+            assert_eq!(cell.len() as u32, ui::EXT_IMAGE_CELL * ui::EXT_IMAGE_CELL * 4);
+            assert!(opaque(cell) > 500);
+        }
+        assert!(cells[4].is_none(), "a missing image must stay transparent");
+    }
 }

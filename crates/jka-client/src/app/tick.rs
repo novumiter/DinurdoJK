@@ -51,7 +51,7 @@ impl App {
         // scene cache. Hold that pose through the image->world crossfade, then
         // begin the animation from phase zero (no position or angle jump).
         let seconds = cinematic.fade_started.map_or(0.0, |ready| {
-            now.saturating_duration_since(ready + Duration::from_secs_f32(
+            now.saturating_duration_since(self.frontend_visual_handoff_start(ready) + Duration::from_secs_f32(
                 crate::app::egui_menu::FRONTEND_SCENE_FADE_IN_SECS,
             ))
             .as_secs_f32()
@@ -78,7 +78,7 @@ impl App {
 
     pub(in crate::app) fn tick(&mut self) {
         if self.extensions.poll() {
-            self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets()));
+            self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, self.extensions.hud_images.clone()));
             if self.overlay == OverlayMode::HudEdit {
                 self.egui_repaint_requested = true;
             }
@@ -355,6 +355,10 @@ impl App {
                     viewer_client: session.client_game.presentation_client_num(),
                     is_live: session.live || session.local,
                     is_demo: !session.live && !session.local,
+                    screen_size: self.window.as_ref().map_or([0, 0], |w| {
+                        let size = w.inner_size();
+                        [size.width, size.height]
+                    }),
                 });
             self.extensions.submit_frame(now, state);
         }

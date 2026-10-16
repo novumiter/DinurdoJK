@@ -17,16 +17,19 @@ pub enum AccountType {
     Login,
     Admin,
     Rcon,
+    /// The server's `g_password` (join password for private servers).
+    Server,
 }
 
 impl AccountType {
-    pub const ALL: [Self; 3] = [Self::Login, Self::Admin, Self::Rcon];
+    pub const ALL: [Self; 4] = [Self::Login, Self::Admin, Self::Rcon, Self::Server];
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Login => "Login",
             Self::Admin => "Admin",
             Self::Rcon => "RCON",
+            Self::Server => "Server",
         }
     }
 
@@ -36,6 +39,7 @@ impl AccountType {
             Self::Login => "login",
             Self::Admin => "admin",
             Self::Rcon => "rcon",
+            Self::Server => "server",
         }
     }
 
@@ -45,6 +49,7 @@ impl AccountType {
             "login" => Some(Self::Login),
             "admin" => Some(Self::Admin),
             "rcon" => Some(Self::Rcon),
+            "server" => Some(Self::Server),
             _ => None,
         }
     }
@@ -54,6 +59,7 @@ impl AccountType {
             Self::Login => 0,
             Self::Admin => 1,
             Self::Rcon => 2,
+            Self::Server => 3,
         }
     }
 }

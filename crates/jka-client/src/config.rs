@@ -99,6 +99,8 @@ pub struct ClientPresentationSettings {
     pub japro: crate::japro_cg::JaproCgame,
     /// TaystJK-compatible server-browser masters (`sv_master1`..`sv_master5`).
     pub master_servers: [String; crate::server_browser::MAX_MASTER_SLOTS],
+    /// `cl_serverFilters`: server-browser hide flags, max ping and mod filter.
+    pub server_filters: String,
 }
 
 /// jaPRO/TaystJK client options (sounds, gibs, auto switch: `cg_jumpSounds` and friends). They apply
@@ -308,6 +310,7 @@ impl Default for ClientPresentationSettings {
             network: crate::net::NetworkSettings::default(),
             japro: crate::japro_cg::JaproCgame::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),
+            server_filters: String::new(),
         }
     }
 }
@@ -1694,6 +1697,12 @@ mod tests {
         crate::app::video_cvar_registry()
             .set(&mut settings, "cg_drawTimer", "on")
             .unwrap();
+        crate::app::video_cvar_registry()
+            .set(&mut settings, "cg_draw2D", "0")
+            .unwrap();
+        crate::app::video_cvar_registry()
+            .set(&mut settings, "cg_drawHud", "off")
+            .unwrap();
         save_video_settings(
             &path,
             settings,
@@ -1705,9 +1714,13 @@ mod tests {
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.matches("seta cg_drawFPS").count(), 1);
         assert_eq!(text.matches("seta cg_drawTimer").count(), 1);
+        assert_eq!(text.matches("seta cg_draw2D").count(), 1);
+        assert_eq!(text.matches("seta cg_drawHud").count(), 1);
         let loaded = load_video_settings(&path);
         assert_eq!(loaded.draw_fps, 2);
         assert!(loaded.draw_timer);
+        assert!(!loaded.draw_2d);
+        assert!(!loaded.draw_hud);
         for (value, expected) in [("7", 2), ("-0", 1), ("256", 1), ("invalid", 1)] {
             fs::write(
                 &path,
@@ -1717,9 +1730,17 @@ mod tests {
             let loaded = load_video_settings(&path);
             assert_eq!(loaded.draw_fps, expected, "{value}");
             assert!(loaded.draw_timer);
+            assert!(loaded.draw_2d); // absent cvar defaults to on
+            assert!(loaded.draw_hud);
         }
         assert!(crate::app::video_cvar_registry()
             .set(&mut settings, "cg_drawFPS", "7")
+            .is_err());
+        assert!(crate::app::video_cvar_registry()
+            .set(&mut settings, "cg_draw2D", "2")
+            .is_err());
+        assert!(crate::app::video_cvar_registry()
+            .set(&mut settings, "cg_drawHud", "-1")
             .is_err());
         fs::remove_file(path).unwrap();
     }

@@ -19,6 +19,7 @@ struct VertexOut {
 @group(0) @binding(4) var ui_keys: texture_2d<f32>;
 @group(0) @binding(5) var ui_icons: texture_2d<f32>;
 @group(0) @binding(6) var ui_team_icons: texture_2d<f32>;
+@group(0) @binding(7) var ui_ext_images: texture_2d<f32>;
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
@@ -49,9 +50,12 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     } else if input.textured < 5.5 {
         // gfx/2d/lag and gfx/2d/net (lagometer): likewise an ordinary 2D pic.
         return textureSampleLevel(ui_icons, ui_font_sampler, input.uv, 0.0) * input.color;
-    } else {
+    } else if input.textured < 6.5 {
         // Dynamic CG_DrawTeamOverlay model/weapon/powerup atlas.
         return textureSampleLevel(ui_team_icons, ui_font_sampler, input.uv, 0.0) * input.color;
+    } else {
+        // Game images requested by extension hud_image() calls.
+        return textureSampleLevel(ui_ext_images, ui_font_sampler, input.uv, 0.0) * input.color;
     }
     return vec4<f32>(input.color.rgb, input.color.a * glyph.a);
 }

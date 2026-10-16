@@ -48,6 +48,11 @@ pub struct VideoSettings {
     /// Opt-in BSP material cost heatmap. No work while disabled.
     pub shader_complexity: bool,
     pub skip_ui: bool,
+    /// TaystJK cg_draw2D: main gameplay 2D (HUD, scoreboards, overlays).
+    /// Engine console, chat input and menus remain usable when disabled.
+    pub draw_2d: bool,
+    /// TaystJK cg_drawHud: core health/shield/ammo/force HUD, not movement tools.
+    pub draw_hud: bool,
     pub pvs_mode: PvsMode,
     pub face_plane_cull: bool,
     pub fps_cap: u32,
@@ -299,6 +304,8 @@ pub struct VideoSettings {
     /// it as a directional light that follows the runtime sun (color, intensity,
     /// direction). Needs Entity ambient lighting = BSP lightgrid.
     pub entity_sun_lighting: bool,
+    /// 0..1: estimate and replace baked map sunlight on BSP lightmapped surfaces.
+    pub baked_sun_removal: f32,
     /// 0 = map/default distanceCull; otherwise multiplier applied to that base.
     pub distance_cull_scale: f32,
     /// Experimental Star Nest procedural override of map-authored sky faces.
@@ -588,6 +595,8 @@ impl Default for VideoSettings {
             wireframe_mask: 0,
             shader_complexity: false,
             skip_ui: false,
+            draw_2d: true,
+            draw_hud: true,
             pvs_mode: PvsMode::Auto,
             face_plane_cull: false,
             fps_cap: 0,
@@ -745,6 +754,7 @@ impl Default for VideoSettings {
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
+            baked_sun_removal: 0.0,
             distance_cull_scale: 0.0,
             sky_fractal_override: false,
             clouds: true,

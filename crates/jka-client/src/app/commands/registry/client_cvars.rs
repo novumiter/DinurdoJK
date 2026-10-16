@@ -2101,6 +2101,38 @@ app_cvars! {
         ]
     }
 
+    APP_CL_SERVERFILTERS {
+        runtime: CvarDef::new(
+                "cl_serverFilters",
+                "",
+                "flags|maxping|mods",
+                "Server browser filters (hide flags, max ping, mod list); saved between launches.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app: &App| CvarValue::String(app.server_browser.filters_string()),
+                |app, value| App::cvar_set_cl_serverfilters(app, APP_CL_SERVERFILTERS.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_cl_serverfilters, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, _name, value| {
+                    settings.server_filters = value.to_owned()
+                }),
+                archive: Some((26036, |state| state.presentation.server_filters.clone())),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_set_cl_serverfilters(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    self.server_browser.apply_filters_string(value);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_SV_MASTER1 {
         runtime: CvarDef::new(
                 "sv_master1",

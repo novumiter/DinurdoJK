@@ -33,6 +33,16 @@ macro_rules! video_cvars {
 }
 
 video_cvars! {
+    DRAW_2D, APP_DRAW_2D, "cg_draw2D", "1", "0|1",
+    "TaystJK: 0 hides gameplay 2D (HUD, scoreboard, crosshair, FPS, overlays) for clean screenshots; console, chat entry and menus remain usable.",
+    CvarType::Bool, Bool, draw_2d, |value| value,
+    |app| { app.mark_config_dirty(); app.publish_ui(); };
+
+    DRAW_HUD, APP_DRAW_HUD, "cg_drawHud", "1", "0|1",
+    "TaystJK: 0 hides the main health/shield/ammo/force status HUD; crosshair, movement tools, chat, timer and scoreboard remain.",
+    CvarType::Bool, Bool, draw_hud, |value| value,
+    |app| { app.mark_config_dirty(); app.publish_ui(); };
+
     DRAW_FPS, APP_DRAW_FPS, "cg_drawFPS", "1", "0|1|2",
     "FPS overlay: 0 off, 1 simple FPS, 2 detailed diagnostics.",
     CvarType::Int { min: 0, max: 2 }, Int, draw_fps, |value: i32| value as u8,

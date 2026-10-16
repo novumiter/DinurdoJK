@@ -2167,12 +2167,35 @@ impl ApplicationHandler<UserEvent> for App {
                         // as soon as the user returns to the game.
                         window.request_user_attention(None);
                     }
-                    // Focus has already been granted by the OS at this point. Restore
-                    // the same gameplay mouse/raw-input capture that a left click used
-                    // to re-enable after Alt+Tab, without stealing focus while another
-                    // application is active. Menus/console intentionally keep the cursor.
+                    // A Windows Locked grab pins the cursor at its *current screen
+                    // position*. In a windowed game that position may still be outside
+                    // the client area after Alt+Tab; a successful grab then traps the
+                    // cursor outside the game, and repeating the grab does not help.
+                    // Move it inside *before* restoring capture, only when the normal
+                    // gameplay/demo input rules actually want a captured cursor.
                     if self.overlay == OverlayMode::None {
-                        if self.demo_playback_active() {
+                        let demo_active = self.demo_playback_active();
+                        let wants_capture = !demo_active
+                            || (!self.live_buttons.contains("+speed") && !self.demo_scrub_dragging);
+                        if wants_capture
+                            && !self.captured
+                            && !self.connection_modal_active()
+                            && self.applied_fullscreen.is_windowed()
+                        {
+                            if let Some(window) = self.window.as_ref() {
+                                let size = window.inner_size();
+                                if size.width > 0 && size.height > 0 {
+                                    let center = PhysicalPosition::new(
+                                        (size.width / 2) as i32,
+                                        (size.height / 2) as i32,
+                                    );
+                                    if let Err(error) = window.set_cursor_position(center) {
+                                        eprintln!("Windowed focus: cursor recenter failed: {error}");
+                                    }
+                                }
+                            }
+                        }
+                        if demo_active {
                             self.sync_demo_camera_capture();
                         } else {
                             self.set_capture(true);

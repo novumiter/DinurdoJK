@@ -708,6 +708,11 @@ impl App {
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
+            ui::ENV_ROW_BAKED_SUN_REMOVAL => {
+                self.video.baked_sun_removal = defaults.baked_sun_removal;
+                self.sync_post_effects();
+                self.mark_config_dirty();
+            }
             ui::ENV_ROW_ENTITY_SUN_LIGHTING => {
                 self.video.entity_sun_lighting = defaults.entity_sun_lighting;
                 self.sync_post_effects();

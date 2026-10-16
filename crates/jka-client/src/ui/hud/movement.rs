@@ -1,4 +1,5 @@
 //! Hud movement.
+use crate::extensions::NativeHud;
 use crate::ui::{
     color_code, draw_placed, fixed_charset_text, hud_line, proportional_text,
     proportional_text_width, rect, rect_outline, text, textured_rect_with_source, HudElementId,
@@ -33,6 +34,9 @@ pub(in crate::ui) fn build_speedometer(
     let Some(speedo) = ui.speedometer.as_ref() else {
         return;
     };
+    if ui.native_replaced(NativeHud::Speedometer) {
+        return;
+    }
     let (sx, sy) = (w as f32 / 640.0, h as f32 / 480.0);
     let paint = |out: &mut Vec<UiVertex>, item: &crate::speedometer::Text| {
         let (px, py) = (item.x * sx, item.y * sy);

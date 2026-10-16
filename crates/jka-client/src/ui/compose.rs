@@ -39,7 +39,7 @@ pub fn build_vertices(
         }
         return out;
     }
-    if matches!(
+    if ui.video.draw_2d && matches!(
         ui.mode,
         OverlayMode::None
             | OverlayMode::Chat
@@ -50,7 +50,7 @@ pub fn build_vertices(
     ) {
         build_scoreboard(&mut out, ui, small_font, width, height);
     }
-    if ui.video.reflection_debug {
+    if ui.video.draw_2d && ui.video.reflection_debug {
         build_reflection_debug_legend(&mut out, ui, width, height);
     }
     match ui.mode {
@@ -88,10 +88,11 @@ pub fn build_vertices(
     out
 }
 
-pub(in crate::ui) fn gameplay_hud_visible(ui: &UiSnapshot, width: u32, height: u32) -> bool {
+pub(crate) fn gameplay_hud_visible(ui: &UiSnapshot, width: u32, height: u32) -> bool {
     width != 0
         && height != 0
         && !ui.video.skip_ui
+        && ui.video.draw_2d
         && ui.loading.is_none()
         && matches!(
             ui.mode,
@@ -115,8 +116,12 @@ pub fn build_dynamic_static_vertices(
     if !gameplay_hud_visible(ui, width, height) {
         return;
     }
-    build_hud(out, ui, width, height);
-    build_extension_hud(out, &ui.extension_hud, width, height);
+    // Mirror TaystJK CG_DrawHUD: only the main status HUD is behind
+    // cg_drawHud; movement helpers and other screen overlays are not.
+    if ui.video.draw_hud {
+        build_hud(out, ui, width, height);
+        build_extension_hud(out, &ui.extension_hud, &ui.extension_images, width, height);
+    }
 }
 
 /// Hot movement-driven HUD geometry. Strafehelper and MovementKeys are the only
@@ -143,7 +148,7 @@ pub fn build_transient_vertices(
     if width == 0 || height == 0 || ui.video.skip_ui || ui.loading.is_some() {
         return;
     }
-    let gameplay_overlay = matches!(
+    let gameplay_overlay = ui.video.draw_2d && matches!(
         ui.mode,
         OverlayMode::None
             | OverlayMode::Chat
@@ -189,19 +194,20 @@ pub fn build_transient_vertices(
     }
     // TaystJK Con_DrawNotify remains visible while KEYCATCH_MESSAGE is active,
     // but not under the solid console or UI/cgame/menu catchers.
-    if matches!(ui.mode, OverlayMode::None | OverlayMode::Chat) {
+    if ui.video.draw_2d && matches!(ui.mode, OverlayMode::None | OverlayMode::Chat) {
         build_console_notify(out, ui, width, height);
     }
-    build_prediction_debug(out, ui, width, height);
-    // FPS/perf is intentionally visible above menus too, matching the old
-    // retained path and submit_ui_overlay ordering.
-    draw_placed(out, ui, HudElementId::Fps, width, height, |out| {
-        match ui.video.draw_fps {
-            0 => {}
-            1 => build_fps_simple(out, ui, width, height),
-            _ => build_perf(out, ui, width, height),
-        }
-    });
+    if ui.video.draw_2d {
+        build_prediction_debug(out, ui, width, height);
+        // FPS/perf may appear above menus, but is still CG_Draw2D content.
+        draw_placed(out, ui, HudElementId::Fps, width, height, |out| {
+            match ui.video.draw_fps {
+                0 => {}
+                1 => build_fps_simple(out, ui, width, height),
+                _ => build_perf(out, ui, width, height),
+            }
+        });
+    }
     if gameplay_overlay {
         // TaystJK CG_DrawFPS/CG_DrawTimer share the same right edge. Reuse the
         // FPS HUD transform as well, so moving/scaling FPS cannot leave the
@@ -217,5 +223,87 @@ pub fn build_transient_vertices(
         // cg_chatBox HUD element. Keep it outside draw_placed(Chat) so the HUD
         // editor's chat extent/position affects history only.
         build_chat_input(out, ui, small_font, width, height);
+    }
+}
+
+#[cfg(test)]
+mod draw2d_tests {
+    use super::*;
+
+    #[test]
+    fn draw2d_gates_gameplay_but_not_engine_console_and_chat_entry() {
+        let mut ui = UiSnapshot::default();
+        assert!(gameplay_hud_visible(&ui, 1920, 1080));
+        ui.video.draw_2d = false;
+        assert!(!gameplay_hud_visible(&ui, 1920, 1080));
+        assert!(build_vertices(&ui, 1920, 1080, None, None).is_empty());
+        let mut stable = Vec::new();
+        let mut movement = Vec::new();
+        build_dynamic_static_vertices(&mut stable, &ui, 1920, 1080);
+        build_movement_vertices(&mut movement, &ui, 1920, 1080);
+        assert!(stable.is_empty());
+        assert!(movement.is_empty());
+        ui.mode = OverlayMode::Console;
+        ui.console_input = "cg_draw2D 1".to_string();
+        assert!(!build_vertices(&ui, 1920, 1080, None, None).is_empty());
+        ui.mode = OverlayMode::Chat;
+        ui.chat_input = "screenshot".to_string();
+        let mut transient = Vec::new();
+        build_transient_vertices(&mut transient, &ui, None, 1920, 1080);
+        assert!(!transient.is_empty());
+    }
+
+    #[test]
+    fn drawhud_only_gates_core_hud_not_entire_draw2d() {
+        let mut ui = UiSnapshot::default();
+        // The distinction is important: cg_drawHud must not disable the
+        // crosshair, scoreboards or movement helpers in CG_Draw2D.
+        ui.hud = Some(crate::ui::HudState {
+            health: 100,
+            max_health: 100,
+            armor: 50,
+            force_power: Some(75),
+            force_power_max: 100,
+            ammo: Some(30),
+            ..Default::default()
+        });
+        let mut vertices = Vec::new();
+        build_dynamic_static_vertices(&mut vertices, &ui, 1920, 1080);
+        assert!(!vertices.is_empty());
+        ui.video.draw_hud = false;
+        assert!(gameplay_hud_visible(&ui, 1920, 1080));
+        vertices.clear();
+        build_dynamic_static_vertices(&mut vertices, &ui, 1920, 1080);
+        assert!(vertices.is_empty()); // the core status HUD is gated
+        ui.game_timer = Some("1:23".to_owned());
+        build_transient_vertices(&mut vertices, &ui, None, 1920, 1080);
+        assert!(!vertices.is_empty()); // unrelated 2D survives cg_drawHud 0
+    }
+
+    #[test]
+    fn extension_replaced_native_elements_are_not_built() {
+        use crate::extensions::{NativeHud, NativeHudMask};
+        let mut ui = UiSnapshot::default();
+        ui.hud = Some(crate::ui::HudState {
+            health: 100, max_health: 100, armor: 50,
+            force_power: Some(75), force_power_max: 100, ammo: Some(30),
+            ..Default::default()
+        });
+        let count = |ui: &UiSnapshot| {
+            let mut v = Vec::new();
+            build_dynamic_static_vertices(&mut v, ui, 1920, 1080);
+            v.len()
+        };
+        let all = count(&ui);
+        ui.native_hidden = NativeHudMask::from_names(&["health".to_owned()]).unwrap();
+        let without_health = count(&ui);
+        assert!(without_health > 0 && without_health < all);
+        ui.native_hidden = NativeHudMask::from_names(
+            &NativeHud::ALL.iter().map(|e| e.name().to_owned()).collect::<Vec<_>>()).unwrap();
+        assert_eq!(count(&ui), 0);
+        // Under cg_drawHud 0 extension widgets are not drawn either, so the
+        // native element is not considered replaced.
+        ui.video.draw_hud = false;
+        assert!(!ui.native_replaced(NativeHud::Speedometer));
     }
 }

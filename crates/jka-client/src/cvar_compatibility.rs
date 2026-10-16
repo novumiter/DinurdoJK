@@ -75,7 +75,8 @@ pub(crate) fn digest(text: &str) -> String {
         // New flare settings did not exist in the frozen pre-registry settings.
         .replace(", world_flares: false", "")
         .replace(", saber_flares: true", "")
-        .replace(", rt_taa: 0", "");
+        .replace(", rt_taa: 0", "")
+        .replace(", baked_sun_removal: 0.0", "");
     for byte in projected.bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }
@@ -111,7 +112,8 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
         projected_archive = actual
             .lines()
             .filter(|line| {
-                !line.starts_with("seta r_rtTaa ") &&
+                !line.starts_with("seta r_bakedSunRemoval ")
+                    && !line.starts_with("seta r_rtTaa ") &&
                 !line.starts_with("seta con_notifylines ")
                     && !line.starts_with("seta cg_thirdPersonFlagAlpha ")
                     && !line.starts_with("seta cg_scoreSpectatorGuess ")
@@ -131,6 +133,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta r_jiggleBreastDamping ")
                     && !line.starts_with("seta r_jiggleGluteStiffness ")
                     && !line.starts_with("seta r_jiggleGluteDamping ")
+                    && !line.starts_with("seta cl_serverFilters ")
                     // New controls are outside the frozen pre-registry archive.
                     && !line.starts_with("seta r_worldFlares ")
                     && !line.starts_with("seta r_saberFlares ")
@@ -556,4 +559,21 @@ fn shared_auto_lod_default_and_archive_round_trip() {
     ).unwrap();
     assert!(fs::read_to_string(&path).unwrap().contains("seta r_md3AutoLod \"0\""));
     assert!(!config::load_video_settings(&path).md3_auto_lod);
+}
+
+#[test]
+fn baked_sun_removal_loads_and_archives_without_changing_legacy_fixtures() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("sun.cfg");
+    fs::write(&path, "seta r_bakedSunRemoval \"0.750\"\n").unwrap();
+    let video = config::load_video_settings(&path);
+    assert_eq!(video.baked_sun_removal, 0.75);
+    config::save_video_settings(
+        &path, video,
+        &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(),
+        &config::AudioSettings::default(),
+    ).unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("seta r_bakedSunRemoval \"0.750\""));
 }

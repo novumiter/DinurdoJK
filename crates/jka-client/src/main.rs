@@ -43,6 +43,7 @@ mod cloud_noise;
 mod cloud_wind;
 mod color_grading;
 mod gamma;
+mod frontend_cache_color;
 mod display_gamma;
 mod color_lut;
 mod config;

@@ -788,7 +788,10 @@ impl App {
         }
         cinematic.fade_started = Some(now);
         if let Some(path) = self.frontend_scene_cache_path.as_ref().filter(|path| !path.exists()) {
-            self.render_command(RenderCommand::CaptureFrontendScene { path: path.clone() });
+            self.render_command(RenderCommand::CaptureFrontendScene {
+                path: path.clone(),
+                neutral_gamma: super::frontend_scene_cache::shader_gamma_reusable(&self.video),
+            });
         }
         self.egui_repaint_requested = true;
     }
@@ -856,7 +859,7 @@ impl App {
             |held| {
                 let resumed = cinematic.fade_started.map_or(0, |start| {
                     Instant::now().saturating_duration_since(
-                        start + Duration::from_secs_f32(
+                        self.frontend_visual_handoff_start(start) + Duration::from_secs_f32(
                             crate::app::egui_menu::FRONTEND_SCENE_FADE_IN_SECS,
                         ),
                     ).as_millis().min(i32::MAX as u128) as i32

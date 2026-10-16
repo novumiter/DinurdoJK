@@ -126,6 +126,8 @@ impl Renderer {
         self.contact_shadows_enabled = effects.contact_shadows;
         self.weather.fog.mode = effects.fog_mode;
         self.weather.fog.strength = effects.fog_strength.clamp(0.0, ui::MAX_FOG_STRENGTH);
+        let previous_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
+                            self.sun_intensity, self.sun_color);
         self.sun_override = effects.sun_override;
         self.sun_yaw = effects.sun_yaw.rem_euclid(360.0);
         self.sun_pitch = effects.sun_pitch.clamp(-90.0, 90.0);
@@ -133,6 +135,15 @@ impl Renderer {
         self.sun_color = effects.sun_color.map(|channel| channel.clamp(0.0, 1.0));
         self.sun_visibility = effects.sun_visibility;
         self.entity_sun_lighting = effects.entity_sun_lighting;
+        let old_baked_sun_removal = self.baked_sun_removal;
+        self.baked_sun_removal = effects.baked_sun_removal.clamp(0.0, 1.0);
+        let current_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
+                           self.sun_intensity, self.sun_color);
+        if old_baked_sun_removal != self.baked_sun_removal
+            || (self.baked_sun_removal > 0.0 && previous_sun != current_sun)
+        {
+            self.update_lighting_settings();
+        }
         self.sky_fractal_override = effects.sky_fractal_override;
         self.clouds_enabled = effects.clouds;
         self.cloud_type = effects.cloud_type;

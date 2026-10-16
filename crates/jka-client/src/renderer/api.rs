@@ -747,6 +747,8 @@ pub struct PostEffects {
     pub sun_color: [f32; 3],
     pub sun_visibility: SunVisibilityMode,
     pub entity_sun_lighting: bool,
+    /// 0..1: estimate and replace baked map sunlight on BSP lightmapped surfaces.
+    pub baked_sun_removal: f32,
     pub sky_fractal_override: bool,
     pub clouds: bool,
     pub cloud_type: CloudType,
@@ -1103,11 +1105,11 @@ pub enum RenderCommand {
     },
     CopyFrameToClipboard,
     /// One-shot scene-only readback, before egui/HUD layers.
-    CaptureFrontendScene { path: PathBuf },
+    CaptureFrontendScene { path: PathBuf, neutral_gamma: bool },
     CaptureVideoFrame { frame_index: u64, depth: bool },
     SetUi(UiSnapshot),
     /// Small independent overlay update; avoids rebuilding the full UiSnapshot.
-    SetExtensionHud(Vec<crate::extensions::PlacedHudWidget>),
+    SetExtensionHud(Vec<crate::extensions::PlacedHudWidget>, crate::extensions::NativeHudMask, Vec<String>),
     SetTransientUi {
         chat_lines: Vec<ui::UiChatLine>,
         console_notify_lines: Vec<ui::UiConsoleNotifyLine>,

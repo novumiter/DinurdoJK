@@ -1,7 +1,7 @@
 //! Lighting state.
 use crate::renderer::{
     legacy_dlight_surface_mask, scene, transient_light_gpu, transient_light_samples,
-    DynamicLightsMode, EntityDlight, GpuPointLight, LegacyDlightPerfStats, LightingSettings,
+    DirectionalSun, DynamicLightsMode, DynamicShadowsMode, EntityDlight, GpuPointLight, LegacyDlightPerfStats, LightingSettings,
     Renderer, TransientLight, Vec3, LOCAL_SHADOW_MAP_SIZE, MAX_DYNAMIC_LIGHTS,
     MAX_ENTITY_DLIGHTS,
 };
@@ -407,6 +407,26 @@ impl Renderer {
             .map_or(scene::SourceMapLighting::default(), |world| {
                 world.source_map_lighting
             });
+        // A BSP lightmap is one combined image, not a per-light decomposition.
+        // Use conservative facing/brightness estimates only for maps whose
+        // authored sun is known; zero on source maps and sunless BSPs.
+        // Without sun shadows, adding a directional light would illuminate
+        // interiors through walls, so replacement requires RT or cascades.
+        let authored_sun = self.world.as_ref()
+            .filter(|world| !world.source_map)
+            .and_then(|world| world.sun);
+        let can_relight = (self.cascaded_shadows_enabled
+            || (self.cascaded_shadow_mode == DynamicShadowsMode::RayTraced
+                && self.ray_tracing_supported))
+            && authored_sun.is_some();
+        let replacement = self.active_sun();
+        let old = authored_sun.unwrap_or(replacement);
+        let strength = if can_relight { self.baked_sun_removal } else { 0.0 };
+        let old_toward = -Vec3::from_array(old.direction).normalize_or_zero();
+        let radiance = |sun: DirectionalSun| {
+            let rgb = Vec3::from_array(sun.color) * (sun.intensity.max(0.0) / 255.0);
+            [rgb.x, rgb.y, rgb.z, 0.0]
+        };
         let settings = LightingSettings {
             values: [
                 u32::from(direct_local_lighting_enabled && light_count != 0),
@@ -453,6 +473,9 @@ impl Renderer {
                 source_map_lighting.ambient[2],
                 self.rt_samples as f32,
             ],
+            baked_sun_direction_strength: [old_toward.x, old_toward.y, old_toward.z, strength],
+            baked_sun_radiance: radiance(old),
+            runtime_sun_radiance: radiance(replacement),
             map_minlight: [
                 source_map_lighting.minlight[0],
                 source_map_lighting.minlight[1],

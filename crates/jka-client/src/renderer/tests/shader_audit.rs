@@ -633,6 +633,7 @@ fn minimal_key() -> WorldShaderVariantKey {
         weather_surface: false,
         classic_render_flags: false,
         static_bsp_ao: false,
+        baked_sun_relight: false,
         planar_debug: false,
         deluxe: false,
         deluxe_specular: false,
@@ -644,6 +645,16 @@ fn minimal_key() -> WorldShaderVariantKey {
         program_mode: super::world::programs::WorldProgramMode::Specialized,
         sky_debug: false,
     }
+}
+
+#[test]
+fn baked_sun_relight_variant_validates() {
+    let variant = WorldShaderVariantKey {
+        baked_sun_relight: true,
+        cascaded_shadows: true,
+        ..minimal_key()
+    };
+    let _ = specialized_lean_module(variant);
 }
 
 fn specialized_lean_module(key: WorldShaderVariantKey) -> Module {

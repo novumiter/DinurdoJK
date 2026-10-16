@@ -68,6 +68,9 @@ struct LightingSettings {
     feature_flags: vec4<u32>, // emissive area lights, voxel/probe GI, point/entity lights, reflection quality
     map_ambient: vec4<f32>, // xyz q3map2 ambient RGB; w RT sample count
     map_minlight: vec4<f32>, // source-.map q3map2 minlight RGB; w runtime-dlight falloff mode (0 stock, 1 physical)
+    baked_sun_direction_strength: vec4<f32>, // xyz toward old sun, w removal strength
+    baked_sun_radiance: vec4<f32>, // RGB old sun intensity / 255
+    runtime_sun_radiance: vec4<f32>, // RGB new sun intensity / 255
 };
 struct PbrSettings {
     // x: PBR companions enabled, y: parallax enabled, z: height scale * 1000.
@@ -201,6 +204,7 @@ override ENABLE_JUMP_SHADE: bool = false;
 // from a uniform per fragment, which costs registers and ALU even while it is off.
 // They default to on so a pipeline built without the constant keeps full behavior.
 override ENABLE_CLASSIC_RENDER_FLAGS: bool = true; // r_fullbright / r_vertexLight / r_lightmap
+override ENABLE_BAKED_SUN_RELIGHT: bool = false;
 override ENABLE_STATIC_BSP_AO: bool = true; // cached BSP ambient occlusion
 override ENABLE_DELUXE: bool = true; // directional baked lighting (deluxemap / lightgrid) on PBR surfaces
 override ENABLE_DELUXE_SPECULAR: bool = true; // GGX lobe from the baked light direction
@@ -3510,6 +3514,36 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 
+// Approximate separation of q3map2's sunlight from its *combined* baked
+// lightmap. A BSP does NOT contain individual light contributions; this cannot
+// reconstruct the exact original direct/indirect split. Only run when the
+// specialized relight variant is active. Shader authored colors, local lamps,
+// and dark areas are protected by a small per-channel residual floor and by
+// limiting subtraction to the surface's old-sun facing/available intensity.
+fn relight_baked_sun(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> {
+    if (!ENABLE_BAKED_SUN_RELIGHT) { return lightmap; }
+    let strength = lighting_settings.baked_sun_direction_strength.w;
+    if (strength <= 0.0) { return lightmap; }
+    let n = normalize(input.world_normal);
+    let toward_old = normalize(lighting_settings.baked_sun_direction_strength.xyz);
+    let old_facing = max(dot(n, toward_old), 0.0);
+    let old_radiance = lighting_settings.baked_sun_radiance.rgb * old_facing;
+    // A colored lamp can still resemble the sun: this is a conservative
+    // estimate, not a claimed exact decomposition. Preserve a residual floor.
+    let available = max(lightmap - vec3<f32>(0.10), vec3<f32>(0.0));
+    let old_direct = min(old_radiance, available);
+    let remaining = max(lightmap - old_direct * strength, vec3<f32>(0.0));
+    // The runtime sun must be tested against scene shadow/sky admission before
+    // it is added. Without CSM/RT support CPU disables this mode entirely.
+    let toward_new = -normalize(shadow_settings.light_direction_enabled.xyz);
+    let new_facing = max(dot(n, toward_new), 0.0);
+    if (new_facing <= 0.0 || all(lighting_settings.runtime_sun_radiance.rgb <= vec3<f32>(0.0))) {
+        return remaining;
+    }
+    let admission = sun_shadow_transmission(input, input.world_normal);
+    return remaining + strength * lighting_settings.runtime_sun_radiance.rgb * new_facing * admission;
+}
+
 fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     let classic_flags = select(0u, camera.render_flags.z, ENABLE_CLASSIC_RENDER_FLAGS);
     let classic_fullbright = (classic_flags & CLASSIC_FULLBRIGHT) != 0u;
@@ -3738,6 +3772,20 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         }
     }
 
+    // Explicit $lightmap stages use the stage's source sample, not the
+    // synthesized implicit lightmap multiply below. Preserve blending order.
+    if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u && explicit_lightmap_stage
+        && input.lightmap_uv.x >= 0.0) {
+        source_sample = vec4<f32>(relight_baked_sun(source_sample.rgb, input), source_sample.a);
+    }
+    // q3map vertex-lit faces have no lightmap. Only touch the authored vertex
+    // color path, never unrelated animated/non-lightmapped shader stages.
+    if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u
+        && (material_flags() & 131072u) != 0u && (material_flags() & 1u) != 0u
+        && !explicit_lightmap_stage) {
+        let restored = relight_baked_sun(input.color.rgb, input);
+        stage_color = vec4<f32>(material.color.rgb * restored, stage_color.a);
+    }
     var base = source_sample * stage_color;
     // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot
     // seed depth. For the narrowly identified multi-stage depth-equal case,
@@ -3836,6 +3884,9 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
             // sampling. r_lightmap + r_vertexLight is the vanilla white debug case.
             lightmap_color = select(input.color.rgb, vec3<f32>(1.0), classic_lightmap_only);
         }
+        if (ENABLE_BAKED_SUN_RELIGHT && classic_flags == 0u) {
+            lightmap_color = relight_baked_sun(lightmap_color, input);
+        }
         if (classic_lightmap_only) {
             // r_lightmap removes the diffuse texture so the lighting data itself
             // is visible (the familiar white-walls/lightmap debug presentation).
@@ -3869,11 +3920,14 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     }
     if ((material_flags() & 4u) != 0u) {
         base = vec4<f32>(base.rgb + voxel_probe_indirect(input, albedo, surface_uv, weather, shared_frame, shared_pbr), base.a);
+        if (!ENABLE_BAKED_SUN_RELIGHT || classic_flags != 0u
+            || (material_flags() & (2u | 131072u | 16777216u)) == 0u) {
         let shadow_rgb = sun_shadow_transmission(input, input.world_normal);
         let light_direction = normalize(shadow_settings.light_direction_enabled.xyz);
         let sun_facing = max(dot(normalize(input.world_normal), -light_direction), 0.0);
-        let shadow_strength = shadow_settings.params.z * sun_facing;
-        base = vec4<f32>(base.rgb * (vec3<f32>(1.0) - shadow_strength * (vec3<f32>(1.0) - shadow_rgb)), base.a);
+            let shadow_strength = shadow_settings.params.z * sun_facing;
+            base = vec4<f32>(base.rgb * (vec3<f32>(1.0) - shadow_strength * (vec3<f32>(1.0) - shadow_rgb)), base.a);
+        }
         // Projected cloud shadows are applied once to the fully composited scene
         // in post.wgsl. Keeping them out of individual legacy material stages
         // avoids shader-dependent holes and prevents multipass surfaces from

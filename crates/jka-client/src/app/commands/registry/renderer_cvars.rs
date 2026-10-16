@@ -1537,6 +1537,33 @@ app_cvars! {
         ]
     }
 
+    APP_R_BAKEDSUNREMOVAL {
+        runtime: CvarDef::new("r_bakedSunRemoval", "", "0..1", "Approximate removal of baked map sunlight and replacement with the runtime sun on BSP lightmapped surfaces (requires sun visibility for relighting). 0 preserves vanilla lighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_bakedsunremoval(app)), |app, value| App::cvar_set_r_bakedsunremoval(app, APP_R_BAKEDSUNREMOVAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunremoval, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.baked_sun_removal = v.clamp(0.0, 1.0); }
+                }
+            }),
+            archive: Some((59, |state| format!("{:.3}", state.video.baked_sun_removal))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_get_r_bakedsunremoval(&self) -> String {
+                    format!("{:.3}", self.video.baked_sun_removal)
+                }
+                fn cvar_set_r_bakedsunremoval(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.baked_sun_removal = Self::parse_cvar_finite(name, value)?.clamp(0.0, 1.0);
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_ENTITYSUNLIGHTING {
         runtime: CvarDef::new("r_entitySunLighting", "", "0..1", "Remove the baked map sun from the entity lightgrid and re-light entities with the runtime sun (needs r_entityAmbientLighting bsp_lightgrid).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_entitysunlighting(app)), |app, value| App::cvar_set_r_entitysunlighting(app, APP_R_ENTITYSUNLIGHTING.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_entitysunlighting, None),
         config: CvarBinding {

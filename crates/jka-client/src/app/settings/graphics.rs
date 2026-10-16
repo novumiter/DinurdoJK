@@ -25,6 +25,7 @@ impl App {
         // Unlocked sliders are expressed relative to the master, so their
         // effective multiplier changes whenever the master moves.
         self.sync_brightness_scales();
+        self.refresh_frontend_cache_for_gamma();
         self.mark_config_dirty();
         self.publish_ui();
     }
@@ -601,6 +602,7 @@ impl App {
             sun_color: self.video.sun_color,
             sun_visibility: self.video.sun_visibility,
             entity_sun_lighting: self.video.entity_sun_lighting,
+            baked_sun_removal: self.video.baked_sun_removal,
             sky_fractal_override: self.video.sky_fractal_override,
             clouds: self.video.clouds,
             cloud_type: self.video.cloud_type,

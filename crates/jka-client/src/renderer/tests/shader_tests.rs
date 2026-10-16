@@ -6,6 +6,7 @@ fn promoted_glass_shader_variants_validate() {
         ("glass", crate::glass::world_shader()),
         ("glass boundaries", include_str!("../../glass_edges.wgsl").to_owned()),
         ("glass Gaussian", include_str!("../../glass_blur.wgsl").to_owned()),
+        ("ui", include_str!("../../ui.wgsl").to_owned()),
         ("world", compose_world_shader(include_str!("../../bsp.wgsl"))),
         ("lean", compose_world_shader(include_str!("../../bsp_lean.wgsl"))),
         ("fast", format!("{}\n{}\n{}",

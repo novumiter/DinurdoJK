@@ -2,6 +2,34 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_CG_DRAW2D {
+        runtime: super::hud::APP_DRAW_2D.copy(),
+        config: CvarBinding {
+            load_video: Some(|settings, _, value, _| {
+                settings.draw_2d = parse_bool(value).unwrap_or(settings.draw_2d);
+            }),
+            archive: Some((453, |state| {
+                format!("{}", u8::from(state.video.draw_2d))
+            })),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_DRAWHUD {
+        runtime: super::hud::APP_DRAW_HUD.copy(),
+        config: CvarBinding {
+            load_video: Some(|settings, _, value, _| {
+                settings.draw_hud = parse_bool(value).unwrap_or(settings.draw_hud);
+            }),
+            archive: Some((454, |state| {
+                format!("{}", u8::from(state.video.draw_hud))
+            })),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_CG_DRAWFPS {
         runtime: super::hud::APP_DRAW_FPS.copy(),
         config: CvarBinding {

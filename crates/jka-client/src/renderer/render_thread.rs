@@ -541,6 +541,7 @@ pub(in crate::renderer) fn render_thread_main(
         sun_color: initial_ui.video.sun_color,
         sun_visibility: initial_ui.video.sun_visibility,
         entity_sun_lighting: initial_ui.video.entity_sun_lighting,
+        baked_sun_removal: initial_ui.video.baked_sun_removal,
         sky_fractal_override: initial_ui.video.sky_fractal_override,
         clouds: initial_ui.video.clouds,
         cloud_type: initial_ui.video.cloud_type,
@@ -1352,10 +1353,10 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.request_screenshot(directory, metadata, format)
                     }
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
-                    Ok(RenderCommand::CaptureFrontendScene { path }) => renderer.request_frontend_scene_capture(path),
+                    Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma }) => renderer.request_frontend_scene_capture(path, neutral_gamma),
                     Ok(RenderCommand::CaptureVideoFrame { frame_index, depth }) => renderer.request_video_frame_capture(frame_index, depth),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
-                    Ok(RenderCommand::SetExtensionHud(widgets)) => renderer.set_extension_hud(widgets),
+                    Ok(RenderCommand::SetExtensionHud(widgets, hidden, images)) => renderer.set_extension_hud(widgets, hidden, images),
                     Ok(RenderCommand::SetTransientUi {
                         chat_lines,
                         console_notify_lines,

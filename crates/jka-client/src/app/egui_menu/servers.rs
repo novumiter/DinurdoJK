@@ -445,6 +445,7 @@ impl App {
         }
         ui.add_space(7.0);
 
+        let filters_before = self.server_browser.filters_string();
         // Search stays prominent; the boolean filters live in one compact menu
         // rather than consuming most of the toolbar as independent chips.
         ui.horizontal(|ui| {
@@ -528,6 +529,9 @@ impl App {
             }
             response.on_hover_text("Case-insensitive exact matches. 'base' matches servers with no mod game directory.");
         });
+        if self.server_browser.filters_string() != filters_before {
+            self.mark_config_dirty();
+        }
         ui.horizontal(|ui| {
             theme::label(ui, theme::plain("PLAYERS", 11.5, theme::TEXT_FAINT));
             let response = ui.add_sized(

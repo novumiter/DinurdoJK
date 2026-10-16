@@ -75,6 +75,13 @@ impl App {
         let mut layout_changed = false;
         let mut drag_ended = false;
         for id in draw_order {
+            // An extension replaced this element: nothing is drawn to grab.
+            if ui::hud_element_replaced(self.extensions.native_hidden, self.video.draw_hud, id) {
+                if self.hud_edit_selected == Some(id) {
+                    self.hud_edit_selected = None;
+                }
+                continue;
+            }
             let layout = self.hud_layout.element(id);
             let hud_rect = ui::hud_element_rect(id, layout, &rect_ctx, size.width, size.height);
             let rect = egui::Rect::from_min_size(
@@ -866,11 +873,15 @@ impl App {
         let painter = root.painter().clone();
         let mut save_layout = false;
         let mut visual_changed = false;
+        let Some(window) = self.window.as_ref() else { return; };
+        let screen = window.inner_size();
         for widget in &widgets {
             let p = self.extensions.widget_placement(&widget.key);
             let to_pt = |n: f32| n / ppp;
+            let (ox, oy) = crate::extensions::hud_widget_origin(
+                widget.anchor, p, widget.width, widget.height, screen.width as f32, screen.height as f32);
             let rect = egui::Rect::from_min_size(
-                full.min + egui::vec2(to_pt(p.x), to_pt(p.y)),
+                full.min + egui::vec2(to_pt(ox), to_pt(oy)),
                 egui::vec2(to_pt(widget.width*p.scale), to_pt(widget.height*p.scale)),
             );
             let response = root.interact(rect, egui::Id::new(("ext_hud", &widget.key)), egui::Sense::click_and_drag());
@@ -909,6 +920,7 @@ impl App {
             if widgets.iter().any(|w|w.key==id) {
                 let mut p=self.extensions.widget_placement(&id);
                 let old=p;
+                let anchor=self.extensions.widget_anchor(&id);
                 egui::Area::new(egui::Id::new("extension_hud_toolbar"))
                     .anchor(egui::Align2::CENTER_BOTTOM,egui::vec2(0.0,-15.0))
                     .order(egui::Order::Foreground)
@@ -920,7 +932,7 @@ impl App {
                                 ui.checkbox(&mut p.visible,"Visible");
                                 ui.label("Scale");
                                 ui.add(egui::Slider::new(&mut p.scale,0.5..=2.0));
-                                if ui.button("RESET").clicked() { p=Default::default(); }
+                                if ui.button("RESET").clicked() { p=crate::extensions::HudPlacement::for_anchor(anchor); }
                             });
                         });
                     });
@@ -936,7 +948,7 @@ impl App {
         }
         if save_layout { self.extensions.save_widget_layouts(); }
         if visual_changed {
-            self.render_command(crate::app::RenderCommand::SetExtensionHud(self.extensions.placed_widgets()));
+            self.render_command(crate::app::RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, self.extensions.hud_images.clone()));
             self.egui_repaint_requested=true;
         }
     }

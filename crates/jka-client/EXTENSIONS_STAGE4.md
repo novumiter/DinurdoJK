@@ -1,0 +1,59 @@
+# DinurdoJK extensions — Stage 4 (replacing native HUD elements)
+
+An extension replaces native HUD elements by listing them in `extension.toml`:
+
+```toml
+api_version = 1
+name = "My HUD"
+hides_native_hud = ["health", "shield", "ammo", "force", "speedometer"]
+```
+
+Elements: `health`, `shield`, `ammo` (also the saber-style panel), `force`,
+`speedometer` (readout, jump counter and speed graph). Only elements whose data
+a script can read through `playerstate()`/`session_info()` are offered. An
+unknown name makes the manifest fail to load (the previous revision stays active).
+
+## Rules
+
+- Runtime overlay only. No cvar or config value is written, and cvars such as
+  `cg_speedometer` and the HUD Edit layout keep working untouched.
+- Active only while the extension is enabled and running. Disabling or removing it
+  restores the native element immediately. A failed hot-reload keeps the previous
+  revision, so its elements stay hidden (no flicker). If the extension's
+  `on_update` hook is disabled by a runtime error, its elements come back.
+- Several extensions combine (union).
+- Extension widgets only draw under `cg_drawHud 1`, so the native element is only
+  replaced under `cg_drawHud 1` as well. `cg_drawHud 0` never hides both.
+- HUD Edit does not offer handles for a replaced native element.
+- Setup -> Extensions shows "Replaces native HUD: ..." for the selected extension.
+
+## Bundled example
+
+`extensions/ups-hud/` is a replacement speedometer (UPS, 2 s peak, speed bar).
+Copy it to `<base>/extensions/ups-hud/` to try it.
+
+## Images, anchors and screen size
+
+- `hud_image(widget, "gfx/hud/hudleft", x, y, w, h, [r,g,b,a])` draws a game image
+  (any `gfx/...` path without extension, from the normal asset search path), tinted by
+  the colour. A negative `w`/`h` mirrors it. Images are clipped to the widget rect.
+  At most 32 distinct images across all widgets; they are packed into one atlas on
+  demand (no cost when unused).
+- `hud_register(id, name, w, h, anchor)` takes an optional anchor: `"top-left"` (default,
+  old behaviour), `"top-right"`, `"bottom-left"`, `"bottom-right"`. Placements are offsets
+  from that corner, so anchored widgets keep their place across resolutions and scale
+  inward. Calling `hud_register` again (e.g. on a resolution change) replaces the widget.
+- `session_info()` now has `screen_width` / `screen_height` (framebuffer pixels).
+- `playerstate()` gained `max_health`, `force_power`, `saber_style`, `saber_active_style`,
+  `ammo_index`, `ammo_current` (or `()`), `ammo_infinite`. **`armor` was reading the wrong
+  stat (holdable item) and is fixed.**
+- Rhai functions called from `on_update` cannot see top-level `let`/`const` values
+  (only `on_update` itself can); pass what helpers need as arguments.
+
+## Bundled: Jedi Academy HUD
+
+`extensions/jka-hud/` redraws the retail MP HUD from `ui/hud.menu` and the
+`CG_DrawHealth/Armor/Ammo/ForcePower/SaberStyle` logic, using the stock `gfx/hud/*` and
+`gfx/2d/numbers/t_*` art, scaled by screen height / 480. It replaces `health`, `shield`,
+`ammo` and `force`. Copy the folder to `<base>/extensions/jka-hud/`. Not reproduced: the
+force-denied red flash and the ammo number's firing/pickup colours (no data reaches scripts).

@@ -74,6 +74,7 @@ pub(in crate::renderer) fn supported_variant(v: WorldShaderVariantKey) -> bool {
         && !v.ray_traced_shadows
         && !v.ray_traced_sun
         && !v.weather_surface
+        && !v.baked_sun_relight
         && !v.classic_render_flags
         && !v.planar_debug
         && !v.dynamic_light_debug

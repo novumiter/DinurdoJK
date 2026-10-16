@@ -99,6 +99,7 @@ impl App {
             .frontend_cinematic
             .and_then(|cinematic| cinematic.fade_started)
             .map_or(0.0, |started| {
+                let started = self.frontend_visual_handoff_start(started);
                 smoothstep01(now.saturating_duration_since(started).as_secs_f32()
                     / FRONTEND_SCENE_FADE_IN_SECS)
             });

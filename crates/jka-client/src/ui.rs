@@ -27,7 +27,7 @@ use chat::{
     build_chat_history, build_chat_input, build_console_notify, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE,
 };
 pub use chat::{KEY_ART_SIZE, KEY_ATLAS_COLUMNS, MOVEMENT_KEY_ART};
-use compose::gameplay_hud_visible;
+pub(crate) use compose::gameplay_hud_visible;
 pub use compose::{
     build_dynamic_static_vertices, build_movement_vertices, build_transient_vertices,
     build_vertices,
@@ -49,6 +49,8 @@ use hud::draw::{
 };
 use hud::layout::draw_placed;
 use hud::extensions::build_extension_hud;
+pub(crate) use hud::extensions::hud_element_replaced;
+pub use hud::extensions::{EXT_IMAGE_CELL, EXT_IMAGE_COLUMNS};
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
@@ -1011,6 +1013,10 @@ pub struct UiSnapshot {
     pub hud_layout: HudLayout,
     /// Cached draw list from the extension worker (no per-render-frame scripting).
     pub extension_hud: Vec<crate::extensions::PlacedHudWidget>,
+    /// Native elements the running extensions replace. Read through `native_hidden()`.
+    pub native_hidden: crate::extensions::NativeHudMask,
+    /// Extension image atlas slots, in cell order (see `Manager::hud_images`).
+    pub extension_images: Vec<String>,
     pub crosshair: CrosshairSettings,
     pub crosshair_target: UiCrosshairTarget,
     /// OpenJK/TaystJK force-power selector shown briefly after forcenext/forceprev.
@@ -1088,6 +1094,8 @@ impl Default for UiSnapshot {
             team_overlay: None,
             hud_layout: HudLayout::default(),
             extension_hud: Vec::new(),
+            native_hidden: crate::extensions::NativeHudMask::default(),
+            extension_images: Vec::new(),
             crosshair: CrosshairSettings::default(),
             crosshair_target: UiCrosshairTarget::default(),
             force_select: None,

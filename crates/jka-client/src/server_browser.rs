@@ -203,6 +203,27 @@ pub struct BrowserUiState {
 }
 
 impl BrowserUiState {
+    /// `cl_serverFilters` value: `<flags>|<max ping>|<mod filter>`, where flags
+    /// are bit 0 empty, 1 full, 2 bots, 3 connecting.
+    pub fn filters_string(&self) -> String {
+        let flags = self.hide_empty as u8
+            | (self.hide_full as u8) << 1
+            | (self.hide_bots as u8) << 2
+            | (self.hide_connecting as u8) << 3;
+        format!("{flags}|{}|{}", self.max_ping, self.mod_filter.replace('|', ""))
+    }
+
+    pub fn apply_filters_string(&mut self, value: &str) {
+        let mut parts = value.splitn(3, '|');
+        let flags = parts.next().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0);
+        self.hide_empty = flags & 1 != 0;
+        self.hide_full = flags & 2 != 0;
+        self.hide_bots = flags & 4 != 0;
+        self.hide_connecting = flags & 8 != 0;
+        self.max_ping = parts.next().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(999);
+        self.mod_filter = parts.next().unwrap_or_default().trim().to_owned();
+    }
+
     pub fn new(
         settings_dir: &Path,
         master_servers: [String; MAX_MASTER_SLOTS],

@@ -563,6 +563,9 @@ pub(in crate::renderer) struct LightingSettings {
     pub(in crate::renderer) feature_flags: [u32; 4], // area lights, voxel/probe GI, point-light mode (0/1/2), reflection quality
     pub(in crate::renderer) map_ambient: [f32; 4], // xyz q3map2 ambient RGB; w RT sample count (1, 2, 4)
     pub(in crate::renderer) map_minlight: [f32; 4], // source-.map q3map2 minlight RGB, normalized; w runtime-dlight falloff mode (0 stock, 1 physical)
+    pub(in crate::renderer) baked_sun_direction_strength: [f32; 4], // xyz toward authored sun, w 0..1 extraction strength
+    pub(in crate::renderer) baked_sun_radiance: [f32; 4], // normalized RGB * authored intensity / 255
+    pub(in crate::renderer) runtime_sun_radiance: [f32; 4], // normalized RGB * replacement intensity / 255
 }
 
 #[repr(C)]

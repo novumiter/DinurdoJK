@@ -1,4 +1,5 @@
 //! Hud draw.
+use crate::extensions::NativeHud;
 use crate::ui::{
     hud_element_rect, rect, rect_gradient, text, with_alpha, HudElementId, HudRect, HudRectContext,
     UiSnapshot, UiVertex,
@@ -32,101 +33,109 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
         return;
     };
 
-    let health_layout = ui.hud_layout.health;
     let ctx = HudRectContext::from_snapshot(ui);
-    let health = hud_element_rect(HudElementId::Health, health_layout, &ctx, w, h);
-    let low_health = hud.health > 0 && hud.health * 4 <= hud.max_health.max(1);
-    hud_meter(
-        out,
-        health,
-        health_layout.scale,
-        "HEALTH",
-        hud.health,
-        hud.max_health.max(1),
-        if low_health {
-            HUD_HEALTH_LOW
-        } else {
-            HUD_HEALTH
-        },
-        w,
-        h,
-    );
-
-    let shield_layout = ui.hud_layout.shield;
-    let shield = hud_element_rect(HudElementId::Shield, shield_layout, &ctx, w, h);
-    hud_meter(
-        out,
-        shield,
-        shield_layout.scale,
-        "SHIELD",
-        hud.armor,
-        hud.max_health.max(1),
-        HUD_SHIELD,
-        w,
-        h,
-    );
-
-    // The ammo slot doubles as the saber-style readout while the saber is out.
-    let ammo_layout = ui.hud_layout.ammo;
-    let ammo = hud_element_rect(HudElementId::Ammo, ammo_layout, &ctx, w, h);
-    if hud.weapon == HUD_WP_SABER {
-        let style_pending = hud.saber_style != 0
-            && hud.saber_active_style != 0
-            && hud.saber_style != hud.saber_active_style;
-        hud_style_panel(
+    if !ui.native_replaced(NativeHud::Health) {
+        let health_layout = ui.hud_layout.health;
+        let health = hud_element_rect(HudElementId::Health, health_layout, &ctx, w, h);
+        let low_health = hud.health > 0 && hud.health * 4 <= hud.max_health.max(1);
+        hud_meter(
             out,
-            ammo,
-            ammo_layout.scale,
-            hud.saber_style,
-            style_pending,
-            w,
-            h,
-        );
-    } else {
-        let ammo_text = hud
-            .ammo
-            .map_or_else(|| "--".to_owned(), |value| value.max(0).to_string());
-        hud_value_panel(
-            out,
-            ammo,
-            ammo_layout.scale,
-            "AMMO",
-            &ammo_text,
-            HUD_AMMO,
+            health,
+            health_layout.scale,
+            "HEALTH",
+            hud.health,
+            hud.max_health.max(1),
+            if low_health {
+                HUD_HEALTH_LOW
+            } else {
+                HUD_HEALTH
+            },
             w,
             h,
         );
     }
 
-    let force_layout = ui.hud_layout.force;
-    let force = hud_element_rect(HudElementId::Force, force_layout, &ctx, w, h);
-    if let Some(force_power) = hud.force_power {
+    if !ui.native_replaced(NativeHud::Shield) {
+        let shield_layout = ui.hud_layout.shield;
+        let shield = hud_element_rect(HudElementId::Shield, shield_layout, &ctx, w, h);
         hud_meter(
             out,
-            force,
-            force_layout.scale,
-            "FORCE",
-            force_power,
-            hud.force_power_max.max(1),
-            if hud.force_flash {
-                [1.0, 0.15, 0.15, 1.0]
-            } else {
-                HUD_FORCE
-            },
+            shield,
+            shield_layout.scale,
+            "SHIELD",
+            hud.armor,
+            hud.max_health.max(1),
+            HUD_SHIELD,
             w,
             h,
         );
-    } else {
-        hud_value_panel(
-            out,
-            force,
-            force_layout.scale,
-            "FORCE",
-            "--",
-            HUD_FORCE,
-            w,
-            h,
-        );
+    }
+
+    if !ui.native_replaced(NativeHud::Ammo) {
+        // The ammo slot doubles as the saber-style readout while the saber is out.
+        let ammo_layout = ui.hud_layout.ammo;
+        let ammo = hud_element_rect(HudElementId::Ammo, ammo_layout, &ctx, w, h);
+        if hud.weapon == HUD_WP_SABER {
+            let style_pending = hud.saber_style != 0
+                && hud.saber_active_style != 0
+                && hud.saber_style != hud.saber_active_style;
+            hud_style_panel(
+                out,
+                ammo,
+                ammo_layout.scale,
+                hud.saber_style,
+                style_pending,
+                w,
+                h,
+            );
+        } else {
+            let ammo_text = hud
+                .ammo
+                .map_or_else(|| "--".to_owned(), |value| value.max(0).to_string());
+            hud_value_panel(
+                out,
+                ammo,
+                ammo_layout.scale,
+                "AMMO",
+                &ammo_text,
+                HUD_AMMO,
+                w,
+                h,
+            );
+        }
+    }
+
+    if !ui.native_replaced(NativeHud::Force) {
+        let force_layout = ui.hud_layout.force;
+        let force = hud_element_rect(HudElementId::Force, force_layout, &ctx, w, h);
+        if let Some(force_power) = hud.force_power {
+            hud_meter(
+                out,
+                force,
+                force_layout.scale,
+                "FORCE",
+                force_power,
+                hud.force_power_max.max(1),
+                if hud.force_flash {
+                    [1.0, 0.15, 0.15, 1.0]
+                } else {
+                    HUD_FORCE
+                },
+                w,
+                h,
+            );
+        } else {
+            hud_value_panel(
+                out,
+                force,
+                force_layout.scale,
+                "FORCE",
+                "--",
+                HUD_FORCE,
+                w,
+                h,
+            );
+        }
     }
 }
 

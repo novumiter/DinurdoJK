@@ -57,6 +57,8 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     pub(in crate::renderer) classic_render_flags: bool,
     /// Cached BSP ambient occlusion applied to baked light.
     pub(in crate::renderer) static_bsp_ao: bool,
+    /// Compile BSP baked-sun separation only when actually selected.
+    pub(in crate::renderer) baked_sun_relight: bool,
     /// An r_planarDebug view is selected.
     pub(in crate::renderer) planar_debug: bool,
     /// Directional baked lighting (deluxemap / lightgrid) on PBR surfaces; implies `pbr`.
@@ -208,7 +210,7 @@ impl MaterialFragmentKey {
             keep_w |= MATERIAL_FLAGS_W_PLANAR;
             fix_tc_gen = true;
         }
-        if variant.classic_render_flags {
+        if variant.classic_render_flags || variant.baked_sun_relight {
             keep |= MATERIAL_FLAG_EXPLICIT_LIGHTMAP
                 | MATERIAL_FLAG_HAS_LIGHTMAP
                 | MATERIAL_FLAG_OPAQUE_STAGE
@@ -280,6 +282,7 @@ impl WorldShaderVariantKey {
             && !self.planar_reflections
             && !self.ocean
             && !self.weather_surface
+            && !self.baked_sun_relight
             && !self.classic_render_flags
             && !self.planar_debug
             && !self.deluxe
@@ -389,6 +392,7 @@ impl WorldShaderVariantKey {
                 "ENABLE_CLASSIC_RENDER_FLAGS",
                 f64::from(u8::from(self.classic_render_flags)),
             ),
+            ("ENABLE_BAKED_SUN_RELIGHT", f64::from(u8::from(self.baked_sun_relight))),
             (
                 "ENABLE_STATIC_BSP_AO",
                 f64::from(u8::from(self.static_bsp_ao)),
@@ -507,6 +511,7 @@ impl WorldShaderVariantKey {
         if self.classic_render_flags {
             enabled.push("classic");
         }
+        if self.baked_sun_relight { enabled.push("baked-sun"); }
         if self.static_bsp_ao {
             enabled.push("static-ao");
         }

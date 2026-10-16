@@ -913,6 +913,9 @@ impl Renderer {
                     feature_flags: [0; 4],
                     map_ambient: [0.0; 4],
                     map_minlight: [0.0; 4],
+                    baked_sun_direction_strength: [0.0; 4],
+                    baked_sun_radiance: [0.0; 4],
+                    runtime_sun_radiance: [0.0; 4],
                 }),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
@@ -1087,6 +1090,7 @@ impl Renderer {
                 texture_entry(4),
                 texture_entry(5),
                 texture_entry(6),
+                texture_entry(7),
             ],
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1159,6 +1163,11 @@ impl Renderer {
             &queue,
             &empty_ui_font_texture("JKA UI team overlay atlas (not loaded)"),
         );
+        let ui_ext_images = upload_texture(
+            &device,
+            &queue,
+            &empty_ui_font_texture("JKA UI extension image atlas (not loaded)"),
+        );
         // Keep the MP unknown-map art resident from renderer startup. Map-load UI
         // can bind this immediately, present it once, and only then resolve the
         // real levelshot. Slow PK3/image I/O can no longer expose the clear color.
@@ -1206,6 +1215,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&ui_team_icons.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&ui_ext_images.view),
                 },
             ],
         });
@@ -2433,6 +2446,8 @@ impl Renderer {
             ui_icons_loaded: false,
             _ui_team_icons: ui_team_icons,
             ui_team_icon_key: Vec::new(),
+            _ui_ext_images: ui_ext_images,
+            ui_ext_image_key: Vec::new(),
             ui_binding_is_unknown_map: false,
             _ui_unknown_map: ui_unknown_map,
             ui_unknown_map_size,
@@ -2520,6 +2535,7 @@ impl Renderer {
             sun_color: [1.0, 1.0, 1.0],
             sun_visibility: SunVisibilityMode::SkyPortals,
             entity_sun_lighting: false,
+            baked_sun_removal: 0.0,
             sky_fractal_override: false,
             clouds_enabled: true,
             cloud_type: CloudType::Storm,

@@ -988,6 +988,7 @@ pub const ENV_ROW_WEATHER_GUST_STRENGTH: usize = 27;
 pub const ENV_ROW_WEATHER_DIRECTION_VARIATION: usize = 28;
 
 pub const ENV_ROW_ENTITY_SUN_LIGHTING: usize = 32;
+pub const ENV_ROW_BAKED_SUN_REMOVAL: usize = 33;
 
 pub const SUN_INTENSITY_MAX: f32 = 4000.0;
 

@@ -107,6 +107,7 @@ impl App {
             network: self.network.clone(),
             japro: self.japro_cg,
             master_servers: self.server_browser.master_servers.clone(),
+            server_filters: self.server_browser.filters_string(),
         };
         let path = self.config_path.clone();
         let bindings = self.bindings.clone();

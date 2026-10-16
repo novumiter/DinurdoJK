@@ -16,7 +16,7 @@ pub(in crate::renderer) enum ScreenshotDestination {
         format: ScreenshotFormat,
     },
     Clipboard,
-    FrontendScene { path: PathBuf },
+    FrontendScene { path: PathBuf, neutral_gamma: f32, captured_gamma: f32, is_neutral: bool, surface_is_srgb: bool },
     VideoFrame { frame_index: u64, depth: bool },
 }
 
@@ -320,19 +320,38 @@ pub(in crate::renderer) fn encode_screenshot_job(
             );
             Ok(ScreenshotOutput::Saved(path))
         }
-        ScreenshotDestination::FrontendScene { path } => {
-            let (jpeg, _) = encode_screenshot_jpeg(
-                &job.pixels,
-                job.width,
-                job.height,
-                job.padded_bytes_per_row,
-                job.pixel_format,
-            )?;
+        ScreenshotDestination::FrontendScene { path, neutral_gamma, captured_gamma, is_neutral, surface_is_srgb } => {
+            // Source is the post-processed scene BEFORE egui/HUD. Copy its
+            // pixels into a lossless PNG, neutralizing only shader output gamma
+            // (later display grades are only approximately reversible from 8-bit output).
+            let mut rgba = Vec::with_capacity(job.width as usize * job.height as usize * 4);
+            let row_bytes = job.width as usize * 4;
+            let padded = job.padded_bytes_per_row as usize;
+            for y in 0..job.height as usize {
+                let row = &job.pixels[y * padded..y * padded + row_bytes];
+                match job.pixel_format {
+                    ScreenshotPixelFormat::Rgba => rgba.extend_from_slice(row),
+                    ScreenshotPixelFormat::Bgra => for pixel in row.chunks_exact(4) {
+                        rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                    },
+                }
+            }
+            crate::frontend_cache_color::transform_rgba(
+                &mut rgba, neutral_gamma, surface_is_srgb,
+            );
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&rgba, job.width, job.height, image::ExtendedColorType::Rgba8)
+                .map_err(|error| format!("menu PNG encode failed: {error}"))?;
             let parent = path.parent().ok_or("invalid frontend scene cache path")?;
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-            // Avoid corrupting an existing cache on an interrupted write.
-            let temp = path.with_extension("jpg.tmp");
-            std::fs::write(&temp, jpeg).map_err(|e| e.to_string())?;
+            // Atomic replacement on the same volume; never accept partial PNGs.
+            let temp = path.with_extension("png.tmp");
+            std::fs::write(&temp, png).map_err(|e| e.to_string())?;
+            // Publish metadata first; PNG is the ready marker for cache readers.
+            crate::frontend_cache_color::write_cache_metadata(
+                &path, is_neutral, captured_gamma, job.width, job.height,
+            )?;
             std::fs::rename(&temp, &path).map_err(|e| e.to_string())?;
             Ok(ScreenshotOutput::FrontendSceneSaved(path))
         }
@@ -436,10 +455,22 @@ impl Renderer {
         });
     }
 
-    pub(in crate::renderer) fn request_frontend_scene_capture(&mut self, path: PathBuf) {
+    pub(in crate::renderer) fn request_frontend_scene_capture(&mut self, path: PathBuf, neutral: bool) {
+        // Capture effective gamma at the same time as the readback request.
+        // Hardware/baked methods are NOT invertible image-space corrections.
+        let captured_gamma = self.output_gamma();
+        let neutral_gamma = if neutral { captured_gamma } else { 1.0 };
+        let format = self.hdr_output.as_ref().map_or(
+            self.config.format, |_| wgpu::TextureFormat::Bgra8UnormSrgb,
+        );
+        let surface_is_srgb = matches!(format,
+            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Rgba8UnormSrgb
+        );
         // A user-requested screenshot has priority over opportunistic caching.
         if self.screenshot_requested.is_none() {
-            self.request_screenshot_capture(ScreenshotDestination::FrontendScene { path });
+            self.request_screenshot_capture(ScreenshotDestination::FrontendScene {
+                path, neutral_gamma, captured_gamma, is_neutral: neutral, surface_is_srgb,
+            });
         }
     }
 

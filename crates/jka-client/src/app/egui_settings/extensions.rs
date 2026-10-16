@@ -71,6 +71,9 @@ impl App {
                     } else if entry.running {
                         ui.label("Active");
                     }
+                    if !entry.hides.is_empty() {
+                        ui.label(format!("Replaces native HUD: {}", entry.hides.names().join(", ")));
+                    }
                     if self.extensions.editor_dirty {
                         ui.label("Unsaved editor changes");
                     }
@@ -97,6 +100,6 @@ impl App {
         if let Some(id) = next_selected { self.extensions.select(&id); }
         if let Some((id, enabled)) = toggle { self.extensions.enable(&id, enabled); }
         ui.add_space(10.0);
-        ui.label("Stage 3: hud_register(), hud_text(), hud_rect(), hud_line(), and hud_circle() are available. Customize positions in HUD Edit mode.");
+        ui.label("Stage 3: hud_register(), hud_text(), hud_rect(), hud_line(), and hud_circle() are available. Customize positions in HUD Edit mode. To replace native elements, list them in extension.toml: hides_native_hud = [\"health\", \"shield\", \"ammo\", \"force\", \"speedometer\"].");
     }
 }

@@ -22,7 +22,7 @@ impl App {
         if let Some(target) = segmented_row(
             ui,
             "Sun source",
-            "Map shader uses the strongest sun/q3map_sun/q3map_sunExt referenced by the current sky. Custom replaces that runtime sun everywhere the renderer consumes it; baked lightmaps and the map-load voxel GI bake are unchanged.",
+            "Map shader uses the strongest sun/q3map_sun/q3map_sunExt referenced by the current sky. Custom replaces that runtime sun everywhere the renderer consumes it. Baked lightmaps remain unless Baked sun removal is enabled; baked voxel GI remains unchanged.",
             theme::Reset::Environment(ui::ENV_ROW_SUN_SOURCE),
             self.video.sun_override,
             &SOURCES,
@@ -67,6 +67,23 @@ impl App {
             self.mark_config_dirty();
         }
         });
+
+        theme::row(
+            ui,
+            "Baked sun removal",
+            "Opt-in approximation: remove the estimated map-sun contribution from BSP lightmapped/vertex-lit surfaces and add the current runtime sun. Requires an authored sun and CSM/RT sun visibility for safe indoor relighting. Does not reconstruct indirect bounce/GI or recover uniquely separated sun/light sources.",
+            theme::Reset::Environment(ui::ENV_ROW_BAKED_SUN_REMOVAL),
+            |ui| {
+                let mut value = self.video.baked_sun_removal;
+                let readout = format!("{:.0}%", value * 100.0);
+                if theme::slider(ui, &mut value, 0.0..=1.0, &readout) {
+                    self.environment_selected = ui::ENV_ROW_BAKED_SUN_REMOVAL;
+                    self.video.baked_sun_removal = value;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                }
+            },
+        );
 
         if !self.video.sun_override {
             if let Some((yaw, pitch, intensity, color)) = authored {

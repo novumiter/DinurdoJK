@@ -79,6 +79,7 @@ impl App {
                         AccountType::Login => format!("{}  ·  {}", entry.username, entry.server),
                         AccountType::Admin => format!("Admin password  ·  {}", entry.server),
                         AccountType::Rcon => format!("RCON password  ·  {}", entry.server),
+                        AccountType::Server => format!("Server password  ·  {}", entry.server),
                     };
                     theme::row(
                         ui,
@@ -88,14 +89,16 @@ impl App {
                         |ui| {
                             theme::glow_label(ui, &detail, 12.5, theme::TEXT);
                             ui.add_space(10.0);
-                            if theme::primary_button(ui, "LOG IN").clicked() {
-                                login = Some((entry.server, account_type));
+                            if account_type != AccountType::Server {
+                                if theme::primary_button(ui, "LOG IN").clicked() {
+                                    login = Some((entry.server, account_type));
+                                }
+                                ui.add_space(6.0);
+                                if theme::ghost_button(ui, "LOG OUT").clicked() {
+                                    logout = Some((entry.server, account_type));
+                                }
+                                ui.add_space(6.0);
                             }
-                            ui.add_space(6.0);
-                            if theme::ghost_button(ui, "LOG OUT").clicked() {
-                                logout = Some((entry.server, account_type));
-                            }
-                            ui.add_space(6.0);
                             if theme::ghost_button(ui, "EDIT").clicked() {
                                 edit = Some((entry.server, account_type));
                             }
@@ -153,7 +156,9 @@ impl App {
                         AccountType::Login => {
                             format!("{}  ·  {}", account_type.label(), entry.username)
                         }
-                        AccountType::Admin | AccountType::Rcon => account_type.label().to_owned(),
+                        AccountType::Admin | AccountType::Rcon | AccountType::Server => {
+                            account_type.label().to_owned()
+                        }
                     };
                     theme::row(
                         ui,
@@ -163,12 +168,14 @@ impl App {
                         |ui| {
                             theme::glow_label(ui, &detail, 12.0, theme::TEXT_FAINT);
                             ui.add_space(10.0);
-                            ui.add_enabled_ui(false, |ui| {
-                                let _ = theme::ghost_button(ui, "LOG IN");
+                            if account_type != AccountType::Server {
+                                ui.add_enabled_ui(false, |ui| {
+                                    let _ = theme::ghost_button(ui, "LOG IN");
+                                    ui.add_space(6.0);
+                                    let _ = theme::ghost_button(ui, "LOG OUT");
+                                });
                                 ui.add_space(6.0);
-                                let _ = theme::ghost_button(ui, "LOG OUT");
-                            });
-                            ui.add_space(6.0);
+                            }
                             if theme::ghost_button(ui, "EDIT").clicked() {
                                 edit = Some((entry.server, account_type));
                             }
@@ -264,7 +271,7 @@ impl App {
             theme::row(
                 ui,
                 "Type",
-                "Login sends /login <user> <password>. Admin sends /amlogin <password>. RCON sets rconPassword locally for rcon commands.",
+                "Login sends /login <user> <password>. Admin sends /amlogin <password>. RCON sets rconPassword locally for rcon commands. Server is the join password (g_password) for private servers and is filled in automatically when connecting.",
                 theme::Reset::None,
                 |ui| {
                     egui::ComboBox::from_id_salt(("saved_account_type", state.server))
@@ -317,6 +324,9 @@ impl App {
                 AccountType::Rcon => {
                     "RCON password loaded into the temporary rconPassword cvar when LOG IN is pressed."
                 }
+                AccountType::Server => {
+                    "Server join password (g_password). Used automatically when this server asks for one."
+                }
             };
             theme::row(
                 ui,
@@ -345,7 +355,9 @@ impl App {
                 AccountType::Login | AccountType::Admin => state
                     .password
                     .retain(|c| !c.is_whitespace() && !matches!(c, ';' | '"' | '\\')),
-                AccountType::Rcon => state.password.retain(|c| !c.is_control()),
+                AccountType::Rcon | AccountType::Server => {
+                    state.password.retain(|c| !c.is_control())
+                }
             }
 
             theme::row(ui, "", "", theme::Reset::None, |ui| {
