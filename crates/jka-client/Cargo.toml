@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "DinurdoJK"
 version = "0.1.0"
 edition.workspace = true
@@ -9,6 +9,11 @@ name = "DinurdoJK"
 path = "src/main.rs"
 
 [dependencies]
+blue-water-core = { path = "../blue-water-core" }
+blue-water-gpu = { path = "../blue-water-gpu" }
+blue-water-render = { path = "../blue-water-render" }
+blue-water-clouds = { path = "../blue-water-clouds" }
+blue-water-sky = { path = "../blue-water-sky" }
 bytemuck = { version = "=1.25.2", features = ["derive", "min_const_generics"] }
 futures-lite = "=2.6.1"
 fastnoise-lite = "=1.1.1"

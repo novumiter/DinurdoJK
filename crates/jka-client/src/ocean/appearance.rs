@@ -1,4 +1,4 @@
-//! Authored water appearance reduced once at upload, without GPU readback.
+﻿//! Authored water appearance reduced once at upload, without GPU readback.
 //! Source images are analyzed at upload; only FFT data shades promoted water.
 use crate::{
     materials::{BlendFactor, TextureData},
@@ -267,6 +267,9 @@ pub fn surface_settings(
     local: Option<super::OceanSettings>,
 ) -> super::OceanSettings {
     let mut settings = local.unwrap_or_else(|| descriptor.settings(shared));
+    settings.backend = shared.backend;
+    settings.blue_water_waves = shared.blue_water_waves;
+    settings.blue_water_optics = shared.blue_water_optics;
     settings.map_size = shared.map_size;
     settings.simulate_when_hidden = shared.simulate_when_hidden;
     settings.updates_per_second = shared.updates_per_second;

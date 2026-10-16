@@ -1,4 +1,4 @@
-//! Environment water.
+﻿//! Environment water.
 use crate::renderer::{PvsMode, Renderer, WorldBatch};
 
 impl Renderer {
@@ -96,20 +96,20 @@ impl Renderer {
     /// camera distance, footprint and exact BSP visibility. Indices change only
     /// at an LOD threshold, a snapped-lattice crossing, or a BSP cluster change;
     /// ordinary camera motion remains a comparison-only path.
-    pub(in crate::renderer) fn update_promoted_ocean_clipmap_lod(&mut self, camera: [f32; 3]) {
+    pub(in crate::renderer) fn update_promoted_ocean_clipmap_lod(
+        &mut self, camera: [f32; 3], prepare_godot_geometry: bool,
+    ) {
         if !self.ocean_enabled {
             return;
         }
         let quality = usize::from(self.ocean_settings.mesh_quality.min(1));
-        // Fresh water boxes: a stale submerged flag would flash missing outer rings
-        // for a frame when surfacing.
-        self.refresh_water_boxes(glam::Vec3::from_array(camera));
+        // The caller refreshes water classification first, including for Hybrid.
         let cull_radius = self.world.as_ref().and_then(|world| {
             crate::ocean::optics::submerged_cull_radius(
                 camera,
                 &self.water_boxes,
                 world.ocean_masks.as_ref(),
-                self.ocean_settings.optics.cull_distance(),
+                self.ocean_settings.underwater_cull_distance(),
             )
         });
         let overrides = &self.promoted_ocean_overrides;
@@ -140,6 +140,11 @@ impl Renderer {
         let mut pvs_tiles = None;
         let index_buffer = &world.index_buffer;
         let mut changed_ranges: Option<Vec<(u8, usize, std::ops::Range<u32>)>> = None;
+        // The native Bluewater surface consumes these values even when no Godot
+        // geometry is submitted. Compute from live camera/PVS/sky data, not the
+        // Godot clipmap's last uploaded index-buffer state.
+        let mut live_centres = [None; crate::ocean::OCEAN_MAX_SURFACES];
+        let mut live_radii = [None; crate::ocean::OCEAN_MAX_SURFACES];
         for runtime in &mut world.runtime_ocean_clipmaps {
             if runtime.quality != quality {
                 continue;
@@ -192,6 +197,18 @@ impl Renderer {
                 let offset = (camera[0] - centre[0]).hypot(camera[2] - centre[1]);
                 active_layout.levels_within(half_cells, offset, radius)
             });
+            let slot = runtime.slot as usize;
+            if slot < crate::ocean::OCEAN_MAX_SURFACES {
+                live_centres[slot] = centre.iter().all(|v| v.is_finite()).then_some(centre);
+                live_radii[slot] = extension.then(|| {
+                    active_layout.coverage_radius_for_limit(half_cells, minimum_level, level_limit)
+                });
+            }
+            // Always update shared Bluewater admission/continuation metadata,
+            // but never build or upload the inactive Godot mesh's indices.
+            if !prepare_godot_geometry {
+                continue;
+            }
             if half_cells == runtime.current_half_cells
                 && level_limit == runtime.current_level_limit
                 && minimum_level == runtime.current_minimum_level
@@ -239,17 +256,8 @@ impl Renderer {
                 .push((runtime.slot, runtime.quality, runtime.active_range.clone()));
         }
 
-        let centres=std::array::from_fn(|slot| {
-            world.runtime_ocean_clipmaps.iter().find(|r|r.quality==quality && r.slot as usize==slot)
-                .map(|r|r.current_centre).filter(|c|c.iter().all(|v|v.is_finite()))
-        });
-        let radii=std::array::from_fn(|slot| {
-            world.runtime_ocean_clipmaps.iter().find(|r|r.quality==quality && r.slot as usize==slot)
-                .filter(|r|r.current_sky_extend)
-                .map(|r| r.layout.coverage_radius_for_limit(r.current_half_cells, r.current_minimum_level, r.current_level_limit))
-        });
-        if let Some(ocean)=self.ocean.as_mut() {
-            ocean.set_promoted_clipmap_centres(queue,centres,radii);
+        if let Some(ocean) = self.ocean.as_mut() {
+            ocean.set_promoted_clipmap_centres(queue, live_centres, live_radii);
         }
         let Some(changed_ranges) = changed_ranges else { return; };
         let apply = |batches: &mut [WorldBatch]| {
@@ -271,14 +279,15 @@ impl Renderer {
         &mut self,
         settings: crate::ocean::OceanSettings,
     ) {
-        let mut settings = settings.sanitize();
+        let mut settings = settings.sanitize().resolved_for_gpu();
         // Atmospheric wind is renderer-global. Ocean-specific settings may
         // arrive through their legacy API, but they cannot fork the wind field.
         settings.wind = self.weather_wind;
         let recreate = self
             .ocean
             .as_ref()
-            .is_some_and(|ocean| ocean.map_size() != settings.map_size);
+            .is_some_and(|ocean| ocean.map_size() != settings.map_size
+                || (ocean.backend() == 0) != (settings.backend == 0));
         self.ocean_settings = settings;
         self.ocean_interaction.set_falloff(settings);
         self.ocean_interaction.configure(&self.device, &self.queue,
@@ -328,7 +337,8 @@ impl Renderer {
             });
             let mut gpu = if let Some(index) = previous
                 .iter()
-                .position(|(a, g)| a.index == descriptor.index && g.map_size() == settings.map_size)
+                .position(|(a, g)| a.index == descriptor.index && g.map_size() == settings.map_size
+                    && (g.backend() == 0) == (settings.backend == 0))
             {
                 previous.swap_remove(index).1
             } else {

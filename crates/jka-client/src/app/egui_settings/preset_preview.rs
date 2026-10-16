@@ -99,11 +99,13 @@ pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
         "r_glow" | "r_halation" | "r_motionBlur" | "r_depthOfField"
         | "r_dofQuality" | "r_chromaticAberration" | "r_vignette" | "r_filmGrain" => S::PostProcessing,
         "r_sunVisibility" => S::Sun,
-        "r_clouds" | "r_cloudQuality" | "r_cloudRenderResolution" | "r_cloudShadows"
-        | "r_cloudTemporal" | "r_cloudTemporalDepthFix" => S::Clouds,
+        "r_clouds" | "r_cloudShadows" => S::Clouds,
+        "r_cloudQuality" | "r_cloudRenderResolution" | "r_cloudTemporal"
+        | "r_cloudTemporalDepthFix" => S::Clouds,
         "r_drawfog" => S::Weather,
         "r_grass" | "r_footprints" => S::Surface,
-        "r_ocean" | "r_oceanMapSize" | "r_oceanMeshQuality" | "r_oceanUpdates"
+        "r_ocean" => S::Water,
+        "r_oceanMapSize" | "r_oceanMeshQuality" | "r_oceanUpdates"
         | "r_oceanSeaSpray" | "r_oceanWindFoam" => S::Water,
         _ => return None,
     })
@@ -353,6 +355,9 @@ mod tests {
             }
         }
         assert_eq!(preset_cvar_section("r_drawfog"), Some(VideoSection::Weather));
+        assert_eq!(preset_cvar_section("r_clouds"), Some(VideoSection::Clouds));
+        assert_eq!(preset_cvar_section("r_cloudShadows"), Some(VideoSection::Clouds));
+        assert_eq!(preset_cvar_section("r_ocean"), Some(VideoSection::Water));
         assert_eq!(preset_cvar_section("r_cloudQuality"), Some(VideoSection::Clouds));
         assert_eq!(preset_cvar_section("r_reflectionQuality"), Some(VideoSection::Effects));
     }

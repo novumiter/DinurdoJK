@@ -750,6 +750,8 @@ pub struct PostEffects {
     /// 0..1: estimate and replace baked map sunlight on BSP lightmapped surfaces.
     pub baked_sun_removal: f32,
     pub sky_fractal_override: bool,
+    pub sky_backend: u8,
+    pub cloud_backend: u8,
     pub clouds: bool,
     pub cloud_type: CloudType,
     pub cloud_quality: f32,

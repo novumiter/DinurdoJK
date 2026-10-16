@@ -45,7 +45,7 @@ fn caustic_receivers_survive_water_boundary_roundoff() {
                 &[&resources.capture_layout, &ocean_layout],
                 "fs_capture",
                 &[
-                    wgpu::TextureFormat::Rgba8Unorm,
+                    wgpu::TextureFormat::Rgba16Float,
                     wgpu::TextureFormat::R32Float,
                 ],
                 1,

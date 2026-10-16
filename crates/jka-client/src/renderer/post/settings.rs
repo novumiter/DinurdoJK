@@ -145,6 +145,11 @@ impl Renderer {
             self.update_lighting_settings();
         }
         self.sky_fractal_override = effects.sky_fractal_override;
+        if self.sky_backend != effects.sky_backend.min(1) || self.cloud_backend != effects.cloud_backend.min(1) {
+            self.cloud_history_valid = false;
+        }
+        self.sky_backend = effects.sky_backend.min(1);
+        self.cloud_backend = effects.cloud_backend.min(1);
         self.clouds_enabled = effects.clouds;
         self.cloud_type = effects.cloud_type;
         self.cloud_quality = effects.cloud_quality.clamp(0.0, 1.0);

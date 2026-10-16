@@ -2,9 +2,10 @@
 //! the JAPRO behaviour (`R_UnderwaterSightDistance` in tr_main.cpp and
 //! `R_SailingSeabedCulled` in tr_world.cpp), ported to per-surface bounds.
 //!
-//! The distance is `transparency * r_oceanUnderwaterCull`
-//! (`Settings::absorption_distance() * multiplier`), the same expression the
-//! absorption shader uses, so the cull and the fog cannot disagree.
+//! The caller supplies a cutoff matched to its active optical model: Unified
+//! uses its transparency distance and `r_oceanUnderwaterCull` multiplier, while
+//! Blue Water derives the cutoff from native RGB absorption. This keeps the
+//! cull tied to the attenuation that actually hides the scene.
 //!
 //! * **Submerged** (eye inside water): water extinction is isotropic, so a radial cut
 //!   measures the distance to the nearest visible surface in every direction at once.

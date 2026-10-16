@@ -704,6 +704,8 @@ impl Camera {
     /// Projection far plane (renderer-space map units), for r_speeds 5.
     pub fn far_distance(&self) -> f32 { self.far }
 
+    pub fn near_distance(&self) -> f32 { self.near }
+
     /// Add the pending shake to a freshly assigned base view (position + angles).
     pub fn apply_shake(&mut self) {
         self.position += self.shake.position;

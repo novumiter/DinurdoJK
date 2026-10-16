@@ -2,6 +2,611 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_BLUEWATERMESHSEGMENTS {
+        runtime: CvarDef::new("r_blueWaterMeshSegments", "64", "64|128|256",
+            "Blue Water native clipmap segments per level: 64/128/256. Independent of r_oceanMeshQuality.", CvarType::Int { min: 64, max: 256 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_mesh_segments as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                if !matches!(value, 64 | 128 | 256) { return Err("r_blueWaterMeshSegments: use 64, 128, or 256".into()); }
+                app.video.ocean_settings.blue_water_mesh_segments = value as u32;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u32>() {
+                    if matches!(v, 64 | 128 | 256) { settings.ocean_settings.blue_water_mesh_segments = v; }
+                }
+            }),
+            archive: Some((25190, |state| state.video.ocean_settings.blue_water_mesh_segments.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERMESHLEVELS {
+        runtime: CvarDef::new("r_blueWaterMeshLevels", "6", "6..9",
+            "Blue Water clipmap level count; 9 is native reference. Rebuilds geometry.", CvarType::Int { min: 6, max: 9 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_mesh_levels as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_mesh_levels = value as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() {
+                    if matches!(v, 6..=9) { settings.ocean_settings.blue_water_mesh_levels = v; }
+                }
+            }),
+            archive: Some((25191, |state| state.video.ocean_settings.blue_water_mesh_levels.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERDEDUPCAPTURE {
+        runtime: CvarDef::new("r_blueWaterDedupCapture", "0", "0|1",
+            "A/B: skip the duplicate legacy scene capture when Blue Water has no Godot, authored-water or glass consumer.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_dedup_capture),
+            |app, value| { let CvarValue::Bool(v) = value else { unreachable!() }; app.video.ocean_settings.blue_water_dedup_capture = v; app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { settings.ocean_settings.blue_water_dedup_capture = parse_bool(value).unwrap_or(settings.ocean_settings.blue_water_dedup_capture); }),
+            archive: Some((25206, |state| u8::from(state.video.ocean_settings.blue_water_dedup_capture).to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_BLUEWATERSSRSTEPS {
+        runtime: CvarDef::new("r_blueWaterSSRSteps", "16", "4..32",
+            "Native Blue Water reflection ray steps (compile-time specialization; rebuilds only its surface pipeline).",
+            CvarType::Int { min: 4, max: 32 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_ssr_steps as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_ssr_steps = v as u32;
+                app.commit_ocean_settings(); Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u32>() { settings.ocean_settings.blue_water_ssr_steps = v.clamp(4, 32); }
+            }),
+            archive: Some((25201, |state| state.video.ocean_settings.blue_water_ssr_steps.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_HYBRIDREFRACTIONMODE {
+        runtime: CvarDef::new("r_hybridRefractionMode", "1", "0..2",
+            "Hybrid only: 0 off, 1 cheap screen offset, 2 ray trace.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.hybrid_refraction_mode as i32),
+            |app, value| { let CvarValue::Int(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_refraction_mode = v as u8; app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_refraction_mode = v.min(2); } }),
+            archive: Some((25202, |state| state.video.ocean_settings.hybrid_refraction_mode.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_HYBRIDCAUSTICSMODE {
+        runtime: CvarDef::new("r_hybridCausticsMode", "3", "0..3",
+            "Hybrid only: 0 native every frame, 1 native on FFT update, 2 off, 3 Godot receiver.",
+            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.hybrid_caustics_mode as i32),
+            |app, value| { let CvarValue::Int(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_caustics_mode = v as u8; app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_caustics_mode = v.min(3); } }),
+            archive: Some((25203, |state| state.video.ocean_settings.hybrid_caustics_mode.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_HYBRIDUNDERWATERMODE {
+        runtime: CvarDef::new("r_hybridUnderwaterMode", "4", "0..4",
+            "Hybrid only: 4 Godot surface+optics when submerged, 0/1/3 native, 2 composite off.",
+            CvarType::Int { min: 0, max: 4 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.hybrid_underwater_mode as i32),
+            |app, value| { let CvarValue::Int(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_underwater_mode = v as u8; app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_underwater_mode = v.min(4); } }),
+            archive: Some((25204, |state| state.video.ocean_settings.hybrid_underwater_mode.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_HYBRIDSSR {
+        runtime: CvarDef::new("r_hybridSSR", "0", "0|1",
+            "Hybrid only: native screen-space reflection tracing (sky/env reflection remains).",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.hybrid_ssr),
+            |app, value| { let CvarValue::Bool(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_ssr = v; app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { settings.ocean_settings.hybrid_ssr = parse_bool(value).unwrap_or(settings.ocean_settings.hybrid_ssr); }),
+            archive: Some((25205, |state| u8::from(state.video.ocean_settings.hybrid_ssr).to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_HYBRIDTRANSPARENCY {
+        runtime: CvarDef::new("r_hybridTransparency", "1", "0.1..10",
+            "Hybrid clarity multiplier for both Godot submerged absorption distance and Blue Water surface.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.hybrid_transparency.to_string()),
+            |app, value| App::cvar_set_hybrid_transparency(app, APP_R_HYBRIDTRANSPARENCY.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_hybrid_transparency, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.hybrid_transparency = v.clamp(0.1, 10.0); } }
+            }),
+            archive: Some((25210, |state| state.video.ocean_settings.hybrid_transparency.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_hybrid_transparency(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.hybrid_transparency = Self::parse_cvar_finite(name, value)?.clamp(0.1, 10.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_HYBRIDFOGCOLOR {
+        runtime: CvarDef::new("r_hybridFogColor", "", "r g b (0..1)",
+            "Hybrid-only fog color shared by Godot submerged optics and native scattering.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c = app.video.ocean_settings.hybrid_fog_color;
+                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_hybrid_fog_color(app, APP_R_HYBRIDFOGCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_hybrid_fog_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(c) = parse_vec3(value) {
+                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.hybrid_fog_color = c.map(|v| v.clamp(0.0, 1.0)); }
+                }
+            }),
+            archive: Some((25211, |state| { let c = state.video.ocean_settings.hybrid_fog_color;
+                format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_hybrid_fog_color(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.hybrid_fog_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_HYBRIDWATERCOLOR {
+        runtime: CvarDef::new("r_hybridWaterColor", "", "r g b (0..1)",
+            "Hybrid-only water body color; native Blue Water is unaffected.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c = app.video.ocean_settings.hybrid_water_color;
+                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_hybrid_water_color(app, APP_R_HYBRIDWATERCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_hybrid_water_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(c) = parse_vec3(value) {
+                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.hybrid_water_color = c.map(|v| v.clamp(0.0, 1.0)); }
+                }
+            }),
+            archive: Some((25212, |state| { let c = state.video.ocean_settings.hybrid_water_color;
+                format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_hybrid_water_color(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.hybrid_water_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_HYBRIDCAUSTICSSCALE {
+        runtime: CvarDef::new("r_hybridCausticsScale", "3", "1..6",
+            "Hybrid Godot-receiver caustic pattern density: 3x matches 181m Blue Water to 57m Godot scale.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.hybrid_caustics_scale.to_string()),
+            |app, value| App::cvar_set_hybrid_caustics_scale(app, APP_R_HYBRIDCAUSTICSSCALE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_hybrid_caustics_scale, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.hybrid_caustics_scale = v.clamp(1.0, 6.0); } }
+            }),
+            archive: Some((25213, |state| state.video.ocean_settings.hybrid_caustics_scale.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_hybrid_caustics_scale(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.hybrid_caustics_scale = Self::parse_cvar_finite(name, value)?.clamp(1.0, 6.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_HYBRIDCAUSTICSGAIN {
+        runtime: CvarDef::new("r_hybridCausticsGain", "1.5", "0..4",
+            "Hybrid-only caustic focus contrast multiplier, applied after Godot receiver calculation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.hybrid_caustics_gain.to_string()),
+            |app, value| App::cvar_set_hybrid_caustics_gain(app, APP_R_HYBRIDCAUSTICSGAIN.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_hybrid_caustics_gain, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.hybrid_caustics_gain = v.clamp(0.0, 4.0); } }
+            }),
+            archive: Some((25214, |state| state.video.ocean_settings.hybrid_caustics_gain.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_hybrid_caustics_gain(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.hybrid_caustics_gain = Self::parse_cvar_finite(name, value)?.clamp(0.0, 4.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_HYBRIDCAUSTICSFAST {
+        runtime: CvarDef::new("r_hybridCausticsFast", "0", "0|1",
+            "Hybrid A/B: 3-tap forward-difference caustics versus reference 4-tap central differences.", CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.hybrid_caustics_fast),
+            |app, value| { let CvarValue::Bool(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_caustics_fast = v; app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { settings.ocean_settings.hybrid_caustics_fast = parse_bool(value).unwrap_or(settings.ocean_settings.hybrid_caustics_fast); }),
+            archive: Some((25215, |state| u8::from(state.video.ocean_settings.hybrid_caustics_fast).to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_BLUEWATERBOUNDARY {
+        runtime: CvarDef::new("r_blueWaterBoundaryMode", "3", "0..3",
+            "0 exact JKA footprint+PVS; 1 bounds/PVS only; 2 no boundary/PVS test (diagnostic); 3 exact with per-tile candidate masks.", CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_boundary_mode as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_boundary_mode = value as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() {
+                    if matches!(v, 0..=3) { settings.ocean_settings.blue_water_boundary_mode = v; }
+                }
+            }),
+            archive: Some((25192, |state| state.video.ocean_settings.blue_water_boundary_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERCAUSTICMODE {
+        runtime: CvarDef::new("r_blueWaterCausticsMode", "0", "0..3",
+            "Native: 0 compute every frame, 1 on FFT updates, 2 disabled. Legacy 3 (Godot) now belongs to r_hybridCausticsMode.", CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_caustics_mode as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_caustics_mode = value as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() {
+                    if matches!(v, 0..=3) { settings.ocean_settings.blue_water_caustics_mode = v; }
+                }
+            }),
+            archive: Some((25193, |state| state.video.ocean_settings.blue_water_caustics_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERUNDERWATERMODE {
+        runtime: CvarDef::new("r_blueWaterUnderwaterMode", "0", "0..4",
+            "Native: 0 full, 1 no motes, 2 no composite, 3 submerged-only. Legacy 4 now belongs to r_hybridUnderwaterMode.",
+            CvarType::Int { min: 0, max: 4 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_underwater_mode as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_underwater_mode = value as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() {
+                    if v <= 4 { settings.ocean_settings.blue_water_underwater_mode = v; }
+                }
+            }),
+            archive: Some((25197, |state| state.video.ocean_settings.blue_water_underwater_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERPREPAREGODOTMESH {
+        runtime: CvarDef::new("r_blueWaterPrepareGodotMesh", "0", "0|1", "A/B: update Godot ocean clipmap indices above water in Blue Water mode. Hybrid mode always prepares them for submersion.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_prepare_godot_mesh),
+            |app, value| {
+                let CvarValue::Bool(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_prepare_godot_mesh = value;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = parse_bool(value) { settings.ocean_settings.blue_water_prepare_godot_mesh = v; }
+            }),
+            archive: Some((25194, |state| if state.video.ocean_settings.blue_water_prepare_godot_mesh { "1".into() } else { "0".into() })),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERADAPTER {
+        runtime: CvarDef::new("r_blueWaterAdapter", "1", "0|1", "A/B: generate legacy displacement/normal textures for JKA water consumers. 0 freezes these textures, Blue Water surface unaffected.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_adapter),
+            |app, value| {
+                let CvarValue::Bool(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_adapter = value;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = parse_bool(value) { settings.ocean_settings.blue_water_adapter = v; }
+            }),
+            archive: Some((25195, |state| if state.video.ocean_settings.blue_water_adapter { "1".into() } else { "0".into() })),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERSSR {
+        runtime: CvarDef::new("r_blueWaterSSR", "1", "0|1",
+            "A/B: native screen-space reflection rays only; sky/environment reflection remains.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.blue_water_ssr),
+            |app, value| {
+                let CvarValue::Bool(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_ssr = value;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = parse_bool(value) { settings.ocean_settings.blue_water_ssr = v; }
+            }),
+            archive: Some((25196, |state| if state.video.ocean_settings.blue_water_ssr { "1".into() } else { "0".into() })),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERREFRACTION {
+        runtime: CvarDef::new("r_blueWaterRefraction", "0.1", "0..0.15",
+            "Blue Water refraction strength; 0 disables. Select cheap screen offset or physical trace with r_blueWaterRefractionMode.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.blue_water_refraction.to_string()),
+            |app, value| App::cvar_set_blue_water_refraction(app, APP_R_BLUEWATERREFRACTION.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_refraction, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.blue_water_refraction = v.clamp(0.0, 0.15); }
+                }
+            }),
+            archive: Some((25198, |state| state.video.ocean_settings.blue_water_refraction.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_refraction(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_refraction = Self::parse_cvar_finite(name, value)?.clamp(0.0, 0.15);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BLUEWATERREFRACTIONMODE {
+        runtime: CvarDef::new("r_blueWaterRefractionMode", "2", "0..2",
+            "A/B: 0 off; 1 inexpensive Godot-style screen offset; 2 physical scene ray trace.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.blue_water_refraction_mode as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.ocean_settings.blue_water_refraction_mode = value as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() {
+                    if v <= 2 { settings.ocean_settings.blue_water_refraction_mode = v; }
+                }
+            }),
+            archive: Some((25199, |state| state.video.ocean_settings.blue_water_refraction_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_BLUEWATERTRANSPARENCY {
+        runtime: CvarDef::new("r_blueWaterTransparency", "1", "0.1..10",
+            "Optical travel distance multiplier for Blue Water; higher is clearer, 1 preserves upstream calibration.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.blue_water_optics.transparency.to_string()),
+            |app, value| App::cvar_set_blue_water_transparency(app, APP_R_BLUEWATERTRANSPARENCY.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_transparency, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.blue_water_optics.transparency = v.clamp(0.1, 10.0); }
+                }
+            }),
+            archive: Some((25155, |state| state.video.ocean_settings.blue_water_optics.transparency.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_transparency(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_optics.transparency = Self::parse_cvar_finite(name, value)?.clamp(0.1, 10.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BLUEWATERWATERCOLOR {
+        runtime: CvarDef::new("r_blueWaterWaterColor", "", "r g b (0..1)",
+            "sRGB tint of the Blue Water body and transmitted crest light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c = app.video.ocean_settings.blue_water_optics.water_color;
+                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_blue_water_water_color(app, APP_R_BLUEWATERWATERCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_water_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(c) = parse_vec3(value) {
+                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.blue_water_optics.water_color = c.map(|v| v.clamp(0.0, 1.0)); }
+                }
+            }),
+            archive: Some((25156, |state| { let c = state.video.ocean_settings.blue_water_optics.water_color;
+                format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_water_color(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_optics.water_color = Self::parse_cvar_floats(name, value)?;
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BLUEWATERFOGCOLOR {
+        runtime: CvarDef::new("r_blueWaterFogColor", "", "r g b (0..1)",
+            "sRGB color of Blue Water underwater scattering.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| { let c = app.video.ocean_settings.blue_water_optics.fog_color;
+                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
+            |app, value| App::cvar_set_blue_water_fog_color(app, APP_R_BLUEWATERFOGCOLOR.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_fog_color, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(c) = parse_vec3(value) {
+                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.blue_water_optics.fog_color = c.map(|v| v.clamp(0.0, 1.0)); }
+                }
+            }),
+            archive: Some((25157, |state| { let c = state.video.ocean_settings.blue_water_optics.fog_color;
+                format!("{} {} {}", c[0], c[1], c[2]) })),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_fog_color(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_optics.fog_color = Self::parse_cvar_floats(name, value)?;
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_BLUEWATERHEIGHT {
+        runtime: CvarDef::new("r_blueWaterHeight", "", "0.0..=20.0",
+            "Significant wave height in metres (4 times the surface height standard deviation). Zero is flat.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.blue_water_waves.height.to_string()),
+            |app, value| App::cvar_set_blue_water_height(app, APP_R_BLUEWATERHEIGHT.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_height, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.blue_water_waves.height = v.clamp(0.0, 20.0); }
+                }
+            }),
+            archive: Some((25150, |state| state.video.ocean_settings.blue_water_waves.height.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_height(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_waves.height = Self::parse_cvar_finite(name, value)?.clamp(0.0, 20.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BLUEWATERDIRECTION {
+        runtime: CvarDef::new("r_blueWaterDirection", "", "-180.0..=180.0",
+            "Direction waves travel, in degrees from +X toward world +Z.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.blue_water_waves.direction.to_string()),
+            |app, value| App::cvar_set_blue_water_direction(app, APP_R_BLUEWATERDIRECTION.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_direction, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.blue_water_waves.direction = v.clamp(-180.0, 180.0); }
+                }
+            }),
+            archive: Some((25151, |state| state.video.ocean_settings.blue_water_waves.direction.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_direction(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_waves.direction = Self::parse_cvar_finite(name, value)?.clamp(-180.0, 180.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BLUEWATERWAVELENGTH {
+        runtime: CvarDef::new("r_blueWaterWavelength", "", "2.0..=512.0",
+            "Dominant crest spacing in metres. Controls wave speed through the native dispersion relation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.blue_water_waves.wavelength.to_string()),
+            |app, value| App::cvar_set_blue_water_wavelength(app, APP_R_BLUEWATERWAVELENGTH.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_wavelength, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.blue_water_waves.wavelength = v.clamp(2.0, 512.0); }
+                }
+            }),
+            archive: Some((25152, |state| state.video.ocean_settings.blue_water_waves.wavelength.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_wavelength(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_waves.wavelength = Self::parse_cvar_finite(name, value)?.clamp(2.0, 512.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BLUEWATERCHOPPINESS {
+        runtime: CvarDef::new("r_blueWaterChoppiness", "", "0.0..=4.0",
+            "Horizontal displacement strength. Zero keeps only vertical waves.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.blue_water_waves.choppiness.to_string()),
+            |app, value| App::cvar_set_blue_water_choppiness(app, APP_R_BLUEWATERCHOPPINESS.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_choppiness, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.blue_water_waves.choppiness = v.clamp(0.0, 4.0); }
+                }
+            }),
+            archive: Some((25153, |state| state.video.ocean_settings.blue_water_waves.choppiness.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_choppiness(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_waves.choppiness = Self::parse_cvar_finite(name, value)?.clamp(0.0, 4.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_BLUEWATERWINDSPEED {
+        runtime: CvarDef::new("r_blueWaterWindSpeed", "", "0.1..=40.0",
+            "Reference wind speed in metres per second. Changes the native spectral shape and fine surface roughness; independent of weather wind.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.blue_water_waves.wind_speed.to_string()),
+            |app, value| App::cvar_set_blue_water_wind_speed(app, APP_R_BLUEWATERWINDSPEED.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_blue_water_wind_speed, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.blue_water_waves.wind_speed = v.clamp(0.1, 40.0); }
+                }
+            }),
+            archive: Some((25154, |state| state.video.ocean_settings.blue_water_waves.wind_speed.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_blue_water_wind_speed(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.blue_water_waves.wind_speed = Self::parse_cvar_finite(name, value)?.clamp(0.1, 40.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+
     APP_CG_WATERWAKE {
         runtime: CvarDef::new("cg_waterwake", "1", "0|1|2",
             "0 off; 1 original JKA water wake on vanilla water; 2 enhanced vanilla wake and enabled Godot water interaction.",
@@ -33,6 +638,48 @@ app_cvars! {
                 Ok(())
             }
         }]
+    }
+    APP_R_OCEANTYPE {
+        runtime: CvarDef::new("r_oceanType", "1", "0..3",
+            "Master ocean type: 0 stock JKA (no promotion), 1 Godot, 2 native Blue Water, 3 Hybrid.",
+            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(if app.video.ocean { app.video.ocean_settings.backend as i32 + 1 } else { 0 }),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.set_ocean_type(value as u8);
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<u8>() {
+                    if v <= 3 {
+                        settings.ocean = v != 0;
+                        if v != 0 { settings.ocean_settings.backend = v - 1; }
+                    }
+                }
+            }),
+            archive: Some((25225, |state| if state.video.ocean {
+                (state.video.ocean_settings.backend + 1).to_string()
+            } else { "0".to_owned() })),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANBACKEND {
+        runtime: CvarDef::new("r_oceanBackend", "0", "0|1",
+            "Legacy compatibility alias: 0 Godot; 1 native Blue Water. Use r_oceanType for Off/Hybrid.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.backend != 0)),
+            |app, value| {
+                let CvarValue::Int(backend) = value else { unreachable!() };
+                let backend = backend as u8;
+                if app.video.ocean_settings.backend != backend || !app.video.ocean {
+                    app.set_ocean_type(backend + 1);
+                }
+                Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
     }
     APP_R_OCEANSKYEXTEND {
         runtime: CvarDef::new("r_oceanSkyExtend", "2", "0|1|2",
@@ -930,6 +1577,30 @@ app_cvars! {
         ]
     }
 
+    APP_R_OCEANCAUSTICSMAXDISTANCE {
+        runtime: CvarDef::new("r_oceanCausticsMaxDistance", "80", "0..500 metres",
+            "Godot and Hybrid Godot caustics: camera-to-receiver range with fade over outer 25%; 0 disables. Native Blue Water has its own height cull.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.optics.caustic_max_distance_m.to_string()),
+            |app, value| App::cvar_set_r_oceancausticsmaxdistance(app, APP_R_OCEANCAUSTICSMAXDISTANCE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_oceancausticsmaxdistance, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() {
+                    if v.is_finite() { settings.ocean_settings.optics.caustic_max_distance_m = v.clamp(0.0, 500.0); }
+                }
+            }),
+            archive: Some((25216, |state| state.video.ocean_settings.optics.caustic_max_distance_m.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_oceancausticsmaxdistance(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.optics.caustic_max_distance_m = Self::parse_cvar_finite(name, value)?.clamp(0.0, 500.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
     APP_R_OCEANCAUSTICS {
         runtime: CvarDef::new(
                 "r_oceanCaustics",

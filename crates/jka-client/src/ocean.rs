@@ -1,4 +1,4 @@
-//! WGPU port/adaptation of 2Retr0/GodotOceanWaves.
+﻿//! WGPU port/adaptation of 2Retr0/GodotOceanWaves.
 //! GodotOceanWaves is MIT licensed:
 //! Copyright (c) 2024 Ethan Truong
 //! Permission is hereby granted, free of charge, to any person obtaining a copy of this
@@ -21,6 +21,12 @@ pub mod appearance;
 pub mod interaction;
 pub mod surfaces;
 pub mod bathymetry;
+mod blue_water;
+mod native_waves;
+mod native_optics;
+pub use native_optics::BlueWaterOptics;
+pub use native_waves::BlueWaterWaves;
+mod original_surface;
 pub mod coastal;
 pub mod sky_extend;
 mod footprint_index;
@@ -87,6 +93,8 @@ pub struct OceanDrawStats {
     pub clipmap_batches: u32,
     /// Clipmap draws actually encoded (one per surface id per pass).
     pub clipmaps_drawn: u32,
+    /// Draws using Blue Water's original surface shader and upstream geometry.
+    pub original_surfaces: u32,
     /// Mesh-free fullscreen triangles drawn for qualifying ocean pools.
     pub analytic_draws: u32,
     pub rejected_area: u32,
@@ -1404,6 +1412,58 @@ impl CascadeSettings {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OceanSettings {
+    /// 0 Godot/Unified, 1 native Blue Water, 2 Hybrid (Blue Water + JKA optics).
+    /// Off is represented by the existing r_ocean enable state.
+    pub backend: u8,
+    pub blue_water_waves: BlueWaterWaves,
+    pub blue_water_optics: BlueWaterOptics,
+    /// Blue Water scene-bending refraction; independent of legacy optics.
+    pub blue_water_refraction: f32,
+    /// 0 off, 1 inexpensive screen offset, 2 physical scene ray trace.
+    pub blue_water_refraction_mode: u8,
+    /// Native geometry independent of the JKA/Godot mesh quality setting.
+    pub blue_water_mesh_segments: u32, // 64/128/256; default 64
+    pub blue_water_mesh_levels: u8, // 6..9; default 6
+    /// 0 exact JKA footprint/PVS/sky, 1 ignore interior triangles/tiles (keep PVS),
+    /// 2 disable all Blue Water admission tests (DIAGNOSTIC, draws through land),
+    /// 3 exact footprint/PVS with per-tile triangle candidates.
+    pub blue_water_boundary_mode: u8,
+    /// 0 full native caustics each frame, 1 update only on native FFT steps,
+    /// 2 off, 3 Godot optics receiver (no native caustics generation).
+    pub blue_water_caustics_mode: u8,
+    /// 0 full native, 1 native without motes, 2 no composite,
+    /// 3 native only when submerged, 4 legacy composite when submerged.
+    pub blue_water_underwater_mode: u8,
+    /// Allow legacy Godot clipmap index recomputation/upload while running Blue Water.
+    pub blue_water_prepare_godot_mesh: bool,
+    /// Blue Water-to-JKA displacement/normal compute bridge (other water consumers).
+    /// Disable for A/B only; downstream legacy effects may sample frozen data.
+    pub blue_water_adapter: bool,
+    /// Gate native screen-space reflection ray tracing (sky reflection remains).
+    pub blue_water_ssr: bool,
+    /// Hybrid-only choices: preserve the working Godot transmission, caustics,
+    /// submerged surface and cheaper refraction without modifying pure Blue Water.
+    pub hybrid_refraction_mode: u8,
+    pub hybrid_caustics_mode: u8,
+    pub hybrid_underwater_mode: u8,
+    pub hybrid_ssr: bool,
+    /// Hybrid owns its appearance; editing it must not overwrite native Blue Water.
+    /// 1x uses the saved Godot fog-distance and native Blue Water calibration.
+    pub hybrid_transparency: f32,
+    pub hybrid_fog_color: [f32; 3],
+    pub hybrid_water_color: [f32; 3],
+    /// Blue Water mid-cascade spans 181m, Godot's caustic cascade spans 57m.
+    /// Rescale only Hybrid's receiver sampling to recover a finer pattern.
+    pub hybrid_caustics_scale: f32,
+    pub hybrid_caustics_gain: f32,
+    /// Optional forward-difference receiver: 3 taps rather than 4.
+    pub hybrid_caustics_fast: bool,
+    /// Fixed specialization parameter for native Blue Water screen-space traces.
+    /// Only the surface pipeline rebuilds when this changes.
+    pub blue_water_ssr_steps: u32,
+    /// Diagnostic: omit Godot's optical scene copy when the native material
+    /// already owns its scene copy and no legacy consumer needs the texture.
+    pub blue_water_dedup_capture: bool,
     pub interaction: bool,
     pub interaction_strength: f32,
     /// 0 off, 1 entry droplets, 2 wake spray, 3 droplets + wake,
@@ -1462,6 +1522,31 @@ pub struct OceanSettings {
 impl Default for OceanSettings {
     fn default() -> Self {
         Self {
+            backend: 0,
+            blue_water_waves: BlueWaterWaves::default(),
+            blue_water_optics: BlueWaterOptics::default(),
+            blue_water_refraction: 0.1,
+            blue_water_refraction_mode: 2,
+            blue_water_mesh_segments: 64,
+            blue_water_mesh_levels: 6,
+            blue_water_boundary_mode: 3,
+            blue_water_caustics_mode: 0,
+            blue_water_underwater_mode: 0,
+            blue_water_prepare_godot_mesh: false,
+            blue_water_adapter: true,
+            blue_water_ssr: true,
+            hybrid_refraction_mode: 1,
+            hybrid_caustics_mode: 3,
+            hybrid_underwater_mode: 4,
+            hybrid_ssr: false,
+            hybrid_transparency: 1.0,
+            hybrid_fog_color: optics::Settings::default().fog_color,
+            hybrid_water_color: BlueWaterOptics::default().water_color,
+            hybrid_caustics_scale: 3.0,
+            hybrid_caustics_gain: 1.5,
+            hybrid_caustics_fast: false,
+            blue_water_ssr_steps: 16,
+            blue_water_dedup_capture: false,
             interaction: false,
             interaction_strength: 1.0,
             interaction_splash_mode: 3,
@@ -1522,7 +1607,85 @@ impl OceanSettings {
         }
     }
 
+    /// Absorption-matched world/clipmap culling distance for the active water
+    /// backend. Blue Water derives this from its native RGB extinction; Unified
+    /// retains its own transparency-distance and user multiplier.
+    pub fn underwater_cull_distance(self) -> f32 {
+        if self.backend != 0 && (self.backend != 2 || self.hybrid_underwater_mode != 4) {
+            self.blue_water_optics.absorption_cull_distance_units()
+        } else {
+            self.optics.cull_distance()
+        }
+    }
+
+    /// Godot capture caustics only belong to Hybrid's explicit Godot mode.
+    /// The native receiver gets the unchanged master strength separately.
+    /// Call on settings resolved for GPU, not on the archived UI values.
+    pub fn godot_capture_caustics_strength(self) -> f32 {
+        if self.backend == 2 && self.blue_water_caustics_mode != 3 {
+            0.0
+        } else {
+            self.optics.caustics
+        }
+    }
+
+    /// Resolve experimental Hybrid optics into the existing Blue Water GPU
+    /// fields at the render boundary. Pure Blue Water remains independent.
+    pub fn resolved_for_gpu(mut self) -> Self {
+        if self.backend == 2 {
+            self.blue_water_refraction_mode = self.hybrid_refraction_mode;
+            self.blue_water_caustics_mode = self.hybrid_caustics_mode;
+            self.blue_water_underwater_mode = self.hybrid_underwater_mode;
+            self.blue_water_ssr = self.hybrid_ssr;
+            // Both the Blue Water surface above and legacy submerged optics
+            // observe Hybrid's own appearance. Preserve each pure backend's
+            // saved appearance for switching/A-B.
+            self.blue_water_optics.transparency = self.hybrid_transparency;
+            self.blue_water_optics.fog_color = self.hybrid_fog_color;
+            self.blue_water_optics.water_color = self.hybrid_water_color;
+            self.optics.transparency = (self.optics.transparency * self.hybrid_transparency)
+                .clamp(1.0, 65536.0);
+            self.optics.fog_color = self.hybrid_fog_color;
+        } else if self.backend == 1 {
+            // Old configs may still contain the pre-split hybrid-only modes.
+            // Never let them silently turn Godot optics back on in Native.
+            if self.blue_water_caustics_mode == 3 { self.blue_water_caustics_mode = 0; }
+            if self.blue_water_underwater_mode == 4 { self.blue_water_underwater_mode = 0; }
+        }
+        self
+    }
+
     pub fn sanitize(mut self) -> Self {
+        self.backend = self.backend.min(2);
+        self.blue_water_waves = self.blue_water_waves.sanitize();
+        self.blue_water_optics = self.blue_water_optics.sanitize();
+        self.blue_water_refraction = if self.blue_water_refraction.is_finite() {
+            self.blue_water_refraction.clamp(0.0, 0.15)
+        } else { 0.0 };
+        self.blue_water_refraction_mode = self.blue_water_refraction_mode.min(2);
+        self.blue_water_mesh_segments = match self.blue_water_mesh_segments { 64 | 128 | 256 => self.blue_water_mesh_segments, _ => 128 };
+        self.blue_water_mesh_levels = self.blue_water_mesh_levels.clamp(6, 9);
+        self.blue_water_boundary_mode = self.blue_water_boundary_mode.min(3);
+        self.blue_water_caustics_mode = self.blue_water_caustics_mode.min(3);
+        self.blue_water_underwater_mode = self.blue_water_underwater_mode.min(4);
+        self.hybrid_underwater_mode = self.hybrid_underwater_mode.min(4);
+        self.hybrid_caustics_mode = self.hybrid_caustics_mode.min(3);
+        self.hybrid_refraction_mode = self.hybrid_refraction_mode.min(2);
+        fn bounded(v: f32, fallback: f32, min: f32, max: f32) -> f32 {
+            if v.is_finite() { v.clamp(min, max) } else { fallback }
+        }
+        self.hybrid_transparency = bounded(self.hybrid_transparency, 1.0, 0.1, 10.0);
+        self.hybrid_caustics_scale = bounded(self.hybrid_caustics_scale, 3.0, 1.0, 6.0);
+        self.hybrid_caustics_gain = bounded(self.hybrid_caustics_gain, 1.5, 0.0, 4.0);
+        for (color, fallback) in [
+            (&mut self.hybrid_fog_color, optics::Settings::default().fog_color),
+            (&mut self.hybrid_water_color, BlueWaterOptics::default().water_color),
+        ] {
+            for (value, default) in color.iter_mut().zip(fallback) {
+                *value = bounded(*value, default, 0.0, 1.0);
+            }
+        }
+        self.blue_water_ssr_steps = self.blue_water_ssr_steps.clamp(4, 32);
         self.interaction_strength = if self.interaction_strength.is_finite() { self.interaction_strength.max(0.0) } else { 1.0 };
         self.interaction_splash_mode = self.interaction_splash_mode.min(5);
         self.interaction_lifetime = if self.interaction_lifetime.is_finite() { self.interaction_lifetime.clamp(0.1,60.0) } else { 2.5 };
@@ -1690,6 +1853,7 @@ fn ocean_lod_deadline(next: &mut f32, now: f32, hz: f32) -> bool {
 }
 
 pub struct OceanGpu {
+    blue_water: Option<blue_water::BlueWaterOcean>,
     sky_extend_enabled: bool,
     sky_infinite_enabled: bool,
     sky_extend_regions: [Option<sky_extend::SkyExtension>; OCEAN_MAX_SURFACES],
@@ -2118,9 +2282,12 @@ impl OceanGpu {
             });
             OceanLodSnapshot{_texture:texture,view,_bind_group:bind_group,foam,size}
         });
+        let blue_water = (settings.backend != 0).then(|| blue_water::BlueWaterOcean::new(device));
+        let render_displacement_view = blue_water.as_ref().map_or_else(|| displacement_view.clone(), |blue| blue.displacement_view.clone());
+        let render_normal_view = blue_water.as_ref().map_or_else(|| normal_view.clone(), |blue| blue.normal_view.clone());
         let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label:Some("Ocean render bind group"), layout:render_layout, entries:&[
-            wgpu::BindGroupEntry{binding:0,resource:wgpu::BindingResource::TextureView(&displacement_view)},
-            wgpu::BindGroupEntry{binding:1,resource:wgpu::BindingResource::TextureView(&normal_view)},
+            wgpu::BindGroupEntry{binding:0,resource:wgpu::BindingResource::TextureView(&render_displacement_view)},
+            wgpu::BindGroupEntry{binding:1,resource:wgpu::BindingResource::TextureView(&render_normal_view)},
             wgpu::BindGroupEntry{binding:2,resource:wgpu::BindingResource::Sampler(&sampler)},
             bg_buffer(3,&render_buffer),
             wgpu::BindGroupEntry{binding:4,resource:wgpu::BindingResource::TextureView(spray_albedo_view)},
@@ -2146,15 +2313,15 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
-            render_displacement_view:displacement_view, render_normal_view:normal_view,
+        let mut ocean = Self { blue_water, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+            render_displacement_view, render_normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
             interaction_splash_uniform: interaction.splash_uniform.clone(),
             coastal: None, coastal_render, coastal_key: None, promoted_centres: [None;OCEAN_MAX_SURFACES], promoted_far_radii: [None;OCEAN_MAX_SURFACES] };
         ocean.upload_params(queue,0.0);
         let mut encoder=device.create_command_encoder(&wgpu::CommandEncoderDescriptor{label:Some("Ocean FFT init")});
-        {
+        if settings.backend == 0 {
             let mut pass=encoder.begin_compute_pass(&wgpu::ComputePassDescriptor{label:Some("Ocean butterfly init"),timestamp_writes:None});
             pass.set_pipeline(&ocean.butterfly_pipeline);
             pass.set_bind_group(0,&ocean.compute_bind_groups[0],&[]);
@@ -2165,11 +2332,14 @@ impl OceanGpu {
     }
 
     pub fn map_size(&self) -> u32 { self.settings.map_size }
+    pub fn backend(&self) -> u8 { self.settings.backend }
+
 
     pub fn set_time(&mut self, seconds: f32) {
         if !seconds.is_finite() { return; }
         if (seconds - self.elapsed).abs() > 0.05 {
             self.elapsed = seconds;
+            if let Some(blue) = &mut self.blue_water { blue.set_time(seconds); }
             self.times = std::array::from_fn(|i| seconds + 120.0 + i as f32 * std::f32::consts::PI);
             self.next_update = seconds;
             // Abandon only scratch work; each visible cascade is written in
@@ -2712,6 +2882,13 @@ impl OceanGpu {
 
     pub fn encode_frame(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32) {
         if !self.enabled { return; }
+        if let Some(blue) = &mut self.blue_water {
+            blue.adapter_enabled = self.settings.blue_water_adapter;
+            blue.encode(queue, encoder, delta, self.settings.updates_per_second, self.settings.blue_water_waves);
+            self.elapsed += delta.max(0.0);
+            self.write_render_uniform(queue);
+            return;
+        }
         let delta=delta.max(0.0);
         let now=self.elapsed;
         let updates=self.settings.updates_per_second;
@@ -2890,7 +3067,7 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         let displacement = cascade.displacement_scale * strength;
         *scale=[1.0/(cascade.tile_length[0]*spatial),1.0/(cascade.tile_length[1]*spatial),displacement,cascade.normal_scale*strength/spatial];
     }
-    OceanRenderUniform {
+    let mut uniform = OceanRenderUniform {
         map_scales:scales,
         water_color:linear_color(settings.water_color),
         foam_color:linear_color(settings.foam_color),
@@ -2927,7 +3104,20 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
             settings.sun_gain, settings.foam_debug as f32],
         appearance_c: [settings.visual_fixes as f32, 0.0,
             if settings.mesh_quality > 0 { OCEAN_HIGH_MESH_SPACING_UNITS } else { OCEAN_LOW_MESH_SPACING_UNITS }, 0.0],
+    };
+    if settings.backend != 0 {
+        // Temporary JKA surface adapter: sample Blue Water's own 1,024/181/31 m tiles.
+        let cascades = blue_water_core::QualityTier::High.cascades();
+        for (i, cascade) in cascades.iter().enumerate() {
+            uniform.map_scales[i] = [1.0 / cascade.size as f32, -1.0 / cascade.size as f32, 1.0, 1.0];
+        }
+        uniform.ocean_info[1] = 256.0;
+        uniform.swell[3] = 0.0;
+        uniform.swell_motion[2] = 1.0;
+        uniform.surface[2] = 0.0;
+        uniform.surface[3] = 0.0;
     }
+    uniform
 }
 
 /// Whether the shader flattens the outermost clipmap ring. Sky extension mode 1
@@ -2947,8 +3137,10 @@ fn make_promoted_render_uniform(
 ) -> OceanRenderUniform {
     let mut local = make_render_uniform(shared.ocean_info[0] > 0.5, settings);
     let amplitude_scale = settings.authored.amplitude / 128.0;
-    local.map_scales[2][2] *= amplitude_scale;
-    local.map_scales[2][3] *= amplitude_scale;
+    if settings.backend == 0 {
+        local.map_scales[2][2] *= amplitude_scale;
+        local.map_scales[2][3] *= amplitude_scale;
+    }
     local.clipmap = shared.clipmap;
     local.swell_motion[3] = shared.swell_motion[3];
     local.sun_direction_intensity = shared.sun_direction_intensity;
@@ -3804,5 +3996,76 @@ mod ocean_fft_heading_tests {
                 assert!(error.abs() < 35.0, "FFT crests travel {travel} deg, swell heading is {expected}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod ocean_backend_selection_tests {
+    use super::{BlueWaterOptics, OceanSettings};
+
+    #[test]
+    fn hybrid_appearance_controls_both_media_without_mutating_native_settings() {
+        let mut settings = OceanSettings::default();
+        settings.backend = 2;
+        settings.hybrid_transparency = 2.0;
+        settings.hybrid_fog_color = [0.8, 0.3, 0.1];
+        let saved = settings;
+        let resolved = settings.resolved_for_gpu().sanitize();
+        assert_eq!(resolved.optics.fog_color, [0.8, 0.3, 0.1]);
+        assert_eq!(resolved.blue_water_optics.fog_color, [0.8, 0.3, 0.1]);
+        assert_eq!(resolved.optics.transparency, saved.optics.transparency * 2.0);
+        assert_eq!(resolved.blue_water_optics.transparency, 2.0);
+        assert_eq!(settings.blue_water_optics, BlueWaterOptics::default());
+        settings.backend = 1;
+        assert_eq!(settings.resolved_for_gpu().blue_water_optics, BlueWaterOptics::default());
+    }
+
+    #[test]
+    fn hybrid_caustic_modes_are_exclusive() {
+        let mut hybrid = OceanSettings::default();
+        hybrid.backend = 2;
+        hybrid.optics.caustics = 3.0;
+        for mode in [0, 1, 2] {
+            hybrid.hybrid_caustics_mode = mode;
+            let resolved = hybrid.resolved_for_gpu();
+            assert_eq!(resolved.godot_capture_caustics_strength(), 0.0);
+            assert_eq!(resolved.blue_water_caustics_mode, mode);
+            // Do not zero the master value: native modes still need it.
+            assert_eq!(resolved.optics.caustics, 3.0);
+        }
+        hybrid.hybrid_caustics_mode = 3;
+        let resolved = hybrid.resolved_for_gpu();
+        assert_eq!(resolved.godot_capture_caustics_strength(), 3.0);
+        let mut godot = OceanSettings::default();
+        godot.backend = 0;
+        assert_eq!(godot.godot_capture_caustics_strength(), godot.optics.caustics);
+    }
+
+    #[test]
+    fn native_and_hybrid_optics_are_independent() {
+        let mut native = OceanSettings::default();
+        native.backend = 1;
+        assert_eq!(native.resolved_for_gpu().blue_water_refraction_mode, 2);
+        assert_eq!(native.resolved_for_gpu().blue_water_caustics_mode, 0);
+        assert_eq!(native.resolved_for_gpu().blue_water_underwater_mode, 0);
+        assert!(native.resolved_for_gpu().blue_water_ssr);
+
+        let mut hybrid = native;
+        hybrid.backend = 2;
+        let resolved = hybrid.resolved_for_gpu().sanitize();
+        assert_eq!(resolved.blue_water_refraction_mode, 1);
+        assert_eq!(resolved.blue_water_caustics_mode, 3);
+        assert_eq!(resolved.blue_water_underwater_mode, 4);
+        assert!(!resolved.blue_water_ssr);
+        // Old configs that contained Hybrid's former Bluewater controls must
+        // not make Native silently invoke the Godot receiver/submerged path.
+        native.blue_water_caustics_mode = 3;
+        native.blue_water_underwater_mode = 4;
+        assert_eq!(native.resolved_for_gpu().blue_water_caustics_mode, 0);
+        assert_eq!(native.resolved_for_gpu().blue_water_underwater_mode, 0);
+        // Resolving one backend must never overwrite the persisted selection
+        // for the other backend.
+        assert_eq!(hybrid.blue_water_refraction_mode, 2);
+        assert_eq!(hybrid.blue_water_caustics_mode, 0);
     }
 }

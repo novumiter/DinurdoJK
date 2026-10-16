@@ -14,6 +14,7 @@ struct Optics {
     maximum: array<vec4<f32>, 8>,
     sky_regions: array<SkyFogRegion, 8>,
     sky_info: vec4<f32>,
+    caustic_tuning: vec4<f32>,
 };
 COLOR_DECLARATION
 @group(0) @binding(1) var scene_sampler: sampler;
@@ -336,7 +337,13 @@ struct Capture {
     @location(0) color: vec4<f32>,
     @location(1) depth: f32,
 };
-fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture {
+struct OpticalSample {
+    color: vec4<f32>,
+    depth: f32,
+    water_distance: f32,
+    receiver: vec4<f32>,
+};
+fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> OpticalSample {
     let h = optics.inverse_view_projection * vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), depth, 1.0);
     let world = h.xyz / h.w;
     let delta = world - optics.eye.xyz;
@@ -348,6 +355,11 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
     var color = sample_color;
     g_span_count = 0u;
     g_eye_depth = 0.0;
+    // Distance gate runs before footprint classification and all caustic
+    // slope samples. No extra pass, texture, FFT work or CPU readback.
+    let caustic_limit = optics.caustic_tuning.w;
+    let caustic_receiver_in_range = optics.params.z > 0.0 && depth > 0.0 &&
+        (caustic_limit <= 0.0 || ray_length < caustic_limit);
     var bottom_depth = 0.0;
     for (var i = 0u; i < min(u32(optics.params.w), 8u); i += 1u) {
         let lo = optics.minimum[i].xyz;
@@ -366,7 +378,7 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
             }
         }
         let receiver_margin = vec3<f32>(CAUSTIC_RECEIVER_MARGIN);
-        if (all(world >= lo - receiver_margin) && all(world <= hi + receiver_margin)
+        if (caustic_receiver_in_range && all(world >= lo - receiver_margin) && all(world <= hi + receiver_margin)
             && ocean_mask_contains(slot, world.xz)) {
             bottom_depth = max(bottom_depth, max(hi.y - world.y, 0.0));
         }
@@ -388,7 +400,7 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
     }
     // Optional low-cost wave-curvature caustics. Approximation, not photon tracing.
     // No caustic-specific normal reconstruction or wave samples when disabled.
-    if (optics.params.z > 0.0 && bottom_depth > 2.0 && depth > 0.0) {
+    if (caustic_receiver_in_range && bottom_depth > 2.0) {
         // Scope to the bound simulation; distinct authored oceans never borrow its waves.
         let own_margin = vec2<f32>(CAUSTIC_RECEIVER_MARGIN);
         let own_water = ocean.authored_plane.x < 0.5 || (all(world.xz >= ocean.authored_bounds.xy - own_margin) && all(world.xz <= ocean.authored_bounds.zw + own_margin));
@@ -409,19 +421,49 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
                     world_pixel_span,
                 );
                 let refracted = refract(-sun, vec3<f32>(0.0, 1.0, 0.0), 1.0 / 1.333);
-                let surface = world.xz - refracted.xz * bottom_depth / max(-refracted.y, 0.1);
-                let step = 8.0;
-                let dx = (slopes(surface + vec2<f32>(step,0.0)) - slopes(surface - vec2<f32>(step,0.0))) / (2.0*step);
-                let dz = (slopes(surface + vec2<f32>(0.0,step)) - slopes(surface - vec2<f32>(0.0,step))) / (2.0*step);
-                let focus = clamp(1.0 / max(0.25, 1.0 + bottom_depth * 0.25 * (dx.x + dz.y)) - 1.0, -0.4, 2.0);
+                // Hybrid samples Blue Water's 181m mid-cascade while Godot uses
+                // a 57m tile. Repeating the native field more densely restores
+                // roughly the Godot pattern size without another FFT/capture.
+                let density = max(optics.caustic_tuning.x, 1.0);
+                let surface = (world.xz - refracted.xz * bottom_depth / max(-refracted.y, 0.1)) * density;
+                // Rescale the finite-difference spacing in texture-space units.
+                // Differentiating in sampled-field space (not scaled world space)
+                // prevents pattern density from accidentally changing contrast.
+                let step = 8.0 / density;
+                var divergence = 0.0;
+                if (optics.caustic_tuning.z > 0.5) {
+                    // A/B inexpensive forward differences: 3 texture reads.
+                    let c = slopes(surface);
+                    let sx = slopes(surface + vec2<f32>(step, 0.0));
+                    let sz = slopes(surface + vec2<f32>(0.0, step));
+                    divergence = ((sx.x - c.x) + (sz.y - c.y)) / step;
+                } else {
+                    // Original Godot-style central differences: 4 texture reads.
+                    let dx = (slopes(surface + vec2<f32>(step,0.0)) - slopes(surface - vec2<f32>(step,0.0))) / (2.0*step);
+                    let dz = (slopes(surface + vec2<f32>(0.0,step)) - slopes(surface - vec2<f32>(0.0,step))) / (2.0*step);
+                    divergence = dx.x + dz.y;
+                }
+                let focus = clamp(1.0 / max(0.25, 1.0 + bottom_depth * 0.25 * divergence) - 1.0, -0.4, 2.0);
                 let fade = exp2(-4.321928 * bottom_depth / max(optics.fog.w, 1.0));
-                let caustic = focus * optics.params.z * fade * abs(dot(scene_normal, sun)) * min(ocean.sun_direction_intensity.w, 1.0);
+                // Enhance bright focus lines without making unfocused regions
+                // excessively dark, as scaling both signed lobes would do.
+                let tuned_focus = min(focus, 0.0) + max(focus, 0.0) * optics.caustic_tuning.y;
+                // Fade during the outer quarter of the receiver range to avoid
+                // a moving cutoff boundary as the player flies over the water.
+                var range_fade = 1.0;
+                if (caustic_limit > 0.0) {
+                    range_fade = 1.0 - smoothstep(caustic_limit * 0.75, caustic_limit, ray_length);
+                }
+                let caustic = tuned_focus * optics.params.z * fade * range_fade * abs(dot(scene_normal, sun)) * min(ocean.sun_direction_intensity.w, 1.0);
                 // Preserve the existing discontinuity fade and brightness clamp.
                 let caustic_multiplier = max(1.0 + caustic, 0.65);
                 color *= mix(1.0, caustic_multiplier, caustic_surface_confidence);
             }
         }
     }
+    // BlueWater applies its own column absorption. Give its surface the same
+    // Godot caustics before fog, so that transmission is not attenuated twice.
+    let receiver_color = vec4<f32>(color, 1.0);
     // No-receiver pixels keep the original box fog only (identical to OFF);
     // sky columns never paint them (see above). The exception is a downward
     // ray seen from above the surface of an extended ocean: it can only end in
@@ -445,19 +487,34 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Capture
         let downwelling = exp2(-4.321928 * ratios * eye_depth / max(optics.params.x, 1.0));
         color = color * transmission + optics.fog.rgb * downwelling * (1.0 - transmission);
     }
-    var out: Capture;
+    var out: OpticalSample;
     out.color = vec4<f32>(color, 1.0);
     out.depth = select(max(dot(delta, optics.forward.xyz), 0.0), 1000000.0, depth <= 0.0);
+    out.water_distance = ray_length * water_fraction;
+    out.receiver = receiver_color;
     return out;
 }
 
-fn capture_pixel(p: vec4<f32>) -> Capture {
+fn capture_pixel(p: vec4<f32>) -> OpticalSample {
     let pixel = vec2<i32>(p.xy);
     let uv = p.xy / vec2<f32>(textureDimensions(scene_color));
     CAPTURE_BODY
 }
 @fragment fn fs_capture(@builtin(position) p: vec4<f32>) -> Capture {
-    return capture_pixel(p);
+    let sample = capture_pixel(p);
+    return Capture(sample.color, sample.depth);
+}
+struct CaptureReceiver {
+    @location(0) color: vec4<f32>,
+    @location(1) depth: f32,
+    @location(2) receiver: vec4<f32>,
+};
+@fragment fn fs_capture_receiver(@builtin(position) p: vec4<f32>) -> CaptureReceiver {
+    let sample = capture_pixel(p);
+    return CaptureReceiver(sample.color, sample.depth, sample.receiver);
+}
+@fragment fn fs_water_distance(@builtin(position) p: vec4<f32>) -> @location(0) f32 {
+    return capture_pixel(p).water_distance / 40.0;
 }
 @fragment fn fs_glass_background(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
     let sample=capture_pixel(p);

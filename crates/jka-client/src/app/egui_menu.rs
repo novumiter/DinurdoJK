@@ -320,6 +320,7 @@ pub(super) enum VideoSection {
     DebugTools,
     Physics,
     Sun,
+    BlueWater,
     Clouds,
     Weather,
     Surface,
@@ -343,7 +344,7 @@ impl VideoSection {
         (Self::Clouds, "Clouds"),
         (Self::Weather, "Weather"),
         (Self::Surface, "Surface"),
-        (Self::Water, "Water"),
+        (Self::Water, "Ocean"),
         (Self::Glass, "Glass"),
     ];
     const TOOLS: [(Self, &'static str); 1] = [(Self::DebugTools, "Debug & tools")];
