@@ -92,8 +92,12 @@ fn splash_vertex(@builtin(vertex_index) index: u32, @location(0) splash: vec4<f3
     let xz = splashes.region.zw + q * REGION;
     // The drawn sea under the splash, where the ocean gives its heights.
     var sea = 0.0;
+    var water = 1.0;
     if splashes.sea_span > 0.0 {
-        sea = textureSampleLevel(sea_heights, sea_sampler, (splashes.camera_xz + xz) / splashes.sea_span, 0.0).r;
+        let surface = textureSampleLevel(sea_heights, sea_sampler, (splashes.camera_xz + xz) / splashes.sea_span, 0.0);
+        sea = surface.r;
+        // The JKA height sampler marks admitted promoted water in alpha.
+        water = step(0.99, surface.a);
     }
     let base = vec3<f32>(xz.x, sea + LIFT - splashes.camera_height, xz.y);
     let crown = corner.z > 0.5;
@@ -108,7 +112,7 @@ fn splash_vertex(@builtin(vertex_index) index: u32, @location(0) splash: vec4<f3
     out.local = corner.xy;
     out.part = corner.z;
     out.age = progress;
-    out.fade = (1.0 - ramp(0.36, 0.5, edge)) * (1.0 - ramp(FAR_FROM, FAR_TO, length(base))) * splashes.opacity;
+    out.fade = (1.0 - ramp(0.36, 0.5, edge)) * (1.0 - ramp(FAR_FROM, FAR_TO, length(base))) * splashes.opacity * water;
     // Rings mirror the sky at a grazing angle; crowns are white water lit by it and by any direct light.
     let around = sky_around(view, splashes.grey) * (sky.flash + 1.0);
     out.water = around * RING_LIGHT;

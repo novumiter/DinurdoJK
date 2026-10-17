@@ -62,6 +62,32 @@ impl App {
                 }
             }
         });
+        theme::row(ui, "Screen-space mesh LOD", "Native clipmap ONLY. Coarsens full interior rings when their projected cells are below the selected width. This is conservative: close water and fine silhouettes remain untouched; it does not change distant individual tiles. Default Off.", theme::Reset::None, |ui| {
+            for (threshold, name) in [(0.0, "Off"), (1.0, "1px"), (2.0, "2px"), (4.0, "4px"), (8.0, "8px")] {
+                if theme::chip(ui, name, ocean.screen_lod_pixels == threshold).clicked() {
+                    ocean.screen_lod_pixels = threshold;
+                    changed = true;
+                }
+            }
+        });
+        theme::row(ui, "Expensive pixel detail", "Native/Hybrid test ONLY: 2x2 shades 1 in 4 ocean fragments fully; 4x4 shades 1 in 16. Other pixels retain full-res geometry/depth but use a cheap tint, NOT hardware VRS or blurred upscaling. Distance modes keep nearby water fully shaded.", theme::Reset::None, |ui| {
+            for (mode, name) in [(0, "Full"), (1, "2x2"), (2, "4x4"), (3, "Far 2x2"), (4, "Far 4x4"), (5, "Cheap all")] {
+                if theme::chip(ui, name, ocean.pixel_detail_mode == mode).clicked() {
+                    ocean.pixel_detail_mode = mode;
+                    changed = true;
+                }
+            }
+        });
+        if matches!(ocean.pixel_detail_mode, 3 | 4) {
+            theme::row(ui, "Detail falloff distance", "Full shading within this many metres of the camera; coarse shading outside.", theme::Reset::None, |ui| {
+                let mut distance = ocean.pixel_detail_distance;
+                let readout = format!("{distance:.0} m");
+                if theme::slider(ui, &mut distance, 1.0..=1000.0, &readout) {
+                    ocean.pixel_detail_distance = distance;
+                    changed = true;
+                }
+            });
+        }
         theme::row(ui, "Screen-space reflections", "Trace nearby scene reflections. Environment and sky remain when disabled.", theme::Reset::None, |ui| {
             let value = if hybrid { &mut ocean.hybrid_ssr } else { &mut ocean.blue_water_ssr };
             if ui.checkbox(value, "Trace scene reflections").changed() { changed = true; }
@@ -81,7 +107,7 @@ impl App {
             }
         });
         theme::row(ui, "Caustics", "Godot carries the inexpensive optics caustics into BlueWater transmission; native modes use its separate receiver pass.", theme::Reset::None, |ui| {
-            for &(mode, name) in if hybrid { &[(3, "Godot"), (0, "Native"), (1, "Native FFT only"), (2, "Off")][..] } else { &[(0, "Native"), (1, "Native FFT only"), (2, "Off")][..] } {
+            for &(mode, name) in if hybrid { &[(3, "Godot"), (4, "Animated"), (0, "Native"), (1, "Native FFT only"), (2, "Off")][..] } else { &[(0, "Native"), (1, "Native FFT only"), (2, "Off")][..] } {
                 if theme::chip(ui, name, (if hybrid { ocean.hybrid_caustics_mode } else { ocean.blue_water_caustics_mode }) == mode).clicked() {
                     if hybrid { ocean.hybrid_caustics_mode = mode; } else { ocean.blue_water_caustics_mode = mode; } changed = true;
                 }
@@ -145,7 +171,14 @@ impl App {
             }
             changed = true;
         }
-        if hybrid {
+        if hybrid && ocean.hybrid_caustics_mode == 4 {
+            theme::section(ui, "ANIMATED CAUSTICS", "Independent procedural light networks that deform, split and merge over time. GPU pattern is generated once, not re-simulated per frame. No ocean FFT reads per receiver pixel.");
+            super::ocean_slider(ui, "Pattern scale", "Larger values make finer light webs, without increasing texture resolution or FFT cost.", theme::Reset::None,
+                &mut ocean.hybrid_procedural_scale, 0.25..=4.0, &mut changed);
+            super::ocean_slider(ui, "Animation speed", "Pattern evolution rate; zero freezes the field for performance/visual A/B. Wave roughness also influences the animation.", theme::Reset::None,
+                &mut ocean.hybrid_procedural_speed, 0.0..=3.0, &mut changed);
+        }
+        if hybrid && ocean.hybrid_caustics_mode == 3 {
             theme::section(ui, "HYBRID CAUSTIC SHAPE", "The 181m Blue Water mid-cascade makes larger patterns than Godot's 57m cascade. These controls only affect Hybrid's Godot receiver caustics (mode: Godot). No extra passes or textures.");
             super::ocean_slider(ui, "Pattern density", "Higher values create smaller caustic markings by tiling the existing Blue Water slope texture. 3x roughly compensates for the 181m vs 57m wave tile lengths.", theme::Reset::None,
                 &mut ocean.hybrid_caustics_scale, 1.0..=6.0, &mut changed);

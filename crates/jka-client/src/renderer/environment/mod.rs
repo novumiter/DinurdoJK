@@ -8,3 +8,5 @@ pub(in crate::renderer) mod water;
 pub(in crate::renderer) mod weather;
 
 pub(super) mod blue_water_air;
+
+pub(in crate::renderer) mod blue_water_scene;

@@ -2,6 +2,7 @@
 mod account;
 mod blue_water;
 mod clouds;
+mod native_environment;
 mod color;
 mod debug;
 mod display;

@@ -71,6 +71,7 @@ mod net;
 mod emote_net;
 mod emote_net_codec;
 mod ocean;
+mod blue_water_environment;
 mod player;
 mod pipeline_cache;
 mod pipeline_jobs;

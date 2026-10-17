@@ -77,6 +77,7 @@ pub struct OriginalSurfacePipeline {
     pub environment_layout: wgpu::BindGroupLayout,
     pub pipeline: wgpu::RenderPipeline,
     pub wireframe: Option<wgpu::RenderPipeline>,
+    pub waterline_marker: Option<wgpu::RenderPipeline>,
     // Keep the existing compiled vertex entry to compile the debug overlay
     // lazily; no wireframe PSO when r_showtris ocean is disabled.
     vertex_shader: wgpu::ShaderModule,
@@ -256,7 +257,8 @@ impl OriginalClipmap {
             appearance.foam_streak_mean,
             0.0,
         ];
-        // JKA applies its own scene fog after this pass.
+        // The host enables aerial perspective and fills legacy fog parameters
+        // when preparing this surface. Clear by default for standalone callers.
         values[23] = [
             appearance.pigment[0],
             appearance.pigment[1],
@@ -1002,6 +1004,19 @@ impl OriginalSurfacePipeline {
         samples: u32,
         reflection_steps: u32,
     ) -> Self {
+        Self::new_with_pixel_detail(device, waves, color_format, samples, reflection_steps, 0)
+    }
+
+    /// Separate program for sparse-shading A/B. Only the selected mode is
+    /// compiled: there is no runtime per-fragment mode check in default mode.
+    pub fn new_with_pixel_detail(
+        device: &wgpu::Device,
+        waves: &SurfaceWaves,
+        color_format: wgpu::TextureFormat,
+        samples: u32,
+        reflection_steps: u32,
+        pixel_detail_mode: u8,
+    ) -> Self {
         let vertex = wgpu::ShaderStages::VERTEX;
         let fragment = wgpu::ShaderStages::FRAGMENT;
         let both = vertex | fragment;
@@ -1063,7 +1078,7 @@ impl OriginalSurfacePipeline {
             immediate_size: 0,
         });
         let mut composer = shader_composer::composer().expect("Blue Water shader modules");
-        let source = shader_composer::jka_surface_module(&mut composer, reflection_steps)
+        let source = shader_composer::jka_surface_module(&mut composer, reflection_steps, pixel_detail_mode)
             .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Blue Water original surface shader"),
@@ -1110,9 +1125,44 @@ impl OriginalSurfacePipeline {
             environment_layout,
             pipeline,
             wireframe: None,
+            waterline_marker: None,
             vertex_shader: shader,
             pipeline_layout: layout,
         }
+    }
+
+    /// Explicit debug mode 3 only: draw the GPU-evaluated wave at a fixed 100 JKA
+    /// units forward, but heights sampled under the camera. No new bindings/readback.
+    pub fn ensure_waterline_marker(&mut self, device: &wgpu::Device,
+        color_format: wgpu::TextureFormat, samples: u32) {
+        if self.waterline_marker.is_some() { return; }
+        let mut composer = shader_composer::composer().expect("Blue Water diagnostic composer");
+        let module = shader_composer::jka_waterline_marker_module(&mut composer)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA native waterline marker"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        self.waterline_marker = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("JKA native waterline diagnostic overlay"),
+            layout: Some(&self.pipeline_layout),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("marker_vertex"),
+                buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("marker_fragment"),
+                targets: &[Some(color_format.into())], compilation_options: Default::default() }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(), bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+            multiview_mask: None, cache: None,
+        }));
     }
 
     /// Compile this diagnostic variant only when r_showtris enables ocean lines.

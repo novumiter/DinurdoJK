@@ -187,6 +187,43 @@ impl Renderer {
         }
     }
 
+    /// Hybrid decides "under water", the underwater cull and the Godot/Blue Water
+    /// mesh from the rasterized wave over the eye, not the flat BSP plane.
+    pub(in crate::renderer) fn hybrid_wave_surface_active(&self) -> bool {
+        self.ocean_enabled
+            && self.ocean_settings.backend == 2
+            && self.ocean_settings.blue_water_underwater_mode == 4
+            && self.ocean_settings.blue_water_adapter
+            && self.ocean.as_ref().is_some_and(|gpu| gpu.backend() != 0)
+    }
+
+    /// Promoted pool whose footprint (and outline) lies over `eye`; where several
+    /// stack, the one whose plane is closest to the eye.
+    pub(in crate::renderer) fn promoted_pool_over(&self, eye: Vec3) -> Option<usize> {
+        let world = self.world.as_ref()?;
+        world
+            .ocean_surfaces
+            .iter()
+            .enumerate()
+            .filter(|(slot, s)| {
+                eye.x >= s.minimum[0] && eye.x <= s.maximum[0]
+                    && eye.z >= s.minimum[1] && eye.z <= s.maximum[1]
+                    && (!world.ocean_masks.is_masked(*slot) || world.ocean_masks.contains(*slot, [eye.x, eye.z]))
+            })
+            .min_by(|a, b| (a.1.plane_height - eye.y).abs().total_cmp(&(b.1.plane_height - eye.y).abs()))
+            .map(|(slot, _)| slot)
+    }
+
+    /// Refreshes `eye_wave_slot` / `eye_wave_offset` from the latest probe sample.
+    /// Zero (the flat plane) whenever Hybrid is not classifying by waves.
+    pub(in crate::renderer) fn refresh_eye_wave_offset(&mut self, eye: Vec3) {
+        let slot = self.hybrid_wave_surface_active().then(|| self.promoted_pool_over(eye)).flatten();
+        self.eye_wave_slot = slot;
+        let sample = slot.and_then(|slot| self.ocean.as_ref()?.eye_wave_sample(slot));
+        self.eye_wave_offset = sample.map_or(0.0, |s| s.offset);
+        self.eye_wave_correction = sample.map(|s| s.correction);
+    }
+
     /// Collects this frame's water volumes (authored oceans first, then promoted
     /// BSP water not already covered by one) and finds the surface above the camera.
     /// Shared by the ocean optics, the rain (which must stop at the surface) and the
@@ -234,7 +271,10 @@ impl Renderer {
         // hollow of an island ring is inside the box but not in the water.
         let no_masks = crate::ocean::OceanMasks::default();
         let masks = self.world.as_ref().map_or(&no_masks, |world| &*world.ocean_masks);
-        let eye_point = [eye.x, eye.y, eye.z];
+        // Under the animated surface = under `plane + offset`; the same test as
+        // against the flat plane once the eye is lowered by that offset.
+        let wave_offset = self.eye_wave_offset;
+        let eye_point = [eye.x, eye.y - wave_offset, eye.z];
         let mut surface = boxes
             .iter()
             .filter(|volume| volume.contains(eye_point, masks))
@@ -250,7 +290,7 @@ impl Renderer {
                         continue;
                     };
                     if self.ocean_extension_active(slot)
-                        && eye.y <= ocean.plane_height && region.contains([eye.x, eye.z]) {
+                        && eye.y - wave_offset <= ocean.plane_height && region.contains([eye.x, eye.z]) {
                         surface = surface.max(ocean.plane_height);
                     }
                 }

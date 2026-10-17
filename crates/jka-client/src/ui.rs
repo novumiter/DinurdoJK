@@ -95,7 +95,7 @@ pub use settings::rendering::{
     DynamicShadowsMode, EntityAmbientLightingMode, EntityShadowLight, FullscreenMode,
     FxGeometryMode, Ghoul2BatchMode, Ghoul2SkinningMode, PlanarReflectionDebugMode,
     PlanarReflectionMode, PvsMode, ReflectionQuality, RendererBackend, SunVisibilityMode,
-    TextureFilter, VsyncMode, ENV_ROW_ENTITY_SUN_LIGHTING, ENV_ROW_GRASS, ENV_ROW_OCEAN,
+    TextureFilter, VsyncMode, ENV_ROW_BAKED_SUN_REMOVAL, ENV_ROW_ENTITY_SUN_LIGHTING, ENV_ROW_GRASS, ENV_ROW_OCEAN,
     ENV_ROW_OCEAN_SETTINGS, ENV_ROW_SUN_COLOR, ENV_ROW_SUN_INTENSITY, ENV_ROW_SUN_PITCH,
     ENV_ROW_SUN_SOURCE, ENV_ROW_SUN_VISIBILITY, ENV_ROW_SUN_YAW, ENV_ROW_VID_RESTART,
     ENV_ROW_WEATHER_DIRECTION_VARIATION, ENV_ROW_WEATHER_GUST_STRENGTH,

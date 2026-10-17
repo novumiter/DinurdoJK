@@ -40,3 +40,13 @@ pub fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
+
+#[path = "../../../vendor/blue-water-sea-and-sky/clouds/src/bolt.rs"]
+pub mod bolt;
+#[path = "../../../vendor/blue-water-sea-and-sky/clouds/src/lightning.rs"]
+pub mod lightning;
+#[path = "../../../vendor/blue-water-sea-and-sky/clouds/src/weather.rs"]
+pub mod weather;
+pub mod reactive;
+#[path = "../../../vendor/blue-water-sea-and-sky/clouds/src/post.rs"]
+pub mod post;

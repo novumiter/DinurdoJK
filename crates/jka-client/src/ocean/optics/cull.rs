@@ -23,13 +23,21 @@ use crate::ocean::{OceanMasks, WaterVolume};
 pub const SUBMERGED_MIN_CULL: f32 = 256.0;
 
 /// Radius of the submerged radial cut, or `None` when the eye is not in water.
-pub fn submerged_cull_radius(eye: [f32; 3], volumes: &[WaterVolume], masks: &OceanMasks, distance: f32) -> Option<f32> {
+///
+/// `surface_offset` is how far the real (animated) surface over the eye sits above
+/// the volume's flat top, in render units. The eye is under water exactly when it is
+/// under `top + surface_offset`, i.e. when `eye.y - surface_offset` is under the top.
+/// Pass 0 for a flat plane. Distances are still measured from the true eye.
+pub fn submerged_cull_radius(
+    eye: [f32; 3], volumes: &[WaterVolume], masks: &OceanMasks, distance: f32, surface_offset: f32,
+) -> Option<f32> {
     if !(distance > 0.0) {
         return None;
     }
+    let wet_point = [eye[0], eye[1] - surface_offset, eye[2]];
     volumes
         .iter()
-        .any(|v| eye[1] < v.maximum[1] && v.contains(eye, masks))
+        .any(|v| wet_point[1] < v.maximum[1] && v.contains(wet_point, masks))
         .then(|| distance.max(SUBMERGED_MIN_CULL))
 }
 
@@ -45,13 +53,15 @@ pub struct WaterCull<'a> {
 
 impl<'a> WaterCull<'a> {
     /// `None` when culling is disabled or there is no water to reason about.
-    pub fn new(eye: [f32; 3], volumes: &[WaterVolume], masks: &'a OceanMasks, distance: f32) -> Option<Self> {
+    pub fn new(
+        eye: [f32; 3], volumes: &[WaterVolume], masks: &'a OceanMasks, distance: f32, surface_offset: f32,
+    ) -> Option<Self> {
         if !(distance > 0.0) || volumes.is_empty() {
             return None;
         }
         Some(Self {
             eye,
-            submerged_radius_sq: submerged_cull_radius(eye, volumes, masks, distance).map(|r| r * r),
+            submerged_radius_sq: submerged_cull_radius(eye, volumes, masks, distance, surface_offset).map(|r| r * r),
             depth: distance,
             masks,
             volumes: volumes.to_vec(),
@@ -83,7 +93,7 @@ mod tests {
         WaterVolume { minimum: [-10000.0, -65536.0, -10000.0], maximum: [10000.0, 0.0, 10000.0], mask_slot: None }
     }
     fn cull<'a>(eye: [f32; 3], volume: WaterVolume, masks: &'a OceanMasks, distance: f32) -> WaterCull<'a> {
-        WaterCull::new(eye, &[volume], masks, distance).unwrap()
+        WaterCull::new(eye, &[volume], masks, distance, 0.0).unwrap()
     }
     fn strip() -> (OceanMasks, WaterVolume) {
         let mut masks = OceanMasks::default();
@@ -99,8 +109,22 @@ mod tests {
     #[test]
     fn disabled_or_waterless_never_culls() {
         let masks = OceanMasks::default();
-        assert!(WaterCull::new([0.0; 3], &[sea()], &masks, 0.0).is_none());
-        assert!(WaterCull::new([0.0; 3], &[], &masks, 3600.0).is_none());
+        assert!(WaterCull::new([0.0; 3], &[sea()], &masks, 0.0, 0.0).is_none());
+        assert!(WaterCull::new([0.0; 3], &[], &masks, 3600.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn wave_offset_moves_the_waterline_with_the_real_surface() {
+        let masks = OceanMasks::default();
+        // Plane at 0, a crest of +60 over the eye: an eye at +30 is under water...
+        let in_crest = WaterCull::new([0.0, 30.0, 0.0], &[sea()], &masks, 2000.0, 60.0).unwrap();
+        assert!(in_crest.culls([2100.0, -50.0, 0.0], [2200.0, 50.0, 100.0]));
+        // ...and with a flat plane the same eye is above water and does not radial-cull.
+        let flat = WaterCull::new([0.0, 30.0, 0.0], &[sea()], &masks, 2000.0, 0.0).unwrap();
+        assert!(!flat.culls([2100.0, -50.0, 0.0], [2200.0, 50.0, 100.0]));
+        // A trough of -60: an eye at -30 is below the plane but in air.
+        assert!(submerged_cull_radius([0.0, -30.0, 0.0], &[sea()], &masks, 2000.0, -60.0).is_none());
+        assert!(submerged_cull_radius([0.0, -30.0, 0.0], &[sea()], &masks, 2000.0, 0.0).is_some());
     }
 
     #[test]

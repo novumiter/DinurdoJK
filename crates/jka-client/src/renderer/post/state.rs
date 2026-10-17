@@ -242,7 +242,9 @@ impl Renderer {
                 // independent. 0 disables ACES, 1 enables SDR ACES, and 3
                 // preserves highlights for the native display-output stage. HDR rendering is
                 // selected separately by scene_format().
-                tone_mapping: if self.hdr_output.is_some() { 3.0 } else { self.tone_mapping_strength },
+                tone_mapping: if self.hdr_output.is_some() { 3.0 } else {
+                    self.tone_mapping_strength.max(if self.native_atmosphere_active() && self.blue_water_environment.filmic { 1.0 } else { 0.0 })
+                },
                 bloom: if self.glow_mode.enabled() { 1.0 } else { 0.0 },
                 ssao: if self.ssao_enabled { 1.0 } else { 0.0 },
             },
@@ -253,7 +255,7 @@ impl Renderer {
                 taa: if self.taa_enabled { 1.0 } else if self.rt_taa_active() { 1.0 + self.rt_taa_mode as f32 } else { 0.0 },
             },
             taa_params: [
-                if self.hdr_enabled { 1.0 } else { 0.0 },
+                if self.hdr_enabled || self.native_atmosphere_active() || self.blue_water_environment.weather_backend == 1 { 1.0 } else { 0.0 },
                 if self.reflection_debug_enabled {
                     1.0
                 } else {
@@ -490,7 +492,10 @@ impl Renderer {
             // The optics only exist with the GPU ocean; a plain BSP water
             // shader gets no underwater treatment, so clouds are left alone.
             underwater: [
-                if self.ocean_enabled {
+                if self.ocean_enabled && self.camera_water_surface > NO_WATER_SURFACE {
+                    // Depth below the REAL surface over the eye (0 offset = flat plane).
+                    self.camera_water_surface + self.eye_wave_offset
+                } else if self.ocean_enabled {
                     self.camera_water_surface
                 } else {
                     NO_WATER_SURFACE

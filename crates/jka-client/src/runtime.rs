@@ -159,6 +159,7 @@ pub enum ScreenshotOutput {
 }
 
 pub enum UserEvent {
+    BlueWaterThunder(f32),
     /// Credential Manager enumeration completes on a separate thread; the main
     /// window must not wait for it to show its first interactive frame.
     SavedAccountsReady(Result<Vec<crate::credential_store::SavedAccount>, String>),

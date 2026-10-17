@@ -89,13 +89,13 @@ app_cvars! {
         }, implementations: []
     }
     APP_R_HYBRIDCAUSTICSMODE {
-        runtime: CvarDef::new("r_hybridCausticsMode", "3", "0..3",
-            "Hybrid only: 0 native every frame, 1 native on FFT update, 2 off, 3 Godot receiver.",
-            CvarType::Int { min: 0, max: 3 }, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_hybridCausticsMode", "3", "0..4",
+            "Hybrid: 0 native, 1 native FFT only, 2 off, 3 Godot wave curvature, 4 animated procedural.",
+            CvarType::Int { min: 0, max: 4 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.ocean_settings.hybrid_caustics_mode as i32),
             |app, value| { let CvarValue::Int(v) = value else { unreachable!() }; app.video.ocean_settings.hybrid_caustics_mode = v as u8; app.commit_ocean_settings(); Ok(()) }),
         config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_caustics_mode = v.min(3); } }),
+            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.hybrid_caustics_mode = v.min(4); } }),
             archive: Some((25203, |state| state.video.ocean_settings.hybrid_caustics_mode.to_string())),
             ..CvarBinding::NONE
         }, implementations: []
@@ -111,6 +111,20 @@ app_cvars! {
             archive: Some((25204, |state| state.video.ocean_settings.hybrid_underwater_mode.to_string())),
             ..CvarBinding::NONE
         }, implementations: []
+    }
+    APP_R_HYBRIDWATERLINEDEBUG {
+        runtime: CvarDef::new("r_hybridWaterlineDebug", "0", "0..3",
+            "Hybrid mode 4 debug: 0 off; 1 CPU/optics log; 2 color Godot mesh; 3 CAMERA-XZ GPU height gauge drawn 100u forward: yellow displaced wave, orange raw wave, magenta native eye probe, cyan flat, green/red eye tick. No GPU readback.",
+            CvarType::Int { min: 0, max: 3 }, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.video.ocean_settings.hybrid_waterline_debug)),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.hybrid_waterline_debug = v as u8;
+                app.commit_ocean_settings();
+                Ok(())
+            }),
+        config: CvarBinding::NONE,
+        implementations: []
     }
     APP_R_HYBRIDSSR {
         runtime: CvarDef::new("r_hybridSSR", "0", "0|1",
@@ -247,6 +261,48 @@ app_cvars! {
             archive: Some((25215, |state| u8::from(state.video.ocean_settings.hybrid_caustics_fast).to_string())),
             ..CvarBinding::NONE
         }, implementations: []
+    }
+    APP_R_HYBRIDPROCEDURALSCALE {
+        runtime: CvarDef::new("r_hybridProceduralScale", "1", "0.25..4",
+            "Hybrid animated caustic pattern density. Does not increase FFT or GPU generation cost.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.hybrid_procedural_scale.to_string()),
+            |app, value| App::cvar_set_hybrid_procedural_scale(app, APP_R_HYBRIDPROCEDURALSCALE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_hybrid_procedural_scale, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.hybrid_procedural_scale = v.clamp(0.25, 4.0); } }
+            }),
+            archive: Some((25217, |state| state.video.ocean_settings.hybrid_procedural_scale.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_hybrid_procedural_scale(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.hybrid_procedural_scale = Self::parse_cvar_finite(name, value)?.clamp(0.25, 4.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
+    }
+    APP_R_HYBRIDPROCEDURALSPEED {
+        runtime: CvarDef::new("r_hybridProceduralSpeed", "1", "0..3",
+            "Hybrid animated caustic evolution speed, modulated by ocean roughness.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.ocean_settings.hybrid_procedural_speed.to_string()),
+            |app, value| App::cvar_set_hybrid_procedural_speed(app, APP_R_HYBRIDPROCEDURALSPEED.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_hybrid_procedural_speed, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.hybrid_procedural_speed = v.clamp(0.0, 3.0); } }
+            }),
+            archive: Some((25218, |state| state.video.ocean_settings.hybrid_procedural_speed.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_hybrid_procedural_speed(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.ocean_settings.hybrid_procedural_speed = Self::parse_cvar_finite(name, value)?.clamp(0.0, 3.0);
+                self.commit_ocean_settings();
+                Ok(())
+            }
+        }]
     }
     APP_R_BLUEWATERBOUNDARY {
         runtime: CvarDef::new("r_blueWaterBoundaryMode", "3", "0..3",
@@ -664,6 +720,70 @@ app_cvars! {
             ..CvarBinding::NONE
         },
         implementations: []
+    }
+    APP_R_OCEANSURFACEPIXELS {
+        runtime: CvarDef::new("r_oceanSurfacePixels", "1", "0|1",
+            "Diagnostic A/B: 0 skips promoted ocean surface draws (Godot, native Blue Water, Hybrid and infinity); FFT, foam and mesh updates continue. 1 renders normally.",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.video.ocean_settings.surface_pixels),
+            |app, value| {
+                let CvarValue::Bool(enabled) = value else { unreachable!() };
+                if app.video.ocean_settings.surface_pixels != enabled {
+                    app.video.ocean_settings.surface_pixels = enabled;
+                    app.commit_ocean_settings();
+                }
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(enabled) = parse_bool(value) { settings.ocean_settings.surface_pixels = enabled; }
+            }),
+            archive: Some((25226, |state| (state.video.ocean_settings.surface_pixels as u8).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+    APP_R_OCEANSCREENLODPIXELS {
+        runtime: CvarDef::new("r_oceanScreenLodPixels", "0", "0..16",
+            "Native/Hybrid screen-space clipmap LOD: 0 off, otherwise projected cell-width threshold in pixels. Only prunes fine interior rings when far from the ocean; no per-tile decimation.",
+            CvarType::Float { min: 0.0, max: 16.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.screen_lod_pixels),
+            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
+                app.video.ocean_settings.screen_lod_pixels = v;
+                app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.screen_lod_pixels = v.clamp(0.0, 16.0); } } }),
+            archive: Some((25227, |state| state.video.ocean_settings.screen_lod_pixels.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_OCEANPIXELDETAIL {
+        runtime: CvarDef::new("r_oceanPixelDetail", "0", "0..5",
+            "Native/Hybrid DIAGNOSTIC: 0 full; 1 sparse 2x2; 2 sparse 4x4; 3 far 2x2; 4 far 4x4; 5 cheap color everywhere. This is NOT VRS/upscaling: other pixels use cheap material tint and have full-resolution depth.",
+            CvarType::Int { min: 0, max: 5 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.ocean_settings.pixel_detail_mode as i32),
+            |app, value| { let CvarValue::Int(v) = value else { unreachable!() };
+                app.video.ocean_settings.pixel_detail_mode = v as u8;
+                app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<u8>() { settings.ocean_settings.pixel_detail_mode = v.min(5); } }),
+            archive: Some((25228, |state| state.video.ocean_settings.pixel_detail_mode.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
+    }
+    APP_R_OCEANPIXELDISTANCE {
+        runtime: CvarDef::new("r_oceanPixelDistance", "100", "1..2000",
+            "Native/Hybrid metres from camera where sparse expensive-fragment shading begins in distance-aware modes.",
+            CvarType::Float { min: 1.0, max: 2000.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.video.ocean_settings.pixel_detail_distance),
+            |app, value| { let CvarValue::Float(v) = value else { unreachable!() };
+                app.video.ocean_settings.pixel_detail_distance = v;
+                app.commit_ocean_settings(); Ok(()) }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Ok(v) = value.parse::<f32>() { if v.is_finite() { settings.ocean_settings.pixel_detail_distance = v.clamp(1.0, 2000.0); } } }),
+            archive: Some((25229, |state| state.video.ocean_settings.pixel_detail_distance.to_string())),
+            ..CvarBinding::NONE
+        }, implementations: []
     }
     APP_R_OCEANBACKEND {
         runtime: CvarDef::new("r_oceanBackend", "0", "0|1",

@@ -9,6 +9,7 @@ use crate::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_weather(&mut self, ui: &mut egui::Ui) {
+        self.egui_native_weather(ui);
         theme::section(
             ui,
             "WIND",

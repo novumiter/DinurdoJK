@@ -3448,6 +3448,12 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     let uv = input.clip_position.xy / dims;
     let water_depth = dot(input.world_position - camera.camera_pos_time.xyz, camera.camera_forward.xyz);
     let undistorted_depth = textureLoad(ocean_scene_depth, vec2<i32>(input.clip_position.xy), 0).r;
+    // Ocean optics encodes no finite receiver (map sky, Blue Water sky/clouds)
+    // with the 1e6 linear-depth sentinel. In a submerged view this captured
+    // background must transmit through the water surface, not be replaced by
+    // an authored JKA water stage whose source texture happens to be opaque.
+    // Keep Fresnel/total-internal-reflection and optical absorption intact.
+    let sky_transmission_below = below && undistorted_depth >= 999999.0;
     let thickness = max(undistorted_depth - water_depth, 0.0);
     let edge = smoothstep(0.0, 0.06, min(min(uv.x, uv.y), min(1.0-uv.x, 1.0-uv.y)));
     let tilt = n - vec3<f32>(0.0, select(1.0, -1.0, below), 0.0);
@@ -3480,10 +3486,14 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     if (visual_mode > 0.5 && ocean.authored_plane.w > 0.5 && !below) {
         body_opacity = max(body_opacity, select(0.42, 0.72, visual_mode > 1.5));
     }
+    // Authored alphas describe the above-water material. They must not turn
+    // the sky into a solid water-colored ceiling when viewed from below.
+    if (sky_transmission_below) { body_opacity = 0.0; }
     var body_transmission = mix(transmission, surface_light, clamp(body_opacity, 0.0, 1.0));
     // Authored framebuffer blends are meaningful only over the authored
     // geometry. Extending them onto sky would simply reintroduce sky pixels.
-    let authored_blend = authored_water && material.ocean_waves.z > 0.0 && !opaque_body_test;
+    let authored_blend = authored_water && material.ocean_waves.z > 0.0
+        && !opaque_body_test && !sky_transmission_below;
     let factors = vec2<u32>(u32(max(material.ocean_waves.z-1.0,0.0)),u32(material.ocean_waves.w));
     var stage = vec4<f32>(0.0);
     if (authored_blend) {
@@ -4289,12 +4299,26 @@ fn promoted_glass(input: VertexOut, front: bool) -> vec4<f32> {
     return vec4<f32>(mix(vec3<f32>(0.65), material.ocean_color.rgb, 0.35), 0.08 + 0.55 * fresnel);
 }
 
+// Debug only. The vertex path has already applied the FFT, swell, coastal,
+// interaction, horizontal, distance and edge displacement; this is its actual
+// rasterized world-space position, interpolated across the visible triangle.
+// It does NOT claim to be a camera-XZ wave-height probe.
+fn hybrid_rendered_mesh_debug(input: VertexOut) -> vec4<f32> {
+    let delta = input.world_position.y - camera.camera_pos_time.y;
+    if (abs(delta) <= 8.0) { return vec4<f32>(1.0, 0.82, 0.02, 1.0); }
+    if (delta > 0.0) { return vec4<f32>(0.02, 0.92, 0.19, 1.0); }
+    return vec4<f32>(0.98, 0.08, 0.08, 1.0);
+}
+
 @fragment fn fs_main(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     if (ENABLE_SURFACE_DEFORMATION && surface_deformation_should_discard(
         input.world_position, material_flags_w(), input.world_normal, input.shell_kind, input.shell_coverage, input.clip_position.xy,
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
+    }
+    if (input.ocean_vertex >= 1.0 && ocean.appearance_b.w >= 8.0) {
+        return hybrid_rendered_mesh_debug(input);
     }
     if ((material_flags_w() & (1u << 17u)) != 0u) {
         return promoted_glass(input, front);
@@ -4312,6 +4336,9 @@ fn promoted_glass(input: VertexOut, front: bool) -> vec4<f32> {
         (!ENABLE_PLANAR_REFLECTIONS || camera.render_flags.x == 0u)
     )) {
         discard;
+    }
+    if (input.ocean_vertex >= 1.0 && ocean.appearance_b.w >= 8.0) {
+        return hybrid_rendered_mesh_debug(input);
     }
     if ((material_flags_w() & (1u << 17u)) != 0u) {
         return promoted_glass(input, front);

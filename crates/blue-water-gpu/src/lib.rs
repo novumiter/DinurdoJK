@@ -19,6 +19,7 @@ pub mod scene_copy;
 pub mod map_environment;
 pub mod underwater;
 pub mod caustics;
+pub mod rain_heights;
 #[path = "../../../vendor/blue-water-sea-and-sky/sky/src/environment.rs"]
 pub mod sky_environment;
 pub mod surface_waves;

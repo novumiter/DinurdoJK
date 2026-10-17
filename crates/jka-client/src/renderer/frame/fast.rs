@@ -265,6 +265,8 @@ impl Renderer {
                 sky_regions: [crate::ocean::optics::SkyFogRegion::default(); 8],
                 sky_info: [0.0; 4],
                 caustic_tuning: [1.0, 1.0, 0.0, 0.0],
+                procedural_params: [0.0; 4],
+                eye_wave: [0.0; 4],
             };
             self.queue.write_buffer(&self.ocean_optics.uniform, 0, bytemuck::bytes_of(&optics));
         }

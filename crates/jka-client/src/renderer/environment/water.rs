@@ -110,6 +110,7 @@ impl Renderer {
                 &self.water_boxes,
                 world.ocean_masks.as_ref(),
                 self.ocean_settings.underwater_cull_distance(),
+                self.eye_wave_offset,
             )
         });
         let overrides = &self.promoted_ocean_overrides;

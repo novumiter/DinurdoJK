@@ -115,14 +115,15 @@ pub fn surface_module(
     composer: &mut Composer,
     point_lights: bool,
 ) -> Result<wgpu::naga::Module, Box<ComposerError>> {
-    compose_surface(composer, point_lights, false, 16)
+    compose_surface(composer, point_lights, false, 16, 0)
 }
 
 pub fn jka_surface_module(
     composer: &mut Composer,
     reflection_steps: u32,
+    pixel_detail_mode: u8,
 ) -> Result<wgpu::naga::Module, Box<ComposerError>> {
-    compose_surface(composer, false, true, reflection_steps.clamp(4, 32))
+    compose_surface(composer, false, true, reflection_steps.clamp(4, 32), pixel_detail_mode.min(5))
 }
 
 /// Original underwater passes with only the JKA pool-admission/path cap added.
@@ -168,11 +169,26 @@ pub fn underwater_module(composer: &mut Composer, pass: &str) -> Result<wgpu::na
     }).map_err(Box::new)
 }
 
+/// Debug-only native wave-height marker. The probe uses the *same* native
+/// displacement and wake helpers as the visible Blue Water vertex shader.
+/// This shader is compiled only on explicit request, not during map load.
+pub fn jka_waterline_marker_module(composer: &mut Composer) -> Result<wgpu::naga::Module, Box<ComposerError>> {
+    let source = format!("{}\n{}", include_str!("waterline_marker.wgsl"), include_str!("surface_boundary.wgsl"));
+    composer.make_naga_module(NagaModuleDescriptor {
+        source: &source,
+        file_path: "JKA native wave line diagnostic",
+        shader_type: ShaderType::Wgsl,
+        shader_defs: [("CASCADES".to_owned(), ShaderDefValue::UInt(3))].into_iter().collect(),
+        ..Default::default()
+    }).map_err(Box::new)
+}
+
 fn compose_surface(
     composer: &mut Composer,
     point_lights: bool,
     jka_boundary: bool,
     reflection_steps: u32,
+    pixel_detail_mode: u8,
 ) -> Result<wgpu::naga::Module, Box<ComposerError>> {
     let mut shader_defs = vec![
         ("CASCADES".to_owned(), ShaderDefValue::UInt(3)),
@@ -212,8 +228,50 @@ fn compose_surface(
         assert_eq!(original.matches(underside).count(), 1, "upstream underside contract changed");
         let original = original.replace(underside, &format!("{underside}\n        let window_ray = refract(-view, -up, 1.333);\n        let window_scene = jka_refracted_scene(input.world, -view, -up, 1.333, 100.0, false);\n        if window_scene.a >= 0.0 {{\n            color += (window_scene.rgb - sky_reflection(window_ray, 0.0)) * WINDOW_GAIN * (1.0 - water_fresnel(max(dot(window_ray, up), 0.0)));\n        }}"));
 
-        format!("{}\n{}", original.replace(entry, &format!(
-            "{entry}\n    if !jka_water_contains(input.grid) {{ discard; }}")),
+        let fog = "var color = apply_fog(above, input.world);";
+        assert_eq!(original.matches(fog).count(), 1, "upstream surface fog contract changed");
+        let original = original.replace(fog, "var color = jka_surface_legacy_fog(apply_fog(above, input.world), input.world);");
+        let original = format!("{original}\n{}", include_str!("surface_fog.wgsl"));
+        // Diagnostic variants isolate expensive native fragment work without
+        // changing full-resolution water coverage, depth or wave displacement.
+        // The cheap fragments are approximations, NOT reconstructed 2x2/4x4
+        // shading / hardware VRS. Preserve the unmodified shader at mode 0.
+        let sparse = r#"
+    // Sparse shading is intentionally non-uniform: derivatives used by the
+    // original material are undefined across mixed cheap/full pixel quads.
+    // These are performance experiments, not production quality modes.
+    let jka_distance = distance(input.world, camera.position.xyz);
+    let far_only = JKA_PIXEL_MODE == 3u || JKA_PIXEL_MODE == 4u;
+    if (!far_only || jka_distance >= jka_boundary.scale.w) {
+        var period = 2u;
+        if (JKA_PIXEL_MODE == 2u || JKA_PIXEL_MODE == 4u) { period = 4u; }
+        let cell = vec2<u32>(floor(input.clip.xy));
+        if (JKA_PIXEL_MODE == 5u || (cell.x % period != 0u || cell.y % period != 0u)) {
+            let scene = textureLoad(scene_color, vec2<i32>(cell), 0).rgb;
+            let cheap = mix(scene, surface.transmission.rgb, 0.55);
+            return vec4<f32>(cheap, 1.0);
+        }
+    }
+"#;
+        let entry_replacement = if pixel_detail_mode == 0 {
+            format!("{entry}\n    if !jka_water_contains(input.grid) {{ discard; }}")
+        } else {
+            format!(
+                "{entry}\n    if !jka_water_contains(input.grid) {{ discard; }}\n{}",
+                sparse.replace("JKA_PIXEL_MODE", &format!("{}u", pixel_detail_mode)),
+            )
+        };
+        let core = original.replace(entry, &entry_replacement);
+        // Preserve new worktree's fog and underwater modifications. The
+        // divergent early return otherwise violates WGSL derivative-uniformity
+        // analysis in the full branch. This waiver is test-only; do not use
+        // these modes as faithful water shading or claim native VRS.
+        let core = if pixel_detail_mode == 0 {
+            core
+        } else {
+            format!("diagnostic(off, derivative_uniformity);\n{core}")
+        };
+        format!("{}\n{}", core,
             format!("{}\n{}", include_str!("surface_boundary.wgsl"), include_str!("surface_refraction.wgsl")))
     } else {
         original.to_owned()
@@ -246,6 +304,23 @@ mod tests {
             )
             .validate(&module)
             .expect("preserved Blue Water surface validates");
+        }
+    }
+
+    #[test]
+    fn jka_sparse_pixel_modes_validate() {
+        // The JKA surface differs from the preserved upstream shader:
+        // validate its unchanged mode and every specialized cheap mode.
+        for mode in 0..=5 {
+            let mut composer = composer().expect("upstream modules");
+            let module = jka_surface_module(&mut composer, 16, mode)
+                .unwrap_or_else(|error| panic!("mode {mode}: {}", error.emit_to_string(&composer)));
+            wgpu::naga::valid::Validator::new(
+                wgpu::naga::valid::ValidationFlags::all(),
+                wgpu::naga::valid::Capabilities::default(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|error| panic!("mode {mode} invalid: {error}"));
         }
     }
 

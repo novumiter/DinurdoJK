@@ -2,6 +2,175 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_BLUESKYALTITUDE {
+        runtime:CvarDef::new("r_blueSkyAltitude","","20.0..15000.0","Cloud base (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.altitude.to_string()),|app,value|App::cvar_set_bluesky_altitude(app,APP_R_BLUESKYALTITUDE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_altitude,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.altitude=v.clamp(20.0, 15000.0) as f32;}}}),archive:Some((27300,|state|state.video.blue_water_environment.altitude.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_altitude(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.altitude=App::parse_cvar_finite(name,value)?.clamp(20.0,15000.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYTHICKNESS {
+        runtime:CvarDef::new("r_blueSkyThickness","","50.0..12000.0","Cloud thickness (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.thickness.to_string()),|app,value|App::cvar_set_bluesky_thickness(app,APP_R_BLUESKYTHICKNESS.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_thickness,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.thickness=v.clamp(50.0, 12000.0) as f32;}}}),archive:Some((27301,|state|state.video.blue_water_environment.thickness.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_thickness(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.thickness=App::parse_cvar_finite(name,value)?.clamp(50.0,12000.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYHORIZON {
+        runtime:CvarDef::new("r_blueSkyHorizon","","0.0..1.0","Horizon coverage",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.horizon.to_string()),|app,value|App::cvar_set_bluesky_horizon(app,APP_R_BLUESKYHORIZON.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_horizon,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.horizon=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27302,|state|state.video.blue_water_environment.horizon.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_horizon(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.horizon=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYAMBIENT {
+        runtime:CvarDef::new("r_blueSkyAmbient","","0.0..3.0","Cloud ambient light",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.ambient.to_string()),|app,value|App::cvar_set_bluesky_ambient(app,APP_R_BLUESKYAMBIENT.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_ambient,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.ambient=v.clamp(0.0, 3.0) as f32;}}}),archive:Some((27303,|state|state.video.blue_water_environment.ambient.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_ambient(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.ambient=App::parse_cvar_finite(name,value)?.clamp(0.0,3.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYBASESHADOW {
+        runtime:CvarDef::new("r_blueSkyBaseShadow","","0.0..1.0","Cloud base shadow",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.base_shadow.to_string()),|app,value|App::cvar_set_bluesky_base_shadow(app,APP_R_BLUESKYBASESHADOW.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_base_shadow,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.base_shadow=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27304,|state|state.video.blue_water_environment.base_shadow.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_base_shadow(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.base_shadow=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYHIGHAMOUNT {
+        runtime:CvarDef::new("r_blueSkyHighAmount","","0.0..1.0","High cloud amount",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.high_amount.to_string()),|app,value|App::cvar_set_bluesky_high_amount(app,APP_R_BLUESKYHIGHAMOUNT.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_high_amount,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.high_amount=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27305,|state|state.video.blue_water_environment.high_amount.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_high_amount(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.high_amount=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYHIGHALTITUDE {
+        runtime:CvarDef::new("r_blueSkyHighAltitude","","2000.0..20000.0","High cloud altitude (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.high_altitude.to_string()),|app,value|App::cvar_set_bluesky_high_altitude(app,APP_R_BLUESKYHIGHALTITUDE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_high_altitude,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.high_altitude=v.clamp(2000.0, 20000.0) as f32;}}}),archive:Some((27306,|state|state.video.blue_water_environment.high_altitude.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_high_altitude(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.high_altitude=App::parse_cvar_finite(name,value)?.clamp(2000.0,20000.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMOONPHASE {
+        runtime:CvarDef::new("r_blueSkyMoonPhase","","0.0..1.0","Moon phase",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.moon_phase.to_string()),|app,value|App::cvar_set_bluesky_moon_phase(app,APP_R_BLUESKYMOONPHASE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_phase,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.moon_phase=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27307,|state|state.video.blue_water_environment.moon_phase.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_moon_phase(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_phase=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMOONELEVATION {
+        runtime:CvarDef::new("r_blueSkyMoonElevation","","-90.0..90.0","Moon elevation",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.moon_elevation.to_string()),|app,value|App::cvar_set_bluesky_moon_elevation(app,APP_R_BLUESKYMOONELEVATION.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_elevation,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.moon_elevation=v.clamp(-90.0, 90.0) as f32;}}}),archive:Some((27308,|state|state.video.blue_water_environment.moon_elevation.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_moon_elevation(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_elevation=App::parse_cvar_finite(name,value)?.clamp(-90.0,90.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMOONAZIMUTH {
+        runtime:CvarDef::new("r_blueSkyMoonAzimuth","","0.0..360.0","Moon azimuth",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.moon_azimuth.to_string()),|app,value|App::cvar_set_bluesky_moon_azimuth(app,APP_R_BLUESKYMOONAZIMUTH.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_azimuth,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.moon_azimuth=v.clamp(0.0, 360.0) as f32;}}}),archive:Some((27309,|state|state.video.blue_water_environment.moon_azimuth.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_moon_azimuth(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_azimuth=App::parse_cvar_finite(name,value)?.clamp(0.0,360.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYRAYLEIGH {
+        runtime:CvarDef::new("r_blueSkyRayleigh","","0.0..1.5","Rayleigh / blue scattering",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.rayleigh.to_string()),|app,value|App::cvar_set_bluesky_rayleigh(app,APP_R_BLUESKYRAYLEIGH.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_rayleigh,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.rayleigh=v.clamp(0.0, 1.5) as f32;}}}),archive:Some((27310,|state|state.video.blue_water_environment.rayleigh.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_rayleigh(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.rayleigh=App::parse_cvar_finite(name,value)?.clamp(0.0,1.5) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYTURBIDITY {
+        runtime:CvarDef::new("r_blueSkyTurbidity","","1.0..10.0","Atmospheric turbidity",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.turbidity.to_string()),|app,value|App::cvar_set_bluesky_turbidity(app,APP_R_BLUESKYTURBIDITY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_turbidity,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.turbidity=v.clamp(1.0, 10.0) as f32;}}}),archive:Some((27311,|state|state.video.blue_water_environment.turbidity.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_turbidity(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.turbidity=App::parse_cvar_finite(name,value)?.clamp(1.0,10.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMIE {
+        runtime:CvarDef::new("r_blueSkyMie","","0.0..2.0","Mie / sun aureole",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.mie.to_string()),|app,value|App::cvar_set_bluesky_mie(app,APP_R_BLUESKYMIE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_mie,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.mie=v.clamp(0.0, 2.0) as f32;}}}),archive:Some((27312,|state|state.video.blue_water_environment.mie.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_mie(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.mie=App::parse_cvar_finite(name,value)?.clamp(0.0,2.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMIEG {
+        runtime:CvarDef::new("r_blueSkyMieG","","0.0..0.95","Mie directionality",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.mie_g.to_string()),|app,value|App::cvar_set_bluesky_mie_g(app,APP_R_BLUESKYMIEG.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_mie_g,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.mie_g=v.clamp(0.0, 0.95) as f32;}}}),archive:Some((27313,|state|state.video.blue_water_environment.mie_g.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_mie_g(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.mie_g=App::parse_cvar_finite(name,value)?.clamp(0.0,0.95) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMULTIPLE {
+        runtime:CvarDef::new("r_blueSkyMultiple","","0.0..3.0","Multiple scattering",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.multiple.to_string()),|app,value|App::cvar_set_bluesky_multiple(app,APP_R_BLUESKYMULTIPLE.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_multiple,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.multiple=v.clamp(0.0, 3.0) as f32;}}}),archive:Some((27314,|state|state.video.blue_water_environment.multiple.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_multiple(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.multiple=App::parse_cvar_finite(name,value)?.clamp(0.0,3.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYRAIN {
+        runtime:CvarDef::new("r_blueSkyRain","","0.0..1.0","Native rainfall",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.rain.to_string()),|app,value|App::cvar_set_bluesky_rain(app,APP_R_BLUESKYRAIN.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_rain,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.rain=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27315,|state|state.video.blue_water_environment.rain.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_rain(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.rain=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYRAINSPEED {
+        runtime:CvarDef::new("r_blueSkyRainSpeed","","0.25..4.0","Native rain fall speed multiplier",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.rain_speed.to_string()),|app,value|App::cvar_set_bluesky_rain_speed(app,APP_R_BLUESKYRAINSPEED.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_rain_speed,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.rain_speed=v.clamp(0.25,4.0);}}}),archive:Some((27325,|state|state.video.blue_water_environment.rain_speed.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_rain_speed(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.rain_speed=App::parse_cvar_finite(name,value)?.clamp(0.25,4.0); app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYLIGHTNING {
+        runtime:CvarDef::new("r_blueSkyLightning","","0.0..30.0","Lightning strikes / minute",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.lightning.to_string()),|app,value|App::cvar_set_bluesky_lightning(app,APP_R_BLUESKYLIGHTNING.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_lightning,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.lightning=v.clamp(0.0, 30.0) as f32;}}}),archive:Some((27316,|state|state.video.blue_water_environment.lightning.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_lightning(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.lightning=App::parse_cvar_finite(name,value)?.clamp(0.0,30.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYFOG {
+        runtime:CvarDef::new("r_blueSkyFog","","0.0..1.0","Sea fog banks",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.fog.to_string()),|app,value|App::cvar_set_bluesky_fog(app,APP_R_BLUESKYFOG.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_fog,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.fog=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27317,|state|state.video.blue_water_environment.fog.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_fog(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.fog=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYVISIBILITY {
+        runtime:CvarDef::new("r_blueSkyVisibility","","200.0..100000.0","Haze visibility (m)",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.visibility.to_string()),|app,value|App::cvar_set_bluesky_visibility(app,APP_R_BLUESKYVISIBILITY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_visibility,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.visibility=v.clamp(200.0, 100000.0) as f32;}}}),archive:Some((27318,|state|state.video.blue_water_environment.visibility.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_visibility(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.visibility=App::parse_cvar_finite(name,value)?.clamp(200.0,100000.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYQUALITY {
+        runtime:CvarDef::new("r_blueSkyQuality","","0..3","Native quality",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.quality.to_string()),|app,value|App::cvar_set_bluesky_quality(app,APP_R_BLUESKYQUALITY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_quality,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.quality=v.clamp(0.0, 3.0) as u8;}}}),archive:Some((27319,|state|state.video.blue_water_environment.quality.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_quality(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.quality=App::parse_cvar_finite(name,value)?.clamp(0.0,3.0) as u8; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYGENUS {
+        runtime:CvarDef::new("r_blueSkyGenus","","0..7","Native cloud type",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.genus.to_string()),|app,value|App::cvar_set_bluesky_genus(app,APP_R_BLUESKYGENUS.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_genus,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.genus=v.clamp(0.0, 7.0) as u8;}}}),archive:Some((27320,|state|state.video.blue_water_environment.genus.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_genus(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.genus=App::parse_cvar_finite(name,value)?.clamp(0.0,7.0) as u8; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYHIGHGENUS {
+        runtime:CvarDef::new("r_blueSkyHighGenus","","0..3","High clouds",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.high_genus.to_string()),|app,value|App::cvar_set_bluesky_high_genus(app,APP_R_BLUESKYHIGHGENUS.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_high_genus,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.high_genus=v.clamp(0.0, 3.0) as u8;}}}),archive:Some((27321,|state|state.video.blue_water_environment.high_genus.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_high_genus(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.high_genus=App::parse_cvar_finite(name,value)?.clamp(0.0,3.0) as u8; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYWEATHERBACKEND {
+        runtime:CvarDef::new("r_blueSkyWeatherBackend","","0..2","Weather renderer",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.weather_backend.to_string()),|app,value|App::cvar_set_bluesky_weather_backend(app,APP_R_BLUESKYWEATHERBACKEND.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_weather_backend,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.weather_backend=v.clamp(0.0, 2.0) as u8;}}}),archive:Some((27322,|state|state.video.blue_water_environment.weather_backend.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_weather_backend(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.weather_backend=App::parse_cvar_finite(name,value)?.clamp(0.0,2.0) as u8; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYMOONCUSTOM {
+        runtime:CvarDef::new("r_blueSkyMoonCustom","","0..1","Manual moon position",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.moon_custom.to_string()),|app,value|App::cvar_set_bluesky_moon_custom(app,APP_R_BLUESKYMOONCUSTOM.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_moon_custom,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.moon_custom=parse_bool(value).unwrap_or(settings.blue_water_environment.moon_custom);}),archive:Some((27323,|state|state.video.blue_water_environment.moon_custom.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_moon_custom(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.moon_custom=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYWORLDLIGHTING {
+        runtime:CvarDef::new("r_blueSkyWorldLighting","","0..1","Sky world lighting",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.world_lighting.to_string()),|app,value|App::cvar_set_bluesky_world_lighting(app,APP_R_BLUESKYWORLDLIGHTING.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_world_lighting,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.world_lighting=parse_bool(value).unwrap_or(settings.blue_water_environment.world_lighting);}),archive:Some((27324,|state|state.video.blue_water_environment.world_lighting.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_world_lighting(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.world_lighting=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYSTRIKEPREVIEW {
+        runtime:CvarDef::new("r_blueSkyStrikePreview","0","0|1","Hold a branched ground strike in front of the camera for inspection",CvarType::String,CvarFlags::NONE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.strike_preview.to_string()),|app,value|App::cvar_set_bluesky_strike_preview(app,APP_R_BLUESKYSTRIKEPREVIEW.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_strike_preview,None),
+        config:CvarBinding::NONE,
+        implementations:[impl App {fn cvar_set_bluesky_strike_preview(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.strike_preview=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.publish_ui();Ok(())}}]
+    }
+    APP_R_BLUESKYFILMIC {
+        runtime:CvarDef::new("r_blueSkyFilmic","1","0|1","Native atmosphere highlight mapping for sky and lightning",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+            |app:&App|CvarValue::String(app.video.blue_water_environment.filmic.to_string()),|app,value|App::cvar_set_bluesky_filmic(app,APP_R_BLUESKYFILMIC.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_filmic,None),
+        config:CvarBinding {load_video:Some(|settings,_name,value,_context| {settings.blue_water_environment.filmic=parse_bool(value).unwrap_or(settings.blue_water_environment.filmic);}),archive:Some((27326,|state|state.video.blue_water_environment.filmic.to_string())),..CvarBinding::NONE},
+        implementations:[impl App {fn cvar_set_bluesky_filmic(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.filmic=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
+    }
+
     APP_R_SKYBACKEND {
         runtime: CvarDef::new("r_skyBackend", "0", "0|1",
             "0 authored JKA sky; 1 original Blue Water atmosphere, celestial bodies and environment lighting.",

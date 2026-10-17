@@ -8,6 +8,7 @@ pub fn linear_color(rgb: [f32; 3]) -> [f32; 3] {
 }
 
 mod cull;
+mod procedural;
 pub use cull::{submerged_cull_radius, WaterCull};
 
 /// Absorption distances of water before culling may remove anything. Blue light
@@ -111,6 +112,11 @@ pub struct Uniform {
     /// Caustics: spatial density, focus gain, optional 3-tap derivative,
     /// camera-to-receiver distance limit in JKA units (0 = unlimited).
     pub caustic_tuning: [f32; 4],
+    /// Procedural caustics: time (seconds), density, wave-responsive speed, chop response (0 = disabled).
+    pub procedural_params: [f32; 4],
+    /// Hybrid wave optics: x = correction added to the shader's two-cascade wave
+    /// height near the eye (JKA units), y = 1 when the CPU probe is valid.
+    pub eye_wave: [f32; 4],
 }
 
 pub fn layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -129,7 +135,13 @@ fn make_layout(device: &wgpu::Device, capture: bool, msaa: bool) -> wgpu::BindGr
         entry(2, wgpu::BindingType::Texture { sample_type: if capture { wgpu::TextureSampleType::Depth } else { wgpu::TextureSampleType::Float { filterable: false } }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: capture && msaa }),
         entry(3, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
     ];
-    if !capture {
+    if capture {
+        entries.push(entry(4, wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false,
+        }));
+        entries.push(entry(5, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)));
+    } else {
         entries.push(entry(4, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }));
         for binding in [5, 6, 7] {
             entries.push(entry(binding, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }));
@@ -163,11 +175,14 @@ pub struct Resources {
     sampler: wgpu::Sampler,
     depth: wgpu::TextureView,
     pub water_distance: wgpu::TextureView,
+    procedural: procedural::Pattern,
     water_distance_capture: wgpu::RenderPipeline,
     distance_params: wgpu::Buffer,
     distance_group: wgpu::BindGroup,
     capture: wgpu::RenderPipeline,
     capture_receiver: wgpu::RenderPipeline,
+    // Lazily specialized: non-Hybrid shaders compile the wave path OUT.
+    hybrid_capture: Option<(wgpu::RenderPipeline, wgpu::RenderPipeline)>,
     blit: wgpu::RenderPipeline,
 }
 impl Resources {
@@ -208,7 +223,7 @@ impl Resources {
             contents: bytemuck::bytes_of(&crate::glass::settings().uniform([0.1; 3])),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let bind_group = bind(device, output_layout, &color, &depth, &sampler, &uniform, Some((&glass_uniform, &edges.field, &edges.mask, &background)));
+        let bind_group = bind(device, output_layout, &color, &depth, &sampler, &uniform, Some((&glass_uniform, &edges.field, &edges.mask, &background)), None);
         let capture_layout = make_layout(device, true, samples > 1);
         let capture_source = shader_source(samples > 1);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -288,8 +303,9 @@ impl Resources {
         }
         Self { key, bind_group, uniform, glass_uniform, edges, capture_color, receiver_color, background,
             background_ready: false, color, background_capture, blur_first, blur_next, blur_groups,
-            blur_layout, blur_inputs, blur_outputs, capture_layout, sampler, depth, capture, capture_receiver, blit,
-            water_distance, water_distance_capture, distance_params, distance_group }
+            blur_layout, blur_inputs, blur_outputs, capture_layout, sampler, depth, capture, capture_receiver, hybrid_capture: None, blit,
+            water_distance, water_distance_capture, distance_params, distance_group,
+            procedural: procedural::Pattern::new(device) }
     }
 
     /// Disabled recovery keeps only a 1x1 binding placeholder. Toggle allocation
@@ -300,7 +316,7 @@ impl Resources {
             else { background_target(device, 1, 1) };
         self.background_ready = enabled;
         self.bind_group = bind(device, output_layout, &self.color, &self.depth, &self.sampler,
-            &self.uniform, Some((&self.glass_uniform, &self.edges.field, &self.edges.mask, &self.background)));
+            &self.uniform, Some((&self.glass_uniform, &self.edges.field, &self.edges.mask, &self.background)), None);
         self.blur_groups = self.blur_inputs.iter().map(|input| device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Glass Gaussian pyramid recovery bindings"), layout: &self.blur_layout, entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) },
@@ -317,7 +333,8 @@ impl Resources {
     /// still comes from the later full capture; only foreground holes use this.
     pub fn capture_background(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup) {
-        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None);
+        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None,
+            Some((&self.procedural.view, &self.procedural.sampler)));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Glass background before opaque models"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -339,13 +356,35 @@ impl Resources {
     pub fn capture(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
         scissor: Option<(u32, u32, u32, u32)>) {
-        self.capture_with_receiver(device, encoder, scene, depth, ocean, scissor, false);
+        self.capture_with_receiver(device, encoder, scene, depth, ocean, scissor, false, false);
+    }
+
+    /// Only Hybrid mode 4 compiles this shader. Non-Hybrid capture retains its
+    /// exact original pipelines, with no wave sampling or shader-cache churn.
+    pub fn ensure_hybrid_wave_capture(&mut self, device: &wgpu::Device,
+        ocean_layout: &wgpu::BindGroupLayout) {
+        if self.hybrid_capture.is_some() { return; }
+        let source = shader_source(self.key.2 > 1).replace(
+            "const JKA_HYBRID_WAVE: bool = false;",
+            "const JKA_HYBRID_WAVE: bool = true;");
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("JKA Hybrid wave-aware optics"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let color = wgpu::TextureFormat::Rgba16Float;
+        let depth = wgpu::TextureFormat::R32Float;
+        self.hybrid_capture = Some((
+            pipeline(device, &shader, &[&self.capture_layout, ocean_layout],
+                "fs_capture", &[color, depth], 1),
+            pipeline(device, &shader, &[&self.capture_layout, ocean_layout],
+                "fs_capture_receiver", &[color, depth, color], 1),
+        ));
     }
 
     pub fn capture_with_receiver(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup,
-        scissor: Option<(u32, u32, u32, u32)>, receiver: bool) {
-        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None);
+        scissor: Option<(u32, u32, u32, u32)>, receiver: bool, hybrid_wave: bool) {
+        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None,
+            Some((&self.procedural.view, &self.procedural.sampler)));
         let views: &[_] = if receiver { &[&self.capture_color, &self.depth, &self.receiver_color] }
             else { &[&self.capture_color, &self.depth] };
         let attachments: Vec<_> = views.iter().map(|view| Some(wgpu::RenderPassColorAttachment {
@@ -355,7 +394,12 @@ impl Resources {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Ocean optical capture"), color_attachments: &attachments, ..Default::default()
         });
-        pass.set_pipeline(if receiver { &self.capture_receiver } else { &self.capture });
+        pass.set_pipeline(match (hybrid_wave, receiver) {
+            (true, true) => &self.hybrid_capture.as_ref().expect("hybrid wave pipeline").1,
+            (true, false) => &self.hybrid_capture.as_ref().expect("hybrid wave pipeline").0,
+            (false, true) => &self.capture_receiver,
+            (false, false) => &self.capture,
+        });
         pass.set_bind_group(0, &input, &[]);
         pass.set_bind_group(1, ocean, &[]);
         if let Some((x, y, width, height)) = scissor {
@@ -366,6 +410,12 @@ impl Resources {
         }
         pass.draw(0..3, 0..1);
     }
+    /// Only generates on first use of Hybrid animated caustics. There is no
+    /// per-frame compute dispatch even when the animation runs at high FPS.
+    pub fn ensure_procedural_pattern(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+        self.procedural.ensure_generated(device, encoder);
+    }
+
     pub fn blur(&self, encoder: &mut wgpu::CommandEncoder) {
         for (index, (group, output)) in self.blur_groups.iter().zip(&self.blur_outputs).enumerate() {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -385,7 +435,8 @@ impl Resources {
     pub fn capture_water_distance(&self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView, ocean: &wgpu::BindGroup, envelope: [f32; 4]) {
         queue.write_buffer(&self.distance_params, 0, bytemuck::bytes_of(&envelope));
-        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None);
+        let input = bind(device, &self.capture_layout, scene, depth, &self.sampler, &self.uniform, None,
+            Some((&self.procedural.view, &self.procedural.sampler)));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blue Water JKA bounded underwater path"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -422,7 +473,9 @@ fn background_target(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
     }).create_view(&Default::default())
 }
 fn bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, color: &wgpu::TextureView,
-    depth: &wgpu::TextureView, sampler: &wgpu::Sampler, uniform: &wgpu::Buffer, glass: Option<(&wgpu::Buffer, &wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView)>) -> wgpu::BindGroup {
+    depth: &wgpu::TextureView, sampler: &wgpu::Sampler, uniform: &wgpu::Buffer,
+    glass: Option<(&wgpu::Buffer, &wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView)>,
+    procedural: Option<(&wgpu::TextureView, &wgpu::Sampler)>) -> wgpu::BindGroup {
     let mut entries = vec![
         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(color) },
         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
@@ -434,6 +487,10 @@ fn bind(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, color: &wgpu::Tex
         entries.push(wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(field) });
         entries.push(wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(mask) });
         entries.push(wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(background) });
+    }
+    if let Some((view, sampler)) = procedural {
+        entries.push(wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(view) });
+        entries.push(wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) });
     }
     device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("Ocean optics bindings"), layout,
         entries: &entries,
@@ -525,13 +582,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hybrid_wave_optics_shaders_validate() {
+        // The Hybrid specialization samples Blue Water's adapter displacement
+        // with no additional binding layout. Validate both MSAA variants.
+        for msaa in [false, true] {
+            let source = shader_source(msaa).replace(
+                "const JKA_HYBRID_WAVE: bool = false;",
+                "const JKA_HYBRID_WAVE: bool = true;");
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+            naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                .validate(&module).unwrap_or_else(|error| panic!("{}", error.emit_to_string(&source)));
+        }
+    }
+
+    #[test]
     fn optics_shaders_validate() {
         for source in [shader_source(false), shader_source(true), include_str!("../ocean_composite.wgsl").to_owned()] {
             let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
                 .validate(&module).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
         }
-        assert_eq!(std::mem::size_of::<Uniform>(), 2704);
+        assert_eq!(std::mem::size_of::<Uniform>(), 2720);
+        let procedural = include_str!("optics/procedural.wgsl");
+        let module = naga::front::wgsl::parse_str(procedural).unwrap_or_else(|e| panic!("{}", e.emit_to_string(procedural)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+            .validate(&module).unwrap_or_else(|e| panic!("{}", e.emit_to_string(procedural)));
     }
 
     #[test]
@@ -618,7 +694,7 @@ mod tests {
                         });
                     }
                     let capture_color = if samples == 1 { &color_view } else { &msaa_view };
-                    resources.capture_with_receiver(&device, &mut encoder, capture_color, &depth_view, &ocean, None, true);
+                    resources.capture_with_receiver(&device, &mut encoder, capture_color, &depth_view, &ocean, None, true, false);
                     resources.capture_water_distance(&device, &queue, &mut encoder, capture_color, &depth_view, &ocean, [top, crest, 0.0, 0.0]);
                     resources.composite(&mut encoder, output, resolve);
                     let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 256*8,

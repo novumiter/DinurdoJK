@@ -38,15 +38,9 @@ impl App {
                 self.set_cloud_coverage(v);
             }
         });
-        if self.video.cloud_backend == 1 {
-            theme::banner(
-                ui,
-                "Blue Water uses its North Atlantic weather preset. Coverage and Weather > Wind feed it; cloud type, height, thickness, quality and raymarch tuning below currently affect JKA clouds only.",
-                theme::TEXT_DIM,
-            );
-        }
+        if self.video.cloud_backend == 1 { self.egui_native_clouds(ui); }
 
-        ui.add_enabled_ui(self.video.clouds, |ui| {
+        ui.add_enabled_ui(self.video.clouds && self.video.cloud_backend == 0, |ui| {
             const TYPES: [(CloudType, &str); 3] = [
                 (CloudType::Cumulus, "Cumulus"),
                 (CloudType::Stratus, "Stratus"),

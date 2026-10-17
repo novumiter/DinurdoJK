@@ -149,6 +149,7 @@ impl Renderer {
             self.cloud_history_valid = false;
         }
         self.sky_backend = effects.sky_backend.min(1);
+        self.blue_water_environment = effects.blue_water_environment.sanitize();
         self.cloud_backend = effects.cloud_backend.min(1);
         self.clouds_enabled = effects.clouds;
         self.cloud_type = effects.cloud_type;
@@ -205,7 +206,10 @@ impl Renderer {
         self.cloud_history_depth_reject = effects.cloud_history_depth_reject;
         self.cloud_thickness_variation = effects.cloud_thickness_variation;
         self.cloud_size = effects.cloud_size;
-        self.weather.rain.enabled = effects.rain;
+        self.weather.rain.enabled = effects.rain && self.blue_water_environment.weather_backend == 0;
+        self.weather.rain.native_precipitation=match self.blue_water_environment.weather_backend {
+            1=>Some(self.blue_water_environment.rain),2=>Some(0.0),_=>None,
+        };
         self.weather.rain.glass_enabled = effects.rain_glass;
         self.weather.rain.intensity = effects.rain_intensity;
         self.weather.rain.density_scale = if effects.rain_density_scale.is_finite() {
@@ -216,7 +220,7 @@ impl Renderer {
         self.weather.rain.tint = effects.rain_tint.map(|channel| channel.clamp(0.0, 1.0));
         self.weather.rain.acid_strength = effects.legacy_acid_rain.clamp(0.0, 1.0);
         self.weather.rain.frozen = effects.rain_frozen;
-        self.weather.snow.enabled = effects.snow;
+        self.weather.snow.enabled = effects.snow && self.blue_water_environment.weather_backend == 0;
         self.weather.snow.density_scale = if effects.snow_density_scale.is_finite() {
             effects.snow_density_scale.clamp(0.0, crate::world_effects::MAX_PARTICLE_CLOUDS as f32)
         } else {
@@ -224,8 +228,8 @@ impl Renderer {
         };
         self.weather.snow.frozen = effects.snow_frozen;
         self.weather.atmosphere.set_override(crate::world_effects::AtmosphereOverride {
-            sand_layers: effects.legacy_sand_layers,
-            space_dust_count: effects.legacy_space_dust_count,
+            sand_layers: if self.blue_water_environment.weather_backend==0 {effects.legacy_sand_layers}else{0},
+            space_dust_count: if self.blue_water_environment.weather_backend==0 {effects.legacy_space_dust_count}else{0},
             frozen: effects.legacy_weather_frozen,
         });
         self.weather.rain.puddle_quality = effects.puddle_quality;

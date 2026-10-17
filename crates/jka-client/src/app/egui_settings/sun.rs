@@ -162,5 +162,6 @@ impl App {
                 self.set_sun_color(color);
             }
         });
+        self.egui_native_sky(ui);
     }
 }

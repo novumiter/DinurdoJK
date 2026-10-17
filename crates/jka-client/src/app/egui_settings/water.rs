@@ -56,6 +56,17 @@ impl App {
             theme::banner(ui, "Stock JKA water is active; promoted-ocean simulation and shading are disabled.", theme::TEXT_DIM);
             return;
         }
+        let mut surface_pixels = self.video.ocean_settings.surface_pixels;
+        if ui.checkbox(&mut surface_pixels, "Render ocean surface pixels")
+            .on_hover_text("Diagnostic A/B (r_oceanSurfacePixels): turn off ALL promoted ocean surface draws, including native Blue Water and infinite water. FFT, wind foam, water interaction and CPU mesh updates keep running; no ocean surface is visible or writes depth. Other ocean optics/caustics remain enabled.")
+            .changed()
+        {
+            self.video.ocean_settings.surface_pixels = surface_pixels;
+            self.commit_ocean_settings();
+        }
+        if !surface_pixels {
+            theme::banner(ui, "Surface draw disabled for benchmarking. FFT and mesh updates continue; GPU vertex displacement is skipped because there are no surface draw calls.", theme::TEXT_DIM);
+        }
         if self.video.ocean && !self.applied_ocean {
             theme::banner(ui, "Ocean resources need Apply because this renderer started without them.", theme::WARNING);
         }

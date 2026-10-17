@@ -309,3 +309,88 @@ impl Camera {
         camera::reversed_perspective(self.fov_y_degrees.to_radians(), aspect, self.near, self.far)
     }
 }
+
+#[derive(Clone)]
+pub struct VertexLayout {
+    pub stride: u64,
+    pub step_mode: wgpu::VertexStepMode,
+    pub attributes: Vec<wgpu::VertexAttribute>,
+}
+pub struct MotionPipeline {
+    pub vertex_entry: &'static str,
+    pub fragment_entry: &'static str,
+    pub vertex_buffers: Vec<VertexLayout>,
+    pub bind_group_layouts: Vec<wgpu::BindGroupLayout>,
+    pub primitive: wgpu::PrimitiveState,
+}
+impl MotionPipeline {
+    pub fn new(vertex_entry: &'static str, fragment_entry: &'static str) -> Self {
+        Self {
+            vertex_entry,
+            fragment_entry,
+            vertex_buffers: Vec::new(),
+            bind_group_layouts: Vec::new(),
+            primitive: Default::default(),
+        }
+    }
+}
+impl RenderContext<'_> {
+    pub fn add_motion_pipeline(
+        &mut self,
+        label: &str,
+        path: &str,
+        desc: MotionPipeline,
+    ) -> Result<PipelineId, ShaderError> {
+        self.add_pipeline(
+            label,
+            path,
+            Vec::new(),
+            Box::new(move |b| {
+                let mut layouts = vec![None];
+                layouts.extend(desc.bind_group_layouts.iter().map(Some));
+                let layout = b
+                    .device
+                    .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("weather motion"),
+                        bind_group_layouts: &layouts,
+                        immediate_size: 0,
+                    });
+                let buffers = desc
+                    .vertex_buffers
+                    .iter()
+                    .map(|v| {
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: v.stride,
+                            step_mode: v.step_mode,
+                            attributes: &v.attributes,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Pipeline::Render(
+                    b.device
+                        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some("weather motion"),
+                            layout: Some(&layout),
+                            vertex: wgpu::VertexState {
+                                module: b.module,
+                                entry_point: Some(desc.vertex_entry),
+                                compilation_options: Default::default(),
+                                buffers: &buffers,
+                            },
+                            fragment: Some(wgpu::FragmentState {
+                                module: b.module,
+                                entry_point: Some(desc.fragment_entry),
+                                compilation_options: Default::default(),
+                                targets: &[Some(wgpu::TextureFormat::Rgba16Float.into())],
+                            }),
+                            primitive: desc.primitive,
+                            depth_stencil: None,
+                            multisample: Default::default(),
+                            multiview_mask: None,
+                            cache: None,
+                        }),
+                )
+            }),
+        )
+    }
+}

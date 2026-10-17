@@ -2,6 +2,10 @@
 param(
     [string]$SourceBase = 'D:\Code\DinurdoJK\target\release\base',
     [string]$Map = 'costadelsol',
+    [switch]$Environment,
+    [switch]$CloudsOff,
+    [switch]$Hybrid,
+    [string]$Executable = '',
     [ValidateRange(640, 7680)]
     [int]$Width = 1920,
     [ValidateRange(480, 4320)]
@@ -9,9 +13,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $workspaceRoot = Split-Path -Parent $PSScriptRoot
-$executable = Join-Path $workspaceRoot 'target\release\DinurdoJK.exe'
+$executable = if ($Executable) { $Executable } elseif ($Environment) { Join-Path $workspaceRoot 'target\blue-water-environment\DinurdoJK.exe' } else { Join-Path $workspaceRoot 'target\release\DinurdoJK.exe' }
 if (-not (Test-Path -LiteralPath $executable)) { throw 'Build the release client first.' }
-$playRoot = Join-Path $workspaceRoot 'target\blue-water-play'
+$playRoot = Join-Path $workspaceRoot $(if ($Environment) { 'target\blue-water-environment-play' } else { 'target\blue-water-play' })
 $playBase = Join-Path $playRoot 'base'
 New-Item -ItemType Directory -Force -Path $playBase | Out-Null
 foreach ($package in Get-ChildItem -LiteralPath $SourceBase -File -Filter '*.pk3') {
@@ -49,6 +53,13 @@ $commands = @(
     'noclip',
     'setviewpos -2397 11562 817 292 -353'
 )
+if ($Environment) {
+    $commands += @('set r_clouds "1"', 'set r_cloudBackend "1"', 'set r_skyBackend "1"',
+        'set r_blueSkyWeatherBackend "1"', 'set r_blueSkyRain "0.3"',
+        'set r_blueSkyLightning "2"', 'set r_blueSkyWorldLighting "0"')
+}
+if ($CloudsOff) { $commands += 'set r_clouds "0"' }
+if ($Hybrid) { $commands += 'set r_oceanType "3"' }
 [System.IO.File]::WriteAllLines((Join-Path $playBase 'blue_water_play.cfg'), $commands)
 $process = Start-Process -FilePath $executable -ArgumentList @(
     '--base', ('"' + $playBase + '"'), '--map', $Map, '+exec', 'blue_water_play.cfg'

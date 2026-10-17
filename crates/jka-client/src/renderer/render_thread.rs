@@ -544,6 +544,7 @@ pub(in crate::renderer) fn render_thread_main(
         baked_sun_removal: initial_ui.video.baked_sun_removal,
         sky_fractal_override: initial_ui.video.sky_fractal_override,
         sky_backend: initial_ui.video.sky_backend,
+        blue_water_environment: initial_ui.video.blue_water_environment,
         cloud_backend: initial_ui.video.cloud_backend,
         clouds: initial_ui.video.clouds,
         cloud_type: initial_ui.video.cloud_type,
@@ -1689,6 +1690,15 @@ pub(in crate::renderer) fn render_thread_main(
         }
         match render_result {
             Ok(info) => {
+                for cue in &info.native_thunder {
+                    if cue.loudness<=0.0 {continue;}
+                    let proxy=proxy.clone();let cue=*cue;
+                    let _=std::thread::Builder::new().name("Blue Water thunder".into()).spawn(move || {
+                        std::thread::sleep(Duration::from_secs_f64(cue.delay.clamp(0.0,180.0)));
+                        let _=proxy.send_event(UserEvent::BlueWaterThunder(cue.loudness as f32));
+                    });
+                }
+
                 if renderer.patch_speeds > 0 && renderer.patch_speeds != 8
                     && last_r_speeds.elapsed() >= Duration::from_secs(1)
                 {

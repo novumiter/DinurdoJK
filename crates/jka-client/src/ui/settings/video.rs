@@ -311,6 +311,7 @@ pub struct VideoSettings {
     /// Experimental Star Nest procedural override of map-authored sky faces.
     pub sky_fractal_override: bool,
     pub sky_backend: u8,
+    pub blue_water_environment: crate::blue_water_environment::Settings,
     pub cloud_backend: u8,
     pub clouds: bool,
     pub cloud_type: CloudType,
@@ -760,6 +761,7 @@ impl Default for VideoSettings {
             distance_cull_scale: 0.0,
             sky_fractal_override: false,
             sky_backend: 0,
+            blue_water_environment: crate::blue_water_environment::Settings::default(),
             cloud_backend: 0,
             clouds: true,
             cloud_type: CloudType::Storm,

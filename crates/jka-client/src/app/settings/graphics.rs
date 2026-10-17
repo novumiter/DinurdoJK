@@ -605,6 +605,7 @@ impl App {
             baked_sun_removal: self.video.baked_sun_removal,
             sky_fractal_override: self.video.sky_fractal_override,
             sky_backend: self.video.sky_backend,
+        blue_water_environment: self.video.blue_water_environment,
             cloud_backend: self.video.cloud_backend,
             clouds: self.video.clouds,
             cloud_type: self.video.cloud_type,

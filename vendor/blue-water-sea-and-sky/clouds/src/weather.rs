@@ -61,6 +61,43 @@ fn wrap(value: f32) -> f32 {
     value - value.floor()
 }
 
+fn splash_region(position: Vec3, forward: Vec3) -> [f32; 4] {
+    [
+        wrap(-(position.x + forward.x) / SPLASH_REGION + 0.5),
+        wrap(-(position.z + forward.z) / SPLASH_REGION + 0.5),
+        forward.x,
+        forward.z,
+    ]
+}
+
+#[cfg(test)]
+mod splash_tests {
+    use super::*;
+
+    #[test]
+    fn live_impacts_stay_in_world_space_when_aim_or_position_changes() {
+        // Reconstruct one live shader instance while its life/seed are held.
+        // Regions may wrap at their edges; world positions must be identical
+        // modulo that region, including while the forward offset rotates.
+        let impact = |eye: Vec3, ahead: Vec3| {
+            let region = splash_region(eye, ahead);
+            Vec3::new(
+                eye.x + region[2] + (wrap(0.21 + region[0]) - 0.5) * SPLASH_REGION,
+                0.0,
+                eye.z + region[3] + (wrap(0.43 + region[1]) - 0.5) * SPLASH_REGION,
+            )
+        };
+        let first = impact(Vec3::new(113.0, 2.0, -47.0), Vec3::Z * 28.0);
+        for (eye, ahead) in [
+            (Vec3::new(113.0, 2.0, -47.0), Vec3::X * 28.0),
+            (Vec3::new(119.0, 2.0, -39.0), Vec3::NEG_Z * 28.0),
+        ] {
+            let delta = (impact(eye, ahead) - first) / SPLASH_REGION;
+            assert!((delta - delta.round()).length() < 1e-5);
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct RainUniforms {
@@ -150,6 +187,8 @@ pub struct Weather {
     velocity: Vec3,
     last_position: Option<Vec3>,
     fall_scale: f32,
+    /// Host speed control; independent of precipitation and storm time.
+    fall_multiplier: f32,
     wind: Vec3,
     rain_uniforms: RainUniforms,
     rain_count: u32,
@@ -554,6 +593,7 @@ impl Weather {
             velocity: Vec3::ZERO,
             last_position: None,
             fall_scale: 1.0,
+            fall_multiplier: 1.0,
             wind: Vec3::ZERO,
             rain_uniforms: RainUniforms::default(),
             rain_count: 0,
@@ -622,10 +662,20 @@ impl Weather {
         );
     }
 
+    /// Publish a sea binding change made after this frame's weather update.
+    pub fn upload_splash_surface(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(&self.splash_buffer, 0, bytemuck::bytes_of(&self.splash_uniforms));
+    }
+
     pub fn set_quality(&mut self, quality: SkyQuality) {
         self.tier = quality::tier(quality);
         self.rain_uniforms.density =
             (REFERENCE_DROPS / f64::from(self.tier.rain_drops)).sqrt() as f32;
+    }
+
+    /// Scale only vertical drop velocity; 1 preserves the upstream terminal speeds.
+    pub fn set_fall_speed(&mut self, multiplier: f32) {
+        self.fall_multiplier = if multiplier.is_finite() { multiplier.clamp(0.25, 4.0) } else { 1.0 };
     }
 
     /// Apply a scene's weather (`WeatherSystem.apply`).
@@ -805,7 +855,7 @@ impl Weather {
             .normalize();
         let wind = self.wind;
         for (k, &(size, _, fall)) in RAIN_CLASSES.iter().enumerate() {
-            let speed = fall * self.fall_scale;
+            let speed = fall * self.fall_scale * self.fall_multiplier;
             let drift = &mut self.drift[k];
             if dt > 0.0 {
                 let dt = dt as f32;
@@ -842,12 +892,9 @@ impl Weather {
         let nearest = position.y.max(0.0) * view.projection.y_axis.y;
         let forward = forward.normalize()
             * SPLASH_FAR.min((SPLASH_REGION * 0.3).max(nearest * 0.8 + SPLASH_REGION * 0.4));
-        u.region = [
-            wrap((position.x + forward.x) / SPLASH_REGION + 0.5),
-            wrap((position.z + forward.z) / SPLASH_REGION + 0.5),
-            forward.x,
-            forward.z,
-        ];
+        // Cancel the moving region centre: a live impact keeps its world
+        // position when the camera translates or changes its aim.
+        u.region = splash_region(position, forward);
         u.camera_height = position.y;
         u.camera_xz = [position.x, position.z];
     }
@@ -982,5 +1029,25 @@ impl Weather {
     /// Drops and splashes drawn this frame.
     pub fn counts(&self) -> (u32, u32) {
         (self.rain_count, self.splash_count)
+    }
+    pub fn draw_layouts(&self) -> &[wgpu::BindGroupLayout; 2] { &self.layouts }
+
+    /// Same visible geometry into the host's temporal rejection target.
+    pub fn draw_reactive(&self, pass: &mut wgpu::RenderPass<'_>, sky: &wgpu::BindGroup,
+        pipelines: &[wgpu::RenderPipeline; 3]) {
+        pass.set_bind_group(1, sky, &[]);
+        if self.rain_count > 0 {
+            pass.set_pipeline(&pipelines[0]);pass.set_bind_group(2,&self.rain_group,&[]);
+            pass.set_vertex_buffer(0,self.drops.slice(..));pass.draw(0..6,0..self.rain_count);
+        }
+        if self.splash_count > 0 {
+            pass.set_pipeline(&pipelines[1]);pass.set_bind_group(2,&self.splash_group,&[]);
+            pass.set_vertex_buffer(0,self.splashes.slice(..));pass.draw(0..12,0..self.splash_count);
+        }
+        if self.bolt_visible && self.channel_count > 0 {
+            pass.set_pipeline(&pipelines[2]);pass.set_bind_group(2,&self.bolt_group,&[]);
+            pass.set_vertex_buffer(0,self.bolt_start.slice(..));pass.set_vertex_buffer(1,self.bolt_end.slice(..));
+            pass.draw(0..6,0..self.channel_count);
+        }
     }
 }

@@ -257,6 +257,7 @@ pub(crate) struct RainSystem {
     pub occlusion: WeatherOcclusionCache,
     pub haze: RainHazeResources,
     pub enabled: bool,
+    pub native_precipitation: Option<f32>,
     pub intensity: RainIntensity,
     /// Runtime-only multiplier used by stacked legacy `r_we` rain clouds.
     pub density_scale: f32,
@@ -325,6 +326,10 @@ pub(crate) struct RainSystem {
 }
 
 impl RainSystem {
+    pub(crate) fn native_sheltered(&self,position:[f32;3])->bool {
+        self.cpu_field.as_ref().is_some_and(|field|field.exposure_at(position)<0.15)
+    }
+
     pub(crate) fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -345,6 +350,7 @@ impl RainSystem {
             occlusion: WeatherOcclusionCache::Unavailable,
             haze: create_rain_haze_resources(device),
             enabled: false,
+            native_precipitation: None,
             intensity: RainIntensity::Rain,
             density_scale: 1.0,
             tint: [1.0; 3],
@@ -382,6 +388,7 @@ impl RainSystem {
 
     /// Rain-intensity response shared by the wet film and the colour grade.
     fn intensity_response(&self) -> f32 {
+        if let Some(rain)=self.native_precipitation {return rain;}
         match self.intensity {
             RainIntensity::Light => 0.72,
             RainIntensity::Rain => 0.88,
@@ -729,14 +736,14 @@ impl RainSystem {
         let settle = 1.0 - (-dt / CAMERA_EXPOSURE_SECONDS).exp();
         self.camera_exposure += (exposure_target - self.camera_exposure) * settle;
 
-        let wet_target = if self.enabled { 1.0 } else { 0.0 };
+        let wet_target = self.native_precipitation.unwrap_or(if self.enabled {1.0}else{0.0});
         if wet_target > self.surface_wetness {
             self.surface_wetness = (self.surface_wetness + dt / RAIN_WETNESS_RISE_SECONDS).min(wet_target);
         } else {
             self.surface_wetness = (self.surface_wetness - dt / RAIN_WETNESS_DRY_SECONDS).max(wet_target);
         }
 
-        let puddle_target = if self.enabled {
+        let puddle_target = if let Some(rain)=self.native_precipitation {rain*rain} else if self.enabled {
             match self.intensity {
                 RainIntensity::Light => 0.22,
                 RainIntensity::Rain => 0.62,

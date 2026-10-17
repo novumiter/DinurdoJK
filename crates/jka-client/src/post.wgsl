@@ -385,20 +385,35 @@ fn apply_legacy1_global_fog(
 ) -> vec3<f32> {
     let scale = settings.taa_params.w;
     let depth_for_opaque = settings.legacy_fog.w;
-    if (scale <= 0.0 || depth_for_opaque <= 0.001 || !valid_depth(radial_depth)) {
+    if (scale <= 0.0 || depth_for_opaque <= 0.001) {
         return color;
     }
+    // The native ocean writes depth after the linear/policy prepass. Use its
+    // completed scene depth, so open sea takes fog and a submerged receiver
+    // does not incorrectly set the fog distance to the seabed.
+    let dims = vec2<i32>(textureDimensions(ssr_visibility_texture));
+    let p = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - 1);
+    let scene_depth = textureLoad(ssr_visibility_texture, p, 0).r;
+    var fog_depth = radial_depth;
+    var late_receiver = false;
+    if scene_depth > 0.0 {
+        let point = settings.inv_view_proj * vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, scene_depth, 1.0);
+        let actual = distance(point.xyz / point.w, settings.camera_pos_time.xyz);
+        late_receiver = !valid_depth(radial_depth) || actual + max(0.5, radial_depth * 0.005) < radial_depth;
+        if late_receiver { fog_depth = actual; }
+    }
+    if !valid_depth(fog_depth) { return color; }
     // Bit 1 says the frontmost opaque surface participates in global fog. The
     // prepass writes it for fogged BSP surfaces (not q3map_nofog/sky) and for
     // every depth-writing entity, which OpenJK assigns the world's global fog.
     // radial_depth already is that surface's own depth, entity or BSP.
-    if ((policy_bits(pixel) & 2u) == 0u) {
+    if ((policy_bits(pixel) & 2u) == 0u && !late_receiver) {
         return color;
     }
 
     let ray = world_ray(uv);
     let camera_forward = world_ray(vec2<f32>(0.5));
-    let forward_distance = radial_depth * max(dot(ray, camera_forward), 0.0);
+    let forward_distance = fog_depth * max(dot(ray, camera_forward), 0.0);
     let amount = openjk_global_fog_alpha(
         (forward_distance / depth_for_opaque) * scale
     );

@@ -20,6 +20,7 @@ struct SurfaceSlot {
     horizon: bool,
     underwater: UnderwaterBindings,
     caustic_receiver: blue_water_gpu::caustics::Receiver,
+    rain: Option<blue_water_gpu::rain_heights::SurfaceRead>,
     probe_due: bool,
     probe_active: bool,
     envelope: [f32; 4],
@@ -28,6 +29,7 @@ struct SurfaceSlot {
 pub(super) struct SurfaceRenderer {
     key: (u32, u32, u32, wgpu::TextureFormat),
     reflection_steps: u32,
+    pixel_detail_mode: u8,
     pipeline: OriginalSurfacePipeline,
     clipmap: OriginalClipmap,
     scene: SceneCopy,
@@ -38,6 +40,7 @@ pub(super) struct SurfaceRenderer {
     slots: [Option<SurfaceSlot>; OCEAN_MAX_SURFACES],
     underwater: UnderwaterPipelines,
     caustics: blue_water_gpu::caustics::Caustics,
+    rain_heights: Option<blue_water_gpu::rain_heights::RainHeights>,
     underwater_slot: Option<usize>,
 }
 
@@ -101,6 +104,7 @@ impl OceanGpu {
         dt: f32,
         frame: u32,
         show_wireframe: bool,
+        show_waterline_marker: bool,
         pvs: &[Option<OceanPvsTileMask>; OCEAN_MAX_SURFACES],
         sky_faces: Option<[&wgpu::TextureView; 6]>,
         water_distance: &wgpu::TextureView,
@@ -111,6 +115,8 @@ impl OceanGpu {
         cloud: Option<&::blue_water_clouds::CloudShadow>,
         volumes: &super::optics::Uniform,
         godot_receiver_color: &wgpu::TextureView,
+        legacy_fog: Option<([f32; 4], [f32; 4])>,
+        rain: f32,
     ) {
         let Some(blue) = self.blue_water.as_mut() else {
             return;
@@ -121,11 +127,17 @@ impl OceanGpu {
         if blue
             .original_surface
             .as_ref()
-            .is_none_or(|renderer| renderer.key != key || renderer.reflection_steps != self.settings.blue_water_ssr_steps)
+            .is_none_or(|renderer| renderer.key != key
+                || renderer.reflection_steps != self.settings.blue_water_ssr_steps
+                || renderer.pixel_detail_mode != self.settings.pixel_detail_mode)
         {
-            let pipeline = OriginalSurfacePipeline::new(device, &blue.surface_waves, key.3, key.2, self.settings.blue_water_ssr_steps);
+            let pipeline = OriginalSurfacePipeline::new_with_pixel_detail(
+                device, &blue.surface_waves, key.3, key.2,
+                self.settings.blue_water_ssr_steps, self.settings.pixel_detail_mode,
+            );
             blue.original_surface = Some(SurfaceRenderer {
                 reflection_steps: self.settings.blue_water_ssr_steps,
+                pixel_detail_mode: self.settings.pixel_detail_mode,
                 underwater: UnderwaterPipelines::new(
                     device,
                     blue.surface_waves.layout(),
@@ -133,6 +145,7 @@ impl OceanGpu {
                     key.2,
                 ),
                 underwater_slot: None,
+                rain_heights: None,
                 caustics: blue_water_gpu::caustics::Caustics::new(
                     device,
                     blue.surface_waves.layout(),
@@ -154,11 +167,14 @@ impl OceanGpu {
             .original_surface
             .as_mut()
             .expect("Blue Water surface renderer");
-        let surface_color = if self.settings.blue_water_caustics_mode == 3 {
+        let surface_color = if matches!(self.settings.blue_water_caustics_mode, 3 | 4) {
             godot_receiver_color
         } else { &renderer.scene.color };
         if show_wireframe {
             renderer.pipeline.ensure_wireframe(device, key.3, key.2);
+        }
+        if show_waterline_marker {
+            renderer.pipeline.ensure_waterline_marker(device, key.3, key.2);
         }
         let current_mesh = renderer.clipmap.clipmap();
         if current_mesh.segments != self.settings.blue_water_mesh_segments
@@ -268,6 +284,7 @@ impl OceanGpu {
                         .caustics
                         .receiver(device, &bindings, &renderer.scene);
                 SurfaceSlot {
+                    rain: None,
                     bindings,
                     caustic_receiver,
                     underwater,
@@ -322,7 +339,12 @@ impl OceanGpu {
                 source.maximum[0],
                 source.maximum[1],
             ];
-            boundary.scale = [OCEAN_UNITS_PER_METER, 0.75, 0.0, 0.0];
+            boundary.scale = [
+                OCEAN_UNITS_PER_METER,
+                0.75,
+                self.settings.pixel_detail_mode.min(5) as f32,
+                self.settings.pixel_detail_distance.max(1.0),
+            ];
             let first = self.masks.ranges[index][0] as usize * 2;
             let count = self.masks.ranges[index][1] as usize;
             assert!(count <= 256 && first + count * 2 <= self.masks.triangles.len());
@@ -362,6 +384,7 @@ impl OceanGpu {
             slot.bindings.write_camera(queue, &surface_view);
             let foam = super::linear_color(promoted.settings.foam_color);
             let appearance = SurfaceAppearance {
+                rain,
                 crest_foam: foam,
                 surface_foam: [foam[0], foam[1], foam[2], 0.6],
                 foam_streak_mean: renderer.foam.streak_mean,
@@ -371,6 +394,15 @@ impl OceanGpu {
                 renderer
                     .clipmap
                     .surface_prefix(centre, f64::from(standoff), appearance);
+            // The upstream material owns aerial perspective for the water;
+            // the earlier opaque-air pass only sees submerged receivers.
+            prefix[20][3] = f32::from(aerial.is_some());
+            if let Some((color_depth, params)) = legacy_fog {
+                prefix[19] = color_depth;
+                prefix[19][3] /= OCEAN_UNITS_PER_METER;
+                prefix[20][0] = params[0];
+                prefix[20][1] = params[1];
+            }
             let point = [camera.position.x, camera.position.z];
             let closest = self.masks.closest_point(index, point).unwrap_or([
                 point[0].clamp(source.minimum[0], source.maximum[0]),
@@ -403,6 +435,30 @@ impl OceanGpu {
                 self.settings.blue_water_refraction,
                 self.settings.blue_water_refraction_mode as f32,
             ];
+            // Native clipmaps already have crack-free fill/ring transitions.
+            // The screen-space option advances the *first* complete ring only
+            // when its cell projects below the requested pixel width at the
+            // nearest possible water. This keeps all topology upstream-defined
+            // and avoids allocating/rebuilding indices when the camera moves.
+            // Distant outer rings are already geometrically coarser, so this
+            // is deliberately a conservative first test rather than per-tile LOD.
+            let mut first = detail.first;
+            let screen_target = self.settings.screen_lod_pixels;
+            if screen_target > 0.0 && standoff > 1.0 {
+                let half_fov = (camera.fov_y_for_viewport(key.0, key.1) * 0.5).tan().max(0.001);
+                let pixels_per_metre = key.1.max(1) as f64 / (2.0 * half_fov as f64 * f64::from(standoff));
+                let mesh = renderer.clipmap.clipmap();
+                while first + 1 < mesh.levels {
+                    let cell_metres = mesh.half(first) * 2.0 / f64::from(mesh.segments);
+                    if cell_metres * pixels_per_metre >= f64::from(screen_target) { break; }
+                    first += 1;
+                }
+            }
+            // The original vertex shader uses surface.detail.x to geomorph
+            // its selected first ring. Match it to the actual submitted ring;
+            // otherwise an LOD-adjusted draw can produce cracks or jumps.
+            prefix[11][0] = first as f32;
+            if first != detail.first { prefix[11][1] = 0.0; }
             slot.bindings.write_surface_prefix(queue, &prefix);
             let sun = self.environment.sun_direction_intensity;
             let tint = self.environment.sun_color;
@@ -461,8 +517,8 @@ impl OceanGpu {
             let ambient = self.environment.sky_ambient;
             slot.bindings
                 .write_ambient(queue, [ambient[0], ambient[1], ambient[2]]);
-            slot.first = detail.first;
-            slot.outer = outer.max(detail.first);
+            slot.first = first;
+            slot.outer = outer.max(first);
             slot.ready = true;
         }
     }
@@ -523,6 +579,26 @@ impl OceanGpu {
                 }
             }
         }
+    }
+
+    /// Sample the same native FFT and admitted footprints used by Hybrid's sea.
+    pub fn prepare_original_rain_heights(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        weather_eye: [f32; 3],
+    ) -> Option<wgpu::TextureView> {
+        let blue = self.blue_water.as_mut()?;
+        let renderer = blue.original_surface.as_mut()?;
+        let heights = renderer.rain_heights.get_or_insert_with(||
+            blue_water_gpu::rain_heights::RainHeights::new(device, blue.surface_waves.layout()));
+        heights.begin(queue, encoder, weather_eye);
+        for slot in renderer.slots.iter_mut().flatten().filter(|slot| slot.ready) {
+            let read = slot.rain.get_or_insert_with(|| heights.surface(device, &slot.bindings));
+            heights.encode(encoder, read, blue.surface_waves.group(&blue.field));
+        }
+        Some(heights.view.clone())
     }
 
     /// Capture the lit scene after opaque caustics and aerial lighting.
@@ -670,6 +746,25 @@ impl OceanGpu {
                 renderer.clipmap.draw(pass, slot.first, slot.outer);
             }
         }
+    }
+
+    /// Mode 3: native GPU wave data sampled at CAMERA XZ and shown 100 units ahead,
+    /// even if Hybrid currently selects the Godot submerged surface.
+    pub fn draw_original_waterline_marker<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) -> u32 {
+        let Some(blue) = &self.blue_water else { return 0; };
+        let Some(renderer) = &blue.original_surface else { return 0; };
+        let Some(pipeline) = &renderer.pipeline.waterline_marker else { return 0; };
+        let mut count = 0;
+        for slot in renderer.slots.iter().flatten().filter(|slot| slot.ready) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &slot.bindings.camera_group, &[]);
+            pass.set_bind_group(1, &slot.bindings.material_group, &[]);
+            pass.set_bind_group(2, blue.surface_waves.group(&blue.field), &[]);
+            pass.set_bind_group(3, &slot.bindings.environment_group, &[]);
+            pass.draw(0..36, 0..1);
+            count += 1;
+        }
+        count
     }
 
     pub fn draw_original_surfaces<'a>(

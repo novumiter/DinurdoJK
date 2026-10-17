@@ -141,12 +141,14 @@ impl Renderer {
         // pass can resolve the float scene to the swapchain. Keep HDR out of the
         // full-post bucket so forced Unified/Advanced + r_hdr 1 pays only the
         // unavoidable 16F bandwidth and one tiny fullscreen resolve.
-        let hdr_resolve = self.hdr_enabled;
+        let hdr_resolve = self.hdr_enabled || self.native_atmosphere_active()
+            || self.blue_water_environment.weather_backend == 1;
         let rain_spatial_post = self.weather.rain.enabled && !self.weather.rain.fast_post;
         let rain_lens_copy = self.weather.rain.enabled
             && self.weather.rain.glass_enabled
             && self.weather.rain.fast_post;
         let other_full_post_effects = self.ocean_enabled
+            || (self.native_atmosphere_active() && self.blue_water_environment.filmic)
             || self.tone_mapping_enabled
             || self.glow_mode.enabled()
             || self.halation_enabled
@@ -192,7 +194,7 @@ impl Renderer {
         // hundreds of times per frame/per draw. This path intentionally matches
         // the feature envelope of the known ~2100 FPS renderer: basic BSP, PVS,
         // texture filtering, MSAA, optional wireframe, optional gamma, and UI.
-        let fast_baseline = !self.force_unified_world
+        let fast_baseline = self.sky_backend == 0 && !self.blue_water_environment.world_lighting && self.blue_water_environment.weather_backend != 1 && !self.force_unified_world
             // Curved-grid LOD belongs to the Unified packed BSP path.
             && self.world.as_ref().is_none_or(|world| !world.patch_lod.has_patches())
             && !self.dynamic_light_debug

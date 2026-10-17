@@ -594,9 +594,17 @@ impl SoundPresenter {
         }
     }
 
-    /// `S_StartLocalSound(sfx, CHAN_LOCAL_SOUND)`: a head-locked interface sound
-    /// (chat beeps). Plays the first candidate that resolves, mirroring jaPRO's
-    /// `privateChatSound` fallback to a base-assets sound.
+    /// Upstream weather supplies the delay and loudness; use installed JKA thunder samples.
+    pub fn play_weather_thunder(&mut self,volume:f32) {
+        for qpath in ["sound/ambience/thunder2.wav","sound/ambience/thunder1.mp3","sound/ambient/1shot_thunder_02.wav"] {
+            if let Ok(sound)=self.assets.register(qpath) {
+                if let Some(backend)=&mut self.backend {backend.play_ambient(SoundRequest {qpath:qpath.to_owned(),entity:1022,channel:0,origin:SoundOrigin::Local},sound,volume);}
+                break;
+            }
+        }
+    }
+
+    /// `S_StartLocalSound(sfx, CHAN_LOCAL_SOUND)`: a head-locked interface sound.
     pub fn play_local_sound(&mut self, candidates: &[&str]) -> bool {
         const CHAN_LOCAL_SOUND: i32 = 8;
         if self.backend.is_none() {

@@ -150,6 +150,7 @@ impl Renderer {
             render_ocean.then(|| usize::from(self.ocean_settings.mesh_quality.min(1)));
         self.refresh_ocean_extension_gate(camera.position.to_array(), render_ocean);
         let topology_started=render_ocean.then(Instant::now);
+        self.refresh_eye_wave_offset(camera.position);
         if render_ocean {
             // Classification must be fresh for submerged Hybrid/caustics choices.
             self.refresh_water_boxes(camera.position);
@@ -364,6 +365,8 @@ impl Renderer {
                 sky_info: [0.0; 4],
                 caustic_tuning: [1.0, 1.0, 0.0,
                     optical.caustic_max_distance_m * crate::ocean::OCEAN_UNITS_PER_METER],
+                procedural_params: [0.0; 4],
+                eye_wave: self.eye_wave_correction.map_or([0.0; 4], |c| [c, 1.0, 0.0, 0.0]),
             };
             // Hybrid alone can tune pattern frequency and focus while keeping
             // Godot (backend 0) and pure native Blue Water (backend 1) untouched.
@@ -374,6 +377,16 @@ impl Renderer {
                     if self.ocean_settings.hybrid_caustics_fast { 1.0 } else { 0.0 },
                     optical.caustic_max_distance_m * crate::ocean::OCEAN_UNITS_PER_METER,
                 ];
+            }
+            if self.ocean_settings.backend == 2 && self.ocean_settings.blue_water_caustics_mode == 4 {
+                let chop = self.ocean_settings.blue_water_waves.choppiness.clamp(0.0, 4.0);
+                uniform.procedural_params = [
+                    frame_time,
+                    self.ocean_settings.hybrid_procedural_scale * (1.0 + 0.10 * chop),
+                    self.ocean_settings.hybrid_procedural_speed * (0.55 + 0.35 * chop),
+                    1.0 + 0.15 * chop,
+                ];
+                uniform.caustic_tuning[1] = self.ocean_settings.hybrid_caustics_gain;
             }
             for (i, volume) in self.water_boxes.iter().enumerate() {
                 let [x, y, z] = volume.minimum;
@@ -415,6 +428,16 @@ impl Renderer {
             }
             self.queue
                 .write_buffer(&self.ocean_optics.uniform, 0, bytemuck::bytes_of(&uniform));
+            // Compile Hybrid's wave-aware capture BEFORE world draw closures
+            // borrow self.ocean_optics.bind_group for the rest of the frame.
+            // This also avoids a mutable-vs-immutable borrow regression.
+            if self.ocean_settings.backend == 2
+                && self.ocean_settings.blue_water_underwater_mode == 4
+                && self.ocean_settings.blue_water_adapter
+                && self.ocean.as_ref().is_some_and(|gpu| gpu.backend() != 0)
+            {
+                self.ocean_optics.ensure_hybrid_wave_capture(&self.device, &self.ocean_layout);
+            }
             optical_volumes = Some(uniform);
         }
         let cloud_view_proj = if self.clouds_enabled {
@@ -527,6 +550,7 @@ impl Renderer {
         self.ensure_shader_complexity_pipelines();
         self.update_sun_ray_preview(camera, player_position);
         self.prepare_rt_sun_shadow(view_proj, camera.position);
+        if self.blue_water_environment.weather_backend==1 {self.ensure_weather_occlusion();}
         if self.weather.rain.enabled {
             self.prepare_rain_frame(camera, frame_time);
         }
@@ -1001,6 +1025,8 @@ impl Renderer {
                 sky_regions: [crate::ocean::optics::SkyFogRegion::default(); 8],
                 sky_info: [0.0; 4],
                 caustic_tuning: [1.0, 1.0, 0.0, 0.0],
+                procedural_params: [0.0; 4],
+                eye_wave: [0.0; 4],
             };
             self.queue.write_buffer(&self.ocean_optics.uniform, 0, bytemuck::bytes_of(&uniform));
         }
@@ -1138,7 +1164,8 @@ impl Renderer {
         // encoded here, before this frame's culling; OCEAN_SIM_GRACE_SECONDS of
         // slack means turning past a pond does not stall the waves.
         const OCEAN_SIM_GRACE_SECONDS: f32 = 0.25;
-        let ocean_sim_hidden = !self.ocean_settings.simulate_when_hidden
+        let ocean_sim_hidden = self.ocean_settings.surface_pixels
+            && !self.ocean_settings.simulate_when_hidden
             && self.ocean_hidden_time > OCEAN_SIM_GRACE_SECONDS;
         let ocean_sim_measured =
             !ocean_sim_hidden && (self.ocean.is_some() || !self.authored_oceans.is_empty());
@@ -1216,6 +1243,11 @@ impl Renderer {
             }
             if !ocean_sim_hidden {
                 ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
+                // After the wave step, so the probe reads the field the mesh draws.
+                ocean.encode_eye_wave_probe(
+                    &self.device, &self.queue, &mut encoder,
+                    camera.position.to_array(), self.eye_wave_slot,
+                );
             }
         }
         for (authored, ocean) in &mut self.authored_oceans {
@@ -2540,6 +2572,7 @@ impl Renderer {
                     &self.water_boxes,
                     world.ocean_masks.as_ref(),
                     self.ocean_settings.underwater_cull_distance(),
+                    self.eye_wave_offset,
                 )
             });
             // Per-surface water culling needs the CPU partial-draw path; the
@@ -2602,7 +2635,7 @@ impl Renderer {
             let effective_area_mask = effective_area_mask(world, self.pvs_mode, area_mask);
             // A water reflection or aerial receiver can remain visible when this PVS has no sky polygons.
             // Keep the physical sky's camera/time current; the draw below still uses exact BSP sky admission.
-            if (self.sky_backend == 1 || (self.cloud_backend == 1 && self.clouds_enabled)) && self.fast_sky == 0 {
+            if self.sky_backend == 1 || self.blue_water_environment.world_lighting || self.blue_water_environment.weather_backend == 1 || (self.cloud_backend == 1 && self.clouds_enabled) {
                 self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterSkyPrepare, false);
                 let key = (self.config.width, self.config.height, self.msaa_samples, flare_scene_format);
                 let atmosphere = self.blue_water_sky.get_or_insert_with(||
@@ -2612,9 +2645,10 @@ impl Renderer {
                     area(a).total_cmp(&area(b))
                 }).map_or(0.0, |surface| surface.plane_height);
                 atmosphere.prepare(&self.device, &self.queue, &mut encoder, key, camera, jitter,
-                    camera_pos_time[3], ocean_sun.direction.map(|value| -value), sea_plane, self.sky_backend == 1,
+                    camera_pos_time[3], ocean_sun.direction.map(|value| -value), sea_plane, self.sky_backend == 1 && self.fast_sky == 0,
                     self.cloud_backend == 1 && self.clouds_enabled, self.cloud_coverage,
-                    [self.weather_wind.speed, self.weather_wind.direction]);
+                    [self.weather_wind.speed, self.weather_wind.direction], self.blue_water_environment, ocean_sun.intensity, frame_delta, self.weather.rain.native_sheltered(camera.position.to_array()));
+                info.native_thunder.extend(atmosphere.take_thunder());
                 if let Some((_, matrix)) = sky_portal_view { atmosphere.write_portal_camera(&self.queue, matrix); }
                 self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterSkyPrepare, true);
             }
@@ -2635,24 +2669,26 @@ impl Renderer {
                         (self.config.width, self.config.height, self.msaa_samples, flare_scene_format),
                         jitter, frame_delta, self.taa_frame_index,
                         self.wireframe_mask & ui::wireframe::OCEAN != 0,
+                        self.ocean_settings.backend == 2
+                            && self.ocean_settings.blue_water_underwater_mode == 4
+                            && self.ocean_settings.hybrid_waterline_debug == 3,
                         &pvs, sky_faces,
                         &self.ocean_optics.water_distance, self.camera_water_surface,
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.environment()),
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.light()),
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| &sky.aerial),
                         self.blue_water_sky.as_ref().filter(|_| self.cloud_backend == 1 && self.clouds_enabled && self.cloud_shadows_enabled).map(|sky| sky.clouds.shadow()), optical_volumes.as_ref().expect("active water volumes"),
-                        &self.ocean_optics.receiver_color);
+                        &self.ocean_optics.receiver_color, self.weather.fog.legacy_self_fog(),
+                        if self.blue_water_environment.weather_backend == 1 { self.blue_water_environment.rain } else { 0.0 });
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterCausticsCompute, false);
                     ocean.prepare_original_caustics(&mut encoder);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterCausticsCompute, true);
                     ocean.prepare_original_probe(&mut encoder);
                 }
             }
-            if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1 || (self.cloud_backend == 1 && self.clouds_enabled)) {
-                let probe = self.ocean.as_ref().and_then(|ocean| ocean.original_underwater_probe());
-                self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, false);
+            if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1 || self.blue_water_environment.world_lighting || self.blue_water_environment.weather_backend==1 || (self.cloud_backend == 1 && self.clouds_enabled)) {
+                let probe = self.ocean.as_ref().filter(|ocean|ocean.backend()!=0).and_then(|ocean| ocean.original_underwater_probe());
                 atmosphere.render_image(&self.device, &mut encoder, probe);
-                self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, true);
             }
             info.world_pvs_batches = u32::try_from(active.indices.len()).unwrap_or(u32::MAX);
             if capture_api_calls {
@@ -3947,6 +3983,7 @@ impl Renderer {
             // Keep projected lighting after authored world stages. The ocean
             // capture needs it before water; ordinary frames need it after the
             // deferred world queue, including any final opaque replacement.
+            let legacy_dlight_optics_group = self.ocean_optics.bind_group.clone();
             let draw_legacy_dlights = |pass: &mut wgpu::RenderPass<'_>,
                 gpu_profiler: &mut crate::renderer::GpuProfiler, info: &mut FrameInfo| {
                 if world.active_pipeline_variant.legacy_dlights
@@ -3978,7 +4015,7 @@ impl Renderer {
                         pass.set_bind_group(4, &self.planar_reflection.bind_group, &[]);
                         if enhanced_world_shader {
                             if capture_api_calls { info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1); }
-                            pass.set_bind_group(5, &self.ocean_optics.bind_group, &[]);
+                            pass.set_bind_group(5, &legacy_dlight_optics_group, &[]);
                         }
                         if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                         pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
@@ -4286,6 +4323,11 @@ impl Renderer {
 
             if optical_volumes.is_some() {
                 drop(pass);
+                if let Some(atmosphere)=self.blue_water_sky.as_mut().filter(|_|self.sky_backend==1 || self.blue_water_environment.world_lighting || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
+                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
+                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled);
+                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
+                }
                 // Light submerged receivers before atmospheric scattering is added.
                 if let Some(ocean) = self.ocean.as_ref().filter(|gpu| gpu.backend() != 0) {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterCausticsReceiver, false);
@@ -4302,8 +4344,18 @@ impl Renderer {
                     GpuPass::OceanOptics,
                     false,
                 );
+                // Only native visible surface fragments and the native
+                // underwater composite sample this copy. The earlier caustic
+                // receiver performs its own capture when actually enabled.
+                // Surface-off above water is an important no-reader A/B: the
+                // 3.7MP scene color+depth copy must not continue every frame.
+                let native_submerged_capture = self.camera_water_surface
+                    > crate::renderer::NO_WATER_SURFACE
+                    && matches!(self.ocean_settings.blue_water_underwater_mode, 0 | 1 | 3);
+                let native_capture_needed = self.ocean_settings.surface_pixels
+                    || native_submerged_capture;
                 // Include the original material's scene copy in optics timing.
-                if let Some(ocean) = self.ocean.as_ref().filter(|gpu| gpu.backend() != 0) {
+                if let Some(ocean) = self.ocean.as_ref().filter(|gpu| gpu.backend() != 0 && native_capture_needed) {
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterSceneCapture, false);
                     ocean.capture_original_scene(&self.device, &mut encoder, color_view, &self.targets.depth_view);
                     self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterSceneCapture, true);
@@ -4324,9 +4376,54 @@ impl Renderer {
                 // (`refresh_water_boxes` ran this frame for the same camera).
                 let submerged = optical_volumes.is_some()
                     && self.camera_water_surface > crate::renderer::NO_WATER_SURFACE;
+                let hybrid_wave_optics = self.ocean_settings.backend == 2
+                    && self.ocean_settings.blue_water_underwater_mode == 4
+                    && self.ocean_settings.blue_water_adapter
+                    && self.ocean.as_ref().is_some_and(|gpu| gpu.backend() != 0);
+                // Preserve existing CPU-controlled Godot mesh selection.
+                // Only the optical capture/composite becomes wave-aware.
                 let hybrid_godot_surface = submerged
                     && self.ocean_settings.backend == 2
                     && self.ocean_settings.blue_water_underwater_mode == 4;
+                if self.ocean_settings.hybrid_waterline_debug > 0
+                    && self.ocean_settings.backend == 2
+                    && self.ocean_settings.blue_water_underwater_mode == 4
+                {
+                    // Deliberately no GPU readback, alternate displacement solver,
+                    // or frame-dependent allocation. These are the REAL CPU decisions.
+                    static DEBUG_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    static LAST_SECOND: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let second = DEBUG_EPOCH.get_or_init(std::time::Instant::now)
+                        .elapsed().as_secs().saturating_add(1);
+                    if LAST_SECOND.swap(second, std::sync::atomic::Ordering::Relaxed) != second {
+                        // The pool's plane is reported EVEN IF the camera is
+                        // above it. `camera_water_surface` is a wet-only sentinel.
+                        let pool = world.ocean_surfaces.iter().enumerate().find(|(_, surface)| {
+                            camera.position.x >= surface.minimum[0]
+                                && camera.position.x <= surface.maximum[0]
+                                && camera.position.z >= surface.minimum[1]
+                                && camera.position.z <= surface.maximum[1]
+                        });
+                        let pool_label = if let Some((slot, surface)) = pool {
+                            format!("{slot} plane={:.2} plane_minus_eye={:+.2}",
+                                surface.plane_height, surface.plane_height - camera.position.y)
+                        } else {
+                            "none (outside promoted XZ bounding boxes)".to_string()
+                        };
+                        println!(
+                            "[HYBRID WATERLINE] eye=({:.2},{:.2},{:.2}) pool={} cpu_wet={} cpu_water_surface={:.2} volumes={} optics_volumes={} mesh={} godot_composite={} wave_optics_active={} surface_pixels={} adapter={} gpu_probe_available={} wave_marker_sample=camera_xz display_forward=100_JKA_units gpu_probe_eye_excludes_wake=true debug_mode={}",
+                            camera.position.x, camera.position.y, camera.position.z,
+                            pool_label, submerged, self.camera_water_surface,
+                            self.water_boxes.len(), optical_volumes.is_some(),
+                            if hybrid_godot_surface { "Godot" } else { "BlueWater" },
+                            submerged, hybrid_wave_optics, self.ocean_settings.surface_pixels,
+                            self.ocean_settings.blue_water_adapter,
+                            self.ocean.as_ref().and_then(|gpu| gpu.original_underwater_probe()).is_some(),
+                            self.ocean_settings.hybrid_waterline_debug,
+                        );
+                    }
+                }
                 // The capture serves exactly two readers: the ocean surface
                 // shader, which samples it where water is drawn, and the
                 // submerged composite, which reads all of it. So the screen area
@@ -4388,7 +4485,8 @@ impl Renderer {
                 // ocean pass puts zero samples on screen - so the occlusion
                 // query from a previous frame decides, with the same grace
                 // period the simulation gate uses.
-                let water_hidden = self.ocean_visibility.primed
+                let water_hidden = self.ocean_settings.surface_pixels
+                    && self.ocean_visibility.primed
                     && self.ocean_visibility.latest_samples == 0
                     && self.ocean_hidden_time > OCEAN_SIM_GRACE_SECONDS;
                 // Native Blue Water has already copied the scene into its own
@@ -4399,13 +4497,14 @@ impl Renderer {
                 // capture without leaving any known legacy consumer unbound.
                 let native_only = self.ocean_settings.backend != 0
                     && self.ocean_settings.blue_water_dedup_capture
-                    && self.ocean_settings.blue_water_caustics_mode != 3
+                    && !matches!(self.ocean_settings.blue_water_caustics_mode, 3 | 4)
                     && !submerged
+                    && !hybrid_wave_optics
                     && self.authored_oceans.is_empty();
                 let skip_capture = (native_only && !glass_capture_needed)
-                    || (!glass_capture_needed && optical.cull && !submerged && water_hidden);
+                    || (!glass_capture_needed && optical.cull && !submerged && !hybrid_wave_optics && water_hidden);
                 let _ = water_visible;
-                let scissor = if optical.scissor && !submerged && !water_unbounded {
+                let scissor = if optical.scissor && !submerged && !hybrid_wave_optics && !water_unbounded {
                     water_rect.map(|(x0, y0, x1, y1)| {
                         // The surface shader offsets its sample by at most
                         // `refraction` in normalized screen space (bsp.wgsl),
@@ -4432,6 +4531,10 @@ impl Renderer {
                 // the underwater optics capture. Sampling the resolved color with
                 // a nearest-depth resolve produces a one-pixel halo at silhouettes.
                 if !skip_capture {
+                    if self.ocean_settings.backend == 2 && self.ocean_settings.blue_water_caustics_mode == 4
+                        && self.ocean_settings.godot_capture_caustics_strength() > 0.0 {
+                        self.ocean_optics.ensure_procedural_pattern(&self.device, &mut encoder);
+                    }
                     self.ocean_optics.capture_with_receiver(
                         &self.device,
                         &mut encoder,
@@ -4439,7 +4542,8 @@ impl Renderer {
                         &self.targets.depth_view,
                         optical_ocean,
                         scissor,
-                        self.ocean_settings.backend != 0 && self.ocean_settings.blue_water_caustics_mode == 3,
+                        self.ocean_settings.backend != 0 && matches!(self.ocean_settings.blue_water_caustics_mode, 3 | 4),
+                        hybrid_wave_optics,
                     );
                 }
                 info.ocean.optics_unbounded = water_unbounded;
@@ -4458,8 +4562,13 @@ impl Renderer {
                             u64::from(self.config.width) * u64::from(self.config.height)
                         }
                     });
-                if submerged && (!self.ocean.as_ref().is_some_and(|gpu| gpu.original_underwater_active())
-                    || (self.ocean_settings.backend == 2 && self.ocean_settings.blue_water_underwater_mode == 4)) {
+                // Hybrid needs the composite even on the DRY side of the flat
+                // BSP plane: the GPU wave-aware capture writes an unchanged
+                // pixel where the camera ray doesn't actually enter water.
+                if !skip_capture && (hybrid_wave_optics ||
+                    (submerged && (!self.ocean.as_ref().is_some_and(|gpu| gpu.original_underwater_active())
+                        || (self.ocean_settings.backend == 2
+                            && self.ocean_settings.blue_water_underwater_mode == 4)))) {
                     self.ocean_optics
                         .composite(&mut encoder, color_view, resolve_target);
                 }
@@ -4469,7 +4578,8 @@ impl Renderer {
                 // query can suppress early-Z on a depth-writing, discarding
                 // pass like this one, so turning both consumers off has to turn
                 // the query off too - otherwise its cost is unmeasurable.
-                let ocean_query = (optical.cull || !self.ocean_settings.simulate_when_hidden)
+                let ocean_query = (self.ocean_settings.surface_pixels
+                    && (optical.cull || !self.ocean_settings.simulate_when_hidden))
                     .then(|| self.ocean_visibility.query_index())
                     .flatten();
                 if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
@@ -4552,6 +4662,9 @@ impl Renderer {
                             info.ocean.rejected_duplicate.saturating_add(1);
                         continue;
                     }
+                    // Keep BSP visibility/footprint preparation and ocean FFT alive,
+                    // but submit no water vertex or fragment work for this A/B.
+                    if !self.ocean_settings.surface_pixels { continue; }
                     info.ocean.clipmaps_drawn = info.ocean.clipmaps_drawn.saturating_add(1);
                     if let Some(ranges) = batch.ocean_clipmap.as_ref() {
                         let range = &ranges[ocean_clipmap.unwrap_or(0).min(1)];
@@ -4596,7 +4709,7 @@ impl Renderer {
                 // original water brush survived this frame's BSP PVS/area list.
                 // Draw at most once per qualified pool through the SAME Unified
                 // ocean pass, shader and material; depth still occludes land.
-                if self.ocean_sky_extend {
+                if self.ocean_sky_extend && self.ocean_settings.surface_pixels {
                     for (slot, extension) in world.ocean_sky_regions.iter().enumerate() {
                         let Some(_extension) = extension else { continue; };
                         if slot >= 8 || self.ocean_extension_mask >> slot & 1 == 0 { continue; }
@@ -4647,7 +4760,7 @@ impl Renderer {
                 // Draw the pre-existing geometric clipmap first. The analytic
                 // tail then fills only the exterior and cannot occlude displaced
                 // near-water triangles.
-                if self.ocean_sky_infinite {
+                if self.ocean_sky_infinite && self.ocean_settings.surface_pixels {
                     if let Some(far_pipeline) = active_pipeline_variant.ocean_far_pipeline.as_ref() {
                         if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                         pass.set_pipeline(far_pipeline);
@@ -4670,7 +4783,8 @@ impl Renderer {
                         }
                     }
                 }
-                if let Some(ocean) = self.ocean.as_ref().filter(|gpu| gpu.backend() != 0 && !hybrid_godot_surface) {
+                if let Some(ocean) = self.ocean.as_ref().filter(|gpu| self.ocean_settings.surface_pixels
+                    && gpu.backend() != 0 && !hybrid_godot_surface) {
                     let (drawn, horizon_only, horizon_triangles) = ocean.draw_original_surfaces(&mut pass, ocean_drawn);
                     info.ocean.original_surfaces = drawn;
                     info.ocean.clipmaps_drawn = info.ocean.clipmaps_drawn.saturating_add(horizon_only);
@@ -4694,11 +4808,40 @@ impl Renderer {
                     pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
                     pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 }
+                // GPU marker works in BOTH Hybrid mode-4 mesh branches; it
+                // never changes the branch, optics, or any world shader binding.
+                if self.ocean_settings.backend == 2
+                    && self.ocean_settings.blue_water_underwater_mode == 4
+                    && self.ocean_settings.hybrid_waterline_debug == 3
+                {
+                    if let Some(ocean) = &self.ocean {
+                        ocean.draw_original_waterline_marker(&mut pass);
+                    }
+                }
                 if ocean_query.is_some() {
                     pass.end_occlusion_query();
                 }
                 self.gpu_profiler
                     .write_render_pass_timestamp(&mut pass, GpuPass::OceanSurface, true);
+            }
+
+            if optical_volumes.is_none() && (self.sky_backend==1 || self.blue_water_environment.world_lighting || (self.cloud_backend==1 && self.clouds_enabled) || self.blue_water_environment.weather_backend==1) {
+                drop(pass);
+                if let Some(atmosphere)=self.blue_water_sky.as_mut() {
+                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,false);
+                    atmosphere.apply_scene(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,self.cloud_shadows_enabled);
+                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::BlueWaterClouds,true);
+                    atmosphere.apply_opaque_air(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view);
+                }
+                pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {label:Some("scene after native clouds"),color_attachments:&[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()});
+                pass.set_bind_group(0,&self.camera_bind_group,&[]);
+                pass.set_bind_group(2,if enhanced_world_shader {&world.lighting_bind_group}else{&world.lighting_bind_group_lean},&[]);
+                pass.set_bind_group(3,world_shadow_receiver_bind_group,&[]);
+                pass.set_bind_group(4,&self.planar_reflection.bind_group,&[]);
+                if enhanced_world_shader {pass.set_bind_group(5,&self.ocean_optics.bind_group,&[]);}
+                pass.set_vertex_buffer(0,world.vertex_buffer.slice(..));
+                pass.set_vertex_buffer(1,world.legacy_dlight_surface_id_buffer.slice(..));
+                pass.set_index_buffer(world.index_buffer.slice(..),wgpu::IndexFormat::Uint32);
             }
 
             if glass_capture_needed {
@@ -4993,7 +5136,8 @@ impl Renderer {
             // usable here: a promoted surface's bounds routinely surround the
             // camera, so it reads 1 while the mask and world occluders leave
             // nothing on screen. Until the first readback lands, assume visible.
-            let water_on_screen = !self.ocean_visibility.primed
+            let water_on_screen = !self.ocean_settings.surface_pixels
+                || !self.ocean_visibility.primed
                 || self.ocean_visibility.latest_samples > 0
                 || info.ocean.submerged;
             if water_on_screen {
@@ -5002,7 +5146,9 @@ impl Renderer {
                 self.ocean_hidden_time += frame_delta.max(0.0);
             }
 
-            if let Some(ocean) = self.ocean.as_ref() {
+            // The surface-off A/B should retain simulation, but no visible
+            // spray draw is needed when promoted water itself is invisible.
+            if let Some(ocean) = self.ocean.as_ref().filter(|_| self.ocean_settings.surface_pixels) {
                 ocean.draw_spray(
                     &mut pass,
                     &self.camera_bind_group,
@@ -5010,6 +5156,7 @@ impl Renderer {
                 );
             }
             for (_, ocean) in &self.authored_oceans {
+                if !self.ocean_settings.surface_pixels { continue; }
                 ocean.draw_spray(
                     &mut pass,
                     &self.camera_bind_group,
@@ -5071,6 +5218,27 @@ impl Renderer {
             self.weather
                 .wind_visuals
                 .render(&mut pass, &self.camera_bind_group);
+
+            if self.blue_water_environment.weather_backend==1 {
+                drop(pass);
+                let rain_eye = self.blue_water_sky.as_ref().and_then(|sky| sky.weather_eye());
+                let heights = if self.blue_water_environment.rain > 0.0 && self.ocean_enabled {
+                    rain_eye.and_then(|eye| self.ocean.as_mut().filter(|ocean| ocean.backend() != 0)
+                        .and_then(|ocean| ocean.prepare_original_rain_heights(&self.device, &self.queue, &mut encoder, eye)))
+                } else { None };
+                if let Some(atmosphere)=self.blue_water_sky.as_mut() {
+                    atmosphere.set_sea_heights(&self.device, &self.queue, heights);
+                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::RainDraw,false);
+                    atmosphere.draw_weather(&self.device,&self.queue,&mut encoder,color_view,resolve_target,&self.targets.depth_view,
+                        self.taa_enabled.then_some(&self.targets.motion_vector_view));
+                    self.gpu_profiler.write_encoder_timestamp(&mut encoder,GpuPass::RainDraw,true);
+                }
+                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene after native weather"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {view:color_view,depth_slice:None,resolve_target,ops:wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],
+                    depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()
+                });
+            }
 
             // Blue Water's full-screen attenuation belongs to the scene, before
             // wireframes and other diagnostics. Keep weather in the scene copy.
@@ -5428,13 +5596,6 @@ impl Renderer {
             // This makes scene depth and color resolves available to the heatmap.
             drop(pass);
 
-            if optical_volumes.is_none() {
-                if let Some(atmosphere) = self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1) {
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, false);
-                    atmosphere.apply_opaque_air(&self.device, &self.queue, &mut encoder, color_view, resolve_target, &self.targets.depth_view);
-                    self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterAerial, true);
-                }
-            }
             // OpenJK Dynamic Glow is authored at shader-stage granularity: only
             // stages carrying the exact `glow` marker are replayed into a black
             // glow buffer while testing against the already-rendered scene depth.
@@ -5896,11 +6057,10 @@ impl Renderer {
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Post, false);
 
-        // Fog does not need this: entities are in the linear-depth prepass, so
-        // it already is the authoritative opaque scene depth. Only SSR still
-        // uses the resolve, to reject reflections under non-prepass geometry
-        // (grass, promoted ocean) drawn over a reflective BSP surface.
-        let needs_resolved_scene_depth = self.ssr_enabled || self.reflection_debug_enabled;
+        // Legacy 1 also needs completed depth: promoted water is drawn after
+        // the linear/policy prepass and can cover its receiver or the sky.
+        let needs_resolved_scene_depth = self.ssr_enabled || self.reflection_debug_enabled
+            || self.weather.fog.legacy1_global_post_active();
         if needs_resolved_scene_depth {
             // Resolve the final opaque device depth after players, vehicles and
             // promoted ocean have rendered. SSR compares its reconstructed

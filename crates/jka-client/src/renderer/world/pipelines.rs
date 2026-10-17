@@ -11,6 +11,9 @@ use crate::renderer::{
 };
 
 impl Renderer {
+    pub(in crate::renderer) fn native_atmosphere_active(&self) -> bool {
+        self.sky_backend == 1 || (self.cloud_backend == 1 && self.clouds_enabled)
+    }
     /// Format the gameplay scene renders into, ignoring the asset viewer.
     pub(in crate::renderer) fn gameplay_scene_format(&self) -> wgpu::TextureFormat {
         // Legacy OpenGL starts with GL_DITHER enabled, and the OpenJK/TaystJK
@@ -23,7 +26,12 @@ impl Renderer {
         // it explicitly. This is deliberately narrower than r_hdr: it changes
         // precision/order only, not tone mapping or any HDR lighting semantics.
         let legacy2_precision = self.weather.fog.legacy2_precision_active();
+        // Native atmosphere and weather produce HDR radiance even when the
+        // host's HDR option is off. Clamping it in an 8-bit scene destroys the
+        // contrast between the lightning channel and its surrounding airlight.
         if self.hdr_enabled
+            || self.native_atmosphere_active()
+            || self.blue_water_environment.weather_backend == 1
             || self.glow_mode.enabled()
             || self.halation_enabled
             || legacy2_precision

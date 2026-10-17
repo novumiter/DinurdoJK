@@ -331,6 +331,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.companion_target_enabled = false;
                 }
             }
+            UserEvent::BlueWaterThunder(volume) => {
+                if self.video.blue_water_environment.weather_backend==1 {
+                    if let Some(sound)=self.game_session.as_mut().and_then(|s|s.sound_presenter.as_mut()) {sound.play_weather_thunder(volume);}
+                }
+            }
             UserEvent::RendererFirstFrame => {
                 crate::startup_timeline::mark(crate::startup_timeline::Milestone::FirstPresent);
                 // The main HWND has now presented. Move the already-visible

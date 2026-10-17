@@ -70,7 +70,11 @@ fn bolt_vertex(@builtin(vertex_index) index: u32, @location(0) start: vec4<f32>,
     out.pixels = pixels;
     out.sigma = core_sigma;
     out.halo_sigma = glow_sigma;
-    out.position = select(vec4<f32>(0.0, 0.0, 2.0, 1.0), vec4<f32>(pixel / half_screen * clip.w, clip.z, clip.w), visible);
+    // JKA's map far plane can be hundreds of metres away while upstream
+    // strikes are kilometres away. Keep distant bolts just inside reversed
+    // depth's far edge; nearer terrain still occludes them normally.
+    let depth = max(clip.z, clip.w * 1e-7);
+    out.position = select(vec4<f32>(0.0, 0.0, 2.0, 1.0), vec4<f32>(pixel / half_screen * clip.w, depth, clip.w), visible);
     return out;
 }
 

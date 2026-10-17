@@ -751,6 +751,7 @@ pub struct PostEffects {
     pub baked_sun_removal: f32,
     pub sky_fractal_override: bool,
     pub sky_backend: u8,
+    pub blue_water_environment: crate::blue_water_environment::Settings,
     pub cloud_backend: u8,
     pub clouds: bool,
     pub cloud_type: CloudType,
@@ -1233,6 +1234,7 @@ pub(in crate::renderer) struct WorldStagePerf {
 
 #[derive(Default)]
 pub(in crate::renderer) struct FrameInfo {
+    pub(in crate::renderer) native_thunder: Vec<blue_water_clouds::lightning::Thunder>,
     pub(in crate::renderer) patch_lod: super::world::patch_lod::PatchLodStats,
     pub(in crate::renderer) frame_ms: f64,
     pub(in crate::renderer) cpu_prepare_ms: f64,

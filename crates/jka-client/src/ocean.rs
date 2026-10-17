@@ -1,4 +1,4 @@
-﻿//! WGPU port/adaptation of 2Retr0/GodotOceanWaves.
+//! WGPU port/adaptation of 2Retr0/GodotOceanWaves.
 //! GodotOceanWaves is MIT licensed:
 //! Copyright (c) 2024 Ethan Truong
 //! Permission is hereby granted, free of charge, to any person obtaining a copy of this
@@ -22,6 +22,7 @@ pub mod interaction;
 pub mod surfaces;
 pub mod bathymetry;
 mod blue_water;
+mod eye_wave;
 mod native_waves;
 mod native_optics;
 pub use native_optics::BlueWaterOptics;
@@ -1415,6 +1416,20 @@ pub struct OceanSettings {
     /// 0 Godot/Unified, 1 native Blue Water, 2 Hybrid (Blue Water + JKA optics).
     /// Off is represented by the existing r_ocean enable state.
     pub backend: u8,
+    /// Diagnostic A/B: enable ocean surface raster draws (Godot, native and hybrid,
+    /// including infinite horizon). Turning this off preserves FFT, foam, and
+    /// mesh/topology updates but submits no ocean color/depth fragments.
+    pub surface_pixels: bool,
+    /// Optional conservative native-clipmap screen-space LOD threshold in
+    /// projected pixels per cell. 0 = preserve native mesh selection.
+    /// Uses existing watertight full rings, not unsafe per-cell decimation.
+    pub screen_lod_pixels: f32,
+    /// Diagnostic native/Hybrid expensive pixel shading rate:
+    /// 0 full; 1=2x2; 2=4x4; 3=distance-aware 2x2; 4=distance-aware 4x4;
+    /// 5=cheap approximation at all pixels (all preserve full-res depth).
+    pub pixel_detail_mode: u8,
+    /// Distance in metres where the distance-aware sparse experiment starts.
+    pub pixel_detail_distance: f32,
     pub blue_water_waves: BlueWaterWaves,
     pub blue_water_optics: BlueWaterOptics,
     /// Blue Water scene-bending refraction; independent of legacy optics.
@@ -1444,8 +1459,13 @@ pub struct OceanSettings {
     /// Hybrid-only choices: preserve the working Godot transmission, caustics,
     /// submerged surface and cheaper refraction without modifying pure Blue Water.
     pub hybrid_refraction_mode: u8,
+    /// 0 native, 1 native FFT, 2 off, 3 Godot curvature, 4 procedural animated.
     pub hybrid_caustics_mode: u8,
     pub hybrid_underwater_mode: u8,
+    /// Session-only Hybrid waterline diagnostics: 0 off, 1 throttled CPU trace,
+    /// 2 colors Godot triangles, 3 draws a GPU-sampled Blue Water wave-height marker.
+    /// This does not influence surface selection, tint, wave simulation, or culling.
+    pub hybrid_waterline_debug: u8,
     pub hybrid_ssr: bool,
     /// Hybrid owns its appearance; editing it must not overwrite native Blue Water.
     /// 1x uses the saved Godot fog-distance and native Blue Water calibration.
@@ -1456,6 +1476,9 @@ pub struct OceanSettings {
     /// Rescale only Hybrid's receiver sampling to recover a finer pattern.
     pub hybrid_caustics_scale: f32,
     pub hybrid_caustics_gain: f32,
+    /// Procedural pattern size and deformation speed; Hybrid only.
+    pub hybrid_procedural_scale: f32,
+    pub hybrid_procedural_speed: f32,
     /// Optional forward-difference receiver: 3 taps rather than 4.
     pub hybrid_caustics_fast: bool,
     /// Fixed specialization parameter for native Blue Water screen-space traces.
@@ -1523,6 +1546,10 @@ impl Default for OceanSettings {
     fn default() -> Self {
         Self {
             backend: 0,
+            surface_pixels: true,
+            screen_lod_pixels: 0.0,
+            pixel_detail_mode: 0,
+            pixel_detail_distance: 100.0,
             blue_water_waves: BlueWaterWaves::default(),
             blue_water_optics: BlueWaterOptics::default(),
             blue_water_refraction: 0.1,
@@ -1537,7 +1564,10 @@ impl Default for OceanSettings {
             blue_water_ssr: true,
             hybrid_refraction_mode: 1,
             hybrid_caustics_mode: 3,
+            hybrid_procedural_scale: 1.0,
+            hybrid_procedural_speed: 1.0,
             hybrid_underwater_mode: 4,
+            hybrid_waterline_debug: 0,
             hybrid_ssr: false,
             hybrid_transparency: 1.0,
             hybrid_fog_color: optics::Settings::default().fog_color,
@@ -1622,10 +1652,12 @@ impl OceanSettings {
     /// The native receiver gets the unchanged master strength separately.
     /// Call on settings resolved for GPU, not on the archived UI values.
     pub fn godot_capture_caustics_strength(self) -> f32 {
-        if self.backend == 2 && self.blue_water_caustics_mode != 3 {
-            0.0
-        } else {
-            self.optics.caustics
+        match self.backend {
+            0 => self.optics.caustics,
+            2 if matches!(self.blue_water_caustics_mode, 3 | 4) => self.optics.caustics,
+            // The native receiver has its own separate draw. Its legacy
+            // optics capture must never evaluate unobserved Godot caustics.
+            _ => 0.0,
         }
     }
 
@@ -1649,7 +1681,7 @@ impl OceanSettings {
         } else if self.backend == 1 {
             // Old configs may still contain the pre-split hybrid-only modes.
             // Never let them silently turn Godot optics back on in Native.
-            if self.blue_water_caustics_mode == 3 { self.blue_water_caustics_mode = 0; }
+            if self.blue_water_caustics_mode >= 3 { self.blue_water_caustics_mode = 0; }
             if self.blue_water_underwater_mode == 4 { self.blue_water_underwater_mode = 0; }
         }
         self
@@ -1666,10 +1698,10 @@ impl OceanSettings {
         self.blue_water_mesh_segments = match self.blue_water_mesh_segments { 64 | 128 | 256 => self.blue_water_mesh_segments, _ => 128 };
         self.blue_water_mesh_levels = self.blue_water_mesh_levels.clamp(6, 9);
         self.blue_water_boundary_mode = self.blue_water_boundary_mode.min(3);
-        self.blue_water_caustics_mode = self.blue_water_caustics_mode.min(3);
+        self.blue_water_caustics_mode = self.blue_water_caustics_mode.min(4);
         self.blue_water_underwater_mode = self.blue_water_underwater_mode.min(4);
         self.hybrid_underwater_mode = self.hybrid_underwater_mode.min(4);
-        self.hybrid_caustics_mode = self.hybrid_caustics_mode.min(3);
+        self.hybrid_caustics_mode = self.hybrid_caustics_mode.min(4);
         self.hybrid_refraction_mode = self.hybrid_refraction_mode.min(2);
         fn bounded(v: f32, fallback: f32, min: f32, max: f32) -> f32 {
             if v.is_finite() { v.clamp(min, max) } else { fallback }
@@ -1677,6 +1709,8 @@ impl OceanSettings {
         self.hybrid_transparency = bounded(self.hybrid_transparency, 1.0, 0.1, 10.0);
         self.hybrid_caustics_scale = bounded(self.hybrid_caustics_scale, 3.0, 1.0, 6.0);
         self.hybrid_caustics_gain = bounded(self.hybrid_caustics_gain, 1.5, 0.0, 4.0);
+        self.hybrid_procedural_scale = bounded(self.hybrid_procedural_scale, 1.0, 0.25, 4.0);
+        self.hybrid_procedural_speed = bounded(self.hybrid_procedural_speed, 1.0, 0.0, 3.0);
         for (color, fallback) in [
             (&mut self.hybrid_fog_color, optics::Settings::default().fog_color),
             (&mut self.hybrid_water_color, BlueWaterOptics::default().water_color),
@@ -1854,6 +1888,8 @@ fn ocean_lod_deadline(next: &mut f32, now: f32, hz: f32) -> bool {
 
 pub struct OceanGpu {
     blue_water: Option<blue_water::BlueWaterOcean>,
+    /// Lazily created: only Hybrid classification asks for the real eye-wave height.
+    eye_wave: Option<eye_wave::EyeWaveProbe>,
     sky_extend_enabled: bool,
     sky_infinite_enabled: bool,
     sky_extend_regions: [Option<sky_extend::SkyExtension>; OCEAN_MAX_SURFACES],
@@ -2313,7 +2349,7 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { blue_water, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { blue_water, eye_wave:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view, render_normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             interaction_view: interaction.view.clone(), interaction_uniform: interaction.uniform.clone(),
@@ -2880,6 +2916,39 @@ impl OceanGpu {
         }
     }
 
+    /// Dispatches the one-thread solve for the rasterized surface height over `eye`
+    /// (render space) in promoted pool `slot`. `None` clears the stored sample.
+    pub fn encode_eye_wave_probe(
+        &mut self, device:&wgpu::Device, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder,
+        eye:[f32;3], slot:Option<usize>,
+    ) {
+        let (Some(blue), Some(slot)) = (self.blue_water.as_ref(), slot) else {
+            if let Some(probe) = self.eye_wave.as_mut() { probe.clear(); }
+            return;
+        };
+        let settings = self.promoted_surfaces.iter().find(|s| s.descriptor.index == slot)
+            .map_or(&self.settings, |s| &s.settings);
+        let mut uniform = make_render_uniform(self.enabled, settings);
+        uniform.swell_motion[3] = self.elapsed;
+        let params = eye_wave::EyeWaveParams {
+            map_scales: uniform.map_scales,
+            ocean_info: uniform.ocean_info,
+            swell: uniform.swell,
+            swell_motion: uniform.swell_motion,
+            eye: [eye[0], eye[2], 0.0, 0.0],
+        };
+        let sampler = &self.render_sampler;
+        self.eye_wave
+            .get_or_insert_with(|| eye_wave::EyeWaveProbe::new(device, &blue.displacement_view, sampler))
+            .encode(queue, encoder, &params, slot);
+    }
+
+    /// Latest rasterized-surface height above pool `slot`'s flat plane at the eye, in
+    /// JKA units, a few frames old.
+    pub fn eye_wave_sample(&self, slot: usize) -> Option<eye_wave::EyeWaveSample> {
+        self.eye_wave.as_ref()?.latest(slot)
+    }
+
     pub fn encode_frame(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32) {
         if !self.enabled { return; }
         if let Some(blue) = &mut self.blue_water {
@@ -3100,8 +3169,13 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         // seam flatten flag, always 0 for the shared (authored) view.
         appearance_a: [settings.foam_detail_mode as f32 + 1.0, settings.foam_activity_mode as f32,
             settings.foam_gain, 0.0],
+        // Values 0..3 are the existing foam diagnostic. 8+ is an opt-in
+        // surface-geometry inspection palette, not a water height calculation.
+        // Reuse this existing float; do not change any shader binding layouts.
         appearance_b: [settings.color_mode as f32, settings.foam_brightness,
-            settings.sun_gain, settings.foam_debug as f32],
+            settings.sun_gain, settings.foam_debug as f32
+                + if settings.backend == 2 && settings.hybrid_underwater_mode == 4
+                    && settings.hybrid_waterline_debug == 2 { 8.0 } else { 0.0 }],
         appearance_c: [settings.visual_fixes as f32, 0.0,
             if settings.mesh_quality > 0 { OCEAN_HIGH_MESH_SPACING_UNITS } else { OCEAN_LOW_MESH_SPACING_UNITS }, 0.0],
     };
@@ -4033,9 +4107,17 @@ mod ocean_backend_selection_tests {
             // Do not zero the master value: native modes still need it.
             assert_eq!(resolved.optics.caustics, 3.0);
         }
-        hybrid.hybrid_caustics_mode = 3;
-        let resolved = hybrid.resolved_for_gpu();
-        assert_eq!(resolved.godot_capture_caustics_strength(), 3.0);
+        for mode in [3, 4] {
+            hybrid.hybrid_caustics_mode = mode;
+            let resolved = hybrid.resolved_for_gpu();
+            assert_eq!(resolved.blue_water_caustics_mode, mode);
+            assert_eq!(resolved.godot_capture_caustics_strength(), 3.0);
+            assert_eq!(resolved.sanitize().blue_water_caustics_mode, mode);
+        }
+        let mut native = OceanSettings::default();
+        native.backend = 1;
+        native.optics.caustics = 3.0;
+        assert_eq!(native.resolved_for_gpu().godot_capture_caustics_strength(), 0.0);
         let mut godot = OceanSettings::default();
         godot.backend = 0;
         assert_eq!(godot.godot_capture_caustics_strength(), godot.optics.caustics);

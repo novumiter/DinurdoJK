@@ -31,6 +31,6 @@ pub use environment::*;
 pub use shaders::add_sky_modules;
 pub use sky::{CloudHooks, SeaLevel, Sky, SkyPipelines, SkyQuality, SkyTargets, SkyView};
 pub use state::{
-    CloudGenus, CloudScene, DEFAULT_SKY_SCENE, HighCloudGenus, HighClouds, SkyScene, WeatherScene,
+    CloudGenus, CloudScene, SkyAngles, DEFAULT_SKY_SCENE, HighCloudGenus, HighClouds, SkyScene, WeatherScene,
 };
 pub use uniforms::SkyUniforms;

@@ -15,12 +15,19 @@ struct Optics {
     sky_regions: array<SkyFogRegion, 8>,
     sky_info: vec4<f32>,
     caustic_tuning: vec4<f32>,
+    procedural_params: vec4<f32>,
+    eye_wave: vec4<f32>,
 };
 COLOR_DECLARATION
 @group(0) @binding(1) var scene_sampler: sampler;
 DEPTH_DECLARATION
 @group(0) @binding(3) var<uniform> optics: Optics;
+@group(0) @binding(4) var caustic_patterns: texture_2d_array<f32>;
+@group(0) @binding(5) var caustic_pattern_sampler: sampler;
 // OCEAN_STRUCT
+// Existing Blue Water adapter displacement. Used ONLY in the specialized
+// Hybrid mode-4 optics shader, never in ordinary Godot/native capture.
+@group(1) @binding(0) var wave_displacement: texture_2d_array<f32>;
 @group(1) @binding(1) var wave_normal: texture_2d_array<f32>;
 @group(1) @binding(2) var wave_sampler: sampler;
 @group(1) @binding(3) var<uniform> ocean: OceanRenderSettings;
@@ -31,6 +38,78 @@ DEPTH_DECLARATION
 // Match the outline's existing tolerance, in map units. Only receiver tests
 // use this margin; ray intervals and absorption retain the actual volume.
 const CAUSTIC_RECEIVER_MARGIN: f32 = 0.75;
+// Replaced at pipeline specialization time; false compiles all extra wave
+// reads and classification out of non-Hybrid optics.
+const JKA_HYBRID_WAVE: bool = false;
+
+// Read the SAME Blue Water simulation adapter passed to the world water
+// material. Sampling varies with the ray's WORLD XZ, NOT one camera height
+// pasted onto a whole frame. Away from the eye this reads the two large
+// cascades only (1024 m and 181 m tiles); the 31 m detail cascade and the
+// horizontal-displacement inversion that the mesh applies are folded into the
+// eye term: the CPU probe (see ocean/eye_wave.rs) solves the exact rasterized
+// surface over the eye, and `optics.eye_wave.x` is its difference from this
+// function's naive value there. That makes the waterline AT THE EYE (the tint
+// switch) agree with the mesh and with the CPU cull, fading out over ~30 m.
+fn jka_wave_height(position_xz: vec2<f32>, flat_plane: f32) -> f32 {
+    if (!JKA_HYBRID_WAVE) { return flat_plane; }
+    let p = position_xz / max(ocean.ocean_info.z, 0.001);
+    var displacement_y = 0.0;
+    for (var i = 0u; i < 2u; i += 1u) {
+        let scale = ocean.map_scales[i];
+        let uv = p * vec2<f32>(1.0, -1.0) * scale.xy;
+        displacement_y += textureSampleLevel(wave_displacement, wave_sampler, uv, i32(i), 0.0).y * scale.z;
+    }
+    // Hybrid's native adapter carries all FFT cascades and no additional
+    // authored Gerstner sine. JKA world units / metre is ocean_info.z.
+    var height = flat_plane + displacement_y * ocean.ocean_info.z;
+    if (optics.eye_wave.y > 0.5) {
+        let near = 1.0 - smoothstep(0.0, 1200.0, distance(position_xz, optics.eye.xz));
+        height += optics.eye_wave.x * near;
+    }
+    return height;
+}
+
+fn jka_wave_signed_depth(t: f32, delta: vec3<f32>, flat_plane: f32) -> f32 {
+    let p = optics.eye.xyz + delta * t;
+    return jka_wave_height(p.xz, flat_plane) - p.y;
+}
+
+// Clip a ray against the animated upper boundary, sampling along THIS ray.
+// A secant estimate (not midpoint bisection!) is essential: the ray may travel
+// thousands of map units while the crest is only tens of units above the eye.
+// Taking the midpoint would create precisely the giant optical walls that the
+// earlier broken fix produced. One refinement catches local wave curvature.
+fn jka_wave_wet_span(span: vec2<f32>, delta: vec3<f32>, flat_plane: f32) -> vec2<f32> {
+    if (!JKA_HYBRID_WAVE) {
+        return sky_fog_clip(span, optics.eye.y, delta.y, flat_plane);
+    }
+    if (span.y <= span.x) { return vec2<f32>(1.0, 0.0); }
+    var a = span.x;
+    var b = span.y;
+    var da = jka_wave_signed_depth(a, delta, flat_plane);
+    var db = jka_wave_signed_depth(b, delta, flat_plane);
+    if (da >= 0.0 && db >= 0.0) { return span; }
+    if (da < 0.0 && db < 0.0) { return vec2<f32>(1.0, 0.0); }
+    let start_wet = da >= 0.0;
+    // Two secant steps, bounded and GPU-only (four wave reads including ends).
+    // Compared with sampling a wave at every screen ray step, this has fixed
+    // work while keeping the critical camera-side crossing precise.
+    for (var i = 0u; i < 2u; i += 1u) {
+        let weight = abs(da) / max(abs(da) + abs(db), 1.0e-5);
+        let t = mix(a, b, weight);
+        let dt = jka_wave_signed_depth(t, delta, flat_plane);
+        if ((dt >= 0.0) == start_wet) {
+            a = t;
+            da = dt;
+        } else {
+            b = t;
+            db = dt;
+        }
+    }
+    let crossing = mix(a, b, abs(da) / max(abs(da) + abs(db), 1.0e-5));
+    return select(vec2<f32>(crossing, span.y), vec2<f32>(span.x, crossing), start_wet);
+}
 
 @vertex fn vs_main(@builtin(vertex_index) id: u32) -> @builtin(position) vec4<f32> {
     let xy = vec2<f32>(f32((id << 1u) & 2u), f32(id & 2u));
@@ -263,7 +342,7 @@ fn add_sky_ocean_spans(delta: vec3<f32>) {
     let direction = delta.xz;
     for (var i = 0u; i < u32(optics.sky_info.x); i += 1u) {
         let top = optics.sky_regions[i].plane.x;
-        let wet = sky_fog_clip(vec2<f32>(0.0, 1.0), optics.eye.y, delta.y, top);
+        let wet = jka_wave_wet_span(vec2<f32>(0.0, 1.0), delta, top);
         if (wet.y <= wet.x) { continue; }
         for (var j = 0u; j < u32(optics.sky_regions[i].plane.y); j += 1u) {
             let seg = optics.sky_regions[i].segments[j];
@@ -343,6 +422,22 @@ struct OpticalSample {
     water_distance: f32,
     receiver: vec4<f32>,
 };
+// 32 seamless phases generated once on the GPU. Consecutive phases change
+// actual light-web shapes (interference and evolving warp), not just UV offsets.
+// Two level-zero filtered taps interpolate continuously at any render FPS.
+fn animated_caustics(position: vec2<f32>) -> f32 {
+    let phase = fract(optics.procedural_params.x * optics.procedural_params.z / 3.2) * 32.0;
+    let slice = i32(floor(phase));
+    let blend = fract(phase);
+    // Slow non-looping advection prevents the precomputed temporal cycle from
+    // obviously repeating. The field still deforms independently of drift.
+    let advection = optics.procedural_params.x * optics.procedural_params.z * vec2<f32>(0.005, -0.004);
+    let uv = fract(position * (optics.procedural_params.y / 1024.0) + advection);
+    let next = (slice + 1) % 32;
+    let a = textureSampleLevel(caustic_patterns, caustic_pattern_sampler, uv, slice / 4, 0.0)[u32(slice % 4)];
+    let b = textureSampleLevel(caustic_patterns, caustic_pattern_sampler, uv, next / 4, 0.0)[u32(next % 4)];
+    return mix(a, b, blend);
+}
 fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> OpticalSample {
     let h = optics.inverse_view_projection * vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), depth, 1.0);
     let world = h.xyz / h.w;
@@ -358,29 +453,40 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Optical
     // Distance gate runs before footprint classification and all caustic
     // slope samples. No extra pass, texture, FFT work or CPU readback.
     let caustic_limit = optics.caustic_tuning.w;
-    let caustic_receiver_in_range = optics.params.z > 0.0 && depth > 0.0 &&
+    // A zero/near-zero sun strength cannot illuminate Godot-style caustics.
+    // Do not compute their footprint and FFT derivatives just to multiply the
+    // result by zero later. Procedural Hybrid uses a deliberate ambient floor.
+    let caustic_sun_eligible = ocean.sun_direction_intensity.w > 0.001 || optics.procedural_params.w > 0.5;
+    let caustic_receiver_in_range = optics.params.z > 0.0 && depth > 0.0 && caustic_sun_eligible &&
         (caustic_limit <= 0.0 || ray_length < caustic_limit);
     var bottom_depth = 0.0;
     for (var i = 0u; i < min(u32(optics.params.w), 8u); i += 1u) {
         let lo = optics.minimum[i].xyz;
         let hi = optics.maximum[i].xyz;
         let slot = i32(round(optics.minimum[i].w)) - 1;
-        let span = interval(optics.eye.xyz, delta, lo, hi);
+        // For Hybrid allow the ray to start above the UNDISTURBED plane while
+        // still inside a crest. The XZ box and floor remain exact. The upper
+        // Y bound is only a conservative candidate envelope: the final span
+        // is clipped individually against the sampled animated wave.
+        let candidate_hi = select(hi, vec3<f32>(hi.x, hi.y + 4096.0, hi.z), JKA_HYBRID_WAVE);
+        let candidate = interval(optics.eye.xyz, delta, lo, candidate_hi);
+        let span = jka_wave_wet_span(candidate, delta, hi.y);
         if (span.y > span.x) {
+            let local_top = jka_wave_height(optics.eye.xz, hi.y);
             if (slot >= 0 && slot < 8) {
-                add_masked_spans(slot, span, hi.y, delta);
-                // The outline hollows (islands, piers, docks) are dry only above
-                // the surface. Deep below it a visible ray is in water, so the
-                // hollow must not leave seabed seen past a pier unabsorbed.
-                add_span(sky_fog_clip(span, optics.eye.y, delta.y, hi.y - MASK_DRY_DEPTH), hi.y, delta.y);
+                add_masked_spans(slot, span, local_top, delta);
+                // Hollows remain dry near the shoreline, even when the wave
+                // rises above the original plane. Keep the deep fallback.
+                add_span(sky_fog_clip(span, optics.eye.y, delta.y, hi.y - MASK_DRY_DEPTH), local_top, delta.y);
             } else {
-                add_span(span, hi.y, delta.y);
+                add_span(span, local_top, delta.y);
             }
         }
         let receiver_margin = vec3<f32>(CAUSTIC_RECEIVER_MARGIN);
-        if (caustic_receiver_in_range && all(world >= lo - receiver_margin) && all(world <= hi + receiver_margin)
+        if (caustic_receiver_in_range && all(world >= lo - receiver_margin)
+            && all(world <= candidate_hi + receiver_margin)
             && ocean_mask_contains(slot, world.xz)) {
-            bottom_depth = max(bottom_depth, max(hi.y - world.y, 0.0));
+            bottom_depth = max(bottom_depth, max(jka_wave_height(world.xz, hi.y) - world.y, 0.0));
         }
     }
     // The continuation exists under the rendered ocean, NOT as fog-painted
@@ -424,26 +530,29 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Optical
                 // Hybrid samples Blue Water's 181m mid-cascade while Godot uses
                 // a 57m tile. Repeating the native field more densely restores
                 // roughly the Godot pattern size without another FFT/capture.
-                let density = max(optics.caustic_tuning.x, 1.0);
-                let surface = (world.xz - refracted.xz * bottom_depth / max(-refracted.y, 0.1)) * density;
-                // Rescale the finite-difference spacing in texture-space units.
-                // Differentiating in sampled-field space (not scaled world space)
-                // prevents pattern density from accidentally changing contrast.
-                let step = 8.0 / density;
-                var divergence = 0.0;
-                if (optics.caustic_tuning.z > 0.5) {
-                    // A/B inexpensive forward differences: 3 texture reads.
-                    let c = slopes(surface);
-                    let sx = slopes(surface + vec2<f32>(step, 0.0));
-                    let sz = slopes(surface + vec2<f32>(0.0, step));
-                    divergence = ((sx.x - c.x) + (sz.y - c.y)) / step;
+                var focus = 0.0;
+                if (optics.procedural_params.w > 0.5) {
+                    // Independent animated interference field: no FFT normal
+                    // texture samples or per-fragment wave-curvature derivative.
+                    let surface = world.xz - refracted.xz * bottom_depth / max(-refracted.y, 0.1);
+                    focus = (animated_caustics(surface) - 0.26) * 1.75 * optics.procedural_params.w;
                 } else {
-                    // Original Godot-style central differences: 4 texture reads.
-                    let dx = (slopes(surface + vec2<f32>(step,0.0)) - slopes(surface - vec2<f32>(step,0.0))) / (2.0*step);
-                    let dz = (slopes(surface + vec2<f32>(0.0,step)) - slopes(surface - vec2<f32>(0.0,step))) / (2.0*step);
-                    divergence = dx.x + dz.y;
+                    let density = max(optics.caustic_tuning.x, 1.0);
+                    let surface = (world.xz - refracted.xz * bottom_depth / max(-refracted.y, 0.1)) * density;
+                    let step = 8.0 / density;
+                    var divergence = 0.0;
+                    if (optics.caustic_tuning.z > 0.5) {
+                        let c = slopes(surface);
+                        let sx = slopes(surface + vec2<f32>(step, 0.0));
+                        let sz = slopes(surface + vec2<f32>(0.0, step));
+                        divergence = ((sx.x - c.x) + (sz.y - c.y)) / step;
+                    } else {
+                        let dx = (slopes(surface + vec2<f32>(step,0.0)) - slopes(surface - vec2<f32>(step,0.0))) / (2.0*step);
+                        let dz = (slopes(surface + vec2<f32>(0.0,step)) - slopes(surface - vec2<f32>(0.0,step))) / (2.0*step);
+                        divergence = dx.x + dz.y;
+                    }
+                    focus = clamp(1.0 / max(0.25, 1.0 + bottom_depth * 0.25 * divergence) - 1.0, -0.4, 2.0);
                 }
-                let focus = clamp(1.0 / max(0.25, 1.0 + bottom_depth * 0.25 * divergence) - 1.0, -0.4, 2.0);
                 let fade = exp2(-4.321928 * bottom_depth / max(optics.fog.w, 1.0));
                 // Enhance bright focus lines without making unfocused regions
                 // excessively dark, as scaling both signed lobes would do.
@@ -454,7 +563,7 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Optical
                 if (caustic_limit > 0.0) {
                     range_fade = 1.0 - smoothstep(caustic_limit * 0.75, caustic_limit, ray_length);
                 }
-                let caustic = tuned_focus * optics.params.z * fade * range_fade * abs(dot(scene_normal, sun)) * min(ocean.sun_direction_intensity.w, 1.0);
+                let caustic = tuned_focus * optics.params.z * fade * range_fade * abs(dot(scene_normal, sun)) * select(min(ocean.sun_direction_intensity.w, 1.0), max(min(ocean.sun_direction_intensity.w, 1.0), 0.25), optics.procedural_params.w > 0.5);
                 // Preserve the existing discontinuity fade and brightness clamp.
                 let caustic_multiplier = max(1.0 + caustic, 0.65);
                 color *= mix(1.0, caustic_multiplier, caustic_surface_confidence);
@@ -471,7 +580,7 @@ fn capture_sample(uv: vec2<f32>, depth: f32, sample_color: vec3<f32>) -> Optical
     // must not leave a dark void-coloured border there.
     if (depth <= 0.0 && delta.y < 0.0) {
         for (var i = 0u; i < u32(optics.sky_info.x); i += 1u) {
-            if (optics.eye.y > optics.sky_regions[i].plane.x) {
+            if (optics.eye.y > jka_wave_height(optics.eye.xz, optics.sky_regions[i].plane.x)) {
                 water_fraction = 1.0;
                 // The unbounded column starts at the surface. Do not inherit the
                 // original box's 128-unit hollow span depth: that darkened only the

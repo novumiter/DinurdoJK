@@ -673,6 +673,12 @@ struct Renderer {
     water_boxes: Vec<crate::ocean::WaterVolume>,
     /// Top of the water volume the camera is inside, or NO_WATER_SURFACE.
     camera_water_surface: f32,
+    /// Hybrid only: promoted pool under the eye, and how far its rasterized surface
+    /// there sits above the flat plane (render units, from the GPU probe; 0 = flat).
+    eye_wave_slot: Option<usize>,
+    eye_wave_offset: f32,
+    /// Offset the optics shader adds to its two-cascade lookup near the eye.
+    eye_wave_correction: Option<f32>,
     ocean_enabled: bool,
     ocean_sky_extend: bool,
     /// Mesh-free far-plane continuation, live only in r_oceanSkyExtend 2.
@@ -868,6 +874,7 @@ struct Renderer {
     baked_sun_removal: f32,
     sky_fractal_override: bool,
     sky_backend: u8,
+    blue_water_environment: crate::blue_water_environment::Settings,
     cloud_backend: u8,
     blue_water_sky: Option<environment::blue_water_sky::AtmosphereRenderer>,
     clouds_enabled: bool,
