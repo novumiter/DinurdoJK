@@ -9,3 +9,6 @@
 /artifacts/
 /target-glass-check/
 /glass-preview-base/
+# C# exporter build output
+/exporter/*/bin/
+/exporter/*/obj/
