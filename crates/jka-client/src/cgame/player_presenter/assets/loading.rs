@@ -946,6 +946,7 @@ fn build_character_model(
         animation_gla,
         retargeter,
         source_native_pivots: None,
+        emote_contacts: Default::default(),
         humanoid,
         animations,
         anim_events,

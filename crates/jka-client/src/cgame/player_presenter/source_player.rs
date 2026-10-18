@@ -410,6 +410,7 @@ pub(in crate::cgame::player_presenter) fn build_source_player_model(
         animation_gla,
         retargeter,
         source_native_pivots,
+        emote_contacts: Default::default(),
         // A Source player is driven by `players/_humanoid/`, so it takes the
         // ordinary multiplayer animation and BG_G2PlayerAngles path.
         humanoid: true,

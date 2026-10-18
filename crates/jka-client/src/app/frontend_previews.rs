@@ -113,6 +113,17 @@ impl App {
     }
 
     pub(in crate::app) fn update_profile_preview(&mut self) {
+        if self.game_session.is_none() {
+            let (effects,voice,separation) = self.effective_audio_mix();
+            let emote_music=self.effective_emote_music_volume();
+            if let Some(sound) = self.menu_emote_sound.as_mut() {
+                sound.set_mix(effects,voice,separation);
+                sound.set_emote_music_volume(emote_music);
+                sound.frame(crate::audio::Listener {
+                    entity:1023,origin:[0.0;3],ahead:[1.0,0.0,0.0],up:[0.0,0.0,1.0],left:[0.0,1.0,0.0],
+                }, &[], None);
+            }
+        } else { self.menu_emote_sound = None; }
         if !self.profile_preview_active {
             return;
         }
@@ -193,7 +204,10 @@ impl App {
             else { saber_stance }
         } else if in_idle { "BOTH_STAND1IDLE1" }
         else { "BOTH_STAND1" });
-        let with_sabers = studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17));
+        // Emotes holster weapons (Fortnite's default), so an emote preview never
+        // shows the studio saber or its blade light in the hands.
+        let with_sabers = (studio_saber || matches!(force_power, Some(15) | Some(16) | Some(17)))
+            && crate::emotes::active_preview().is_none();
 
         // 30 Hz is ample for the isolated Profile character and keeps its CPU
         // skinning/studio-lighting work independent of an uncapped render loop.
@@ -207,19 +221,20 @@ impl App {
         let preview_model = self.profile_model_staged.as_deref()
             .map(str::to_owned)
             .unwrap_or_else(|| self.solo_client_info.model_cvar());
-        let animation_tick = (animation_elapsed.as_millis() / 33) as i32;
+        let preview_interval=if self.video.emote_cubic && crate::emotes::active_preview().is_some(){16}else{33};
+        let animation_tick = (animation_elapsed.as_millis() / preview_interval as u128) as i32;
         // One-shot idle poses must start at frame zero when their 3-second
         // window opens. Otherwise an animation installed with a start time
         // of zero instantly freezes at its final frame after 13.5 seconds.
         let current_time = if in_idle && force_animation.is_none() {
-            (idle_phase - 13500).max(0) / 33 * 33
+            (idle_phase - 13500).max(0) / preview_interval * preview_interval
         } else {
-            animation_tick.saturating_mul(33)
+            animation_tick.saturating_mul(preview_interval)
         };
         let key = (
             format!(
                 "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{}:{:.2}:{:.2}",
-                animation_name,
+                format!("{animation_name}:{:?}",crate::emotes::active_preview().map(|p|p.emote.id)),
                 preview_model,
                 self.network.saber1,
                 self.network.saber2,
@@ -300,6 +315,7 @@ impl App {
                     cosmetics,
                     self.profile_studio_head_look,
                     true,
+                    crate::emotes::active_preview(),
                 )?;
                 let requests = presenter.drain_fx_requests();
                 self.profile_studio_world_anchors = anchors;
@@ -313,13 +329,34 @@ impl App {
                 .expect("profile Ghoul2 presenter initialized")
                 .drain_cosmetic_draws();
             if !worn.is_empty() {
+                // Emote props can produce attachments even with cosmetics and
+                // sabers disabled. Initialize after seeing the actual draw list.
+                self.ensure_asset_preview_entity_presenter()?;
+                self.asset_preview_entity_presenter.as_mut().ok_or("profile attachment presenter unavailable")?.set_material_eye([0.;3]);
                 let mut hats = self
                     .asset_preview_entity_presenter
                     .as_mut()
-                    .expect("profile MD3 presenter initialized")
+                    .ok_or("profile attachment presenter unavailable")?
                     .present_cosmetics(worn);
                 crate::cgame::player_presenter::apply_profile_studio_light(&mut hats, true);
                 draws.append(&mut hats);
+            }
+
+            let (emote_fx, _) = self
+                .asset_preview_player_presenter
+                .as_mut()
+                .expect("profile Ghoul2 presenter initialized")
+                .drain_emote_fx();
+            if !emote_fx.is_empty() {
+                self.ensure_asset_preview_entity_presenter()?;
+                let view = crate::fx::draw::FxView::from_camera(&self.asset_preview_camera());
+                let presenter = self
+                    .asset_preview_entity_presenter
+                    .as_mut()
+                    .ok_or("profile effect presenter unavailable")?;
+                draws.extend(crate::fx::draw::tessellate(&emote_fx, &view, &mut |shader| {
+                    presenter.fx_material_stages(shader)
+                }));
             }
 
             if with_sabers {
