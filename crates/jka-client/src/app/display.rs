@@ -1160,6 +1160,9 @@ impl App {
             return;
         }
         self.window_hidden_for_restart = false;
+        if super::lifecycle::headless() {
+            return;
+        }
         if let Some(window) = &self.window {
             window.set_visible(true);
             window.focus_window();
